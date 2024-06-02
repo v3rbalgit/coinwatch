@@ -19,7 +19,7 @@ def get_instruments() -> List[str]:
     if res['retMsg'] == 'OK':
       symbols.extend(symbol['symbol'] for symbol in res['result']['list'] if 'USDT' in symbol['symbol'])
     else:
-      raise ValueError(f'Could not fetch results: {res['retCode']} {res['retMsg']}')
+      raise ValueError(f'Could not fetch results: {res["retCode"]} {res["retMsg"]}')
   except ValueError as e:
     print(e.args[0])
 
@@ -48,7 +48,7 @@ def get_prices(symbols: List):
           'turnover': kline[6]
         } for kline in res['result']['list']], index=timestamps, dtype=np.float32)
       else:
-        raise ValueError(f'Could not fetch results: {res['retCode']} {res['retMsg']}')
+        raise ValueError(f'Could not fetch results: {res["retCode"]} {res["retMsg"]}')
     except ValueError as e:
       print(e.args[0])
 
