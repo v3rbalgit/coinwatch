@@ -21,6 +21,11 @@ Run synchronization
 docker compose up -d
 ```
 
+Stop synchronization
+```
+docker compose stop
+```
+
 See app container logs to ensure synchronization is running 
 ```
 docker compose logs app
