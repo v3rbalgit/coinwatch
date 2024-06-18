@@ -30,6 +30,7 @@ services:
       context: .
     container_name: coinwatch
     tty: true
+    command: ["python", "src/main.py"]
     volumes:
       - .:/app
     depends_on:

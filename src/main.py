@@ -1,3 +1,5 @@
+from time import sleep
+
 from sqlalchemy.orm import sessionmaker
 from db.init_db import init_db, engine
 from api.bybit_adapter import get_kline, get_instruments
@@ -52,4 +54,5 @@ def main():
 
 
 if __name__ == "__main__":
+    sleep(5) # FIXME! Ensure database started
     main()
