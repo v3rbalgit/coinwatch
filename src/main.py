@@ -4,6 +4,7 @@ from sqlalchemy.orm import sessionmaker
 from db.init_db import init_db, engine
 from api.bybit_adapter import get_kline, get_instruments
 from services.kline_service import get_symbol_id, get_latest_timestamp, insert_kline_data
+from config import SYNCHRONIZATION_DAYS
 from utils.timestamp import get_current_timestamp, get_past_timestamp, calculate_hours_between
 
 
@@ -23,7 +24,7 @@ def main():
         if latest_timestamp:
             start_time = latest_timestamp
         else:
-            start_time = get_past_timestamp(2)
+            start_time = get_past_timestamp(SYNCHRONIZATION_DAYS)
 
         hours_between = calculate_hours_between(start_time, end_time)
 
@@ -54,5 +55,6 @@ def main():
 
 
 if __name__ == "__main__":
-    sleep(5) # FIXME! Ensure database started
-    main()
+    while(True):
+        sleep(5) # FIXME! Ensure database started
+        main()
