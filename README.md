@@ -13,3 +13,22 @@ Cieľ je vedieť vyhodnotiť, ktoré kryptomeny sa oplatí sledovať a obchodova
 2. Nástroj by mal vedieť nielen stiahnuť dáta, ale aj overiť ich integritu od posledného spustenia, t.j. zistiť, či je databáza kompletná, a vložiť chýbajúce cenové údaje, aby boli aktuálne.
 3. Jediné údaje, ktoré budú uložené v databáze sú 1h OHLC dáta vrátane Volume. V knižnici **Pybit** na to slúži metóda _get_kline()_. Tým pádom nebude databáza príliš obrovská.
 4. Keď bude fungovať synchronizácia databázy, treba navrhnuť API, pomocou ktorého z nej bude možné vytiahnuť požadované indikátory. Užívateľ si bude môcť na frontende zvoliť, ktoré indikátory ho zaujímajú a vybrať si zobrazenie napr. v nejakej tabuľke. Na samotnom UI, a spôsobe používania aplikácie ešte popracujem.
+
+### Usage
+
+Run synchronization
+```
+docker compose up -d
+```
+
+Stop synchronization
+```
+docker compose stop
+```
+
+See app container logs to ensure synchronization is running 
+```
+docker compose logs app
+```
+
+phpMyAdmin is available on http://localhost:8080/
