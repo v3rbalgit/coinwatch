@@ -49,7 +49,8 @@ def main():
 
             print(f"Added last {hours_between} hours - {symbol}")
 
-            insert_kline_data(session, symbol_id, formatted_data)
+            print(f"Data to be added for symbol ID {symbol_id}: {formatted_data}")
+            # insert_kline_data(session, symbol_id, formatted_data)
 
     session.close()
 
