@@ -1,13 +1,24 @@
+import time
 from datetime import datetime, timedelta
 
 def get_current_timestamp() -> int:
-    return int(datetime.now().timestamp() * 1000)
+    """Get the current timestamp in milliseconds."""
+    return int(time.time() * 1000)
 
 def get_past_timestamp(days: int) -> int:
-    return int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+    """Get a timestamp from 'days' ago in milliseconds."""
+    past_date = datetime.now() - timedelta(days=days)
+    return to_timestamp(past_date)
 
 def calculate_hours_between(start_time: int, end_time: int) -> int:
-    start_dt = datetime.fromtimestamp(start_time / 1000)
-    end_dt = datetime.fromtimestamp(end_time / 1000)
-    delta = end_dt - start_dt
-    return int(delta.total_seconds() // 3600)
+    """Calculate the number of hours between two millisecond timestamps."""
+    time_difference = end_time - start_time
+    return int(time_difference / (1000 * 60 * 60))  # Convert milliseconds to hours
+
+def from_timestamp(timestamp: int) -> datetime:
+    """Convert millisecond timestamp to datetime object."""
+    return datetime.fromtimestamp(timestamp / 1000)
+
+def to_timestamp(dt: datetime) -> int:
+    """Convert datetime object to millisecond timestamp."""
+    return int(dt.timestamp() * 1000)
