@@ -19,6 +19,18 @@ engine = create_engine(DATABASE_URL)
 Session = sessionmaker(bind=engine)
 
 def cleanup_database(session):
+    """
+    Perform database cleanup operations.
+
+    This function removes symbols no longer present in the current list,
+    deletes duplicate klines, and removes data older than SYNCHRONIZATION_DAYS.
+
+    Args:
+        session (Session): The database session to use for operations.
+
+    Raises:
+        Exception: If any error occurs during the cleanup process.
+    """
     try:
         # 1. Remove symbols not present in the current list
         current_symbols = set(get_instruments())
@@ -50,6 +62,22 @@ def cleanup_database(session):
         logger.error(f"Error during database cleanup: {str(e)}")
 
 def fill_data_gaps(session, symbol, symbol_id, start_time, end_time):
+    """
+    Fill gaps in kline data for a specific symbol.
+
+    This function identifies missing data points between start_time and end_time,
+    and attempts to fetch and insert the missing data.
+
+    Args:
+        session (Session): The database session to use for operations.
+        symbol (str): The trading pair symbol.
+        symbol_id (int): The database ID of the symbol.
+        start_time (int): The start timestamp for gap filling.
+        end_time (int): The end timestamp for gap filling.
+
+    Raises:
+        Exception: If any error occurs during the gap filling process.
+    """
     try:
         current_time = get_current_timestamp()
         if end_time > current_time:
@@ -90,6 +118,20 @@ def fill_data_gaps(session, symbol, symbol_id, start_time, end_time):
         logger.error(f"Error filling data gaps for {symbol}: {str(e)}")
 
 def sync_symbol_data(session, symbol, symbol_id, end_time):
+    """
+    Synchronize kline data for a specific symbol.
+
+    This function fills any gaps in existing data and fetches new data up to the specified end_time.
+
+    Args:
+        session (Session): The database session to use for operations.
+        symbol (str): The trading pair symbol.
+        symbol_id (int): The database ID of the symbol.
+        end_time (int): The end timestamp for data synchronization.
+
+    Raises:
+        Exception: If any error occurs during the synchronization process.
+    """
     try:
         current_time = get_current_timestamp()
         if end_time > current_time:
@@ -122,6 +164,21 @@ def sync_symbol_data(session, symbol, symbol_id, end_time):
         logger.error(f"Error syncing data for {symbol}: {str(e)}")
 
 def get_current_symbols(max_retries=3, retry_delay=60):
+    """
+    Fetch the current list of trading pair symbols from the exchange.
+
+    This function attempts to fetch the list of instruments multiple times in case of failure.
+
+    Args:
+        max_retries (int): The maximum number of retry attempts. Defaults to 3.
+        retry_delay (int): The delay in seconds between retry attempts. Defaults to 60.
+
+    Returns:
+        List[str]: A list of current trading pair symbols.
+
+    Raises:
+        RuntimeError: If unable to fetch the instrument list after all retry attempts.
+    """
     for attempt in range(max_retries):
         try:
             return get_instruments()
@@ -134,7 +191,16 @@ def get_current_symbols(max_retries=3, retry_delay=60):
                 logger.critical("Failed to fetch instruments after maximum retries.")
                 return []
 
-def main():
+def main() -> None:
+    """
+    Main function to run the data synchronization process.
+
+    This function initializes the database, performs cleanup, and continuously
+    synchronizes data for all current trading pairs.
+
+    Raises:
+        Exception: If a fatal error occurs during execution.
+    """
     try:
         init_db()
         logger.info("Database initialized successfully.")
