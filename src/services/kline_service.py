@@ -2,8 +2,8 @@
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.dialects.mysql import insert
-from src.models.symbol import Symbol
-from src.models.kline import Kline
+from models.symbol import Symbol
+from models.kline import Kline
 import logging
 from typing import Optional, List, Tuple, Dict, Any
 from datetime import datetime

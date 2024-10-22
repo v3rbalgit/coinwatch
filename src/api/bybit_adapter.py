@@ -4,7 +4,6 @@ from typing import List, Dict, Any, Optional, TypedDict, Union
 from pybit.unified_trading import HTTP
 import logging
 import time
-from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
