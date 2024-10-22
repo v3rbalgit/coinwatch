@@ -43,6 +43,25 @@ services:
       DB_PASSWORD: password
       DB_NAME: coinwatch
 
+  test:
+    build:
+      context: .
+    container_name: coinwatch_test
+    tty: true
+    command: /bin/sh -c "python -m src.tests.test_connections && python -m src.tests.test_data_collection"
+    volumes:
+      - .:/app
+    depends_on:
+      - db
+      - app
+    networks:
+      - coinwatch_network
+    environment:
+      DB_HOST: db
+      DB_USER: user
+      DB_PASSWORD: password
+      DB_NAME: coinwatch
+
 volumes:
   data:
 
