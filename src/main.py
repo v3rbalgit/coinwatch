@@ -1,18 +1,18 @@
-
 # src/main.py
 import logging
 from time import sleep
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import text
-from src.db.init_db import init_db, db_manager
-from src.api.bybit_adapter import bybit
-from src.services.kline_service import get_symbol_id, get_latest_timestamp, insert_kline_data, remove_symbol
-from src.config import SYNCHRONIZATION_DAYS
-from src.utils.timestamp import get_current_timestamp, get_past_timestamp, calculate_hours_between, from_timestamp
-from src.models.symbol import Symbol
-from src.models.kline import Kline
+from db.init_db import init_db, db_manager
+from api.bybit_adapter import bybit
+from services.kline_service import get_symbol_id, get_latest_timestamp, insert_kline_data, remove_symbol
+from config import SYNCHRONIZATION_DAYS
+from utils.timestamp import get_current_timestamp, get_past_timestamp, calculate_hours_between, from_timestamp
+from models.symbol import Symbol
+from models.kline import Kline
 import threading
+import random
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -32,6 +32,8 @@ def process_symbol(symbol: str, end_time: int) -> None:
     """Process a single symbol's data synchronization."""
     session = get_thread_session()
     try:
+        # Add small random delay to spread out connections
+        sleep(random.uniform(0.1, 0.3))  # Random delay between 100-300ms
         symbol_id = get_symbol_id(session, symbol)
         sync_symbol_data(session, symbol, symbol_id, end_time)
     except Exception as e:
@@ -135,7 +137,7 @@ def main() -> None:
                     end_time = get_current_timestamp()
 
                     # Process symbols in parallel
-                    max_workers = min(20, len(current_symbols))  # Limit concurrent threads
+                    max_workers = min(10, len(current_symbols))  # Limit concurrent threads
                     with ThreadPoolExecutor(max_workers=max_workers) as executor:
                         futures = [
                             executor.submit(process_symbol, symbol, end_time)

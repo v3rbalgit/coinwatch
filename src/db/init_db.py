@@ -6,8 +6,8 @@ from contextlib import contextmanager
 import time
 import logging
 from typing import Generator, Optional
-from src.config import DATABASE_URL
-from src.models.base import Base
+from config import DATABASE_URL
+from models.base import Base
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)

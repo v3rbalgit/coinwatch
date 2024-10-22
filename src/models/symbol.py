@@ -1,6 +1,6 @@
 # src/models/symbol.py
 from sqlalchemy import Column, String, BigInteger
-from src.models.base import Base
+from models.base import Base
 
 class Symbol(Base):
     __tablename__ = 'symbols'

@@ -1,7 +1,7 @@
 # src/models/kline.py
 from sqlalchemy import Column, BigInteger, DECIMAL, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import relationship
-from src.models.base import Base
+from models.base import Base
 
 
 class Kline(Base):
