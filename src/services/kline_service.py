@@ -1,63 +1,65 @@
 # src/services/kline_service.py
+
 from sqlalchemy.orm import Session
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.dialects.mysql import insert
 from models.symbol import Symbol
 from models.kline import Kline
 import logging
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Optional, List, Tuple, cast
 from datetime import datetime
+from utils.integrity import DataIntegrityManager
+from utils.exceptions import DataValidationError, DatabaseError
+from utils.validation import KlineValidator, ValidationError
 
 logger = logging.getLogger(__name__)
 
-class KlineServiceError(Exception):
-    """Base exception for kline service errors"""
-    pass
-
 def get_symbol_id(session: Session, symbol_name: str) -> int:
     """
-    Get the database ID for a given symbol, creating a new entry if it doesn't exist.
+    Get or create the database ID for a given symbol.
 
     Args:
-        session (Session): The database session
-        symbol_name (str): The name of the symbol
+        session: Database session
+        symbol_name: Name of the symbol
 
     Returns:
-        int: The database ID of the symbol
+        int: Database ID of the symbol
 
     Raises:
-        KlineServiceError: If unable to get or create the symbol
+        DatabaseError: If unable to get or create symbol
     """
     try:
         symbol = session.query(Symbol).filter_by(name=symbol_name).first()
         if not symbol:
             symbol = Symbol(name=symbol_name)
             session.add(symbol)
-            session.commit()
-            session.refresh(symbol)
-        return int(symbol.id)
+            session.flush()  # Use flush to get the ID without committing
+            logger.debug(f"Added new symbol: {symbol_name} with ID {symbol.id}")
+        return cast(int, symbol.id)
     except IntegrityError:
         session.rollback()
-        # Handle race condition
+        # Handle race condition by querying again
         symbol = session.query(Symbol).filter_by(name=symbol_name).first()
         if symbol:
-            return int(symbol.id)
-        raise KlineServiceError(f"Failed to get or create symbol: {symbol_name}")
+            return cast(int, symbol.id)
+        raise DatabaseError(f"Failed to get or create symbol: {symbol_name}")
     except Exception as e:
         session.rollback()
-        logger.error(f"Error in get_symbol_id for {symbol_name}: {str(e)}")
-        raise KlineServiceError(f"Error processing symbol: {symbol_name}")
+        raise DatabaseError(f"Error processing symbol: {symbol_name}: {str(e)}")
 
 def get_latest_timestamp(session: Session, symbol_id: int) -> Optional[int]:
     """
     Get the most recent timestamp for a given symbol.
 
     Args:
-        session (Session): The database session
-        symbol_id (int): The symbol ID
+        session: Database session
+        symbol_id: Symbol ID
 
     Returns:
-        Optional[int]: The latest timestamp or None if no data exists
+        Optional[int]: Latest timestamp or None if no data exists
+
+    Raises:
+        DatabaseError: If query fails
     """
     try:
         result = session.query(Kline.start_time)\
@@ -66,8 +68,7 @@ def get_latest_timestamp(session: Session, symbol_id: int) -> Optional[int]:
             .first()
         return result[0] if result else None
     except Exception as e:
-        logger.error(f"Error getting latest timestamp for symbol_id {symbol_id}: {str(e)}")
-        raise KlineServiceError(f"Failed to get latest timestamp for symbol_id: {symbol_id}")
+        raise DatabaseError(f"Failed to get latest timestamp for symbol_id {symbol_id}: {str(e)}")
 
 def validate_kline_data(data: Tuple) -> bool:
     """
@@ -99,30 +100,45 @@ def validate_kline_data(data: Tuple) -> bool:
 
 def insert_kline_data(session: Session, symbol_id: int, kline_data: List[Tuple], batch_size: int = 1000) -> None:
     """
-    Insert kline data in batches with validation.
+    Insert kline data with integrity checks.
 
     Args:
-        session (Session): The database session
-        symbol_id (int): The symbol ID
-        kline_data (List[Tuple]): List of kline data tuples
-        batch_size (int): Size of each batch for insertion
+        session: Database session
+        symbol_id: Symbol ID
+        kline_data: List of kline data tuples
+        batch_size: Size of each insert batch
 
     Raises:
-        KlineServiceError: If data insertion fails
+        DataValidationError: If data validation fails
+        DatabaseError: If insert fails
     """
     try:
-        # Validate all data first
-        invalid_data = [(i, data) for i, data in enumerate(kline_data) if not validate_kline_data(data)]
-        if invalid_data:
-            invalid_indices = [i for i, _ in invalid_data]
-            logger.error(f"Invalid kline data found at indices: {invalid_indices}")
-            raise ValueError(f"Invalid kline data found at indices: {invalid_indices}")
+        # Basic validation first
+        validation_errors = KlineValidator.validate_klines(kline_data)
+        if validation_errors:
+            error_indices = [i for i, _ in validation_errors]
+            error_messages = [msg for _, msg in validation_errors]
+            raise ValidationError(
+                f"Invalid kline data found at indices: {error_indices}\n"
+                f"Errors: {error_messages}"
+            )
+
+        # Integrity checks
+        if kline_data:
+            integrity_manager = DataIntegrityManager(session)
+            start_time = min(data[0] for data in kline_data)
+            end_time = max(data[0] for data in kline_data)
+
+            validation_result = integrity_manager.validate_kline_data(
+                symbol_id, start_time, end_time
+            )
+
+            if not validation_result.get('time_range_valid', False):
+                raise DataValidationError("Invalid time range in kline data")
 
         # Process in batches
         for i in range(0, len(kline_data), batch_size):
             batch = kline_data[i:i + batch_size]
-
-            # Prepare batch data
             values = [
                 {
                     'symbol_id': symbol_id,
@@ -137,7 +153,6 @@ def insert_kline_data(session: Session, symbol_id: int, kline_data: List[Tuple],
                 for item in batch
             ]
 
-            # Use MySQL's INSERT ... ON DUPLICATE KEY UPDATE
             stmt = insert(Kline).values(values)
             stmt = stmt.on_duplicate_key_update({
                 'open_price': stmt.inserted.open_price,
@@ -149,40 +164,37 @@ def insert_kline_data(session: Session, symbol_id: int, kline_data: List[Tuple],
             })
 
             session.execute(stmt)
-            session.commit()
-
             logger.debug(f"Inserted batch of {len(batch)} klines for symbol_id {symbol_id}")
 
-    except ValueError as e:
-        session.rollback()
-        raise KlineServiceError(str(e))
+    except ValidationError as ve:
+        logger.error(f"Data validation error: {ve}")
+        raise
+    except DataValidationError as dve:
+        logger.error(f"Data validation error: {dve}")
+        raise
     except Exception as e:
-        session.rollback()
-        logger.error(f"Error inserting kline data for symbol_id {symbol_id}: {str(e)}")
-        raise KlineServiceError(f"Failed to insert kline data for symbol_id: {symbol_id}")
+        logger.error(f"Failed to insert kline data for symbol_id {symbol_id}: {str(e)}")
+        raise DatabaseError(f"Failed to insert kline data for symbol_id {symbol_id}: {str(e)}")
 
 def remove_symbol(session: Session, symbol_name: str) -> None:
     """
     Remove a symbol and its associated kline data.
 
     Args:
-        session (Session): The database session
-        symbol_name (str): The symbol name to remove
+        session: Database session
+        symbol_name: Symbol name to remove
 
     Raises:
-        KlineServiceError: If symbol removal fails
+        DatabaseError: If removal fails
     """
     try:
         symbol = session.query(Symbol).filter_by(name=symbol_name).first()
         if symbol:
-            # Delete associated kline data first
-            session.query(Kline).filter_by(symbol_id=symbol.id).delete()
+            deleted = session.query(Kline).filter_by(symbol_id=symbol.id).delete()
             session.delete(symbol)
-            session.commit()
-            logger.info(f"Removed symbol and its klines: {symbol_name}")
+            logger.info(f"Removed symbol '{symbol_name}' and its {deleted} associated klines.")
         else:
             logger.warning(f"Symbol not found for removal: {symbol_name}")
     except Exception as e:
-        session.rollback()
-        logger.error(f"Error removing symbol {symbol_name}: {str(e)}")
-        raise KlineServiceError(f"Failed to remove symbol: {symbol_name}")
+        logger.error(f"Failed to remove symbol '{symbol_name}': {e}")
+        raise DatabaseError(f"Failed to remove symbol '{symbol_name}': {str(e)}")

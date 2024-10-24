@@ -1,39 +1,69 @@
 # src/api/bybit_adapter.py
 
-from typing import List, Dict, Any, Optional, TypedDict, Union
-from pybit.unified_trading import HTTP
-import logging
+import threading
 import time
+import logging
+from typing import List, Dict, Any, Optional
+from pybit.unified_trading import HTTP
+from requests.exceptions import RequestException
+from utils.exceptions import APIError
 
 logger = logging.getLogger(__name__)
 
-class BybitResponse(TypedDict):
-    retCode: int
-    retMsg: str
-    result: Dict[str, Any]
-    retExtInfo: Dict[str, Any]
-    time: int
-
 class BybitAdapter:
+    # Class-level variables shared among all instances (and thus all threads)
+    _lock = threading.Lock()
+    _tokens = 600  # Bybit allows 600 requests per 5 seconds
+    _last_refill = time.time()
+
+    RATE_LIMIT = 600  # Max requests per window
+    WINDOW_SIZE = 5   # Window size in seconds
+
     def __init__(self):
+        # Each thread can have its own session
         self.session = HTTP()
-        self.rate_limit_remaining = 100
-        self.last_request_time = 0
-        self.min_request_interval = 0.05  # 50ms between requests
 
-    def _handle_rate_limit(self) -> None:
-        """Handle rate limiting for API requests."""
-        current_time = time.time()
-        time_since_last_request = current_time - self.last_request_time
+    @classmethod
+    def _acquire_token(cls):
+        """Acquire a token for making an API request."""
+        with cls._lock:
+            current_time = time.time()
+            elapsed = current_time - cls._last_refill
 
-        if time_since_last_request < self.min_request_interval:
-            sleep_time = self.min_request_interval - time_since_last_request
-            time.sleep(sleep_time)
+            # Refill tokens if window has passed
+            if elapsed >= cls.WINDOW_SIZE:
+                cls._tokens = cls.RATE_LIMIT
+                cls._last_refill = current_time
+                logger.debug("Token bucket refilled")
 
-        self.last_request_time = time.time()
+            if cls._tokens > 0:
+                cls._tokens -= 1
+                return True
+            else:
+                return False
 
-    def _validate_response(self, response: Union[Dict[str, Any], Any]) -> None:
-        """Validate API response."""
+    def _wait_for_token(self):
+        """Wait until a token is available for making an API request."""
+        while not self._acquire_token():
+            sleep_time = self.WINDOW_SIZE - (time.time() - self._last_refill)
+            if sleep_time > 0:
+                logger.debug(f"Rate limit reached, sleeping for {sleep_time:.2f} seconds")
+                time.sleep(sleep_time)
+            else:
+                # Tokens should have been refilled, but acquire again to be sure
+                continue
+
+    def _handle_rate_limit(self):
+        """Wait for token availability before making a request."""
+        self._wait_for_token()
+
+    def _validate_response(self, response: Any) -> Dict[str, Any]:
+        """Validate API response and return the response dictionary."""
+        # Check if response is a tuple
+        if isinstance(response, tuple):
+            # PyBit sometimes returns a tuple (response, request_time, headers)
+            response = response[0]  # Extract the response dictionary
+
         if not isinstance(response, dict):
             raise ValueError(f"Invalid response type: {type(response)}")
 
@@ -44,7 +74,9 @@ class BybitAdapter:
         if ret_code != 0:
             error_msg = f"API Error: {ret_code} - {response.get('retMsg')}"
             logger.error(error_msg)
-            raise ValueError(error_msg)
+            raise APIError(error_msg)
+
+        return response  # Return the validated response dictionary
 
     def get_kline(self,
                   symbol: str,
@@ -55,21 +87,6 @@ class BybitAdapter:
                   retry_count: int = 3) -> Dict[str, Any]:
         """
         Fetch kline/candlestick data from Bybit.
-
-        Args:
-            symbol: Trading pair symbol
-            interval: Kline interval in minutes ('5' for 5m, '60' for 1h, etc.)
-            limit: Number of klines to fetch (max 200)
-            start_time: Start timestamp in milliseconds
-            end_time: End timestamp in milliseconds
-            retry_count: Number of retry attempts
-
-        Returns:
-            Dict[str, Any]: Processed API response
-
-        Raises:
-            ValueError: If API response is invalid
-            Exception: For other errors during API call
         """
         for attempt in range(retry_count):
             try:
@@ -88,56 +105,53 @@ class BybitAdapter:
                     params["end"] = end_time
 
                 response = self.session.get_kline(**params)
-                self._validate_response(response)
+                response = self._validate_response(response)
 
                 return response
 
-            except ValueError as e:
-                if "Too many visits" in str(e):
-                    sleep_time = 2 ** attempt
-                    logger.warning(f"Rate limit hit, sleeping for {sleep_time} seconds")
+            except APIError as e:
+                if "Too many visits" in str(e) or "Rate limit exceeded" in str(e):
+                    # Handle rate limit error specifically
+                    logger.warning(f"Rate limit error: {e}")
+                    sleep_time = self.WINDOW_SIZE
+                    logger.debug(f"Sleeping for {sleep_time} seconds before retrying")
                     time.sleep(sleep_time)
-                    continue
-                raise
+                    continue  # Retry after sleeping
+                else:
+                    logger.error(f"APIError on attempt {attempt + 1}: {e}")
+                    raise  # Non-recoverable API error
 
-            except Exception as e:
+            except (RequestException, ValueError) as e:
+                logger.error(f"RequestException on attempt {attempt + 1}: {e}")
                 if attempt < retry_count - 1:
                     sleep_time = 2 ** attempt
-                    logger.warning(f"Request failed, attempt {attempt + 1}/{retry_count}. "
-                                 f"Retrying in {sleep_time} seconds. Error: {str(e)}")
+                    logger.debug(f"Retrying in {sleep_time} seconds")
                     time.sleep(sleep_time)
+                    continue
                 else:
-                    logger.error(f"Failed to fetch kline data after {retry_count} attempts: {str(e)}")
                     raise
 
-        raise Exception(f"Failed to get kline data after {retry_count} attempts")
+            except Exception as e:
+                logger.exception(f"Unexpected error on attempt {attempt + 1}: {e}")
+                raise
+
+        raise APIError(f"Failed to get kline data for {symbol} after {retry_count} attempts")
 
     def get_instruments(self) -> List[str]:
         """
         Fetch all available USDT perpetual trading pairs.
-
-        Returns:
-            List[str]: List of trading pair symbols
-
-        Raises:
-            ValueError: If API response is invalid
-            Exception: For other errors during API call
         """
         try:
             self._handle_rate_limit()
             response = self.session.get_instruments_info(category='linear')
-            self._validate_response(response)
+            response = self._validate_response(response)
 
-            if not isinstance(response, dict) or 'result' not in response:
-                raise ValueError("Invalid response format")
-
-            result = response['result']
-            if not isinstance(result, dict) or 'list' not in result:
-                raise ValueError("Invalid response structure")
+            result = response.get('result', {})
+            instrument_list = result.get('list', [])
 
             symbols = [
                 item['symbol']
-                for item in result['list']
+                for item in instrument_list
                 if isinstance(item, dict) and
                 'symbol' in item and
                 isinstance(item['symbol'], str) and
@@ -148,44 +162,34 @@ class BybitAdapter:
             return symbols
 
         except Exception as e:
-            logger.error(f"Failed to fetch instruments: {str(e)}")
+            logger.exception(f"Failed to fetch instruments: {e}")
             raise
 
     def get_active_instruments(self) -> List[str]:
         """
         Fetch only actively trading USDT perpetual pairs.
-
-        Returns:
-            List[str]: List of active trading pair symbols
         """
         try:
             self._handle_rate_limit()
             response = self.session.get_instruments_info(category='linear')
-            self._validate_response(response)
+            response = self._validate_response(response)
 
-            if not isinstance(response, dict) or 'result' not in response:
-                raise ValueError("Invalid response format")
-
-            result = response['result']
-            if not isinstance(result, dict) or 'list' not in result:
-                raise ValueError("Invalid response structure")
+            result = response.get('result', {})
+            instrument_list = result.get('list', [])
 
             symbols = [
                 item['symbol']
-                for item in result['list']
+                for item in instrument_list
                 if isinstance(item, dict) and
+                item.get('status') == 'Trading' and
                 'symbol' in item and
                 isinstance(item['symbol'], str) and
-                'USDT' in item['symbol'] and
-                item.get('status') == 'Trading'  # Only get actively trading pairs
+                'USDT' in item['symbol']
             ]
 
             logger.info(f"Successfully fetched {len(symbols)} active trading pairs")
             return symbols
 
         except Exception as e:
-            logger.error(f"Failed to fetch instruments: {str(e)}")
+            logger.exception(f"Failed to fetch active instruments: {e}")
             raise
-
-# Create global instance
-bybit = BybitAdapter()
