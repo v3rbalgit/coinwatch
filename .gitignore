@@ -175,3 +175,6 @@ cython_debug/
 
 # InteliJ IDEA
 .idea
+
+# Custom ignores
+project_structure.txt

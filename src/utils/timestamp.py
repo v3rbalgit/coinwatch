@@ -1,5 +1,7 @@
+# src/utils/timestamp.py
+
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 def get_current_timestamp() -> int:
     """Get the current timestamp in milliseconds."""
@@ -7,18 +9,17 @@ def get_current_timestamp() -> int:
 
 def get_past_timestamp(days: int) -> int:
     """Get a timestamp from 'days' ago in milliseconds."""
-    past_date = datetime.now() - timedelta(days=days)
+    past_date = datetime.now(timezone.utc) - timedelta(days=days)
     return to_timestamp(past_date)
-
-def calculate_hours_between(start_time: int, end_time: int) -> int:
-    """Calculate the number of hours between two millisecond timestamps."""
-    time_difference = end_time - start_time
-    return int(time_difference / (1000 * 60 * 60))  # Convert milliseconds to hours
 
 def from_timestamp(timestamp: int) -> datetime:
     """Convert millisecond timestamp to datetime object."""
-    return datetime.fromtimestamp(timestamp / 1000)
+    return datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
 
 def to_timestamp(dt: datetime) -> int:
     """Convert datetime object to millisecond timestamp."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
     return int(dt.timestamp() * 1000)

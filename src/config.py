@@ -1,3 +1,5 @@
+# src/config.py
+
 import os
 from dotenv import load_dotenv
 
@@ -13,7 +15,3 @@ DB_CONFIG = {
 }
 
 DATABASE_URL = f"mysql+mysqlconnector://{DB_CONFIG['user']}:{DB_CONFIG['password']}@{DB_CONFIG['host']}/{DB_CONFIG['database']}"
-
-
-# Application configuration
-SYNCHRONIZATION_DAYS = int(os.getenv('SYNCHRONIZATION_DAYS', 14))
