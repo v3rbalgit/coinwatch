@@ -3,6 +3,7 @@
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.dialects.mysql import insert
+from sqlalchemy import func
 from models.symbol import Symbol
 from models.kline import Kline
 import logging
@@ -11,9 +12,11 @@ from datetime import datetime
 from utils.integrity import DataIntegrityManager
 from utils.exceptions import DataValidationError, DatabaseError
 from utils.validation import KlineValidator, ValidationError
+from utils.db_retry import with_db_retry
 
 logger = logging.getLogger(__name__)
 
+@with_db_retry(max_attempts=3)
 def get_symbol_id(session: Session, symbol_name: str) -> int:
     """
     Get or create the database ID for a given symbol.
@@ -62,11 +65,10 @@ def get_latest_timestamp(session: Session, symbol_id: int) -> Optional[int]:
         DatabaseError: If query fails
     """
     try:
-        result = session.query(Kline.start_time)\
+        result = session.query(func.max(Kline.start_time))\
             .filter_by(symbol_id=symbol_id)\
-            .order_by(Kline.start_time.desc())\
-            .first()
-        return result[0] if result else None
+            .scalar()
+        return result
     except Exception as e:
         raise DatabaseError(f"Failed to get latest timestamp for symbol_id {symbol_id}: {str(e)}")
 
@@ -98,6 +100,7 @@ def validate_kline_data(data: Tuple) -> bool:
     except Exception:
         return False
 
+@with_db_retry(max_attempts=3)
 def insert_kline_data(session: Session, symbol_id: int, kline_data: List[Tuple], batch_size: int = 1000) -> None:
     """
     Insert kline data with integrity checks.
@@ -113,7 +116,6 @@ def insert_kline_data(session: Session, symbol_id: int, kline_data: List[Tuple],
         DatabaseError: If insert fails
     """
     try:
-        # Basic validation first
         validation_errors = KlineValidator.validate_klines(kline_data)
         if validation_errors:
             error_indices = [i for i, _ in validation_errors]
@@ -123,7 +125,6 @@ def insert_kline_data(session: Session, symbol_id: int, kline_data: List[Tuple],
                 f"Errors: {error_messages}"
             )
 
-        # Integrity checks
         if kline_data:
             integrity_manager = DataIntegrityManager(session)
             start_time = min(data[0] for data in kline_data)
@@ -136,9 +137,9 @@ def insert_kline_data(session: Session, symbol_id: int, kline_data: List[Tuple],
             if not validation_result.get('time_range_valid', False):
                 raise DataValidationError("Invalid time range in kline data")
 
-        # Process in batches
         for i in range(0, len(kline_data), batch_size):
             batch = kline_data[i:i + batch_size]
+
             values = [
                 {
                     'symbol_id': symbol_id,
@@ -154,6 +155,7 @@ def insert_kline_data(session: Session, symbol_id: int, kline_data: List[Tuple],
             ]
 
             stmt = insert(Kline).values(values)
+
             stmt = stmt.on_duplicate_key_update({
                 'open_price': stmt.inserted.open_price,
                 'high_price': stmt.inserted.high_price,
@@ -164,6 +166,7 @@ def insert_kline_data(session: Session, symbol_id: int, kline_data: List[Tuple],
             })
 
             session.execute(stmt)
+            session.flush()  # Ensure IDs are generated
             logger.debug(f"Inserted batch of {len(batch)} klines for symbol_id {symbol_id}")
 
     except ValidationError as ve:

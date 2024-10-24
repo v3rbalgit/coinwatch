@@ -1,7 +1,7 @@
 # src/tests/test_connections.py
 from sqlalchemy import text  # Add this import
 from src.db.init_db import db_manager
-from src.api.bybit_adapter import bybit
+from src.api.bybit_adapter import BybitAdapter
 
 def test_connections():
     try:
@@ -12,6 +12,7 @@ def test_connections():
         print(f"❌ Database connection failed: {e}")
 
     try:
+        bybit = BybitAdapter()  # Create Bybit adapter instance
         symbols = bybit.get_instruments()
         print(f"✅ Bybit API connection successful. Found {len(symbols)} symbols")
     except Exception as e:

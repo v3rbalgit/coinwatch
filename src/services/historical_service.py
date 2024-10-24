@@ -4,9 +4,11 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional, List, TypedDict
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError, OperationalError
 from api.bybit_adapter import BybitAdapter
 from services.kline_service import get_symbol_id, insert_kline_data
 from utils.timestamp import to_timestamp, from_timestamp
+from utils.db_retry import with_db_retry
 from models.checkpoint import Checkpoint
 from db.init_db import session_scope
 import time
@@ -109,6 +111,7 @@ class HistoricalDataManager:
         logger.error(f"API call failed after {self.max_retries} attempts.")
         raise Exception(f"Failed to make API call after {self.max_retries} retries.")
 
+    @with_db_retry(max_attempts=3)
     def _get_symbol_first_trade(self, symbol: str) -> Optional[int]:
         """
         Get the timestamp of the first trade for a symbol.
@@ -139,27 +142,76 @@ class HistoricalDataManager:
             logger.error(f"Error getting first trade date for {symbol}: {e}")
             return None
 
+    @with_db_retry(max_attempts=3)
     def _update_checkpoint(self, session: Session, symbol: str, last_timestamp: int) -> None:
         """
-        Update the checkpoint for a given symbol.
+        Update the checkpoint for a given symbol with proper concurrency handling.
 
         Args:
-            session (Session): Database session.
-            symbol (str): Symbol name.
-            last_timestamp (int): Last timestamp processed.
+            session (Session): Database session
+            symbol (str): Symbol name
+            last_timestamp (int): Last timestamp processed
         """
         try:
-            checkpoint: Optional[Checkpoint] = session.query(Checkpoint).filter_by(symbol=symbol).one_or_none()
-            if checkpoint:
-                checkpoint.last_timestamp = last_timestamp
-                logger.debug(f"Updated checkpoint for symbol '{symbol}' to {last_timestamp}")
-            else:
+            # Try to update existing checkpoint
+            rows_updated = session.query(Checkpoint)\
+                .filter_by(symbol=symbol)\
+                .update({'last_timestamp': last_timestamp})
+
+            if rows_updated == 0:
+                # If no existing checkpoint, try to create one
                 checkpoint = Checkpoint(symbol=symbol, last_timestamp=last_timestamp)
-                session.add(checkpoint)
-                logger.debug(f"Created new checkpoint for symbol '{symbol}' with {last_timestamp}")
+                try:
+                    session.add(checkpoint)
+                    session.flush()  # Try to insert immediately
+                except IntegrityError:
+                    # If another thread created the checkpoint, update it
+                    session.rollback()
+                    session.query(Checkpoint)\
+                        .filter_by(symbol=symbol)\
+                        .update({'last_timestamp': last_timestamp})
+
+            session.commit()
+            logger.debug(f"Updated checkpoint for symbol '{symbol}' to {last_timestamp}")
+
         except Exception as e:
+            session.rollback()
             logger.error(f"Failed to update checkpoint for symbol '{symbol}': {e}")
             raise
+
+    def _process_time_chunk(self, session: Session, symbol: str, symbol_id: int,
+                          start_time: int, end_time: int) -> bool:
+        """Process a single time chunk with proper error handling."""
+        try:
+            raw_data = self._make_api_call(
+                symbol=symbol,
+                interval='5',
+                start_time=start_time,
+                end_time=end_time,
+                limit=self.batch_size
+            )
+
+            if raw_data["retCode"] == 0 and raw_data["result"]["list"]:
+                kline_list = raw_data["result"]["list"]
+                formatted_data = [
+                    (int(item[0]), float(item[1]), float(item[2]), float(item[3]),
+                     float(item[4]), float(item[5]), float(item[6]))
+                    for item in kline_list
+                ]
+
+                insert_kline_data(session, symbol_id, formatted_data)
+                last_timestamp = max(item[0] for item in formatted_data)
+                self._update_checkpoint(session, symbol, last_timestamp)
+
+                return True
+            else:
+                logger.warning(f"No data returned for {symbol} in time range")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error processing time chunk: {e}")
+            raise
+
 
     def fetch_complete_history(self, symbol: str) -> bool:
         """
@@ -175,69 +227,53 @@ class HistoricalDataManager:
             with session_scope() as session:
                 symbol_id = get_symbol_id(session, symbol)
 
-                # Load checkpoint if exists from database
-                checkpoint: Optional[Checkpoint] = session.query(Checkpoint).filter_by(symbol=symbol).one_or_none()
+                # Use SELECT FOR UPDATE with a short timeout
+                checkpoint = None
+                try:
+                    checkpoint = (
+                        session.query(Checkpoint)
+                        .filter_by(symbol=symbol)
+                        .with_for_update(skip_locked=True)  # Allow concurrent processing of different symbols
+                        .one_or_none()
+                    )
+                except OperationalError as e:
+                    logger.error(f"Failed to acquire lock for {symbol}: {e}")
+                    return False
+
                 start_time: Optional[int] = checkpoint.last_timestamp if checkpoint else None
 
-                # If no checkpoint, get first trade date
                 if start_time is None:
                     start_time = self._get_symbol_first_trade(symbol)
                     if start_time is None:
                         logger.error(f"Could not determine start time for {symbol}")
                         return False
 
+                # Process data in smaller chunks with savepoints
+                chunk_size = 200  # Number of klines per chunk
                 end_time = to_timestamp(datetime.now(timezone.utc))
                 current_start = start_time
 
                 while current_start < end_time:
-                    remaining = end_time - current_start
-                    max_batch_interval = self.batch_size * 5 * 60 * 1000  # 5-minute interval in ms
-                    current_end = current_start + min(remaining, max_batch_interval)
+                    try:
+                        with session.begin_nested():  # Create savepoint
+                            # Process chunk
+                            current_end = min(current_start + (chunk_size * 5 * 60 * 1000), end_time)
+                            success = self._process_time_chunk(session, symbol, symbol_id, current_start, current_end)
 
-                    raw_kline_data = self._make_api_call(
-                        symbol=symbol,
-                        interval='5',
-                        start_time=current_start,
-                        end_time=current_end,
-                        limit=self.batch_size
-                    )
+                            if not success:
+                                break
 
-                    if isinstance(raw_kline_data, dict) and raw_kline_data.get("retCode") == 0:
-                        kline_list = raw_kline_data.get("result", {}).get("list", [])
-                        if kline_list:
-                            formatted_data = [
-                                (int(item[0]), float(item[1]), float(item[2]), float(item[3]),
-                                float(item[4]), float(item[5]), float(item[6]))
-                                for item in kline_list
-                            ]
+                            current_start = current_end + 1
 
-                            insert_kline_data(session, symbol_id, kline_data=formatted_data)
-
-                            # Get the latest timestamp from the batch
-                            last_timestamp = max(item[0] for item in formatted_data)
-                            self._update_checkpoint(session, symbol, last_timestamp)
-
-                            logger.info(f"{symbol}: Processed data from {from_timestamp(current_start)} to {from_timestamp(current_end)}")
-                        else:
-                            logger.warning(f"No kline data returned for {symbol} between {from_timestamp(current_start)} and {from_timestamp(current_end)}")
-                            # Advance current_start by a minimum increment to prevent infinite loops
-                            current_start += 60 * 1000  # 1 minute in ms
-                            continue  # Skip sleep and proceed to next iteration
-
-                    else:
-                        logger.warning(f"Unexpected API response for {symbol} between {from_timestamp(current_start)} and {from_timestamp(current_end)}")
-                        # Advance current_start to prevent infinite loop
-                        current_start = current_end
-                        continue  # Skip sleep and proceed to next iteration
-
-                    # Update current_start to current_end to prevent overlap
-                    current_start = current_end
-
-                    # Sleep to respect rate limits between requests
-                    time.sleep(self.rate_limit_pause)
+                    except Exception as e:
+                        logger.error(f"Error processing chunk for {symbol}: {e}")
+                        if isinstance(e, IntegrityError):
+                            session.rollback()  # Rollback to last savepoint
+                            continue
+                        raise
 
                 return True
 
         except Exception as e:
-            logger.error(f"Error fetching history for {symbol}: {e}")
+            logger.error(f"Error in historical data collection for {symbol}: {e}")
             return False
