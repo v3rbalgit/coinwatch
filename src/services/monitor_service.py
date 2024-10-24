@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 import json
 from pathlib import Path
 from utils.db_resource_manager import DatabaseResourceManager
+from utils.db_retry import with_db_retry
 from services.data_quality_service import DataQualityMetrics
 import atexit
 
@@ -105,6 +106,7 @@ class DatabaseMonitor:
 
         return alerts
 
+    @with_db_retry(max_attempts=3)
     def get_table_stats(self) -> List[TableStats]:
         """Get statistics for all tables in the database."""
         try:
@@ -154,6 +156,7 @@ class DatabaseMonitor:
         except Exception as e:
             logger.error(f"Error saving statistics: {e}")
 
+    @with_db_retry(max_attempts=3)
     def collect_stats(self) -> None:
         """Collect and save current database statistics."""
         try:

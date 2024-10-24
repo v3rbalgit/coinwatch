@@ -22,6 +22,7 @@ class BybitAdapter:
     def __init__(self):
         # Each thread can have its own session
         self.session = HTTP()
+        self._local_lock = threading.Lock()  # Instance-level lock for better granularity
 
     @classmethod
     def _acquire_token(cls):
@@ -42,6 +43,10 @@ class BybitAdapter:
             else:
                 return False
 
+    def _handle_rate_limit(self):
+        """Wait for token availability before making a request."""
+        self._wait_for_token()
+
     def _wait_for_token(self):
         """Wait until a token is available for making an API request."""
         while not self._acquire_token():
@@ -52,10 +57,6 @@ class BybitAdapter:
             else:
                 # Tokens should have been refilled, but acquire again to be sure
                 continue
-
-    def _handle_rate_limit(self):
-        """Wait for token availability before making a request."""
-        self._wait_for_token()
 
     def _validate_response(self, response: Any) -> Dict[str, Any]:
         """Validate API response and return the response dictionary."""

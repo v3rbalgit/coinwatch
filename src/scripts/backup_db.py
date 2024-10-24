@@ -2,7 +2,7 @@
 
 import os
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 import gzip
 import logging
 from pathlib import Path
@@ -33,7 +33,7 @@ class DatabaseBackup:
 
     def create_backup(self, compress: bool = True) -> str:
         """Create a compressed backup of the database."""
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
         backup_name = f"{self.db_name}_{timestamp}"
         backup_file = self.backup_dir / f"{backup_name}.sql"
 

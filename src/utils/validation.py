@@ -84,10 +84,13 @@ class PriceValidator:
 class TimestampValidator:
     """Validates timestamp data."""
 
+    BYBIT_LAUNCH_DATE = int(datetime(2019, 11, 1, tzinfo=timezone.utc).timestamp() * 1000)
+    MAX_FUTURE_TOLERANCE = 60  # seconds
+
     @staticmethod
     def validate_timestamp(timestamp: int) -> bool:
         """
-        Validate a timestamp value.
+        Validate a timestamp value with stricter checks.
 
         Args:
             timestamp: Timestamp in milliseconds
@@ -103,25 +106,34 @@ class TimestampValidator:
                 raise ValidationError("Timestamp must be an integer")
 
             # Check if timestamp is in milliseconds (13 digits)
-            if len(str(timestamp)) != 13:
+            if len(str(abs(timestamp))) != 13:
                 raise ValidationError("Timestamp must be in milliseconds (13 digits)")
 
             # Convert to datetime for range checking
             dt = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
-
-            # Check if timestamp is in reasonable range
             now = datetime.now(timezone.utc)
-            min_date = datetime(2015, 1, 1, tzinfo=timezone.utc)  # Bybit's launch
 
-            if dt < min_date:
-                raise ValidationError("Timestamp is before exchange launch")
-            if dt > now + timedelta(minutes=1):  # Allow 1 minute future tolerance
-                raise ValidationError("Timestamp is in the future")
+            # Check if timestamp is before Bybit's launch
+            if timestamp < TimestampValidator.BYBIT_LAUNCH_DATE:
+                raise ValidationError(
+                    f"Timestamp {dt.isoformat()} is before exchange launch "
+                    f"({datetime.fromtimestamp(TimestampValidator.BYBIT_LAUNCH_DATE/1000, tz=timezone.utc).isoformat()})"
+                )
+
+            # Check for future timestamps with tolerance
+            max_allowed = now + timedelta(seconds=TimestampValidator.MAX_FUTURE_TOLERANCE)
+            if dt > max_allowed:
+                raise ValidationError(
+                    f"Timestamp {dt.isoformat()} is too far in the future. "
+                    f"Maximum allowed: {max_allowed.isoformat()}"
+                )
 
             return True
 
         except Exception as e:
-            raise ValidationError(f"Timestamp validation failed: {str(e)}")
+            if not isinstance(e, ValidationError):
+                raise ValidationError(f"Timestamp validation failed: {str(e)}")
+            raise
 
 class KlineValidator:
     """Validates complete kline records."""

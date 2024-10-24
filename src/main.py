@@ -15,6 +15,7 @@ from services.database_monitor_service import DatabaseMonitorService
 from db.partition_manager import PartitionManager
 from utils.timestamp import get_current_timestamp, from_timestamp
 from utils.db_resource_manager import DatabaseResourceManager
+from utils.db_retry import with_db_retry
 from models.symbol import Symbol
 import threading
 import random
@@ -42,11 +43,20 @@ def process_symbol(symbol: str, end_time: int) -> None:
         with session_scope() as session:
             # Add small random delay to spread out connections
             sleep(random.uniform(0.1, 0.3))  # Random delay between 100-300ms
-            symbol_id = get_symbol_id(session, symbol)
+
+            # Get symbol ID with retry
+            try:
+                symbol_id = get_symbol_id(session, symbol)
+            except Exception as e:
+                logger.error(f"Failed to get symbol ID for {symbol}: {e}")
+                raise
+
+            # Sync data with retry handled internally
             sync_symbol_data(session, symbol, symbol_id, end_time, bybit)
     except Exception as e:
         logger.error(f"Error processing {symbol}: {str(e)}")
 
+@with_db_retry(max_attempts=3)
 def sync_symbol_data(session: Session, symbol: str, symbol_id: int, end_time: int, bybit: BybitAdapter, batch_size: int = 200) -> None:
     """
     Synchronize data for a single symbol with batch processing.

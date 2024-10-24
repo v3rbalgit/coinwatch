@@ -4,6 +4,7 @@ import logging
 from typing import Dict, Any, Optional
 from sqlalchemy.engine import Engine
 from sqlalchemy.pool import QueuePool
+from utils.db_retry import with_db_retry
 import threading
 import time
 import atexit
@@ -49,6 +50,7 @@ class DatabaseResourceManager:
                 logger.error(f"Error in database resource monitoring: {e}")
                 time.sleep(5)
 
+    @with_db_retry(max_attempts=3)
     def update_pool_stats(self) -> None:
         """Update database connection pool statistics."""
         with self._lock:
