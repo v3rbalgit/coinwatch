@@ -2,7 +2,7 @@
 
 import logging
 from sqlalchemy.orm import scoped_session
-from db.init_db import db_manager, init_db
+from src.db.init_db import db_manager, init_db
 import threading
 import atexit
 

@@ -11,6 +11,12 @@ services:
       - data:/var/lib/mysql
     networks:
       - coinwatch_network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "db", "-u", "user", "--password=password"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
 
   phpmyadmin:
     image: phpmyadmin/phpmyadmin
@@ -21,7 +27,8 @@ services:
     ports:
       - '8080:80'
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     networks:
       - coinwatch_network
 
@@ -30,37 +37,45 @@ services:
       context: .
     container_name: coinwatch
     tty: true
-    command: ["python", "src/main.py"]
+    command: ["python", "-m", "src.main"]
     volumes:
       - .:/app
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     networks:
       - coinwatch_network
     environment:
+      PYTHONPATH: /app
       DB_HOST: db
       DB_USER: user
       DB_PASSWORD: password
       DB_NAME: coinwatch
+      PYTHONUNBUFFERED: 1
+      LOG_LEVEL: DEBUG
 
-  test:
-    build:
-      context: .
-    container_name: coinwatch_test
-    tty: true
-    command: /bin/sh -c "python -m src.tests.test_connections && python -m src.tests.test_data_collection"
-    volumes:
-      - .:/app
-    depends_on:
-      - db
-      - app
-    networks:
-      - coinwatch_network
-    environment:
-      DB_HOST: db
-      DB_USER: user
-      DB_PASSWORD: password
-      DB_NAME: coinwatch
+  # test:
+  #   build:
+  #     context: .
+  #   container_name: coinwatch_test
+  #   tty: true
+  #   command: /bin/sh -c "PYTHONPATH=/app python -m src.tests.test_connections && PYTHONPATH=/app python -m src.tests.test_data_collection"
+  #   volumes:
+  #     - .:/app
+  #   depends_on:
+  #     db:
+  #       condition: service_healthy
+  #     app:
+  #       condition: service_started
+  #   networks:
+  #     - coinwatch_network
+  #   environment:
+  #     PYTHONPATH: /app
+  #     DB_HOST: db
+  #     DB_USER: user
+  #     DB_PASSWORD: password
+  #     DB_NAME: coinwatch
+
 
 volumes:
   data:

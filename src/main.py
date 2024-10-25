@@ -1,31 +1,55 @@
 # src/main.py
 
 import logging
+import traceback
 from time import sleep
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
-from db.init_db import init_db, db_manager, session_scope
-from api.bybit_adapter import BybitAdapter
-from services.kline_service import get_symbol_id, get_latest_timestamp, insert_kline_data, remove_symbol
-from services.historical_service import HistoricalDataManager
-from services.partition_maintenance_service import PartitionMaintenanceService
-from services.database_monitor_service import DatabaseMonitorService
-from db.partition_manager import PartitionManager
-from utils.timestamp import get_current_timestamp, from_timestamp
-from utils.db_resource_manager import DatabaseResourceManager
-from utils.db_retry import with_db_retry
-from models.symbol import Symbol
+# Database imports
+from src.db.init_db import init_db, db_manager, session_scope
+from src.db.partition_manager import PartitionManager
+# API and services
+from src.api.bybit_adapter import BybitAdapter
+from src.services.kline_service import (
+    get_symbol_id,
+    get_latest_timestamp,
+    insert_kline_data,
+    remove_symbol
+)
+from src.services.historical_service import HistoricalDataManager
+from src.services.partition_maintenance_service import PartitionMaintenanceService
+from src.services.database_monitor_service import DatabaseMonitorService
+# Utilities
+from src.utils.timestamp import get_current_timestamp, from_timestamp
+from src.utils.db_resource_manager import DatabaseResourceManager
+from src.utils.db_retry import with_db_retry
+# Models
+from src.models.symbol import Symbol
 import threading
 import random
 
-# Set up logging with thread name
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s'
-)
+# Force DEBUG level regardless of environment
+logging.getLogger().setLevel(logging.DEBUG)
+for handler in logging.getLogger().handlers:
+    handler.setLevel(logging.DEBUG)
+
+# Set up our specific logger
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+# Add a handler if none exist
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s - %(threadName)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+# Quiet noisy loggers
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('sqlalchemy').setLevel(logging.WARNING)
 
 def process_symbol(symbol: str, end_time: int) -> None:
     """
@@ -58,19 +82,6 @@ def process_symbol(symbol: str, end_time: int) -> None:
 
 @with_db_retry(max_attempts=3)
 def sync_symbol_data(session: Session, symbol: str, symbol_id: int, end_time: int, bybit: BybitAdapter, batch_size: int = 200) -> None:
-    """
-    Synchronize data for a single symbol with batch processing.
-
-    Args:
-        session: Database session
-        symbol: Trading pair symbol
-        symbol_id: Database ID for the symbol
-        end_time: Target end time in milliseconds
-        batch_size: Number of klines to fetch per request (max 200)
-
-    Fetches 5-minute kline data in batches, starting from the most recent stored
-    timestamp up to the specified end time. Implements rate limiting and error handling.
-    """
     try:
         latest_timestamp = get_latest_timestamp(session, symbol_id)
         if latest_timestamp is None:
@@ -82,7 +93,7 @@ def sync_symbol_data(session: Session, symbol: str, symbol_id: int, end_time: in
 
         logger.info(f"Syncing {symbol} from {from_timestamp(latest_timestamp)} to {from_timestamp(end_time)}")
 
-        current_start = latest_timestamp + 1  # Ensure we don't fetch the last timestamp again
+        current_start = latest_timestamp
         while current_start < end_time:
             current_end = min(current_start + (batch_size * 5 * 60 * 1000), end_time)
 
@@ -96,26 +107,50 @@ def sync_symbol_data(session: Session, symbol: str, symbol_id: int, end_time: in
 
             if kline_data["retCode"] == 0 and kline_data["result"]["list"]:
                 kline_list = kline_data["result"]["list"]
+                logger.debug(f"Got {len(kline_list)} klines for {symbol} from API")
+
+                # Sort by timestamp ascending and validate timestamps
+                kline_list.sort(key=lambda x: int(x[0]))
+
+                # Log first and last timestamps for debugging
+                first_ts = int(kline_list[0][0])
+                last_ts = int(kline_list[-1][0])
+                logger.debug(f"{symbol} - First API timestamp: {from_timestamp(first_ts)}")
+                logger.debug(f"{symbol} - Last API timestamp: {from_timestamp(last_ts)}")
+
                 formatted_data = [
                     (int(item[0]), float(item[1]), float(item[2]), float(item[3]),
                      float(item[4]), float(item[5]), float(item[6]))
                     for item in kline_list
                 ]
 
-                insert_kline_data(session, symbol_id, formatted_data)
-                logger.debug(f"Inserted batch of {len(formatted_data)} klines for {symbol}")
+                try:
+                    insert_kline_data(session, symbol_id, formatted_data)
+                    logger.debug(f"Inserted batch of {len(formatted_data)} klines for {symbol}")
 
-                # Update current_start based on the last timestamp in the data
-                current_start = max(item[0] for item in kline_list) + 1
+                    # Update current_start based on the last timestamp in the data
+                    if formatted_data:
+                        current_start = formatted_data[-1][0] + (5 * 60 * 1000)  # Add 5 minutes
+                    else:
+                        current_start += (5 * 60 * 1000)
+                except Exception as e:
+                    logger.error(f"Error inserting data for {symbol}: {e}")
+                    raise
+
             else:
-                logger.warning(f"No data returned for {symbol} in time range")
-                break
+                logger.warning(
+                    f"No data returned for {symbol} between "
+                    f"{from_timestamp(current_start)} and {from_timestamp(current_end)}, "
+                    "moving to next time window"
+                )
+                current_start += (5 * 60 * 1000)
 
             # Small delay between batches to prevent rate limiting
             sleep(0.05)
 
     except Exception as e:
         logger.error(f"Error syncing data for {symbol}: {str(e)}")
+        logger.debug(traceback.format_exc())
         raise
 
 def cleanup_database(session: Session) -> None:
@@ -269,7 +304,7 @@ def main() -> None:
         bybit = BybitAdapter()
 
         # Get current active symbols
-        current_symbols = bybit.get_active_instruments()
+        current_symbols = bybit.get_active_instruments(limit=5)
         if not current_symbols:
             logger.error("No symbols fetched from Bybit")
             return
@@ -286,7 +321,7 @@ def main() -> None:
                     cleanup_database(session)
 
                     # Get current active symbols
-                    current_symbols = bybit.get_active_instruments()
+                    current_symbols = bybit.get_active_instruments(limit=5)
                     if not current_symbols:
                         logger.warning("No symbols fetched. Retrying in 5 minutes...")
                         sleep(300)

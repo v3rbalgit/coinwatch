@@ -6,7 +6,7 @@ import logging
 from typing import List, Dict, Any, Optional
 from pybit.unified_trading import HTTP
 from requests.exceptions import RequestException
-from utils.exceptions import APIError
+from src.utils.exceptions import APIError
 
 logger = logging.getLogger(__name__)
 
@@ -44,25 +44,18 @@ class BybitAdapter:
                 return False
 
     def _handle_rate_limit(self):
-        """Wait for token availability before making a request."""
-        self._wait_for_token()
-
-    def _wait_for_token(self):
-        """Wait until a token is available for making an API request."""
+        """Wait for token availability before making an API request."""
         while not self._acquire_token():
             sleep_time = self.WINDOW_SIZE - (time.time() - self._last_refill)
             if sleep_time > 0:
                 logger.debug(f"Rate limit reached, sleeping for {sleep_time:.2f} seconds")
                 time.sleep(sleep_time)
-            else:
-                # Tokens should have been refilled, but acquire again to be sure
-                continue
 
     def _validate_response(self, response: Any) -> Dict[str, Any]:
         """Validate API response and return the response dictionary."""
         # Check if response is a tuple
+        # PyBit sometimes returns a tuple (response, request_time, headers)
         if isinstance(response, tuple):
-            # PyBit sometimes returns a tuple (response, request_time, headers)
             response = response[0]  # Extract the response dictionary
 
         if not isinstance(response, dict):
@@ -77,99 +70,75 @@ class BybitAdapter:
             logger.error(error_msg)
             raise APIError(error_msg)
 
-        return response  # Return the validated response dictionary
+        return response
 
     def get_kline(self,
                   symbol: str,
                   interval: str = '5',
+                  category: str = 'linear',
                   limit: int = 200,
                   start_time: Optional[int] = None,
                   end_time: Optional[int] = None,
                   retry_count: int = 3) -> Dict[str, Any]:
         """
-        Fetch kline/candlestick data from Bybit.
+        Fetch kline data from Bybit API.
+
+        Args:
+            start_time: Start time in milliseconds
+            end_time: End time in milliseconds
+            Other args remain unchanged
         """
         for attempt in range(retry_count):
             try:
                 self._handle_rate_limit()
 
                 params = {
-                    "category": "linear",
+                    "category": category,
                     "symbol": symbol,
                     "interval": interval,
-                    "limit": min(limit, 200)
+                    "limit": limit or 200
                 }
 
-                if start_time:
+                if start_time is not None:
                     params["start"] = start_time
-                if end_time:
+                if end_time is not None:
                     params["end"] = end_time
 
-                response = self.session.get_kline(**params)
-                response = self._validate_response(response)
+                logger.debug(f"Making request for {symbol} with params: {params}")
+                raw_response = self.session.get_kline(**params)
 
-                return response
+                if isinstance(raw_response, tuple):
+                    response = raw_response[0]
+                else:
+                    response = raw_response
+
+                return self._validate_response(response)
 
             except APIError as e:
                 if "Too many visits" in str(e) or "Rate limit exceeded" in str(e):
-                    # Handle rate limit error specifically
                     logger.warning(f"Rate limit error: {e}")
                     sleep_time = self.WINDOW_SIZE
                     logger.debug(f"Sleeping for {sleep_time} seconds before retrying")
                     time.sleep(sleep_time)
-                    continue  # Retry after sleeping
+                    continue
                 else:
                     logger.error(f"APIError on attempt {attempt + 1}: {e}")
-                    raise  # Non-recoverable API error
+                    raise
 
-            except (RequestException, ValueError) as e:
+            except (RequestException, ConnectionError) as e:
                 logger.error(f"RequestException on attempt {attempt + 1}: {e}")
                 if attempt < retry_count - 1:
                     sleep_time = 2 ** attempt
                     logger.debug(f"Retrying in {sleep_time} seconds")
                     time.sleep(sleep_time)
                     continue
-                else:
-                    raise
-
-            except Exception as e:
-                logger.exception(f"Unexpected error on attempt {attempt + 1}: {e}")
                 raise
 
         raise APIError(f"Failed to get kline data for {symbol} after {retry_count} attempts")
 
-    def get_instruments(self) -> List[str]:
-        """
-        Fetch all available USDT perpetual trading pairs.
-        """
-        try:
-            self._handle_rate_limit()
-            response = self.session.get_instruments_info(category='linear')
-            response = self._validate_response(response)
 
-            result = response.get('result', {})
-            instrument_list = result.get('list', [])
-
-            symbols = [
-                item['symbol']
-                for item in instrument_list
-                if isinstance(item, dict) and
-                'symbol' in item and
-                isinstance(item['symbol'], str) and
-                'USDT' in item['symbol']
-            ]
-
-            logger.info(f"Successfully fetched {len(symbols)} trading pairs")
-            return symbols
-
-        except Exception as e:
-            logger.exception(f"Failed to fetch instruments: {e}")
-            raise
-
-    def get_active_instruments(self) -> List[str]:
-        """
-        Fetch only actively trading USDT perpetual pairs.
-        """
+    def get_active_instruments(self, limit: Optional[int] = None) -> List[str]:
+        """Fetch only actively trading USDT perpetual pairs."""
         try:
             self._handle_rate_limit()
             response = self.session.get_instruments_info(category='linear')
@@ -187,6 +156,10 @@ class BybitAdapter:
                 isinstance(item['symbol'], str) and
                 'USDT' in item['symbol']
             ]
+
+            if limit is not None:
+                symbols.sort()
+                symbols = symbols[:limit]
 
             logger.info(f"Successfully fetched {len(symbols)} active trading pairs")
             return symbols

@@ -8,12 +8,12 @@ from contextlib import contextmanager
 import time
 import logging
 from typing import Generator, Optional, Dict, Any
-from config import DATABASE_URL
-from models.base import Base
-from models.symbol import Symbol
-from models.kline import Kline
-from models.checkpoint import Checkpoint
-from utils.exceptions import DatabaseError, SessionError
+from src.config import DATABASE_URL
+from src.models.base import Base
+from src.models.symbol import Symbol
+from src.models.kline import Kline
+from src.models.checkpoint import Checkpoint
+from src.utils.exceptions import DatabaseError, SessionError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 logger = logging.getLogger(__name__)
@@ -88,13 +88,18 @@ class DatabaseManager:
                     pool_recycle=1800,      # 30 minutes
                     pool_pre_ping=True,     # Verify connections
                     pool_use_lifo=True,     # Better connection reuse
-                    # Add these MySQL-specific arguments
                     connect_args={
-                        'connect_timeout': 10,
-                        'read_timeout': 30,
-                        'write_timeout': 30,
-                        'keepalive': True,
-                        'keepalive_interval': 180,  # 3 minutes
+                        'connect_timeout': 60,
+                        'pool_name': 'coinwatch_pool',
+                        'pool_size': 10,
+                        'allow_local_infile': True,
+                        'use_pure': False,  # Use C extension for better performance
+                        'raise_on_warnings': True,
+                        'autocommit': False,
+                        'get_warnings': True,
+                        'compress': True,    # Enable compression for better network performance
+                        'use_unicode': True,
+                        'charset': 'utf8mb4'
                     }
                 )
 
@@ -235,17 +240,35 @@ def init_db() -> None:
 
         # Ensure indexes exist
         with db_manager.engine.connect() as connection:
-            # Check for symbol name index
-            connection.execute(text("""
-                CREATE INDEX IF NOT EXISTS idx_symbol_name
-                ON symbols (name)
-            """))
+            # Check if symbol name index exists
+            symbol_index_exists = connection.execute(text("""
+                SELECT COUNT(1)
+                FROM information_schema.statistics
+                WHERE table_schema = DATABASE()
+                AND table_name = 'symbols'
+                AND index_name = 'idx_symbol_name'
+            """)).scalar()
 
-            # Check for kline timestamp index
-            connection.execute(text("""
-                CREATE INDEX IF NOT EXISTS idx_kline_time
-                ON kline_data (start_time)
-            """))
+            if not symbol_index_exists:
+                connection.execute(text("""
+                    CREATE INDEX idx_symbol_name
+                    ON symbols (name)
+                """))
+
+            # Check if kline timestamp index exists
+            kline_index_exists = connection.execute(text("""
+                SELECT COUNT(1)
+                FROM information_schema.statistics
+                WHERE table_schema = DATABASE()
+                AND table_name = 'kline_data'
+                AND index_name = 'idx_kline_time'
+            """)).scalar()
+
+            if not kline_index_exists:
+                connection.execute(text("""
+                    CREATE INDEX idx_kline_time
+                    ON kline_data (start_time)
+                """))
 
             # Commit the changes
             connection.commit()

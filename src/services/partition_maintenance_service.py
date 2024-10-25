@@ -1,14 +1,14 @@
 # src/services/partition_maintenance_service.py
 
-from services.background_service import BackgroundService
-from db.partition_manager import PartitionManager
-import logging
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from typing import Optional
-import time
-from db.init_db import session_scope
+import logging
 import threading
+import time
+from src.db.init_db import session_scope
+from src.services.background_service import BackgroundService
+from src.db.partition_manager import PartitionManager
 
 logger = logging.getLogger(__name__)
 
