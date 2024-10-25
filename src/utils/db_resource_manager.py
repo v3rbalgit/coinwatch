@@ -4,7 +4,7 @@ import logging
 from typing import Dict, Any, Optional
 from sqlalchemy.engine import Engine
 from sqlalchemy.pool import QueuePool
-from utils.db_retry import with_db_retry
+from src.utils.db_retry import with_db_retry
 import threading
 import time
 import atexit

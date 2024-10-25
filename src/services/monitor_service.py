@@ -7,10 +7,10 @@ from sqlalchemy import text, Engine
 from sqlalchemy.orm import Session
 import json
 from pathlib import Path
-from utils.db_resource_manager import DatabaseResourceManager
-from utils.db_retry import with_db_retry
-from services.data_quality_service import DataQualityMetrics
 import atexit
+from src.utils.db_resource_manager import DatabaseResourceManager
+from src.utils.db_retry import with_db_retry
+from src.services.data_quality_service import DataQualityMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -112,24 +112,44 @@ class DatabaseMonitor:
         try:
             query = text("""
                 SELECT
-                    table_name as name,
-                    table_rows as rows,
-                    data_length/(1024*1024) as size_mb,
-                    index_length/(1024*1024) as index_size_mb,
-                    (data_length + index_length)/(1024*1024) as total_size_mb
-                FROM information_schema.tables
-                WHERE table_schema = DATABASE()
-                  AND table_type = 'BASE TABLE'
+                    t.table_name as name,
+                    COALESCE(t.table_rows, 0) as row_count,
+                    COALESCE(ROUND(t.data_length/(1024*1024), 2), 0) as size_mb,
+                    COALESCE(ROUND(t.index_length/(1024*1024), 2), 0) as index_size_mb,
+                    COALESCE(ROUND((t.data_length + t.index_length)/(1024*1024), 2), 0) as total_size_mb
+                FROM information_schema.tables t
+                WHERE t.table_schema = DATABASE()
+                    AND t.table_type = 'BASE TABLE'
             """)
 
             result = self.session.execute(query)
-            return [TableStats(
+
+            # Add integrity check for symbol references
+            integrity_stats = self.session.execute(text("""
+                SELECT
+                    COUNT(*) as total_klines,
+                    SUM(CASE
+                        WHEN NOT EXISTS (
+                            SELECT 1 FROM symbols s
+                            WHERE s.id = k.symbol_id
+                        )
+                        THEN 1 ELSE 0
+                    END) as orphaned_records
+                FROM kline_data k
+            """)).first()
+
+            stats = [TableStats(
                 name=row.name,
-                rows=row.rows or 0,
+                rows=row.row_count or 0,
                 size_mb=float(row.size_mb or 0),
                 index_size_mb=float(row.index_size_mb or 0),
                 total_size_mb=float(row.total_size_mb or 0)
             ) for row in result]
+
+            if integrity_stats:
+                logger.info(f"Data integrity check: {integrity_stats.orphaned_records} orphaned records out of {integrity_stats.total_klines} total")
+
+            return stats
 
         except Exception as e:
             logger.error(f"Error getting table statistics: {e}")
@@ -140,15 +160,19 @@ class DatabaseMonitor:
         try:
             if self.stats_file.exists():
                 with open(self.stats_file, 'r') as f:
-                    data = json.load(f)
+                    try:
+                        data = json.load(f)
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"Stats file is corrupted or empty. Reinitializing stats file. Error: {e}")
+                        data = {'history': []}
             else:
                 data = {'history': []}
 
             # Keep last 30 days of statistics
             retention_period = self.config['retention_days'] * 24 * 60 * 60 * 1000
             data['history'] = ([stat for stat in data['history']
-                              if stat['timestamp'] > stats['timestamp'] - retention_period]
-                             + [stats])
+                            if stat['timestamp'] > stats['timestamp'] - retention_period]
+                            + [stats])
 
             with open(self.stats_file, 'w') as f:
                 json.dump(data, f, indent=2)

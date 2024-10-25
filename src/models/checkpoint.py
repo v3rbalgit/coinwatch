@@ -2,7 +2,7 @@
 
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy import String, BigInteger, Index
-from models.base import Base
+from src.models.base import Base
 
 class Checkpoint(Base):
     __tablename__ = 'checkpoints'

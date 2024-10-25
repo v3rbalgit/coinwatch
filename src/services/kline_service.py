@@ -4,15 +4,16 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.dialects.mysql import insert
 from sqlalchemy import func
-from models.symbol import Symbol
-from models.kline import Kline
 import logging
+import traceback
 from typing import Optional, List, Tuple, cast
-from datetime import datetime
-from utils.integrity import DataIntegrityManager
-from utils.exceptions import DataValidationError, DatabaseError
-from utils.validation import KlineValidator, ValidationError
-from utils.db_retry import with_db_retry
+from datetime import datetime, timezone, timedelta
+from src.models.symbol import Symbol
+from src.models.kline import Kline
+from src.utils.integrity import DataIntegrityManager
+from src.utils.exceptions import DataValidationError, DatabaseError
+from src.utils.db_retry import with_db_retry
+from src.utils.timestamp import from_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -32,22 +33,27 @@ def get_symbol_id(session: Session, symbol_name: str) -> int:
         DatabaseError: If unable to get or create symbol
     """
     try:
+        logger.info(f"Attempting to get or create symbol: {symbol_name}")
         symbol = session.query(Symbol).filter_by(name=symbol_name).first()
         if not symbol:
             symbol = Symbol(name=symbol_name)
             session.add(symbol)
             session.flush()  # Use flush to get the ID without committing
-            logger.debug(f"Added new symbol: {symbol_name} with ID {symbol.id}")
+            logger.info(f"Added new symbol: {symbol_name} with ID {symbol.id}")
+        else:
+            logger.info(f"Symbol found: {symbol_name} with ID {symbol.id}")
         return cast(int, symbol.id)
     except IntegrityError:
         session.rollback()
         # Handle race condition by querying again
+        logger.warning(f"IntegrityError occurred while adding symbol: {symbol_name}. Retrying.")
         symbol = session.query(Symbol).filter_by(name=symbol_name).first()
         if symbol:
             return cast(int, symbol.id)
         raise DatabaseError(f"Failed to get or create symbol: {symbol_name}")
     except Exception as e:
         session.rollback()
+        logger.error(f"Error processing symbol: {symbol_name}: {str(e)}")
         raise DatabaseError(f"Error processing symbol: {symbol_name}: {str(e)}")
 
 def get_latest_timestamp(session: Session, symbol_id: int) -> Optional[int]:
@@ -59,7 +65,7 @@ def get_latest_timestamp(session: Session, symbol_id: int) -> Optional[int]:
         symbol_id: Symbol ID
 
     Returns:
-        Optional[int]: Latest timestamp or None if no data exists
+        Optional[int]: Latest timestamp or timestamp from 30 minutes ago if no data exists
 
     Raises:
         DatabaseError: If query fails
@@ -68,78 +74,72 @@ def get_latest_timestamp(session: Session, symbol_id: int) -> Optional[int]:
         result = session.query(func.max(Kline.start_time))\
             .filter_by(symbol_id=symbol_id)\
             .scalar()
+
+        if result is None:
+            symbol = session.query(Symbol.name).filter_by(id=symbol_id).scalar()
+            logger.info(f"No data found for {symbol or symbol_id}, starting from 30 minutes ago")
+            return int((datetime.now(timezone.utc) - timedelta(minutes=30)).timestamp() * 1000)
+
+        # Return exact timestamp - we'll handle overlap in validation
         return result
+
     except Exception as e:
         raise DatabaseError(f"Failed to get latest timestamp for symbol_id {symbol_id}: {str(e)}")
 
-def validate_kline_data(data: Tuple) -> bool:
-    """
-    Validate a single kline data tuple.
-
-    Args:
-        data: Tuple of (timestamp, open, high, low, close, volume, turnover)
-
-    Returns:
-        bool: True if valid, False otherwise
-    """
-    try:
-        timestamp, open_price, high, low, close, volume, turnover = data
-        current_time = int(datetime.now().timestamp() * 1000)
-
-        return all([
-            isinstance(timestamp, int),
-            timestamp > 0,
-            timestamp <= current_time,
-            all(isinstance(x, (int, float)) for x in [open_price, high, low, close, volume, turnover]),
-            low <= high,
-            low <= open_price <= high,
-            low <= close <= high,
-            volume >= 0,
-            turnover >= 0
-        ])
-    except Exception:
-        return False
-
 @with_db_retry(max_attempts=3)
 def insert_kline_data(session: Session, symbol_id: int, kline_data: List[Tuple], batch_size: int = 1000) -> None:
-    """
-    Insert kline data with integrity checks.
-
-    Args:
-        session: Database session
-        symbol_id: Symbol ID
-        kline_data: List of kline data tuples
-        batch_size: Size of each insert batch
-
-    Raises:
-        DataValidationError: If data validation fails
-        DatabaseError: If insert fails
-    """
+    """Insert kline data with integrity checks."""
     try:
-        validation_errors = KlineValidator.validate_klines(kline_data)
+        # Verify symbol exists first
+        symbol_exists = session.query(
+            session.query(Symbol).filter_by(id=symbol_id).exists()
+        ).scalar()
+
+        if not symbol_exists:
+            raise DataValidationError(f"Symbol ID {symbol_id} does not exist")
+
+        if not kline_data:
+            logger.debug(f"No data to insert for symbol_id {symbol_id}")
+            return
+
+        # Get the latest timestamp from existing data
+        latest_ts = session.query(func.max(Kline.start_time))\
+            .filter_by(symbol_id=symbol_id)\
+            .scalar() or 0
+
+        # Filter out any records we already have and sort by timestamp
+        filtered_data = sorted(
+            [data for data in kline_data if data[0] > latest_ts],
+            key=lambda x: x[0]
+        )
+
+        if not filtered_data:
+            logger.debug(f"No new data to insert for symbol_id {symbol_id}")
+            return
+
+        # Log the timestamps we're working with
+        logger.debug(f"Symbol {symbol_id} - Processing {len(filtered_data)} records:")
+        if filtered_data:
+            logger.debug(f"First timestamp: {from_timestamp(filtered_data[0][0])}")
+            logger.debug(f"Last timestamp: {from_timestamp(filtered_data[-1][0])}")
+
+        # Then validate individual records
+        validation_errors = []
+        for data in filtered_data:
+            try:
+                integrity_manager = DataIntegrityManager(session)
+                if not integrity_manager.validate_kline(data):
+                    validation_errors.append(f"Data validation failed for timestamp {data[0]}")
+            except Exception as e:
+                validation_errors.append(str(e))
+
         if validation_errors:
-            error_indices = [i for i, _ in validation_errors]
-            error_messages = [msg for _, msg in validation_errors]
-            raise ValidationError(
-                f"Invalid kline data found at indices: {error_indices}\n"
-                f"Errors: {error_messages}"
-            )
+            logger.error(f"Validation errors for symbol {symbol_id}: {'; '.join(validation_errors)}")
+            raise DataValidationError(f"Validation errors: {'; '.join(validation_errors)}")
 
-        if kline_data:
-            integrity_manager = DataIntegrityManager(session)
-            start_time = min(data[0] for data in kline_data)
-            end_time = max(data[0] for data in kline_data)
-
-            validation_result = integrity_manager.validate_kline_data(
-                symbol_id, start_time, end_time
-            )
-
-            if not validation_result.get('time_range_valid', False):
-                raise DataValidationError("Invalid time range in kline data")
-
-        for i in range(0, len(kline_data), batch_size):
-            batch = kline_data[i:i + batch_size]
-
+        # Insert in batches
+        for i in range(0, len(filtered_data), batch_size):
+            batch = filtered_data[i:i + batch_size]
             values = [
                 {
                     'symbol_id': symbol_id,
@@ -155,7 +155,6 @@ def insert_kline_data(session: Session, symbol_id: int, kline_data: List[Tuple],
             ]
 
             stmt = insert(Kline).values(values)
-
             stmt = stmt.on_duplicate_key_update({
                 'open_price': stmt.inserted.open_price,
                 'high_price': stmt.inserted.high_price,
@@ -166,17 +165,16 @@ def insert_kline_data(session: Session, symbol_id: int, kline_data: List[Tuple],
             })
 
             session.execute(stmt)
-            session.flush()  # Ensure IDs are generated
+            session.flush()
             logger.debug(f"Inserted batch of {len(batch)} klines for symbol_id {symbol_id}")
 
-    except ValidationError as ve:
+    except DataValidationError as ve:
         logger.error(f"Data validation error: {ve}")
         raise
-    except DataValidationError as dve:
-        logger.error(f"Data validation error: {dve}")
-        raise
     except Exception as e:
+        session.rollback()
         logger.error(f"Failed to insert kline data for symbol_id {symbol_id}: {str(e)}")
+        logger.debug(traceback.format_exc())
         raise DatabaseError(f"Failed to insert kline data for symbol_id {symbol_id}: {str(e)}")
 
 def remove_symbol(session: Session, symbol_name: str) -> None:

@@ -1,11 +1,11 @@
 # src/services/database_monitor_service.py
 
-from services.background_service import BackgroundService
-from services.monitor_service import DatabaseMonitor
 import logging
 from sqlalchemy.orm import Session
 import time
-from db.init_db import session_scope
+from src.services.background_service import BackgroundService
+from src.services.monitor_service import DatabaseMonitor
+from src.db.init_db import session_scope
 
 logger = logging.getLogger(__name__)
 

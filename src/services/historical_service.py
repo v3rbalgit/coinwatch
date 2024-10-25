@@ -2,114 +2,79 @@
 
 import logging
 from datetime import datetime, timezone
-from typing import Optional, List, TypedDict
+from typing import Optional
 from sqlalchemy.orm import Session
-from sqlalchemy.exc import IntegrityError, OperationalError
-from api.bybit_adapter import BybitAdapter
-from services.kline_service import get_symbol_id, insert_kline_data
-from utils.timestamp import to_timestamp, from_timestamp
-from utils.db_retry import with_db_retry
-from models.checkpoint import Checkpoint
-from db.init_db import session_scope
+from sqlalchemy.exc import IntegrityError
+from src.api.bybit_adapter import BybitAdapter
+from src.services.kline_service import get_symbol_id, insert_kline_data
+from src.utils.timestamp import to_timestamp
+from src.utils.db_retry import with_db_retry
+from src.utils.exceptions import APIError
+from src.models.checkpoint import Checkpoint
+from src.models.symbol import Symbol
+from src.models.kline import Kline
+from src.db.init_db import session_scope
 import time
-import threading
 
 logger = logging.getLogger(__name__)
 
-class InstrumentInfo(TypedDict):
-    symbol: str
-    launchTime: str
-
-class InstrumentResult(TypedDict):
-    list: List[InstrumentInfo]
-
-class InstrumentResponse(TypedDict):
-    retCode: int
-    result: InstrumentResult
-
-class RateLimiter:
-    """
-    A simple rate limiter to ensure that API calls do not exceed
-    a specified rate limit.
-    """
-    def __init__(self, max_calls: int, period: float):
-        """
-        Initialize the RateLimiter.
-
-        Args:
-            max_calls (int): Maximum number of calls allowed within the period.
-            period (float): Time period in seconds.
-        """
-        self.max_calls = max_calls
-        self.period = period
-        self.lock = threading.Lock()
-        self.calls = []
-
-    def acquire(self):
-        """
-        Acquire permission to make an API call. If the rate limit is reached,
-        this method will block until a call slot becomes available.
-        """
-        with self.lock:
-            current = time.time()
-            # Remove timestamps older than the current period
-            self.calls = [call for call in self.calls if call > current - self.period]
-            if len(self.calls) >= self.max_calls:
-                # Calculate sleep time until the oldest call exits the period
-                sleep_time = self.period - (current - self.calls[0])
-                logger.debug(f"Rate limit reached. Sleeping for {sleep_time:.2f} seconds.")
-                time.sleep(sleep_time)
-                current = time.time()
-                self.calls = [call for call in self.calls if call > current - self.period]
-            # Record the current call
-            self.calls.append(time.time())
-
-# Define a global rate limiter instance
-global_rate_limiter = RateLimiter(max_calls=110, period=1.0)  # Max 120 reqs/sec. Using 110 here for safety
-
 class HistoricalDataManager:
-    def __init__(self, bybit_adapter: BybitAdapter, rate_limiter: RateLimiter = global_rate_limiter):
+    """
+    Manages the collection and storage of historical price data from Bybit.
+
+    This class handles fetching complete historical data for trading pairs,
+    processes it in batches, and stores it in the database with proper
+    checkpointing for resume capability.
+
+    Rate limiting is handled by the BybitAdapter class.
+    """
+
+    def __init__(self, bybit_adapter: BybitAdapter):
         """
         Initialize the HistoricalDataManager.
 
         Args:
-            bybit_adapter (BybitAdapter): Adapter to interact with Bybit API.
-            rate_limiter (RateLimiter, optional): Shared rate limiter instance.
+            bybit_adapter: Instance of BybitAdapter for API interactions
         """
         self.bybit = bybit_adapter
-        self.batch_size = 200  # Bybit's max limit
-        self.rate_limit_pause = 0.05  # 50ms between requests
-        self.rate_limiter = rate_limiter
+        self.batch_size = 1000  # Maximum allowed by Bybit API
         self.max_retries = 5
         self.backoff_factor = 2
 
     def _make_api_call(self, *args, **kwargs):
         """
-        Make an API call with rate limiting and retry logic.
+        Make an API call with retry logic.
 
         Args:
-            *args: Positional arguments for the API call.
-            **kwargs: Keyword arguments for the API call.
+            *args: Positional arguments for the API call
+            **kwargs: Keyword arguments for the API call
 
         Returns:
-            dict: The API response.
+            dict: The API response
 
         Raises:
-            Exception: If all retry attempts fail.
+            Exception: If all retry attempts fail
         """
         retries = 0
         while retries < self.max_retries:
             try:
-                self.rate_limiter.acquire()
                 response = self.bybit.get_kline(*args, **kwargs)
-                return response
+
+                if response.get("retCode") == 0:
+                    return response
+
+                raise APIError(f"API Error: {response.get('retCode')} - {response.get('retMsg')}")
+
             except Exception as e:
                 retries += 1
-                sleep_time = self.backoff_factor ** retries
-                logger.warning(f"API call failed on attempt {retries}/{self.max_retries}: {e}. Retrying in {sleep_time} seconds.")
-                time.sleep(sleep_time)
-        logger.error(f"API call failed after {self.max_retries} attempts.")
-        raise Exception(f"Failed to make API call after {self.max_retries} retries.")
+                if retries < self.max_retries:
+                    sleep_time = self.backoff_factor ** retries
+                    logger.warning(f"API call failed (attempt {retries}/{self.max_retries}). Retrying in {sleep_time}s")
+                    time.sleep(sleep_time)
+                    continue
+                raise
+
+        raise Exception(f"Failed to make API call after {self.max_retries} retries")
 
     @with_db_retry(max_attempts=3)
     def _get_symbol_first_trade(self, symbol: str) -> Optional[int]:
@@ -117,11 +82,10 @@ class HistoricalDataManager:
         Get the timestamp of the first trade for a symbol.
 
         Args:
-            session (Session): Database session.
-            symbol (str): Symbol name.
+            symbol: Trading pair symbol name
 
         Returns:
-            Optional[int]: Timestamp in milliseconds or None if not found.
+            Optional[int]: Launch timestamp in milliseconds or None if not found
         """
         try:
             raw_response = self.bybit.session.get_instruments_info(
@@ -133,131 +97,143 @@ class HistoricalDataManager:
                 instrument_list = raw_response.get('result', {}).get('list', [])
                 for item in instrument_list:
                     if item.get('symbol') == symbol and 'launchTime' in item:
-                        return int(item['launchTime']) * 1000
+                        launch_time = item['launchTime']
+                        if isinstance(launch_time, (int, str)) and str(launch_time).isdigit():
+                            ts = int(float(launch_time))
+                            # API returns milliseconds, only convert to seconds for validation
+                            ts_seconds = ts // 1000
+                            if 1500000000 < ts_seconds < int(time.time()):
+                                logger.debug(f"Found valid launch time for {symbol}")
+                                return ts
+                            else:
+                                logger.warning(f"Invalid launch time for {symbol}: {launch_time}")
+                                return None
 
-            logger.warning(f"No launch time found for symbol {symbol}")
+            logger.warning(f"No valid launch time found for {symbol}")
             return None
 
         except Exception as e:
             logger.error(f"Error getting first trade date for {symbol}: {e}")
             return None
 
+    def _process_time_chunk(self, session: Session, symbol: str, symbol_id: int,
+                          start_time: int, end_time: int) -> bool:
+        """
+        Process a chunk of historical data for a symbol.
+
+        Args:
+            session: Database session
+            symbol: Trading pair symbol
+            symbol_id: Database ID for the symbol
+            start_time: Start time in milliseconds
+            end_time: End time in milliseconds
+
+        Returns:
+            bool: True if data was processed successfully, False otherwise
+        """
+        try:
+            logger.debug(f"Processing chunk for {symbol}")
+            raw_data = self._make_api_call(
+                symbol=symbol,
+                interval='5',
+                category='linear',
+                start_time=start_time,
+                end_time=end_time,
+                limit=self.batch_size
+            )
+
+            if raw_data.get("retCode") == 0:
+                kline_list = raw_data.get("result", {}).get("list", [])
+                if kline_list:
+                    # Sort by timestamp ascending before processing
+                    kline_list.sort(key=lambda x: int(x[0]))
+                    logger.info(f"Processing {len(kline_list)} klines for {symbol}")
+
+                    formatted_data = [
+                        (int(item[0]), float(item[1]), float(item[2]), float(item[3]),
+                         float(item[4]), float(item[5]), float(item[6]))
+                        for item in kline_list
+                    ]
+
+                    insert_kline_data(session, symbol_id, formatted_data)
+                    last_timestamp = formatted_data[-1][0]  # Latest time after sorting
+                    self._update_checkpoint(session, symbol, last_timestamp)
+                    return True
+
+                logger.debug(f"No data available for {symbol} in requested time range")
+                return False
+
+            logger.warning(f"API error for {symbol}")
+            return False
+
+        except Exception as e:
+            logger.error(f"Error processing chunk for {symbol}: {e}")
+            raise
+
     @with_db_retry(max_attempts=3)
     def _update_checkpoint(self, session: Session, symbol: str, last_timestamp: int) -> None:
         """
-        Update the checkpoint for a given symbol with proper concurrency handling.
+        Update or create a checkpoint for a symbol's data collection progress.
 
         Args:
-            session (Session): Database session
-            symbol (str): Symbol name
-            last_timestamp (int): Last timestamp processed
+            session: Database session
+            symbol: Trading pair symbol
+            last_timestamp: Last processed timestamp in milliseconds
         """
         try:
-            # Try to update existing checkpoint
             rows_updated = session.query(Checkpoint)\
                 .filter_by(symbol=symbol)\
                 .update({'last_timestamp': last_timestamp})
 
             if rows_updated == 0:
-                # If no existing checkpoint, try to create one
                 checkpoint = Checkpoint(symbol=symbol, last_timestamp=last_timestamp)
                 try:
                     session.add(checkpoint)
-                    session.flush()  # Try to insert immediately
+                    session.flush()
                 except IntegrityError:
-                    # If another thread created the checkpoint, update it
                     session.rollback()
                     session.query(Checkpoint)\
                         .filter_by(symbol=symbol)\
                         .update({'last_timestamp': last_timestamp})
 
             session.commit()
-            logger.debug(f"Updated checkpoint for symbol '{symbol}' to {last_timestamp}")
+            logger.debug(f"Updated checkpoint for {symbol}")
 
         except Exception as e:
             session.rollback()
-            logger.error(f"Failed to update checkpoint for symbol '{symbol}': {e}")
+            logger.error(f"Failed to update checkpoint for {symbol}: {e}")
             raise
-
-    def _process_time_chunk(self, session: Session, symbol: str, symbol_id: int,
-                          start_time: int, end_time: int) -> bool:
-        """Process a single time chunk with proper error handling."""
-        try:
-            raw_data = self._make_api_call(
-                symbol=symbol,
-                interval='5',
-                start_time=start_time,
-                end_time=end_time,
-                limit=self.batch_size
-            )
-
-            if raw_data["retCode"] == 0 and raw_data["result"]["list"]:
-                kline_list = raw_data["result"]["list"]
-                formatted_data = [
-                    (int(item[0]), float(item[1]), float(item[2]), float(item[3]),
-                     float(item[4]), float(item[5]), float(item[6]))
-                    for item in kline_list
-                ]
-
-                insert_kline_data(session, symbol_id, formatted_data)
-                last_timestamp = max(item[0] for item in formatted_data)
-                self._update_checkpoint(session, symbol, last_timestamp)
-
-                return True
-            else:
-                logger.warning(f"No data returned for {symbol} in time range")
-                return False
-
-        except Exception as e:
-            logger.error(f"Error processing time chunk: {e}")
-            raise
-
 
     def fetch_complete_history(self, symbol: str) -> bool:
         """
-        Fetch complete historical kline data for a given symbol.
+        Fetch complete historical data for a symbol.
 
         Args:
-            symbol (str): Symbol name.
+            symbol: Trading pair symbol name
 
         Returns:
-            bool: True if fetching is successful, False otherwise.
+            bool: True if successful, False otherwise
         """
         try:
             with session_scope() as session:
                 symbol_id = get_symbol_id(session, symbol)
 
-                # Use SELECT FOR UPDATE with a short timeout
-                checkpoint = None
-                try:
-                    checkpoint = (
-                        session.query(Checkpoint)
-                        .filter_by(symbol=symbol)
-                        .with_for_update(skip_locked=True)  # Allow concurrent processing of different symbols
-                        .one_or_none()
-                    )
-                except OperationalError as e:
-                    logger.error(f"Failed to acquire lock for {symbol}: {e}")
+                if not session.query(Symbol).filter_by(id=symbol_id).first():
+                    logger.error(f"Symbol {symbol} does not exist in database")
                     return False
 
-                start_time: Optional[int] = checkpoint.last_timestamp if checkpoint else None
-
+                start_time = self._get_symbol_first_trade(symbol)
                 if start_time is None:
-                    start_time = self._get_symbol_first_trade(symbol)
-                    if start_time is None:
-                        logger.error(f"Could not determine start time for {symbol}")
-                        return False
+                    logger.error(f"Could not determine first trade time for {symbol}")
+                    return False
 
-                # Process data in smaller chunks with savepoints
-                chunk_size = 200  # Number of klines per chunk
                 end_time = to_timestamp(datetime.now(timezone.utc))
                 current_start = start_time
 
                 while current_start < end_time:
                     try:
-                        with session.begin_nested():  # Create savepoint
-                            # Process chunk
-                            current_end = min(current_start + (chunk_size * 5 * 60 * 1000), end_time)
+                        with session.begin_nested():
+                            current_end = min(current_start + (self.batch_size * 5 * 60 * 1000), end_time)
                             success = self._process_time_chunk(session, symbol, symbol_id, current_start, current_end)
 
                             if not success:
@@ -268,10 +244,12 @@ class HistoricalDataManager:
                     except Exception as e:
                         logger.error(f"Error processing chunk for {symbol}: {e}")
                         if isinstance(e, IntegrityError):
-                            session.rollback()  # Rollback to last savepoint
+                            session.rollback()
                             continue
                         raise
 
+                records = session.query(Kline).filter_by(symbol_id=symbol_id).count()
+                logger.info(f"Historical data fetch complete for {symbol}. Total records: {records}")
                 return True
 
         except Exception as e:

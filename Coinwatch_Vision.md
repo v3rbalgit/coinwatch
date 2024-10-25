@@ -11,7 +11,7 @@ The primary goal of this application is to allow users to stay "ahead of the mar
 ## 3. Key Features
 
 ### 3.1 Data Management
-- Real-time and historical price data for all 417 USDT derivative pairs on Bybit
+- Real-time and historical price data for all USDT derivative pairs on Bybit
 - Storage and retrieval of price data at 5-minute intervals
 - On-demand aggregation of data into larger timeframes (15m, 30m, 1h, 2h, 4h, etc.)
 

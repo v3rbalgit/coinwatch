@@ -2,10 +2,10 @@
 
 import logging
 from typing import Dict
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-from utils.timestamp import from_timestamp
+from src.utils.timestamp import from_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -63,15 +63,26 @@ class DataQualityMetrics:
     def get_system_quality_metrics(self) -> Dict:
         """Get system-wide data quality metrics including integrity checks."""
         try:
-            # Get basic system stats
+            # First check for orphaned records
+            orphaned_query = text("""
+                SELECT COUNT(*) as orphaned
+                FROM kline_data k
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM symbols s
+                    WHERE s.id = k.symbol_id
+                )
+            """)
+            orphaned_count = self.session.execute(orphaned_query).scalar() or 0
+
+            # Get basic system stats (modified to use LEFT JOIN to catch orphaned records)
             base_query = text("""
                 SELECT
                     COUNT(DISTINCT s.id) as symbol_count,
-                    COUNT(*) as total_records,
+                    COUNT(k.id) as total_records,
                     MIN(k.start_time) as oldest_record,
                     MAX(k.start_time) as newest_record
                 FROM symbols s
-                JOIN kline_data k ON k.symbol_id = s.id
+                LEFT JOIN kline_data k ON k.symbol_id = s.id
             """)
 
             system_stats = self.session.execute(base_query).first()
@@ -84,12 +95,12 @@ class DataQualityMetrics:
             if system_stats.symbol_count > 0:
                 symbols_query = text("SELECT id FROM symbols")
                 symbol_ids = [row[0] for row in self.session.execute(symbols_query)]
-
                 for symbol_id in symbol_ids:
                     integrity = self.check_data_integrity(symbol_id)
                     if integrity:
                         integrity_metrics[str(symbol_id)] = integrity
 
+            # Build comprehensive metrics
             return {
                 'system_stats': {
                     'symbol_count': system_stats.symbol_count if system_stats else 0,
@@ -102,9 +113,17 @@ class DataQualityMetrics:
                 'integrity_metrics': integrity_metrics,
                 'overall_integrity': {
                     'symbols_with_gaps': sum(1 for m in integrity_metrics.values()
-                                          if m.get('actual_records', 0) < m.get('expected_records', 0)),
+                                        if m.get('actual_records', 0) < m.get('expected_records', 0)),
                     'symbols_with_duplicates': sum(1 for m in integrity_metrics.values()
-                                                if m.get('has_duplicates', False))
+                                                if m.get('has_duplicates', False)),
+                    'orphaned_records': orphaned_count
+                },
+                'data_quality': {
+                    'orphaned_records_percentage': (
+                        (orphaned_count / system_stats.total_records * 100)
+                        if system_stats.total_records > 0 else 0
+                    ),
+                    'last_check_time': datetime.now(timezone.utc).isoformat()
                 }
             }
 
