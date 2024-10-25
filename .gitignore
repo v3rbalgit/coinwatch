@@ -178,3 +178,7 @@ cython_debug/
 
 # Custom ignores
 project_structure.txt
+logs/
+*.log
+*.log.*
+stats/
