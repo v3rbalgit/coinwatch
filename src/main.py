@@ -1,15 +1,18 @@
 # src/main.py
 
-import logging
 import traceback
+import random
+import threading
 from time import sleep
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
+
 # Database imports
 from src.db.init_db import init_db, db_manager, session_scope
 from src.db.partition_manager import PartitionManager
+
 # API and services
 from src.api.bybit_adapter import BybitAdapter
 from src.services.kline_service import (
@@ -21,35 +24,18 @@ from src.services.kline_service import (
 from src.services.historical_service import HistoricalDataManager
 from src.services.partition_maintenance_service import PartitionMaintenanceService
 from src.services.database_monitor_service import DatabaseMonitorService
+
 # Utilities
 from src.utils.timestamp import get_current_timestamp, from_timestamp
 from src.utils.db_resource_manager import DatabaseResourceManager
 from src.utils.db_retry import with_db_retry
+from src.utils.logger import LoggerSetup
+
 # Models
 from src.models.symbol import Symbol
-import threading
-import random
 
-# Force DEBUG level regardless of environment
-logging.getLogger().setLevel(logging.DEBUG)
-for handler in logging.getLogger().handlers:
-    handler.setLevel(logging.DEBUG)
-
-# Set up our specific logger
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-
-# Add a handler if none exist
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setLevel(logging.DEBUG)
-    formatter = logging.Formatter('%(asctime)s - %(threadName)s - %(levelname)s - %(message)s')
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-
-# Quiet noisy loggers
-logging.getLogger('urllib3').setLevel(logging.WARNING)
-logging.getLogger('sqlalchemy').setLevel(logging.WARNING)
+# Configure logging
+logger = LoggerSetup.setup(__name__)
 
 def process_symbol(symbol: str, end_time: int) -> None:
     """
@@ -58,30 +44,37 @@ def process_symbol(symbol: str, end_time: int) -> None:
     Args:
         symbol: The trading pair symbol (e.g., 'BTCUSDT')
         end_time: Target end time in milliseconds for data synchronization
-
-    Uses thread-local session management to ensure thread safety.
-    Adds random delays to prevent API rate limiting.
     """
-    bybit = BybitAdapter()  # Create a new instance per thread
+    bybit = BybitAdapter()
     try:
         with session_scope() as session:
             # Add small random delay to spread out connections
-            sleep(random.uniform(0.1, 0.3))  # Random delay between 100-300ms
+            sleep(random.uniform(0.1, 0.3))
 
-            # Get symbol ID with retry
             try:
                 symbol_id = get_symbol_id(session, symbol)
             except Exception as e:
                 logger.error(f"Failed to get symbol ID for {symbol}: {e}")
                 raise
 
-            # Sync data with retry handled internally
             sync_symbol_data(session, symbol, symbol_id, end_time, bybit)
     except Exception as e:
+        # Critical errors should go to console
         logger.error(f"Error processing {symbol}: {str(e)}")
 
 @with_db_retry(max_attempts=3)
 def sync_symbol_data(session: Session, symbol: str, symbol_id: int, end_time: int, bybit: BybitAdapter, batch_size: int = 200) -> None:
+    """
+    Synchronize data for a single symbol with batch processing.
+
+    Args:
+        session: Database session
+        symbol: Trading pair symbol
+        symbol_id: Database ID for the symbol
+        end_time: Target end time in milliseconds
+        bybit: BybitAdapter instance
+        batch_size: Number of klines to fetch per request
+    """
     try:
         latest_timestamp = get_latest_timestamp(session, symbol_id)
         if latest_timestamp is None:
@@ -91,6 +84,7 @@ def sync_symbol_data(session: Session, symbol: str, symbol_id: int, end_time: in
         if end_time > get_current_timestamp():
             end_time = get_current_timestamp()
 
+        # Console log for sync start
         logger.info(f"Syncing {symbol} from {from_timestamp(latest_timestamp)} to {from_timestamp(end_time)}")
 
         current_start = latest_timestamp
@@ -107,12 +101,11 @@ def sync_symbol_data(session: Session, symbol: str, symbol_id: int, end_time: in
 
             if kline_data["retCode"] == 0 and kline_data["result"]["list"]:
                 kline_list = kline_data["result"]["list"]
+
                 logger.debug(f"Got {len(kline_list)} klines for {symbol} from API")
 
-                # Sort by timestamp ascending and validate timestamps
                 kline_list.sort(key=lambda x: int(x[0]))
 
-                # Log first and last timestamps for debugging
                 first_ts = int(kline_list[0][0])
                 last_ts = int(kline_list[-1][0])
                 logger.debug(f"{symbol} - First API timestamp: {from_timestamp(first_ts)}")
@@ -128,9 +121,8 @@ def sync_symbol_data(session: Session, symbol: str, symbol_id: int, end_time: in
                     insert_kline_data(session, symbol_id, formatted_data)
                     logger.debug(f"Inserted batch of {len(formatted_data)} klines for {symbol}")
 
-                    # Update current_start based on the last timestamp in the data
                     if formatted_data:
-                        current_start = formatted_data[-1][0] + (5 * 60 * 1000)  # Add 5 minutes
+                        current_start = formatted_data[-1][0] + (5 * 60 * 1000)
                     else:
                         current_start += (5 * 60 * 1000)
                 except Exception as e:
@@ -145,7 +137,7 @@ def sync_symbol_data(session: Session, symbol: str, symbol_id: int, end_time: in
                 )
                 current_start += (5 * 60 * 1000)
 
-            # Small delay between batches to prevent rate limiting
+            # Small delay between batches
             sleep(0.05)
 
     except Exception as e:
@@ -156,19 +148,12 @@ def sync_symbol_data(session: Session, symbol: str, symbol_id: int, end_time: in
 def cleanup_database(session: Session) -> None:
     """
     Perform database cleanup operations.
-
-    Args:
-        session: Database session
-
     Removes symbols that are no longer active on Bybit.
-    Ensures database consistency with current trading pairs.
     """
-    bybit = BybitAdapter()  # Create a new instance
+    bybit = BybitAdapter()
     try:
         # Get current active symbols from Bybit
         current_symbols = set(bybit.get_active_instruments())
-
-        # Get symbols from database
         db_symbols = session.query(Symbol.name).all()
         db_symbols = set(symbol[0] for symbol in db_symbols)
 
@@ -178,23 +163,17 @@ def cleanup_database(session: Session) -> None:
             remove_symbol(session, symbol_name)
 
         session.commit()
-        logger.info("Database cleanup completed successfully")
+        logger.info("Database cleanup completed")
 
     except Exception as e:
-        logger.error(f"Error during database cleanup: {str(e)}")
+        logger.error(f"Database cleanup failed: {str(e)}")
         session.rollback()
         raise
 
 def initialize_historical_data(symbols: List[str], bybit_adapter: BybitAdapter) -> None:
     """
-    Initialize historical data for all provided symbols.
-
-    Args:
-        symbols: List of trading pair symbols
-
-    Fetches complete price history for each symbol from their listing date.
-    Uses checkpointing to allow resume of interrupted downloads.
-    Must be run before starting regular synchronization.
+    Initialize historical data for provided symbols.
+    Fetches complete price history with checkpointing.
     """
     try:
         historical_manager = HistoricalDataManager(bybit_adapter)
@@ -207,25 +186,18 @@ def initialize_historical_data(symbols: List[str], bybit_adapter: BybitAdapter) 
                 logger.error(f"Failed to fetch complete history for {symbol}")
 
     except Exception as e:
-        logger.error(f"Error in historical data initialization: {e}")
+        logger.error(f"Historical data initialization failed: {e}")
         raise
 
-def start_services() -> List[threading.Thread]:
+def start_background_services() -> None:
     """
-    Start all background services needed for system operation.
+    Start background services for system maintenance and monitoring.
 
-    Returns:
-        List of started service threads
-
-    Starts the following services:
-    - Partition maintenance: Manages database partitions
-    - Database monitoring: Tracks database size and performance
-    - Resource monitoring: Monitors database connection pool
-
-    All services are started as daemon threads and include error recovery.
+    Services:
+    - Partition maintenance
+    - Database monitoring
+    - Resource monitoring
     """
-    threads = []
-
     try:
         # Start partition maintenance
         maintenance_service = PartitionMaintenanceService()
@@ -235,7 +207,6 @@ def start_services() -> List[threading.Thread]:
             name="PartitionMaintenance"
         )
         maintenance_thread.start()
-        threads.append(maintenance_thread)
         logger.info("Partition maintenance service started")
 
         # Start database monitoring
@@ -246,10 +217,9 @@ def start_services() -> List[threading.Thread]:
             name="DatabaseMonitor"
         )
         monitor_thread.start()
-        threads.append(monitor_thread)
         logger.info("Database monitoring service started")
 
-        # Start resource monitoring
+        # Start resource monitoring if engine is available
         if db_manager.engine:
             db_resource_manager = DatabaseResourceManager(db_manager.engine)
             resource_thread = threading.Thread(
@@ -258,33 +228,21 @@ def start_services() -> List[threading.Thread]:
                 name="ResourceMonitor"
             )
             resource_thread.start()
-            threads.append(resource_thread)
             logger.info("Resource monitoring started")
 
     except Exception as e:
-        logger.error(f"Failed to start services: {e}")
-        # Try to stop any services that did start
-        for thread in threads:
-            if hasattr(thread, "stop"):
-                thread.stop()
-
-    return threads
+        logger.error(f"Failed to start background services: {e}")
+        raise
 
 def main() -> None:
     """
     Main application entry point.
 
-    Application flow:
+    Flow:
     1. Initialize database and set up partitioning
-    2. Start background services (monitoring, maintenance)
-    3. Initialize historical data for all symbols
-    4. Enter main loop for continuous data synchronization:
-       - Cleanup inactive symbols
-       - Fetch new data for active symbols
-       - Process symbols in parallel with rate limiting
-
-    Includes comprehensive error handling and recovery mechanisms.
-    Uses connection pooling and thread-safe session management.
+    2. Start background services
+    3. Initialize historical data
+    4. Enter main synchronization loop
     """
     try:
         # Initialize database and setup partitioning
@@ -296,42 +254,39 @@ def main() -> None:
             partition_manager.setup_partitioning()
             logger.info("Partition setup completed")
 
-        # Start all background services
-        background_threads = start_services()
+        # Start background services
+        start_background_services()
         logger.info("All background services started")
 
-        # Create a BybitAdapter instance
+        # Create BybitAdapter instance
         bybit = BybitAdapter()
 
-        # Get current active symbols
+        # Get initial symbols and initialize historical data
         current_symbols = bybit.get_active_instruments(limit=5)
         if not current_symbols:
             logger.error("No symbols fetched from Bybit")
             return
 
-        # Initialize historical data
         initialize_historical_data(current_symbols, bybit)
         logger.info("Historical data initialization completed")
 
-        # Main synchronization loop
-        while True:
-            try:
-                with session_scope() as session:
-                    # Cleanup and integrity check
-                    cleanup_database(session)
+        # Create thread pool for symbol processing
+        with ThreadPoolExecutor(max_workers=min(10, len(current_symbols))) as executor:
+            # Main synchronization loop
+            while True:
+                try:
+                    with session_scope() as session:
+                        cleanup_database(session)
+                        current_symbols = bybit.get_active_instruments(limit=5)
 
-                    # Get current active symbols
-                    current_symbols = bybit.get_active_instruments(limit=5)
-                    if not current_symbols:
-                        logger.warning("No symbols fetched. Retrying in 5 minutes...")
-                        sleep(300)
-                        continue
+                        if not current_symbols:
+                            logger.warning("No symbols fetched, retrying in 5 minutes")
+                            sleep(300)
+                            continue
 
-                    end_time = get_current_timestamp()
+                        end_time = get_current_timestamp()
 
-                    # Process symbols in parallel
-                    max_workers = min(10, len(current_symbols))
-                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        # Process symbols in parallel
                         futures = [
                             executor.submit(process_symbol, symbol, end_time)
                             for symbol in current_symbols
@@ -343,16 +298,16 @@ def main() -> None:
                             except Exception as e:
                                 logger.error(f"Thread execution failed: {str(e)}")
 
-                    logger.info("Synchronization cycle completed")
-                    logger.info("Sleeping for 5 minutes before next cycle")
-                    sleep(300)
+                        logger.info("Synchronization cycle completed")
+                        logger.info("Sleeping for 5 minutes before next cycle")
+                        sleep(300)
 
-            except SQLAlchemyError as e:
-                logger.error(f"Database error in main loop: {str(e)}")
-                sleep(300)
-            except Exception as e:
-                logger.critical(f"Critical error in main loop: {str(e)}")
-                sleep(600)
+                except SQLAlchemyError as e:
+                    logger.error(f"Database error in main loop: {str(e)}")
+                    sleep(300)
+                except Exception as e:
+                    logger.critical(f"Critical error in main loop: {str(e)}")
+                    sleep(600)
 
     except Exception as e:
         logger.critical(f"Fatal error in main function: {str(e)}")

@@ -9,14 +9,25 @@ from src.utils.db_retry import with_db_retry
 from src.models.symbol import Symbol
 from src.models.kline import Kline
 from datetime import datetime, timezone, timedelta
-import logging
+from src.utils.logger import LoggerSetup
 
-logger = logging.getLogger(__name__)
+logger = LoggerSetup.setup(__name__)
 
 class DataIntegrityManager:
     """
     Manages data integrity checking and repair operations.
-    Handles both partition-level and data-level integrity.
+
+    Provides comprehensive data validation and repair functionality:
+    - Partition integrity verification
+    - Time series data validation
+    - Price and volume validation
+    - Anomaly detection
+    - Data repair operations
+
+    Constants:
+    - BYBIT_LAUNCH_DATE: Earliest valid timestamp
+    - MAX_FUTURE_TOLERANCE: Maximum allowed future timestamp
+    - MAX_DECIMAL_PLACES: Maximum price decimal places
     """
 
     BYBIT_LAUNCH_DATE = int(datetime(2019, 11, 1, tzinfo=timezone.utc).timestamp() * 1000)
@@ -24,21 +35,33 @@ class DataIntegrityManager:
     MAX_DECIMAL_PLACES = 10
 
     def __init__(self, session: Session):
+        """
+        Initialize integrity manager with database session.
+
+        Args:
+            session: Active SQLAlchemy database session
+        """
         self.session = session
+        logger.debug("Data integrity manager initialized")
 
     @with_db_retry(max_attempts=3)
     def verify_partition_integrity(self) -> Dict[str, Any]:
         """
-        Verify the integrity of partitioned data.
+        Verify database partition integrity.
+
+        Checks:
+        - Orphaned records (no matching symbol)
+        - Partition gaps
+        - Overall partition validity
 
         Returns:
             Dict containing:
                 - orphaned_records: Count of records with no matching symbol
                 - partition_gaps: Number of gaps between partitions
-                - partitions_valid: Boolean indicating overall partition validity
+                - partitions_valid: Boolean indicating overall validity
 
         Raises:
-            DataValidationError: If verification fails
+            DataValidationError: If verification process fails
         """
         try:
             # Check for orphaned records
@@ -50,6 +73,9 @@ class DataIntegrityManager:
                     WHERE s.id = k.symbol_id
                 )
             """)).scalar() or 0
+
+            if orphaned > 0:
+                logger.warning(f"Found {orphaned:,} orphaned records")
 
             # Check for partition gaps
             partition_gaps = self.session.execute(text("""
@@ -67,13 +93,25 @@ class DataIntegrityManager:
                     AND p1.partition_description != p2.partition_description
             """)).fetchall()
 
-            return {
+            gap_count = len(partition_gaps)
+            if gap_count > 0:
+                logger.warning(f"Found {gap_count} partition gaps")
+
+            result = {
                 'orphaned_records': orphaned,
-                'partition_gaps': len(partition_gaps),
-                'partitions_valid': len(partition_gaps) == 0 and orphaned == 0
+                'partition_gaps': gap_count,
+                'partitions_valid': gap_count == 0 and orphaned == 0
             }
+
+            logger.info(
+                f"Partition integrity verification completed: "
+                f"{'valid' if result['partitions_valid'] else 'invalid'}"
+            )
+            return result
+
         except Exception as e:
-            raise DataValidationError(f"Failed to verify partition integrity: {str(e)}")
+            logger.error("Partition integrity verification failed", exc_info=e)
+            raise DataValidationError(f"Partition integrity verification failed: {str(e)}")
 
     @with_db_retry(max_attempts=3)
     def validate_kline_data(self, symbol_id: int, start_time: int, end_time: int) -> Dict[str, Any]:
@@ -81,10 +119,11 @@ class DataIntegrityManager:
         Validate kline data for a specific time range.
 
         Performs comprehensive validation including:
-        - Time range validity considering existing data
-        - Detection of time gaps in 5-minute intervals
-        - Price and volume anomaly detection
-        - Duplicate timestamp detection
+        1. Time range and overlap checks
+        2. Gap detection in 5-minute intervals
+        3. Price and volume anomaly detection using statistical methods
+        4. Duplicate timestamp detection
+        5. Data relationship validation
 
         Args:
             symbol_id: Database ID for the symbol
@@ -92,19 +131,31 @@ class DataIntegrityManager:
             end_time: End timestamp in milliseconds
 
         Returns:
-            Dict containing validation results:
-                - has_gaps: Boolean indicating if time gaps exist
+            Dict containing:
+                - has_gaps: True if time gaps exist
                 - gap_count: Number of gaps found
-                - anomaly_count: Number of price anomalies found
-                - time_range_valid: Boolean indicating if time range is valid
-                - data_valid: Boolean indicating overall data validity
-                - duplicates_found: Number of duplicate timestamps found
+                - anomaly_count: Number of price/volume anomalies
+                - time_range_valid: True if time range is valid
+                - data_valid: True if all checks pass
+                - duplicates_found: Number of duplicate timestamps
+                - overlap_count: Number of overlapping records
 
         Raises:
             DataValidationError: If validation query fails
         """
         try:
-            # Get the latest timestamp for this symbol
+            # Get symbol info for logging context
+            symbol_name = self.session.query(Symbol.name)\
+                .filter(Symbol.id == symbol_id)\
+                .scalar() or str(symbol_id)
+
+            logger.debug(
+                f"Validating data for {symbol_name} from "
+                f"{datetime.fromtimestamp(start_time/1000, tz=timezone.utc)} to "
+                f"{datetime.fromtimestamp(end_time/1000, tz=timezone.utc)}"
+            )
+
+            # Get the latest timestamp
             latest_ts = self.session.query(func.max(Kline.start_time))\
                 .filter_by(symbol_id=symbol_id)\
                 .scalar() or 0
@@ -116,14 +167,17 @@ class DataIntegrityManager:
                     Kline.start_time <= end_time)\
                 .count()
 
-            # More permissive time range validation
+            if overlap > 0:
+                logger.debug(f"Found {overlap} overlapping records for {symbol_name}")
+
+            # Time range validation
             time_range_valid = (
                 end_time > start_time and  # Basic sanity check
                 (start_time >= latest_ts or  # Either starting after last record
                 overlap == 0)  # Or no overlapping records if starting earlier
             )
 
-            # Check for time gaps (periods > 5 minutes)
+            # Check for time gaps
             gaps = self.session.execute(text("""
                 WITH time_series AS (
                     SELECT
@@ -142,7 +196,10 @@ class DataIntegrityManager:
                 'end_time': end_time
             }).scalar() or 0
 
-            # Check for price anomalies with dynamic thresholds
+            if gaps > 0:
+                logger.warning(f"Found {gaps} time gaps for {symbol_name}")
+
+            # Check for price/volume anomalies
             anomalies = self.session.execute(text("""
                 WITH price_stats AS (
                     SELECT
@@ -152,23 +209,20 @@ class DataIntegrityManager:
                         STDDEV(volume) as stddev_volume
                     FROM kline_data USE INDEX (idx_symbol_time)
                     WHERE symbol_id = :symbol_id
-                    AND start_time BETWEEN :start_time - 86400000 AND :end_time  -- Include last 24h for better statistics
+                    AND start_time BETWEEN :start_time - 86400000 AND :end_time
                 )
                 SELECT COUNT(*) as anomaly_count
                 FROM kline_data k, price_stats s
                 WHERE k.symbol_id = :symbol_id
                 AND start_time BETWEEN :start_time AND :end_time
                 AND (
-                    -- Check for price anomalies
                     (high_price - low_price) > (avg_range + 3 * stddev_range)
                     OR volume > (avg_volume + 3 * stddev_volume)
-                    -- Check for invalid price relationships
                     OR high_price < low_price
                     OR open_price < low_price
                     OR open_price > high_price
                     OR close_price < low_price
                     OR close_price > high_price
-                    -- Check for invalid values
                     OR volume < 0
                     OR turnover < 0
                 )
@@ -178,7 +232,10 @@ class DataIntegrityManager:
                 'end_time': end_time
             }).scalar() or 0
 
-            # Check for duplicate timestamps
+            if anomalies > 0:
+                logger.warning(f"Found {anomalies} price/volume anomalies for {symbol_name}")
+
+            # Check for duplicates
             duplicates = self.session.execute(text("""
                 SELECT COUNT(*)
                 FROM (
@@ -195,20 +252,10 @@ class DataIntegrityManager:
                 'end_time': end_time
             }).scalar() or 0
 
-            # Log validation results for debugging
-            symbol_name = self.session.query(Symbol.name)\
-                .filter(Symbol.id == symbol_id)\
-                .scalar() or str(symbol_id)
+            if duplicates > 0:
+                logger.warning(f"Found {duplicates} duplicate timestamps for {symbol_name}")
 
-            logger.debug(
-                f"Validation results for {symbol_name} "
-                f"({datetime.fromtimestamp(start_time/1000, tz=timezone.utc)} to "
-                f"{datetime.fromtimestamp(end_time/1000, tz=timezone.utc)}): "
-                f"gaps={gaps}, anomalies={anomalies}, duplicates={duplicates}, "
-                f"time_range_valid={time_range_valid}"
-            )
-
-            return {
+            validation_results = {
                 'has_gaps': gaps > 0,
                 'gap_count': gaps,
                 'anomaly_count': anomalies,
@@ -218,58 +265,135 @@ class DataIntegrityManager:
                 'overlap_count': overlap
             }
 
+            logger.debug(f"Validation results for {symbol_name}: {validation_results}")
+            return validation_results
+
         except Exception as e:
-            logger.error(f"Failed to validate kline data: {str(e)}")
-            raise DataValidationError(f"Failed to validate kline data: {str(e)}")
+            logger.error(
+                f"Data validation failed for {symbol_name}: {e}",
+                exc_info=True
+            )
+            raise DataValidationError(f"Data validation failed: {str(e)}")
 
     def validate_kline(self, kline_data: Tuple) -> bool:
         """
-        Validate a single kline record with enhanced checks.
+        Validate a single kline (candlestick) record.
+
+        Performs comprehensive validation checks:
+        1. Data format validation
+        2. Timestamp validation (past/future bounds)
+        3. Price value and decimal place validation
+        4. Volume and turnover validation
+        5. OHLC price relationship validation
+
+        Args:
+            kline_data: Tuple of (timestamp, open, high, low, close, volume, turnover)
+
+        Returns:
+            bool: True if record passes all validations
+
+        Raises:
+            DataValidationError: If any validation check fails
+
+        Note:
+            Timestamp must be:
+            - Integer in milliseconds (13 digits)
+            - After exchange launch date
+            - Not too far in the future
         """
         try:
             if len(kline_data) != 7:
-                raise DataValidationError("Invalid kline data format")
+                raise DataValidationError(f"Invalid kline format: expected 7 values, got {len(kline_data)}")
 
             timestamp, open_price, high, low, close, volume, turnover = kline_data
 
-            # Enhanced timestamp validation
+            # Timestamp validation
             if not isinstance(timestamp, int):
-                raise DataValidationError("Timestamp must be an integer")
-            if len(str(abs(timestamp))) != 13:
-                raise DataValidationError("Timestamp must be in milliseconds (13 digits)")
-            if timestamp < self.BYBIT_LAUNCH_DATE:
-                raise DataValidationError(f"Timestamp is before exchange launch ({self.BYBIT_LAUNCH_DATE})")
+                raise DataValidationError(f"Invalid timestamp type: {type(timestamp)}, must be int")
 
+            if len(str(abs(timestamp))) != 13:
+                raise DataValidationError(f"Invalid timestamp length: {len(str(abs(timestamp)))}, must be 13 digits")
+
+            if timestamp < self.BYBIT_LAUNCH_DATE:
+                launch_date = datetime.fromtimestamp(self.BYBIT_LAUNCH_DATE/1000, tz=timezone.utc)
+                raise DataValidationError(f"Timestamp before exchange launch ({launch_date})")
+
+            # Future timestamp check
             dt = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
             max_allowed = datetime.now(timezone.utc) + timedelta(seconds=self.MAX_FUTURE_TOLERANCE)
             if dt > max_allowed:
-                raise DataValidationError(f"Timestamp is too far in the future")
+                raise DataValidationError(
+                    f"Future timestamp not allowed: {dt} > {max_allowed}"
+                )
 
-            # Price validation with decimal place check
-            for price in (open_price, high, low, close):
-                if not isinstance(price, (int, float)) or price <= 0:
-                    raise DataValidationError(f"Invalid price value: {price}")
+            # Price validation
+            for name, price in [
+                ('open', open_price),
+                ('high', high),
+                ('low', low),
+                ('close', close)
+            ]:
+                if not isinstance(price, (int, float)):
+                    raise DataValidationError(f"Invalid {name} price type: {type(price)}")
+
+                if price <= 0:
+                    raise DataValidationError(f"Non-positive {name} price: {price}")
+
                 decimal_str = str(float(price)).split('.')[-1]
                 if len(decimal_str) > self.MAX_DECIMAL_PLACES:
-                    raise DataValidationError(f"Price has too many decimal places: {price}")
+                    raise DataValidationError(
+                        f"{name} price has too many decimal places: "
+                        f"{len(decimal_str)} > {self.MAX_DECIMAL_PLACES}"
+                    )
 
             # Volume and turnover validation
-            for value in (volume, turnover):
-                if not isinstance(value, (int, float)) or value < 0:
-                    raise DataValidationError(f"Invalid volume/turnover value: {value}")
+            for name, value in [('volume', volume), ('turnover', turnover)]:
+                if not isinstance(value, (int, float)):
+                    raise DataValidationError(f"Invalid {name} type: {type(value)}")
+
+                if value < 0:
+                    raise DataValidationError(f"Negative {name}: {value}")
 
             # Price relationship validation
             if not (low <= min(open_price, close) <= max(open_price, close) <= high):
-                raise DataValidationError("Invalid price relationships in OHLC data")
+                raise DataValidationError(
+                    f"Invalid OHLC relationships: "
+                    f"O={open_price}, H={high}, L={low}, C={close}"
+                )
 
+            logger.debug(
+                f"Validated kline: {dt} - "
+                f"O:{open_price}, H:{high}, L:{low}, C:{close}, V:{volume}"
+            )
             return True
 
         except DataValidationError:
             raise
         except Exception as e:
+            logger.error("Unexpected validation error", exc_info=e)
             raise DataValidationError(f"Validation failed: {str(e)}")
 
     def repair_data_issues(self, issues: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Repair detected data integrity issues.
+
+        Performs the following repairs:
+        1. Removes orphaned records
+        2. Removes duplicate timestamps (keeps most recent)
+        3. Removes records with invalid price relationships
+        4. Removes records with invalid values
+
+        Args:
+            issues: Dictionary of detected issues to repair
+
+        Returns:
+            Dict containing:
+                - orphaned_removed: Count of orphaned records removed
+                - duplicates_removed: Count of duplicate records removed
+                - anomalies_removed: Count of anomalous records removed
+                - success: Whether repair operations succeeded
+                - error: Error message if repair failed
+        """
         try:
             repairs = {
                 'orphaned_removed': 0,
@@ -278,15 +402,16 @@ class DataIntegrityManager:
                 'success': False
             }
 
+            # Remove orphaned records
             if issues.get('orphaned_records', 0) > 0:
                 result = cast(CursorResult, self.session.execute(text("""
                     DELETE FROM kline_data
                     WHERE symbol_id NOT IN (SELECT id FROM symbols)
                 """)))
                 repairs['orphaned_removed'] = result.rowcount
-                logger.info(f"Removed {repairs['orphaned_removed']} orphaned records")
+                logger.info(f"Removed {repairs['orphaned_removed']:,} orphaned records")
 
-            # Remove duplicate timestamps keeping the most recent insert
+            # Remove duplicate timestamps
             if issues.get('duplicates_found', 0) > 0:
                 result = cast(CursorResult, self.session.execute(text("""
                     DELETE k1 FROM kline_data k1
@@ -296,9 +421,9 @@ class DataIntegrityManager:
                     AND k1.id < k2.id
                 """)))
                 repairs['duplicates_removed'] = result.rowcount
-                logger.info(f"Removed {repairs['duplicates_removed']} duplicate records")
+                logger.info(f"Removed {repairs['duplicates_removed']:,} duplicate records")
 
-            # Remove obvious data anomalies
+            # Remove anomalous records
             result = cast(CursorResult, self.session.execute(text("""
                 DELETE FROM kline_data
                 WHERE high_price < low_price
@@ -310,13 +435,18 @@ class DataIntegrityManager:
                 OR turnover < 0
             """)))
             repairs['anomalies_removed'] = result.rowcount
-            logger.info(f"Removed {repairs['anomalies_removed']} anomalous records")
+            logger.info(f"Removed {repairs['anomalies_removed']:,} anomalous records")
 
             self.session.commit()
             repairs['success'] = True
+
+            total_removed = sum(
+                repairs[k] for k in ['orphaned_removed', 'duplicates_removed', 'anomalies_removed']
+            )
+            logger.info(f"Data repair completed: {total_removed:,} total records removed")
             return repairs
 
         except Exception as e:
             self.session.rollback()
-            logger.error(f"Failed to repair data issues: {str(e)}")
+            logger.error("Data repair failed", exc_info=e)
             return {**repairs, 'success': False, 'error': str(e)}
