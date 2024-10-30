@@ -54,28 +54,28 @@ services:
       PYTHONUNBUFFERED: 1
       LOG_LEVEL: DEBUG
 
-  # test:
-  #   build:
-  #     context: .
-  #   container_name: coinwatch_test
-  #   tty: true
-  #   command: /bin/sh -c "PYTHONPATH=/app python -m src.tests.test_connections && PYTHONPATH=/app python -m src.tests.test_data_collection"
-  #   volumes:
-  #     - .:/app
-  #   depends_on:
-  #     db:
-  #       condition: service_healthy
-  #     app:
-  #       condition: service_started
-  #   networks:
-  #     - coinwatch_network
-  #   environment:
-  #     PYTHONPATH: /app
-  #     DB_HOST: db
-  #     DB_USER: user
-  #     DB_PASSWORD: password
-  #     DB_NAME: coinwatch
-
+  test:
+    build:
+      context: .
+    container_name: coinwatch_test
+    command: pytest
+    volumes:
+      - .:/app
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - coinwatch_network
+    environment:
+      PYTHONPATH: /app
+      DB_HOST: db
+      DB_USER: user
+      DB_PASSWORD: password
+      DB_NAME: coinwatch
+      # Set test-specific environment variables
+      LOG_LEVEL: DEBUG
+      # Use a different log location for tests
+      LOG_FILE: /app/logs/test.log
 
 volumes:
   data:

@@ -1,7 +1,7 @@
 # src/config.py
 
-from typing import Optional
-from dataclasses import dataclass
+from typing import Optional, List
+from dataclasses import dataclass, field
 import os
 from dotenv import load_dotenv
 
@@ -51,7 +51,9 @@ class MarketDataConfig:
     retry_interval: int = 60  # 1 minute
     max_retries: int = 3
     batch_size: int = 100
-    default_timeframes: list[Timeframe] = [Timeframe.MINUTE_5]
+    default_timeframes: List[Timeframe] = field(
+        default_factory=lambda: [Timeframe.MINUTE_5]
+    )
 
 @dataclass
 class LogConfig:

@@ -4,9 +4,9 @@ from typing import Set, Dict, Optional, List, Tuple
 import asyncio
 from datetime import datetime, timezone
 
-from config import MarketDataConfig
+from src.config import MarketDataConfig
 
-from .base import ServiceBase
+from src.services.base import ServiceBase
 from ..repositories.market_data import SymbolRepository, KlineRepository
 from ..adapters.registry import ExchangeAdapterRegistry
 from ..utils.domain_types import Timeframe, ExchangeName, SymbolName, Timestamp, ServiceStatus
