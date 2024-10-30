@@ -1,28 +1,25 @@
 # src/core/exceptions.py
-class StateError(Exception):
-    """Base exception for state-related errors."""
+
+class CoinwatchError(Exception):
+    """Base exception for all application errors"""
     pass
 
-class InvalidStateTransition(StateError):
-    """Raised when attempting an invalid state transition."""
+class ServiceError(CoinwatchError):
+    """Base exception for service layer errors"""
     pass
 
-class EventProcessingError(StateError):
-    """Raised when an error occurs processing an event."""
+class RepositoryError(CoinwatchError):
+    """Base exception for repository layer errors"""
     pass
 
-class ActionError(Exception):
-    """Base exception for action-related errors."""
+class ValidationError(CoinwatchError):
+    """Base exception for validation errors"""
     pass
 
-class ActionValidationError(ActionError):
-    """Raised when action validation fails."""
+class AdapterError(CoinwatchError):
+    """Base exception for adapter errors"""
     pass
 
-class ActionExecutionError(ActionError):
-    """Raised when action execution fails."""
-    pass
-
-class ActionRollbackError(ActionError):
-    """Raised when action rollback fails."""
+class ConfigurationError(CoinwatchError):
+    """Base exception for configuration errors"""
     pass
