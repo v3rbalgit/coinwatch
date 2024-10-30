@@ -1,176 +1,163 @@
 # src/main.py
-
+import sys
 import asyncio
-from typing import Optional
-from src.actions.symbol_actions import FetchSymbolsAction
-from src.actions.data_actions import FetchHistoricalDataAction, SyncRecentDataAction
-from src.actions.resource_actions import ResourceActionFactory
-from src.actions.data_sync_actions import DataSyncActionFactory
-from src.actions.database_actions import DatabaseActionFactory
-from src.core.actions import ActionPriority
-from src.core.system import System
-from src.managers.database_manager import DatabaseManager
-from src.api.bybit_adapter import BybitAdapter
-from src.observers.resource_observer import ResourceObserver
-from src.observers.data_sync_observer import DataSyncObserver
-from src.observers.database_observer import DatabaseObserver
-from src.config import DATABASE_URL
-from src.utils.logger import LoggerSetup
+
+from .config import BybitConfig, Config
+from .services.database import DatabaseService
+from .services.market_data import MarketDataService
+from .repositories.market_data import SymbolRepository, KlineRepository
+from .adapters.registry import ExchangeAdapterRegistry
+from .adapters.bybit import BybitAdapter
+from .core.exceptions import CoinwatchError
+from .utils.logger import LoggerSetup
+from .domain_types import ExchangeName
 
 logger = LoggerSetup.setup(__name__)
 
-class CoinwatchApp:
-    """
-    Main application class coordinating all components.
-    Manages lifecycle and integration of all services, observers, and actions.
-    """
+class Application:
+    """Main application class demonstrating component usage"""
 
     def __init__(self):
-        # Core components
-        self.system = System()
-        self.db_manager = DatabaseManager(DATABASE_URL)
-        self.session_factory = self.db_manager.SessionLocal
-        self.bybit_adapter = BybitAdapter()
+        # Load configuration
+        self.config = Config()
 
-        # Initialize observers
-        self.resource_observer: Optional[ResourceObserver] = None
-        self.data_sync_observer: Optional[DataSyncObserver] = None
-        self.database_observer: Optional[DatabaseObserver] = None
+        # Setup logging
+        self.logger = LoggerSetup.setup(f"{__name__}.Application")
 
-    async def setup(self):
-        """Initialize and start all system components."""
-        try:
-            # Start core system
-            await self.system.start()
+        # Initialize services
+        self.db_service = DatabaseService(self.config.database)
+        self.exchange_registry = ExchangeAdapterRegistry()
 
-            # Register actions
-            self._register_actions()
-
-            # Wait for database readiness
-            await self.db_manager.wait_for_ready()
-
-            # Setup observers
-            await self._setup_observers()
-
-            # Perform initial symbol fetch
-            await self.system.action_manager.submit_action(
-                "fetch_symbols",
-                {
-                    "session_factory": self.session_factory
-                },
-                priority=ActionPriority.HIGH
+    async def _setup_exchanges(self) -> None:
+        """Setup exchange adapters"""
+        bybit_config = self.config.exchanges.bybit
+        await self.exchange_registry.register(
+            ExchangeName("bybit"),
+            BybitAdapter(BybitConfig(
+                api_key=bybit_config.api_key,
+                api_secret=bybit_config.api_secret,
+                testnet=bybit_config.testnet,
+                rate_limit=bybit_config.rate_limit,
+                rate_limit_window=bybit_config.rate_limit_window)
             )
-
-            logger.info("Coinwatch application setup completed")
-
-        except Exception as e:
-            logger.error(f"Failed to setup application: {e}", exc_info=True)
-            raise
-
-    def _register_actions(self):
-        """Register all available actions."""
-        # Symbol actions
-        self.system.register_action(
-            "fetch_symbols",
-            FetchSymbolsAction
         )
 
-        # Data actions
-        self.system.register_action(
-            "fetch_historical_data",
-            FetchHistoricalDataAction
-        )
-        self.system.register_action(
-            "sync_recent_data",
-            SyncRecentDataAction
-        )
-
-        # Register resource actions
-        for action_name, action_class in ResourceActionFactory._actions.items():
-            self.system.register_action(action_name, action_class)
-
-        # Register data sync actions
-        for action_name, action_class in DataSyncActionFactory._actions.items():
-            self.system.register_action(action_name, action_class)
-
-        # Register database actions
-        for action_name, action_class in DatabaseActionFactory._actions.items():
-            self.system.register_action(action_name, action_class)
-
-    async def _setup_observers(self):
-        """Initialize and start observers."""
+    async def start(self) -> None:
+        """Start the application"""
         try:
-            # Initialize observers
-            self.resource_observer = ResourceObserver(
-                self.system.state_manager,
-                self.system.action_manager,
-                observation_interval=30.0  # 30 seconds
-            )
+            # Initialize database
+            await self.db_service.start()
 
-            self.data_sync_observer = DataSyncObserver(
-                self.system.state_manager,
-                self.system.action_manager,
-                self.session_factory,
-                observation_interval=300.0  # 5 minutes
-            )
+            # Create repositories
+            async with self.db_service.get_session() as session:
+                symbol_repo = SymbolRepository(session)
+                kline_repo = KlineRepository(session)
 
-            self.database_observer = DatabaseObserver(
-                self.system.state_manager,
-                self.system.action_manager,
-                self.db_manager.engine,
-                self.session_factory,
-                observation_interval=60.0  # 1 minute
-            )
+                # Setup market data service
+                market_service = MarketDataService(
+                    symbol_repo,
+                    kline_repo,
+                    self.exchange_registry,
+                    self.config.market_data
+                )
 
-            # Start observers
-            await self.resource_observer.start()
-            await self.data_sync_observer.start()
-            await self.database_observer.start()
+                # Start service
+                await market_service.start()
 
-            logger.info("All observers started successfully")
+                # Keep application running
+                while True:
+                    if not market_service.is_healthy:
+                        self.logger.error(
+                            f"Service unhealthy: {market_service._last_error}"
+                        )
+                        await market_service.handle_error(
+                            market_service._last_error
+                        )
+                    await asyncio.sleep(60)
 
         except Exception as e:
-            logger.error(f"Failed to setup observers: {e}", exc_info=True)
+            self.logger.error(f"Application error: {e}")
+            await self.stop()
             raise
 
-    async def stop(self):
-        """Gracefully shutdown all components."""
-        try:
-            logger.info("Stopping Coinwatch application...")
-
-            # Stop observers
-            if self.resource_observer:
-                await self.resource_observer.stop()
-            if self.data_sync_observer:
-                await self.data_sync_observer.stop()
-            if self.database_observer:
-                await self.database_observer.stop()
-
-            # Stop core system
-            await self.system.stop()
-
-            logger.info("Coinwatch application stopped")
-
-        except Exception as e:
-            logger.error(f"Error during shutdown: {e}", exc_info=True)
-            raise
+    async def stop(self) -> None:
+        """Stop the application"""
+        await self.db_service.stop()
 
 async def main():
-    app = CoinwatchApp()
+    """Application entry point"""
+    app = Application()
 
     try:
-        await app.setup()
-
-        # Keep application running
-        while True:
-            await asyncio.sleep(1)
-
+        await app.start()
+    except CoinwatchError as e:
+        logger.error(f"Application error: {e}")
+        sys.exit(1)
     except KeyboardInterrupt:
         logger.info("Shutdown requested")
         await app.stop()
     except Exception as e:
-        logger.critical(f"Fatal error in main function: {str(e)}", exc_info=True)
-        raise
+        logger.error(f"Unexpected error: {e}")
+        await app.stop()
+        sys.exit(1)
 
+
+# Run the application
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+# Example usage with specific operations
+# async def example_operations():
+#     """Example of specific operations using the components"""
+#     app = Application("postgresql+asyncpg://user:pass@localhost/coinwatch")
+
+#     try:
+#         async with app.get_repository() as repository:
+#             # Get or create symbol
+#             symbol = await repository.get_or_create_symbol(
+#                 "BTCUSDT", "bybit"
+#             )
+
+#             # Get latest timestamp
+#             latest_ts = await repository.get_latest_timestamp(
+#                 "BTCUSDT",
+#                 Timeframe.MINUTE_5,
+#                 "bybit"
+#             )
+
+#             # Get exchange adapter
+#             exchange = app.exchange_registry.get_adapter("bybit")
+
+#             # Fetch new data
+#             klines = await exchange.get_klines(
+#                 "BTCUSDT",
+#                 Timeframe.MINUTE_5,
+#                 latest_ts
+#             )
+
+#             # Insert new data
+#             if klines:
+#                 inserted = await repository.insert_klines(
+#                     symbol.id,
+#                     Timeframe.MINUTE_5,
+#                     klines
+#                 )
+#                 logger.info(f"Inserted {inserted} new klines")
+
+#             # Check for gaps
+#             gaps = await repository.get_data_gaps(
+#                 "BTCUSDT",
+#                 Timeframe.MINUTE_5,
+#                 "bybit",
+#                 latest_ts - (86400 * 1000),  # Last 24 hours
+#                 latest_ts
+#             )
+
+#             if gaps:
+#                 logger.warning(f"Found {len(gaps)} gaps in data")
+
+#     except CoinwatchError as e:
+#         logger.error(f"Operation failed: {e}")
+#     finally:
+#         await app.stop()
