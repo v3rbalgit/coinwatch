@@ -9,7 +9,7 @@ from config import MarketDataConfig
 from .base import ServiceBase
 from ..repositories.market_data import SymbolRepository, KlineRepository
 from ..adapters.registry import ExchangeAdapterRegistry
-from ..domain_types import Timeframe, ExchangeName, SymbolName, Timestamp, ServiceStatus
+from ..utils.domain_types import Timeframe, ExchangeName, SymbolName, Timestamp, ServiceStatus
 from ..core.exceptions import ServiceError
 from ..utils.logger import LoggerSetup
 

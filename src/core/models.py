@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import Tuple
-from ..domain_types import SymbolName, ExchangeName, Timestamp
+from ..utils.domain_types import SymbolName, ExchangeName, Timestamp
 
 @dataclass
 class KlineData:

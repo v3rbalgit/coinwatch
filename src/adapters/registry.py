@@ -1,7 +1,7 @@
 # src/adapters/registry.py
 
 from typing import Dict, List
-from ..domain_types import ExchangeName
+from ..utils.domain_types import ExchangeName
 from ..core.protocols import ExchangeAdapter
 from ..core.exceptions import AdapterError
 from ..utils.logger import LoggerSetup

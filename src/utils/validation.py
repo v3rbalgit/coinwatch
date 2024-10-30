@@ -3,7 +3,7 @@
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import Union, Tuple
-from ..domain_types import Timestamp
+from .domain_types import Timestamp
 from ..core.exceptions import ValidationError
 from ..utils.logger import LoggerSetup
 
