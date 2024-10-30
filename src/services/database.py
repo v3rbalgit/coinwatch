@@ -16,9 +16,9 @@ from contextlib import asynccontextmanager
 from sqlalchemy import text, event
 from enum import Enum
 
-from config import DatabaseConfig
+from src.config import DatabaseConfig
 
-from .base import ServiceBase
+from src.services.base import ServiceBase
 from ..core.exceptions import ServiceError
 from ..utils.logger import LoggerSetup
 from ..utils.domain_types import CriticalCondition, ServiceStatus

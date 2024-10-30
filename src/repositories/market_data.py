@@ -5,7 +5,6 @@ from typing import List, Tuple
 from sqlalchemy import select, func, and_, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy.exc import IntegrityError
-from contextlib import asynccontextmanager
 
 from .base import Repository
 from ..models.market import Symbol, Kline

@@ -5,7 +5,7 @@ from typing import List, Optional, Dict, Any
 from decimal import Decimal
 from pybit.unified_trading import HTTP
 
-from config import BybitConfig
+from src.config import BybitConfig
 
 from ..core.models import KlineData, SymbolInfo
 from ..core.protocols import ExchangeAdapter
