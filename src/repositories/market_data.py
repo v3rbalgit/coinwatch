@@ -3,12 +3,13 @@
 from datetime import datetime, timezone
 from typing import List, Tuple
 from sqlalchemy import select, func, and_, text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy.exc import IntegrityError
+from contextlib import asynccontextmanager
 
 from .base import Repository
 from ..models.market import Symbol, Kline
-from ..domain_types import SymbolName, ExchangeName, Timeframe, Timestamp
+from ..utils.domain_types import SymbolName, ExchangeName, Timeframe, Timestamp
 from ..core.exceptions import RepositoryError, ValidationError
 from ..utils.logger import LoggerSetup
 from ..utils.validation import MarketDataValidator
@@ -18,43 +19,51 @@ logger = LoggerSetup.setup(__name__)
 class SymbolRepository(Repository[Symbol]):
     """Repository for Symbol operations"""
 
-    def __init__(self, session: AsyncSession):
-        super().__init__(session, Symbol)
+    def __init__(self, session_factory: async_sessionmaker):
+        super().__init__(session_factory, Symbol)
 
     async def get_or_create(self, name: SymbolName, exchange: ExchangeName) -> Symbol:
         """Get existing symbol or create new one"""
         try:
-            stmt = select(self.model_class).where(
-                and_(Symbol.name == name, Symbol.exchange == exchange)
-            )
-            result = await self.session.execute(stmt)
-            symbol = result.scalar_one_or_none()
+            async with self.get_session() as session:
+                stmt = select(self.model_class).where(
+                    and_(Symbol.name == name, Symbol.exchange == exchange)
+                )
+                result = await session.execute(stmt)
+                symbol = result.scalar_one_or_none()
 
-            if symbol:
+                if symbol:
+                    return symbol
+
+                symbol = Symbol(name=name, exchange=exchange)
+                session.add(symbol)
+                await session.flush()
+                logger.info(f"Created new symbol: {name} for {exchange}")
                 return symbol
-
-            symbol = await self.create(Symbol(name=name, exchange=exchange))
-            logger.info(f"Created new symbol: {name} for {exchange}")
-            return symbol
 
         except IntegrityError:
-            await self.session.rollback()
             # Retry get in case of race condition
-            stmt = select(self.model_class).where(
-                and_(Symbol.name == name, Symbol.exchange == exchange)
-            )
-            result = await self.session.execute(stmt)
-            symbol = result.scalar_one_or_none()
-            if symbol:
-                return symbol
-            raise RepositoryError(f"Failed to get/create symbol: {name}")
+            async with self.get_session() as session:
+                stmt = select(self.model_class).where(
+                    and_(Symbol.name == name, Symbol.exchange == exchange)
+                )
+                result = await session.execute(stmt)
+                symbol = result.scalar_one_or_none()
+                if symbol:
+                    return symbol
+                raise RepositoryError(f"Failed to get/create symbol: {name}")
+
+        except Exception as e:
+            logger.error(f"Error in get_or_create: {e}")
+            raise RepositoryError(f"Failed to get or create symbol: {str(e)}")
 
     async def get_by_exchange(self, exchange: ExchangeName) -> List[Symbol]:
         """Get all symbols for an exchange"""
         try:
-            stmt = select(self.model_class).where(Symbol.exchange == exchange)
-            result = await self.session.execute(stmt)
-            return list(result.scalars().all())
+            async with self.get_session() as session:
+                stmt = select(self.model_class).where(Symbol.exchange == exchange)
+                result = await session.execute(stmt)
+                return list(result.scalars().all())
         except Exception as e:
             logger.error(f"Error getting symbols: {e}")
             raise RepositoryError(f"Failed to get symbols: {str(e)}")
@@ -62,43 +71,44 @@ class SymbolRepository(Repository[Symbol]):
 class KlineRepository(Repository[Kline]):
     """Repository for Kline operations"""
 
-    def __init__(self, session: AsyncSession):
-        super().__init__(session, Kline)
+    def __init__(self, session_factory: async_sessionmaker):
+        super().__init__(session_factory, Kline)
         self.validator = MarketDataValidator()
         self._batch_size = 100
 
     async def get_latest_timestamp(self,
-                                 symbol: SymbolName,
-                                 timeframe: Timeframe,
-                                 exchange: ExchangeName) -> Timestamp:
+                                   symbol: SymbolName,
+                                   timeframe: Timeframe,
+                                   exchange: ExchangeName) -> Timestamp:
         try:
-            stmt = select(func.max(Kline.start_time)).join(Symbol).where(
-                and_(
-                    Symbol.name == symbol,
-                    Symbol.exchange == exchange,
-                    Kline.timeframe == timeframe.value
+            async with self.get_session() as session:
+                stmt = select(func.max(Kline.start_time)).join(Symbol).where(
+                    and_(
+                        Symbol.name == symbol,
+                        Symbol.exchange == exchange,
+                        Kline.timeframe == timeframe.value
+                    )
                 )
-            )
-            result = await self.session.execute(stmt)
-            latest = result.scalar_one_or_none()
+                result = await session.execute(stmt)
+                latest = result.scalar_one_or_none()
 
-            if latest is None:
-                start_time = Timestamp(int(
-                    (datetime.now(timezone.utc).timestamp() - (30 * 24 * 3600)) * 1000
-                ))
-                logger.info(f"No data for {symbol} {timeframe.value}, starting from {datetime.fromtimestamp(start_time/1000)}")
-                return start_time
+                if latest is None:
+                    start_time = Timestamp(int(
+                        (datetime.now(timezone.utc).timestamp() - (30 * 24 * 3600)) * 1000
+                    ))
+                    logger.info(f"No data for {symbol} {timeframe.value}, starting from {datetime.fromtimestamp(start_time/1000)}")
+                    return start_time
 
-            return Timestamp(latest)
+                return Timestamp(latest)
 
         except Exception as e:
             logger.error(f"Error getting latest timestamp: {e}")
             raise RepositoryError(f"Failed to get latest timestamp: {str(e)}")
 
     async def insert_batch(self,
-                         symbol_id: int,
-                         timeframe: Timeframe,
-                         klines: List[Tuple]) -> int:
+                           symbol_id: int,
+                           timeframe: Timeframe,
+                           klines: List[Tuple]) -> int:
         try:
             inserted_count = 0
             for i in range(0, len(klines), self._batch_size):
@@ -126,10 +136,11 @@ class KlineRepository(Repository[Kline]):
                         continue
 
                 if kline_objects:
-                    self.session.add_all(kline_objects)
-                    await self.session.flush()
-                    inserted_count += len(kline_objects)
-                    logger.debug(f"Inserted batch of {len(kline_objects)} klines for symbol {symbol_id}")
+                    async with self.get_session() as session:
+                        session.add_all(kline_objects)
+                        await session.flush()
+                        inserted_count += len(kline_objects)
+                        logger.debug(f"Inserted batch of {len(kline_objects)} klines for symbol {symbol_id}")
 
             return inserted_count
 
@@ -138,88 +149,89 @@ class KlineRepository(Repository[Kline]):
             raise RepositoryError(f"Failed to insert klines: {str(e)}")
 
     async def get_data_gaps(self,
-                           symbol: SymbolName,
-                           timeframe: Timeframe,
-                           exchange: ExchangeName,
-                           start_time: Timestamp,
-                           end_time: Timestamp) -> List[Tuple[Timestamp, Timestamp]]:
+                            symbol: SymbolName,
+                            timeframe: Timeframe,
+                            exchange: ExchangeName,
+                            start_time: Timestamp,
+                            end_time: Timestamp) -> List[Tuple[Timestamp, Timestamp]]:
         try:
-            interval_ms = timeframe.to_milliseconds() * 2
-            stmt = text("""
-                WITH time_series AS (
-                    SELECT
-                        k.start_time,
-                        LEAD(k.start_time) OVER (ORDER BY k.start_time) as next_start
-                    FROM kline_data k
-                    JOIN symbols s ON k.symbol_id = s.id
-                    WHERE s.name = :symbol
-                    AND s.exchange = :exchange
-                    AND k.timeframe = :timeframe
-                    AND k.start_time BETWEEN :start_time AND :end_time
+            async with self.get_session() as session:
+                interval_ms = timeframe.to_milliseconds() * 2
+                stmt = text("""
+                    WITH time_series AS (
+                        SELECT
+                            k.start_time,
+                            LEAD(k.start_time) OVER (ORDER BY k.start_time) as next_start
+                        FROM kline_data k
+                        JOIN symbols s ON k.symbol_id = s.id
+                        WHERE s.name = :symbol
+                        AND s.exchange = :exchange
+                        AND k.timeframe = :timeframe
+                        AND k.start_time BETWEEN :start_time AND :end_time
+                    )
+                    SELECT start_time, next_start
+                    FROM time_series
+                    WHERE next_start - start_time > :interval_ms
+                """)
+
+                result = await session.execute(
+                    stmt,
+                    {
+                        "symbol": symbol,
+                        "exchange": exchange,
+                        "timeframe": timeframe.value,
+                        "start_time": start_time,
+                        "end_time": end_time,
+                        "interval_ms": interval_ms
+                    }
                 )
-                SELECT start_time, next_start
-                FROM time_series
-                WHERE next_start - start_time > :interval_ms
-            """)
 
-            result = await self.session.execute(
-                stmt,
-                {
-                    "symbol": symbol,
-                    "exchange": exchange,
-                    "timeframe": timeframe.value,
-                    "start_time": start_time,
-                    "end_time": end_time,
-                    "interval_ms": interval_ms
-                }
-            )
+                gaps = [
+                    (Timestamp(row.start_time + timeframe.to_milliseconds()),
+                     Timestamp(row.next_start))
+                    for row in result
+                ]
 
-            gaps = [
-                (Timestamp(row.start_time + timeframe.to_milliseconds()),
-                 Timestamp(row.next_start))
-                for row in result
-            ]
-
-            if gaps:
-                logger.warning(f"Found {len(gaps)} gaps for {symbol} {timeframe.value}")
-            return gaps
+                if gaps:
+                    logger.warning(f"Found {len(gaps)} gaps for {symbol} {timeframe.value}")
+                return gaps
 
         except Exception as e:
             logger.error(f"Error finding data gaps: {e}")
             raise RepositoryError(f"Failed to find data gaps: {str(e)}")
 
     async def delete_old_data(self,
-                            symbol: SymbolName,
-                            timeframe: Timeframe,
-                            exchange: ExchangeName,
-                            before_timestamp: Timestamp) -> int:
+                              symbol: SymbolName,
+                              timeframe: Timeframe,
+                              exchange: ExchangeName,
+                              before_timestamp: Timestamp) -> int:
         try:
-            stmt = text("""
-                DELETE FROM kline_data k
-                USING symbols s
-                WHERE k.symbol_id = s.id
-                AND s.name = :symbol
-                AND s.exchange = :exchange
-                AND k.timeframe = :timeframe
-                AND k.start_time < :before_timestamp
-                RETURNING 1
-            """)
+            async with self.get_session() as session:
+                stmt = text("""
+                    DELETE FROM kline_data k
+                    USING symbols s
+                    WHERE k.symbol_id = s.id
+                    AND s.name = :symbol
+                    AND s.exchange = :exchange
+                    AND k.timeframe = :timeframe
+                    AND k.start_time < :before_timestamp
+                    RETURNING 1
+                """)
 
-            result = await self.session.execute(
-                stmt,
-                {
-                    "symbol": symbol,
-                    "exchange": exchange,
-                    "timeframe": timeframe.value,
-                    "before_timestamp": before_timestamp
-                }
-            )
+                result = await session.execute(
+                    stmt,
+                    {
+                        "symbol": symbol,
+                        "exchange": exchange,
+                        "timeframe": timeframe.value,
+                        "before_timestamp": before_timestamp
+                    }
+                )
 
-            deleted_count = len(result.fetchall())
-            logger.info(f"Deleted {deleted_count} old records for {symbol} {timeframe.value}")
-            return deleted_count
+                deleted_count = len(result.fetchall())
+                logger.info(f"Deleted {deleted_count} old records for {symbol} {timeframe.value}")
+                return deleted_count
 
         except Exception as e:
             logger.error(f"Error deleting old data: {e}")
             raise RepositoryError(f"Failed to delete old data: {str(e)}")
-

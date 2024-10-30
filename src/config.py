@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import os
 from dotenv import load_dotenv
 
-from .domain_types import Timeframe
+from .utils.domain_types import Timeframe
 from .core.exceptions import ConfigurationError
 from .utils.logger import LoggerSetup
 

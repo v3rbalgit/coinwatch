@@ -9,7 +9,7 @@ from config import BybitConfig
 
 from ..core.models import KlineData, SymbolInfo
 from ..core.protocols import ExchangeAdapter
-from ..domain_types import Timeframe, SymbolName
+from ..utils.domain_types import Timeframe, SymbolName
 from ..utils.logger import LoggerSetup
 
 logger = LoggerSetup.setup(__name__)

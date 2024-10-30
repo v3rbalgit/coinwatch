@@ -1,7 +1,7 @@
 # src/core/protocols.py
 
 from typing import Protocol, List, Optional
-from ..domain_types import SymbolName, Timeframe, Price, Timestamp
+from ..utils.domain_types import SymbolName, Timeframe, Price, Timestamp
 from ..core.models import KlineData, SymbolInfo
 
 class ExchangeAdapter(Protocol):

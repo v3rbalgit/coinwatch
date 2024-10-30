@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from typing import TypeVar, Dict, Any
-from ..domain_types import CriticalCondition
+from ..utils.domain_types import CriticalCondition
 
 T = TypeVar('T')
 
