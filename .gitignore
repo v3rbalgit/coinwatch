@@ -142,6 +142,7 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
 .venv
 env/
 venv/
@@ -181,4 +182,6 @@ project_structure.txt
 logs/
 *.log
 *.log.*
-stats/
+tests/test_logs/
+reports/
+test_results.txt

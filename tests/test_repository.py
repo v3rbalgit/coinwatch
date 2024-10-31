@@ -4,6 +4,7 @@ import pytest
 from datetime import datetime, timezone
 from src.utils.domain_types import SymbolName, Timeframe, ExchangeName
 
+@pytest.mark.mysql
 async def test_symbol_repository_operations(symbol_repo):
     # Test symbol creation
     symbol = await symbol_repo.get_or_create(
@@ -18,6 +19,7 @@ async def test_symbol_repository_operations(symbol_repo):
     assert len(symbols) > 0
     assert any(s.name == "BTCUSDT" for s in symbols)
 
+@pytest.mark.mysql
 async def test_kline_repository_operations(kline_repo, symbol_repo):
     # Create test symbol
     symbol = await symbol_repo.get_or_create(

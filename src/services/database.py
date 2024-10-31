@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.pool import AsyncAdaptedQueuePool
 from sqlalchemy.exc import OperationalError
 from contextlib import asynccontextmanager
-from sqlalchemy import text, event
+from sqlalchemy import text
 from enum import Enum
 
 from src.config import DatabaseConfig
@@ -73,29 +73,16 @@ class DatabaseService(ServiceBase):
             **self._config
         )
 
-    def _setup_pool_listeners(self) -> None:
-        """Set up connection pool event listeners"""
-        if not self.engine:
-            return
-
-        @event.listens_for(self.engine.sync_engine.pool, 'checkout')
-        def on_checkout(dbapi_con, con_record, con_proxy):
-            self._pool_stats['checkout_count'] += 1
-
-        @event.listens_for(self.engine.sync_engine.pool, 'checkin')
-        def on_checkin(dbapi_con, con_record):
-            self._pool_stats['checkin_count'] += 1
-
-        @event.listens_for(self.engine.sync_engine.pool, 'overflow')
-        def on_overflow(dbapi_con, con_record):
-            self._pool_stats['overflow_count'] += 1
-
     async def start(self) -> None:
         """Start the database service with pool monitoring"""
         try:
             self._status = ServiceStatus.STARTING
             self.engine = self._create_engine()
-            self._setup_pool_listeners()
+
+            # Create tables if they don't exist
+            async with self.engine.begin() as conn:
+                from ..models.base import Base
+                await conn.run_sync(Base.metadata.create_all)
 
             self.session_factory = async_sessionmaker(
                 bind=self.engine,
@@ -251,7 +238,6 @@ class DatabaseService(ServiceBase):
                 await self.engine.dispose()
                 self._config["max_overflow"] += 5
                 self.engine = self._create_engine()
-                self._setup_pool_listeners()
                 self.session_factory = async_sessionmaker(
                     bind=self.engine,
                     class_=AsyncSession,
@@ -265,7 +251,6 @@ class DatabaseService(ServiceBase):
                 await self.engine.dispose()
                 self._config["pool_timeout"] += 10
                 self.engine = self._create_engine()
-                self._setup_pool_listeners()
                 self.session_factory = async_sessionmaker(
                     bind=self.engine,
                     class_=AsyncSession,
