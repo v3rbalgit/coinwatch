@@ -1,9 +1,9 @@
-# test_adapter.py
-
+# tests/test_adapter.py
 import pytest
 from src.core.models import KlineData
 from src.utils.domain_types import SymbolName, Timeframe, ExchangeName
 
+@pytest.mark.asyncio
 async def test_bybit_adapter_initialization(test_registry):
     adapter = test_registry.get_adapter(ExchangeName("bybit"))
     assert adapter is not None
@@ -11,6 +11,7 @@ async def test_bybit_adapter_initialization(test_registry):
     assert len(symbols) > 0
     assert any(s.name == "BTCUSDT" for s in symbols)
 
+@pytest.mark.asyncio
 async def test_bybit_adapter_kline_fetching(test_registry):
     adapter = test_registry.get_adapter(ExchangeName("bybit"))
     klines = await adapter.get_klines(

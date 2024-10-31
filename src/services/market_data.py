@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from src.config import MarketDataConfig
 
 from src.services.base import ServiceBase
+from src.utils.time import get_current_timestamp
 from ..repositories.market_data import SymbolRepository, KlineRepository
 from ..adapters.registry import ExchangeAdapterRegistry
 from ..utils.domain_types import Timeframe, ExchangeName, SymbolName, Timestamp, ServiceStatus
@@ -168,7 +169,7 @@ class MarketDataService(ServiceBase):
             )
 
             # Check if update needed
-            current_time = Timestamp(int(datetime.now(timezone.utc).timestamp() * 1000))
+            current_time = get_current_timestamp()
             if (current_time - latest_ts) < timeframe.to_milliseconds():
                 return
 

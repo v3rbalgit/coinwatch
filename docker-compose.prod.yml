@@ -1,0 +1,53 @@
+services:
+  db:
+    image: mysql:8.4
+    container_name: mysql_prod
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: coinwatch
+      MYSQL_USER: user
+      MYSQL_PASSWORD: password
+    ports:
+      - "3306:3306"
+    networks:
+      - coinwatch_network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "user", "--password=password"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: coinwatch_prod
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - coinwatch_network
+    environment:
+      - PYTHONPATH=/app
+      - DB_HOST=db
+      - DB_PORT=3306
+      - DB_USER=user
+      - DB_PASSWORD=password
+      - DB_NAME=coinwatch
+      - BYBIT_TESTNET=false
+      - LOG_LEVEL=INFO
+    command: python -m src.main
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+
+networks:
+  coinwatch_network:
+    name: coinwatch_network
+
+volumes:
+  mysql_data:
+  logs:

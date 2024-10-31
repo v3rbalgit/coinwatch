@@ -25,10 +25,15 @@ class DatabaseConfig:
     pool_recycle: int = 1800
     echo: bool = False
 
+    dialect: str = "mysql"
+    driver: str = "aiomysql"
+
     @property
     def url(self) -> str:
         """Get database URL"""
-        return f"mysql+mysqlconnector://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
+        if self.dialect == "sqlite":
+            return f"sqlite+{self.driver}:///{self.database}"
+        return f"{self.dialect}+{self.driver}://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
 
 @dataclass
 class BybitConfig:
@@ -113,7 +118,7 @@ class Config:
         try:
             timeframes = [
                 Timeframe(tf) for tf in
-                os.getenv('DEFAULT_TIMEFRAMES', '5m').split(',')
+                os.getenv('DEFAULT_TIMEFRAMES', '5').split(',')
             ]
 
             return MarketDataConfig(

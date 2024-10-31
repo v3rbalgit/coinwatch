@@ -6,6 +6,8 @@ from sqlalchemy import select, func, and_, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy.exc import IntegrityError
 
+from src.utils.time import from_timestamp, get_current_timestamp, get_past_timestamp
+
 from .base import Repository
 from ..models.market import Symbol, Kline
 from ..utils.domain_types import SymbolName, ExchangeName, Timeframe, Timestamp
@@ -37,6 +39,7 @@ class SymbolRepository(Repository[Symbol]):
                 symbol = Symbol(name=name, exchange=exchange)
                 session.add(symbol)
                 await session.flush()
+                await session.refresh(symbol)
                 logger.info(f"Created new symbol: {name} for {exchange}")
                 return symbol
 
@@ -79,8 +82,10 @@ class KlineRepository(Repository[Kline]):
                                    symbol: SymbolName,
                                    timeframe: Timeframe,
                                    exchange: ExchangeName) -> Timestamp:
+        """Get latest timestamp to check for updates"""
         try:
             async with self.get_session() as session:
+                # Get last stored timestamp
                 stmt = select(func.max(Kline.start_time)).join(Symbol).where(
                     and_(
                         Symbol.name == symbol,
@@ -91,14 +96,22 @@ class KlineRepository(Repository[Kline]):
                 result = await session.execute(stmt)
                 latest = result.scalar_one_or_none()
 
-                if latest is None:
-                    start_time = Timestamp(int(
-                        (datetime.now(timezone.utc).timestamp() - (30 * 24 * 3600)) * 1000
-                    ))
-                    logger.info(f"No data for {symbol} {timeframe.value}, starting from {datetime.fromtimestamp(start_time/1000)}")
-                    return start_time
+                current_time = get_current_timestamp()
 
-                return Timestamp(latest)
+                if latest is None:
+                    # First time fetching - start from 30 days ago
+                    return Timestamp(get_past_timestamp(30))
+
+                # Calculate next timestamp we should check
+                # This should be latest + timeframe interval
+                interval_ms = timeframe.to_milliseconds()
+                next_timestamp = latest + interval_ms
+
+                # Don't request future data
+                if next_timestamp > current_time:
+                    next_timestamp = current_time - (current_time % interval_ms)
+
+                return Timestamp(next_timestamp)
 
         except Exception as e:
             logger.error(f"Error getting latest timestamp: {e}")

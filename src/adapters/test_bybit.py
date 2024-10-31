@@ -5,10 +5,7 @@ from typing import List, Optional, Dict, Any
 from decimal import Decimal
 from pybit.unified_trading import HTTP
 
-from src.config import BybitConfig
-from src.core.exceptions import ValidationError
-from src.utils.time import from_timestamp, get_current_timestamp
-
+from config import BybitConfig
 from ..core.models import KlineData, SymbolInfo
 from ..core.protocols import ExchangeAdapter
 from ..utils.domain_types import Timeframe, SymbolName
@@ -16,13 +13,13 @@ from ..utils.logger import LoggerSetup
 
 logger = LoggerSetup.setup(__name__)
 
-class BybitAdapter(ExchangeAdapter):
-    """Bybit exchange adapter with async rate limiting"""
+class BybitTestAdapter(ExchangeAdapter):
+    """Bybit exchange adapter with test symbol filtering"""
 
     def __init__(self, config: Optional[BybitConfig] = None):
         self.session = HTTP(
-        testnet=config.testnet if config else False
-    )
+            testnet=config.testnet if config else False
+        )
         self._initialized = False
 
         # Set rate limits from config or use defaults
@@ -33,12 +30,14 @@ class BybitAdapter(ExchangeAdapter):
         self._api_key = config.api_key if config else None
         self._api_secret = config.api_secret if config else None
 
+
         # Initialize rate limiting
         self._lock = Lock()
         self._tokens = self.RATE_LIMIT
         self._last_refill = time.time()
 
     async def _acquire_token(self) -> bool:
+        """Rate limiting logic remains the same"""
         async with self._lock:
             current_time = time.time()
             elapsed = current_time - self._last_refill
@@ -54,6 +53,7 @@ class BybitAdapter(ExchangeAdapter):
             return False
 
     async def _handle_rate_limit(self) -> None:
+        """Rate limit handling remains the same"""
         while not await self._acquire_token():
             sleep_time = self.WINDOW_SIZE - (time.time() - self._last_refill)
             if sleep_time > 0:
@@ -61,6 +61,7 @@ class BybitAdapter(ExchangeAdapter):
                 await asyncio.sleep(sleep_time)
 
     def _validate_response(self, response: Any) -> Dict[str, Any]:
+        """Response validation remains the same"""
         if isinstance(response, tuple):
             response = response[0]
 
@@ -76,20 +77,8 @@ class BybitAdapter(ExchangeAdapter):
 
         return response
 
-    async def initialize(self) -> None:
-        """Initialize the adapter"""
-        if not self._initialized:
-            try:
-                # Test connection
-                await self.get_latest_price(SymbolName("BTCUSDT"))
-                self._initialized = True
-                logger.info("BybitAdapter initialized successfully")
-            except Exception as e:
-                logger.error(f"Failed to initialize BybitAdapter: {e}")
-                raise
-
     async def get_symbols(self) -> List[SymbolInfo]:
-        """Get available trading pairs"""
+        """Get available trading pairs, filtered by test symbols"""
         try:
             await self._handle_rate_limit()
             response = await asyncio.to_thread(
@@ -114,7 +103,7 @@ class BybitAdapter(ExchangeAdapter):
                         min_order_qty=Decimal(str(item['lotSizeFilter']['minOrderQty']))
                     ))
 
-            logger.info(f"Fetched {len(symbols)} active USDT pairs")
+            logger.info(f"Fetched {len(symbols)} test symbols")
             return symbols
 
         except Exception as e:
@@ -138,12 +127,6 @@ class BybitAdapter(ExchangeAdapter):
             }
 
             if start_time is not None:
-                # Validate start time is not in future
-                current_time = get_current_timestamp()
-                if start_time > current_time:
-                    raise ValidationError(
-                        f"Cannot request future data: {from_timestamp(start_time)}"
-                    )
                 params["start"] = start_time
 
             logger.debug(f"Requesting klines for {symbol}: {params}")
@@ -154,31 +137,21 @@ class BybitAdapter(ExchangeAdapter):
 
             response = self._validate_response(response)
 
-
             # Add debug logging
             logger.debug(f"Raw kline response for {symbol}: {response}")
 
             klines: List[KlineData] = []
             for item in response.get('result', {}).get('list', []):
-                timestamp = int(item[0])
-
-                # Validate response timestamp
-                if timestamp > get_current_timestamp():
-                    logger.warning(
-                        f"Received future timestamp from API: {from_timestamp(timestamp)}"
-                    )
-                    continue
                 # Debug log each item
                 logger.debug(f"Processing kline item: {item}")
-
                 klines.append(KlineData(
                     timestamp=int(item[0]),
-                    open_price=Decimal(str(item[1])),
-                    high_price=Decimal(str(item[2])),
-                    low_price=Decimal(str(item[3])),
-                    close_price=Decimal(str(item[4])),
-                    volume=Decimal(str(item[5])),
-                    turnover=Decimal(str(item[6])),
+                    open_price=Decimal(item[1]),
+                    high_price=Decimal(item[2]),
+                    low_price=Decimal(item[3]),
+                    close_price=Decimal(item[4]),
+                    volume=Decimal(item[5]),
+                    turnover=Decimal(item[6]),
                     symbol=symbol,
                     timeframe=timeframe.value
                 ))

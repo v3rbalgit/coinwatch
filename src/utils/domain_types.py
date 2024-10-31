@@ -9,20 +9,33 @@ Timestamp = NewType('Timestamp', int)
 Price = NewType('Price', float)
 
 class Timeframe(Enum):
-    MINUTE_5 = "5m"
-    MINUTE_15 = "15m"
-    HOUR_1 = "1h"
-    HOUR_4 = "4h"
-    DAY_1 = "1d"
+    MINUTE_1 = "1"
+    MINUTE_3 = "3"
+    MINUTE_5 = "5"
+    MINUTE_15 = "15"
+    MINUTE_30 = "30"
+    HOUR_1 = "60"
+    HOUR_2 = "120"
+    HOUR_4 = "240"
+    HOUR_6 = "360"
+    HOUR_12 = "720"
+    DAY_1 = "D"
+    WEEK_1 = "W"
 
     def to_milliseconds(self) -> int:
         """Convert timeframe to milliseconds"""
         mapping = {
-            "5m": 5 * 60 * 1000,
-            "15m": 15 * 60 * 1000,
-            "1h": 60 * 60 * 1000,
-            "4h": 4 * 60 * 60 * 1000,
-            "1d": 24 * 60 * 60 * 1000
+            "1": 1 * 60 * 1000,
+            "3": 3 * 60 * 1000,
+            "5": 5 * 60 * 1000,
+            "15": 15 * 60 * 1000,
+            "60": 60 * 60 * 1000,
+            "120": 2 * 60 * 60 * 1000,
+            "240": 4 * 60 * 60 * 1000,
+            "360": 6 * 60 * 60 * 1000,
+            "720": 12 * 60 * 60 * 1000,
+            "D": 24 * 60 * 60 * 1000,
+            "W": 7 * 24 * 60 * 60 * 1000
         }
         return mapping[self.value]
 
