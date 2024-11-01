@@ -6,6 +6,7 @@ from sqlalchemy import select, func, and_, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy.exc import IntegrityError
 
+from src.core.models import SymbolInfo
 from src.utils.time import from_timestamp, get_current_timestamp, get_past_timestamp
 
 from .base import Repository
@@ -23,37 +24,34 @@ class SymbolRepository(Repository[Symbol]):
     def __init__(self, session_factory: async_sessionmaker):
         super().__init__(session_factory, Symbol)
 
-    async def get_or_create(self, name: SymbolName, exchange: ExchangeName) -> Symbol:
-        """Get existing symbol or create new one"""
+    async def get_or_create(self, symbol_info: SymbolInfo, exchange: ExchangeName) -> Symbol:
         try:
             async with self.get_session() as session:
                 stmt = select(self.model_class).where(
-                    and_(Symbol.name == name, Symbol.exchange == exchange)
+                    and_(Symbol.name == symbol_info.name, Symbol.exchange == exchange)
                 )
                 result = await session.execute(stmt)
                 symbol = result.scalar_one_or_none()
 
                 if symbol:
+                    if symbol.first_trade_time is None:
+                        symbol.first_trade_time = symbol_info.launch_time
+                        await session.flush()
                     return symbol
 
-                symbol = Symbol(name=name, exchange=exchange)
+                symbol = Symbol(
+                    name=symbol_info.name,
+                    exchange=exchange,
+                    first_trade_time=symbol_info.launch_time
+                )
                 session.add(symbol)
                 await session.flush()
                 await session.refresh(symbol)
-                logger.info(f"Created new symbol: {name} for {exchange}")
-                return symbol
-
-        except IntegrityError:
-            # Retry get in case of race condition
-            async with self.get_session() as session:
-                stmt = select(self.model_class).where(
-                    and_(Symbol.name == name, Symbol.exchange == exchange)
+                logger.info(
+                    f"Created new symbol: {symbol_info.name} for {exchange} "
+                    f"with launch time {from_timestamp(symbol_info.launch_time)}"
                 )
-                result = await session.execute(stmt)
-                symbol = result.scalar_one_or_none()
-                if symbol:
-                    return symbol
-                raise RepositoryError(f"Failed to get/create symbol: {name}")
+                return symbol
 
         except Exception as e:
             logger.error(f"Error in get_or_create: {e}")
@@ -85,7 +83,14 @@ class KlineRepository(Repository[Kline]):
         """Get latest timestamp to check for updates"""
         try:
             async with self.get_session() as session:
-                # Get last stored timestamp
+                # First get the symbol record to check first_trade_time
+                symbol_stmt = select(Symbol).where(
+                    and_(Symbol.name == symbol, Symbol.exchange == exchange)
+                )
+                symbol_result = await session.execute(symbol_stmt)
+                symbol_record = symbol_result.scalar_one()
+
+                # Get latest timestamp we have
                 stmt = select(func.max(Kline.start_time)).join(Symbol).where(
                     and_(
                         Symbol.name == symbol,
@@ -96,22 +101,25 @@ class KlineRepository(Repository[Kline]):
                 result = await session.execute(stmt)
                 latest = result.scalar_one_or_none()
 
-                current_time = get_current_timestamp()
-
                 if latest is None:
-                    # First time fetching - start from 30 days ago
-                    return Timestamp(get_past_timestamp(30))
+                    # Start from first_trade_time if we have it
+                    if symbol_record.first_trade_time:
+                        start_time = symbol_record.first_trade_time
+                        logger.info(
+                            f"No data for {symbol} {timeframe.value}, "
+                            f"starting from first trade at {from_timestamp(start_time)}"
+                        )
+                        return Timestamp(start_time)
+                    else:
+                        # Fallback to 30 days if no first_trade_time
+                        start_time = get_past_timestamp(30)
+                        logger.warning(
+                            f"No first trade time for {symbol}, "
+                            f"falling back to {from_timestamp(start_time)}"
+                        )
+                        return Timestamp(start_time)
 
-                # Calculate next timestamp we should check
-                # This should be latest + timeframe interval
-                interval_ms = timeframe.to_milliseconds()
-                next_timestamp = latest + interval_ms
-
-                # Don't request future data
-                if next_timestamp > current_time:
-                    next_timestamp = current_time - (current_time % interval_ms)
-
-                return Timestamp(next_timestamp)
+                return Timestamp(latest)
 
         except Exception as e:
             logger.error(f"Error getting latest timestamp: {e}")

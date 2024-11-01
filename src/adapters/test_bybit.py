@@ -8,7 +8,7 @@ from pybit.unified_trading import HTTP
 from config import BybitConfig
 from ..core.models import KlineData, SymbolInfo
 from ..core.protocols import ExchangeAdapter
-from ..utils.domain_types import Timeframe, SymbolName
+from ..utils.domain_types import Timeframe, SymbolName, Timestamp
 from ..utils.logger import LoggerSetup
 
 logger = LoggerSetup.setup(__name__)
@@ -100,7 +100,8 @@ class BybitTestAdapter(ExchangeAdapter):
                         quote_asset=item['quoteCoin'],
                         price_precision=str(item['priceFilter']['tickSize']).count('0'),
                         qty_precision=str(item['lotSizeFilter']['qtyStep']).count('0'),
-                        min_order_qty=Decimal(str(item['lotSizeFilter']['minOrderQty']))
+                        min_order_qty=Decimal(str(item['lotSizeFilter']['minOrderQty'])),
+                        launch_time=Timestamp(int(item.get('launchTime', '0')))
                     ))
 
             logger.info(f"Fetched {len(symbols)} test symbols")

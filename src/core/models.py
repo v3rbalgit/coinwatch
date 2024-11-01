@@ -50,6 +50,7 @@ class SymbolInfo:
     price_precision: int
     qty_precision: int
     min_order_qty: Decimal
+    launch_time: Timestamp
     exchange: ExchangeName = ExchangeName("bybit")
 
     @property

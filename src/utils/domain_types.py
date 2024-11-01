@@ -1,4 +1,4 @@
-# src/domain_types.py
+# src/utils/domain_types.py
 
 from enum import Enum
 from typing import NewType, Literal, TypedDict
