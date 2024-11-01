@@ -12,6 +12,7 @@ class Symbol(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     name: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     exchange: Mapped[str] = mapped_column(String(50), index=True)
+    first_trade_time: Mapped[int] = mapped_column(BigInteger, nullable=True)
 
     # Define the relationship to Kline
     klines: Mapped[List['Kline']] = relationship(

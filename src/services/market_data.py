@@ -6,11 +6,12 @@ from datetime import datetime, timezone
 
 from src.config import MarketDataConfig
 
+from src.core.models import SymbolInfo
 from src.services.base import ServiceBase
-from src.utils.time import get_current_timestamp
+from src.utils.time import from_timestamp, get_current_timestamp
 from ..repositories.market_data import SymbolRepository, KlineRepository
 from ..adapters.registry import ExchangeAdapterRegistry
-from ..utils.domain_types import Timeframe, ExchangeName, SymbolName, Timestamp, ServiceStatus
+from ..utils.domain_types import Timeframe, ExchangeName, Timestamp, ServiceStatus
 from ..core.exceptions import ServiceError
 from ..utils.logger import LoggerSetup
 
@@ -127,7 +128,7 @@ class MarketDataService(ServiceBase):
                 for symbol_info in symbols:
                     for timeframe in self._active_timeframes:
                         await self._sync_symbol_data(
-                            symbol_info.name,
+                            symbol_info,
                             timeframe,
                             exchange
                         )
@@ -153,61 +154,65 @@ class MarketDataService(ServiceBase):
                 await asyncio.sleep(self._retry_interval)
 
     async def _sync_symbol_data(self,
-                              symbol: SymbolName,
-                              timeframe: Timeframe,
-                              exchange: ExchangeName) -> None:
-        """Sync data for a specific symbol and timeframe"""
+                          symbol: SymbolInfo,
+                          timeframe: Timeframe,
+                          exchange: ExchangeName) -> None:
+
         try:
             # Get or create symbol record
-            symbol_record = await self.symbol_repository.get_or_create(
-                symbol, exchange
+            symbol_record = await self.symbol_repository.get_or_create(symbol, exchange)
+
+            # Get timestamp to start checking from
+            check_from = await self.kline_repository.get_latest_timestamp(
+                symbol.name, timeframe, exchange
             )
 
-            # Get latest timestamp
-            latest_ts = await self.kline_repository.get_latest_timestamp(
-                symbol, timeframe, exchange
-            )
-
-            # Check if update needed
             current_time = get_current_timestamp()
-            if (current_time - latest_ts) < timeframe.to_milliseconds():
-                return
+            interval_ms = timeframe.to_milliseconds()
 
-            # Get new data
-            adapter = self.exchange_registry.get_adapter(exchange)
-            klines = await adapter.get_klines(
-                symbol, timeframe, latest_ts
-            )
-
-            if klines:
-                # Insert new data
-                inserted = await self.kline_repository.insert_batch(
-                    symbol_record.id,
-                    timeframe,
-                    [k.to_tuple() for k in klines]
-                )
-                logger.info(
-                    f"Inserted {inserted} klines for {symbol} "
-                    f"{timeframe.value}"
+            # Only sync if enough time has passed
+            if (current_time - check_from) >= interval_ms:
+                adapter = self.exchange_registry.get_adapter(exchange)
+                klines = await adapter.get_klines(
+                    symbol.name, timeframe, check_from
                 )
 
-                # Check for gaps
-                end_time = Timestamp(max(k.timestamp for k in klines))
-                gaps = await self.kline_repository.get_data_gaps(
-                    symbol,
-                    timeframe,
-                    exchange,
-                    latest_ts,
-                    end_time
-                )
+                if klines:
+                    # Filter out future data
+                    valid_klines = [
+                        k for k in klines
+                        if k.timestamp <= current_time
+                    ]
 
-                if gaps:
-                    await self._handle_data_gaps(
-                        symbol,
-                        timeframe,
-                        exchange,
-                        gaps
-                    )
+                    if valid_klines:
+                        inserted = await self.kline_repository.insert_batch(
+                            symbol_record.id,
+                            timeframe,
+                            [k.to_tuple() for k in valid_klines]
+                        )
+                        logger.info(
+                            f"Inserted {inserted} klines for {symbol.name} "
+                            f"{timeframe.value}"
+                        )
+
+                        # Check for gaps between check_from and latest valid kline
+                        if len(valid_klines) > 0:
+                            end_time = Timestamp(max(k.timestamp for k in valid_klines))
+                            gaps = await self.kline_repository.get_data_gaps(
+                                symbol.name,
+                                timeframe,
+                                exchange,
+                                check_from,
+                                end_time
+                            )
+
+                            if gaps:
+                                await self._handle_data_gaps(
+                                    symbol,
+                                    timeframe,
+                                    exchange,
+                                    gaps
+                                )
 
         except Exception as e:
             logger.error(f"Error syncing {symbol} {timeframe.value}: {e}")
@@ -216,10 +221,10 @@ class MarketDataService(ServiceBase):
             )
 
     async def _handle_data_gaps(self,
-                              symbol: SymbolName,
-                              timeframe: Timeframe,
-                              exchange: ExchangeName,
-                              gaps: List[Tuple[Timestamp, Timestamp]]) -> None:
+                          symbol: SymbolInfo,
+                          timeframe: Timeframe,
+                          exchange: ExchangeName,
+                          gaps: List[Tuple[Timestamp, Timestamp]]) -> None:
         """Handle detected data gaps"""
         adapter = self.exchange_registry.get_adapter(exchange)
         symbol_record = await self.symbol_repository.get_or_create(
@@ -228,19 +233,35 @@ class MarketDataService(ServiceBase):
 
         for start, end in gaps:
             try:
+                # Verify we're not requesting future data
+                current_time = get_current_timestamp()
+                if start > current_time:
+                    logger.warning(f"Skipping future gap fill request for {symbol}: {from_timestamp(start)} > {from_timestamp(current_time)}")
+                    continue
+
                 klines = await adapter.get_klines(
-                    symbol, timeframe, start
+                    symbol.name, timeframe, start
                 )
+
                 if klines:
-                    await self.kline_repository.insert_batch(
-                        symbol_record.id,
-                        timeframe,
-                        [k.to_tuple() for k in klines]
-                    )
-                    logger.info(
-                        f"Filled gap for {symbol} {timeframe.value} "
-                        f"from {start} to {end}"
-                    )
+                    # Filter out any future data
+                    valid_klines = [
+                        k for k in klines
+                        if k.timestamp <= current_time
+                    ]
+
+                    if valid_klines:
+                        inserted = await self.kline_repository.insert_batch(
+                            symbol_record.id,
+                            timeframe,
+                            [k.to_tuple() for k in valid_klines]
+                        )
+                        logger.info(
+                            f"Filled gap for {symbol} {timeframe.value} "
+                            f"from {from_timestamp(start)} to {from_timestamp(end)} "
+                            f"with {inserted} klines"
+                        )
+
             except Exception as e:
                 logger.error(f"Failed to fill gap for {symbol}: {e}")
 

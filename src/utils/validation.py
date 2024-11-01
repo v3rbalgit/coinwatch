@@ -135,8 +135,8 @@ class MarketDataValidator:
                       high_price: float,
                       low_price: float,
                       close_price: float,
-                      turnover: float,
-                      volume: float) -> Tuple[bool, Tuple[Decimal, ...]]:
+                      volume: float,
+                      turnover: float) -> Tuple[bool, Tuple[Decimal, ...]]:
         """
         Validate complete kline (candlestick) data.
 
