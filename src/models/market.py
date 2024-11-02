@@ -1,7 +1,7 @@
 # src/models/market.py
 
 from typing import List
-from sqlalchemy import BigInteger, Float, String, ForeignKey
+from sqlalchemy import BigInteger, Float, String, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .base import Base
 
@@ -28,6 +28,12 @@ class Symbol(Base):
 class Kline(Base):
     """Kline (candlestick) data model"""
     __tablename__ = 'kline_data'
+
+    # Add unique constraint for symbol_id + timeframe + start_time combination
+    __table_args__ = (
+        UniqueConstraint('symbol_id', 'timeframe', 'start_time',
+                        name='uix_kline_symbol_timeframe_start'),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     symbol_id: Mapped[int] = mapped_column(

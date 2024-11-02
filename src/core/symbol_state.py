@@ -29,22 +29,37 @@ class SymbolProgress:
     last_sync_time: Optional[Timestamp] = None
     error_count: int = 0
     last_error: Optional[str] = None
-    historical_progress: Optional[float] = None  # Percentage complete
+    historical_progress: Optional[float] = None
+    total_periods: Optional[int] = None
+    processed_periods: Optional[int] = None
 
-    def update_progress(self, current_time: Timestamp) -> None:
+    def update_progress(self, current_time: Timestamp, processed_time: Optional[Timestamp] = None) -> None:
         """Update historical data collection progress"""
         if self.launch_time and current_time > self.launch_time:
-            total_time = get_current_timestamp() - self.launch_time
-            if self.last_sync_time:
-                collected_time = self.last_sync_time - self.launch_time
+            total_time = current_time - self.launch_time
+
+            if processed_time:
+                collected_time = processed_time - self.launch_time
+                self.processed_periods = int(collected_time / (5 * 60 * 1000))  # for 5-minute candles
+                self.total_periods = int(total_time / (5 * 60 * 1000))
                 self.historical_progress = min(100.0, (collected_time / total_time) * 100)
 
     def __str__(self) -> str:
-        status = f"Symbol: {self.symbol.name} | State: {self.state.value}"
+        """Enhanced string representation with detailed progress"""
+        status = f"Symbol: {self.symbol.name} @ {self.symbol.exchange} | State: {self.state.value}"
+
         if self.historical_progress is not None:
             status += f" | Progress: {self.historical_progress:.2f}%"
+            if self.processed_periods and self.total_periods:
+                status += f" ({self.processed_periods}/{self.total_periods} periods)"
+
+        if self.last_sync_time:
+            from ..utils.time import from_timestamp
+            status += f" | Last Sync: {from_timestamp(self.last_sync_time)}"
+
         if self.last_error:
-            status += f" | Last Error: {self.last_error}"
+            status += f" | Error: {self.last_error}"
+
         return status
 
 class SymbolStateManager:
@@ -62,7 +77,6 @@ class SymbolStateManager:
                 state=SymbolState.INITIALIZING,
                 launch_time=symbol.launch_time
             )
-            logger.info(f"Added new symbol for tracking: {symbol}")
 
     async def update_state(self,
                          symbol: SymbolInfo,
@@ -82,8 +96,6 @@ class SymbolStateManager:
                 else:
                     progress.last_error = None
 
-                logger.info(f"Symbol {symbol} state updated: {progress}")
-
     async def update_sync_time(self,
                              symbol: SymbolInfo,
                              sync_time: Timestamp) -> None:
@@ -93,14 +105,11 @@ class SymbolStateManager:
                 progress = self._symbols[symbol]
                 progress.last_sync_time = sync_time
                 progress.update_progress(Timestamp(get_current_timestamp()))
-                logger.debug(f"Updated sync time for {symbol}: {progress}")
 
     async def get_symbols_by_state(self, state: SymbolState) -> List[SymbolInfo]:
         """Get all symbols in a specific state"""
-        return [
-            symbol for symbol, progress in self._symbols.items()
-            if progress.state == state
-        ]
+        return [ symbol for symbol, progress in self._symbols.items()
+                if progress.state == state ]
 
     async def get_progress(self, symbol: SymbolInfo) -> Optional[SymbolProgress]:
         """Get progress for a specific symbol"""
@@ -113,8 +122,18 @@ class SymbolStateManager:
             logger.info(f"Removed symbol from tracking: {symbol}")
 
     def get_status_report(self) -> str:
-        """Generate status report for all symbols"""
-        report = ["Symbol Status Report:"]
+        """Generate detailed status report for all symbols"""
+        status_groups = {state: [] for state in SymbolState}
+
         for progress in self._symbols.values():
-            report.append(str(progress))
+            status_groups[progress.state].append(str(progress))
+
+        report = ["Symbol Status Report:"]
+
+        for state in SymbolState:
+            symbols = status_groups[state]
+            if symbols:
+                report.append(f"\n{state.value} Symbols ({len(symbols)}):")
+                report.extend(f"  {s}" for s in symbols)
+
         return "\n".join(report)
