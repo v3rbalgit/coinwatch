@@ -41,8 +41,9 @@ class BybitConfig:
     api_key: Optional[str] = None
     api_secret: Optional[str] = None
     testnet: bool = False
-    rate_limit: int = 600  # requests per window
-    rate_limit_window: int = 300  # 5 minutes in seconds
+    kline_limit: int = 200
+    rate_limit: int = 600       # requests per window
+    rate_limit_window: int = 5  # seconds
 
 @dataclass
 class ExchangeConfig:
@@ -55,7 +56,6 @@ class MarketDataConfig:
     sync_interval: int = 300  # 5 minutes
     retry_interval: int = 60  # 1 minute
     max_retries: int = 3
-    batch_size: int = 100
     default_timeframes: List[Timeframe] = field(
         default_factory=lambda: [Timeframe.MINUTE_5]
     )
@@ -106,6 +106,7 @@ class Config:
                 api_key=os.getenv('BYBIT_API_KEY'),
                 api_secret=os.getenv('BYBIT_API_SECRET'),
                 testnet=bool(os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'),
+                kline_limit=int(os.getenv('BYBIT_KLINE_LIMIT', '200')),
                 rate_limit=int(os.getenv('BYBIT_RATE_LIMIT', '600')),
                 rate_limit_window=int(os.getenv('BYBIT_RATE_LIMIT_WINDOW', '300'))
             )
@@ -125,7 +126,6 @@ class Config:
                 sync_interval=int(os.getenv('SYNC_INTERVAL', 300)),
                 retry_interval=int(os.getenv('RETRY_INTERVAL', 60)),
                 max_retries=int(os.getenv('MAX_RETRIES', 3)),
-                batch_size=int(os.getenv('BATCH_SIZE', 100)),
                 default_timeframes=timeframes
             )
         except Exception as e:

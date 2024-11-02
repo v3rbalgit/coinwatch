@@ -1,24 +1,23 @@
 # src/services/market_data.py
 
-from typing import Set, Dict, Optional, List, Tuple
 import asyncio
-from datetime import datetime, timezone
+from typing import Optional
 
+from src.adapters.registry import ExchangeAdapterRegistry
 from src.config import MarketDataConfig
-
-from src.core.models import SymbolInfo
+from src.core.symbol_state import SymbolState, SymbolStateManager
+from src.repositories.market_data import KlineRepository, SymbolRepository
 from src.services.base import ServiceBase
-from src.utils.time import from_timestamp, get_current_timestamp
-from ..repositories.market_data import SymbolRepository, KlineRepository
-from ..adapters.registry import ExchangeAdapterRegistry
-from ..utils.domain_types import Timeframe, ExchangeName, Timestamp, ServiceStatus
+from src.services.data_sync import BatchSynchronizer, HistoricalCollector
+from src.utils.time import get_current_timestamp
+from ..utils.domain_types import CriticalCondition, ServiceStatus, Timeframe, Timestamp
 from ..core.exceptions import ServiceError
 from ..utils.logger import LoggerSetup
 
 logger = LoggerSetup.setup(__name__)
 
 class MarketDataService(ServiceBase):
-    """Core market data service"""
+    """Core market data service with historical and batch synchronization"""
 
     def __init__(self,
                  symbol_repository: SymbolRepository,
@@ -26,25 +25,35 @@ class MarketDataService(ServiceBase):
                  exchange_registry: ExchangeAdapterRegistry,
                  config: MarketDataConfig):
         super().__init__()
+
         self.symbol_repository = symbol_repository
         self.kline_repository = kline_repository
         self.exchange_registry = exchange_registry
+        self.config = config
+
+        # Initialize components
+        self.state_manager = SymbolStateManager()
+        self.historical_collector = HistoricalCollector(
+            exchange_registry,
+            symbol_repository,
+            kline_repository,
+            self.state_manager
+        )
+        self.batch_synchronizer = BatchSynchronizer(
+            self.state_manager,
+            exchange_registry,
+            kline_repository,
+            sync_interval=config.sync_interval
+        )
 
         # Service state
         self._status = ServiceStatus.STOPPED
-        self._active_timeframes: Set[Timeframe] = set(config.default_timeframes)
-        self._sync_tasks: Dict[str, asyncio.Task] = {}
         self._last_error: Optional[Exception] = None
+        self._symbol_check_interval = 3600  # 1 hour
 
-        # Configuration
-        self._sync_interval = config.sync_interval
-        self._retry_interval = config.retry_interval
-        self._max_retries = config.max_retries
-
-    @property
-    def is_healthy(self) -> bool:
-        """Check if service is healthy"""
-        return self._status == ServiceStatus.RUNNING and not self._last_error
+        # Add synchronization primitives
+        self._symbol_lock = asyncio.Lock()              # Protect symbol state changes
+        self._processing_symbols = set()                # Track symbols being processed
 
     async def start(self) -> None:
         """Start market data service"""
@@ -55,12 +64,14 @@ class MarketDataService(ServiceBase):
             # Initialize exchange adapters
             await self.exchange_registry.initialize_all()
 
-            # Start data synchronization
-            for exchange in self.exchange_registry.get_registered():
-                await self._start_sync_task(exchange)
+            # Start components
+            await self.historical_collector.start()
+            await self.batch_synchronizer.start()
 
+            # Start symbol monitoring
             self._status = ServiceStatus.RUNNING
             logger.info("Market data service started successfully")
+            await self._monitor_symbols()
 
         except Exception as e:
             self._status = ServiceStatus.ERROR
@@ -68,220 +79,162 @@ class MarketDataService(ServiceBase):
             logger.error(f"Failed to start market data service: {e}")
             raise ServiceError(f"Service start failed: {str(e)}")
 
+    async def _monitor_symbols(self) -> None:
+        """Monitor for new and delisted symbols"""
+        while self._status == ServiceStatus.RUNNING:
+            try:
+                for exchange in self.exchange_registry.get_registered():
+                    adapter = self.exchange_registry.get_adapter(exchange)
+                    symbols = await adapter.get_symbols()
+
+                    # Process potential new symbols
+                    for symbol in symbols:
+                        progress = await self.state_manager.get_progress(symbol)
+                        if not progress:
+                            await self.historical_collector.add_symbol(symbol)
+
+                    # Handle delisted symbols
+                    tracked_symbols = set(await self.state_manager.get_symbols_by_state(SymbolState.READY))
+                    current_symbols = set(symbols)
+
+                    for delisted in tracked_symbols - current_symbols:
+                        await self.state_manager.update_state(
+                            delisted,
+                            SymbolState.DELISTED
+                        )
+
+                await asyncio.sleep(self._symbol_check_interval)
+
+            except Exception as e:
+                logger.error(f"Error monitoring symbols: {e}")
+                await asyncio.sleep(60)
+
     async def stop(self) -> None:
-        """Stop market data service"""
+        """Stop market data service with proper cleanup"""
         try:
             self._status = ServiceStatus.STOPPING
             logger.info("Stopping market data service")
 
-            # Cancel all sync tasks
-            for task in self._sync_tasks.values():
-                task.cancel()
-            await asyncio.gather(*self._sync_tasks.values(), return_exceptions=True)
-            self._sync_tasks.clear()
+            # Stop batch synchronizer first to prevent new updates
+            logger.info("Stopping batch synchronizer...")
+            await self.batch_synchronizer.stop()
 
-            # Close exchange connections
+            # Stop historical collector next to prevent new symbol processing
+            logger.info("Stopping historical collector...")
+            await self.historical_collector.stop()
+
+            # Stop all exchange connections last
+            logger.info("Closing exchange connections...")
             await self.exchange_registry.close_all()
 
             self._status = ServiceStatus.STOPPED
-            logger.info("Market data service stopped")
+            logger.info("Market data service stopped successfully")
 
         except Exception as e:
             self._status = ServiceStatus.ERROR
             self._last_error = e
-            logger.error(f"Error stopping market data service: {e}")
+            logger.error(f"Error during service shutdown: {e}")
             raise ServiceError(f"Service stop failed: {str(e)}")
 
-    async def add_timeframe(self, timeframe: Timeframe) -> None:
-        """Add new timeframe support"""
-        if timeframe in self._active_timeframes:
-            return
-
-        self._active_timeframes.add(timeframe)
-        logger.info(f"Added support for timeframe: {timeframe.value}")
-
-    async def _start_sync_task(self, exchange: ExchangeName) -> None:
-        """Start synchronization task for an exchange"""
-        if exchange in self._sync_tasks:
-            return
-
-        task = asyncio.create_task(
-            self._sync_loop(exchange),
-            name=f"sync_{exchange}"
-        )
-        self._sync_tasks[exchange] = task
-        logger.info(f"Started sync task for exchange: {exchange}")
-
-    async def _sync_loop(self, exchange: ExchangeName) -> None:
-        """Main synchronization loop for an exchange"""
-        retry_count = 0
-
-        while True:
-            try:
-                # Get exchange adapter
-                adapter = self.exchange_registry.get_adapter(exchange)
-
-                # Get active symbols
-                symbols = await adapter.get_symbols()
-
-                # Sync each symbol
-                for symbol_info in symbols:
-                    for timeframe in self._active_timeframes:
-                        await self._sync_symbol_data(
-                            symbol_info,
-                            timeframe,
-                            exchange
-                        )
-
-                # Reset retry count on success
-                retry_count = 0
-                await asyncio.sleep(self._sync_interval)
-
-            except asyncio.CancelledError:
-                logger.info(f"Sync task cancelled for {exchange}")
-                break
-
-            except Exception as e:
-                retry_count += 1
-                self._last_error = e
-                logger.error(f"Error in sync loop for {exchange}: {e}")
-
-                if retry_count >= self._max_retries:
-                    logger.error(f"Max retries reached for {exchange}")
-                    self._status = ServiceStatus.ERROR
-                    break
-
-                await asyncio.sleep(self._retry_interval)
-
-    async def _sync_symbol_data(self,
-                          symbol: SymbolInfo,
-                          timeframe: Timeframe,
-                          exchange: ExchangeName) -> None:
-
-        try:
-            # Get or create symbol record
-            symbol_record = await self.symbol_repository.get_or_create(symbol, exchange)
-
-            # Get timestamp to start checking from
-            check_from = await self.kline_repository.get_latest_timestamp(
-                symbol.name, timeframe, exchange
-            )
-
-            current_time = get_current_timestamp()
-            interval_ms = timeframe.to_milliseconds()
-
-            # Only sync if enough time has passed
-            if (current_time - check_from) >= interval_ms:
-                adapter = self.exchange_registry.get_adapter(exchange)
-                klines = await adapter.get_klines(
-                    symbol.name, timeframe, check_from
-                )
-
-                if klines:
-                    # Filter out future data
-                    valid_klines = [
-                        k for k in klines
-                        if k.timestamp <= current_time
-                    ]
-
-                    if valid_klines:
-                        inserted = await self.kline_repository.insert_batch(
-                            symbol_record.id,
-                            timeframe,
-                            [k.to_tuple() for k in valid_klines]
-                        )
-                        logger.info(
-                            f"Inserted {inserted} klines for {symbol.name} "
-                            f"{timeframe.value}"
-                        )
-
-                        # Check for gaps between check_from and latest valid kline
-                        if len(valid_klines) > 0:
-                            end_time = Timestamp(max(k.timestamp for k in valid_klines))
-                            gaps = await self.kline_repository.get_data_gaps(
-                                symbol.name,
-                                timeframe,
-                                exchange,
-                                check_from,
-                                end_time
-                            )
-
-                            if gaps:
-                                await self._handle_data_gaps(
-                                    symbol,
-                                    timeframe,
-                                    exchange,
-                                    gaps
-                                )
-
-        except Exception as e:
-            logger.error(f"Error syncing {symbol} {timeframe.value}: {e}")
-            raise ServiceError(
-                f"Symbol sync failed: {symbol} {timeframe.value}: {str(e)}"
-            )
-
-    async def _handle_data_gaps(self,
-                          symbol: SymbolInfo,
-                          timeframe: Timeframe,
-                          exchange: ExchangeName,
-                          gaps: List[Tuple[Timestamp, Timestamp]]) -> None:
-        """Handle detected data gaps"""
-        adapter = self.exchange_registry.get_adapter(exchange)
-        symbol_record = await self.symbol_repository.get_or_create(
-            symbol, exchange
-        )
-
-        for start, end in gaps:
-            try:
-                # Verify we're not requesting future data
-                current_time = get_current_timestamp()
-                if start > current_time:
-                    logger.warning(f"Skipping future gap fill request for {symbol}: {from_timestamp(start)} > {from_timestamp(current_time)}")
-                    continue
-
-                klines = await adapter.get_klines(
-                    symbol.name, timeframe, start
-                )
-
-                if klines:
-                    # Filter out any future data
-                    valid_klines = [
-                        k for k in klines
-                        if k.timestamp <= current_time
-                    ]
-
-                    if valid_klines:
-                        inserted = await self.kline_repository.insert_batch(
-                            symbol_record.id,
-                            timeframe,
-                            [k.to_tuple() for k in valid_klines]
-                        )
-                        logger.info(
-                            f"Filled gap for {symbol} {timeframe.value} "
-                            f"from {from_timestamp(start)} to {from_timestamp(end)} "
-                            f"with {inserted} klines"
-                        )
-
-            except Exception as e:
-                logger.error(f"Failed to fill gap for {symbol}: {e}")
-
     async def handle_error(self, error: Optional[Exception]) -> None:
-        """Handle service errors"""
+        """
+        Handle service errors and attempt recovery.
+        Implements ServiceBase.handle_error.
+        """
         if error is None:
             return
 
-        if isinstance(error, ServiceError):
-            # Try to recover service
-            try:
-                logger.info("Attempting service recovery")
-                await self.stop()
-                await asyncio.sleep(self._retry_interval)
-                await self.start()
-                self._last_error = None
-                logger.info("Service recovered successfully")
-            except Exception as e:
-                logger.error(f"Recovery failed: {e}")
-                raise ServiceError("Service recovery failed")
-        else:
-            logger.error(f"Unhandled error: {error}")
-            raise error
+        try:
+            logger.error(f"Handling service error: {error}")
+
+            # Stop components
+            logger.info("Stopping components for recovery...")
+            await self.historical_collector.stop()
+            await self.batch_synchronizer.stop()
+
+            # Wait a bit before recovery attempt
+            await asyncio.sleep(self.config.retry_interval)
+
+            # Attempt to restart components
+            logger.info("Attempting service recovery...")
+
+            # Verify exchange connections
+            await self.exchange_registry.initialize_all()
+
+            # Restart components
+            await self.historical_collector.start()
+            await self.batch_synchronizer.start()
+
+            # Update service status
+            self._status = ServiceStatus.RUNNING
+            self._last_error = None
+
+            # Resume symbol monitoring
+            asyncio.create_task(self._monitor_symbols())
+
+            logger.info("Service recovered successfully")
+
+        except Exception as recovery_error:
+            self._status = ServiceStatus.ERROR
+            self._last_error = recovery_error
+            logger.error(f"Service recovery failed: {recovery_error}")
+            raise ServiceError(
+                f"Failed to recover from error: {str(recovery_error)}"
+            )
+
+    # TODO: make this more useful
+    # what is 'connection_overflow' and 'connection_timeout'?
+    # where do we check if the storage is full?
+    async def handle_critical_condition(self, condition: CriticalCondition) -> None:
+        """Handle critical system conditions"""
+        logger.warning(f"Critical condition detected: {condition}")
+
+        if condition["type"] == "connection_overflow":
+            new_limit = max(
+                10,  # minimum concurrent updates
+                int(self.batch_synchronizer.max_concurrent_updates * 0.90)  # reduce by 10%
+            )
+            await self.batch_synchronizer.set_max_concurrent_updates(new_limit)
+            logger.info(f"Reduced concurrent updates limit to {new_limit}")
+
+        elif condition["type"] == "connection_timeout":
+            # Increase delays between operations
+            self.batch_synchronizer.sync_interval = min(
+                900,  # max 15 minutes
+                int(self.batch_synchronizer.sync_interval * 1.5)
+            )
+            logger.info(f"Increased sync interval to {self.batch_synchronizer.sync_interval}")
+
+        elif condition["type"] == "storage_full":
+            # Trigger cleanup of old data
+            await self._cleanup_old_data()
+
+        await super().handle_critical_condition(condition)
+
+    async def _cleanup_old_data(self) -> None:
+        """Clean up old kline data to free storage"""
+        try:
+            cutoff_time = get_current_timestamp() - (90 * 24 * 60 * 60 * 1000)  # 90 days
+            ready_symbols = await self.state_manager.get_symbols_by_state(SymbolState.READY)
+
+            for symbol in ready_symbols:
+                deleted = await self.kline_repository.delete_old_data(
+                    symbol,
+                    Timeframe.MINUTE_5,
+                    Timestamp(cutoff_time)
+                )
+                if deleted:
+                    logger.info(f"Cleaned up {deleted} old records for {symbol}")
+
+        except Exception as e:
+            logger.error(f"Error during data cleanup: {e}")
+
+    @property
+    def is_healthy(self) -> bool:
+        """Check if service is healthy"""
+        return (
+            self._status == ServiceStatus.RUNNING and
+            not self._last_error and
+            self.historical_collector._active and
+            self.batch_synchronizer._active
+        )

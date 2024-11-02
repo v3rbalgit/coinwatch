@@ -92,7 +92,7 @@ class MarketDataValidator:
 
         try:
             decimal_value = Decimal(str(value))
-            if decimal_value <= 0:
+            if decimal_value < 0:
                 raise ValidationError(f"Non-positive {name}: {value}")
             return decimal_value
         except (ValueError, TypeError) as e:
