@@ -10,7 +10,7 @@ from .adapters.registry import ExchangeAdapterRegistry
 from .adapters.bybit import BybitAdapter
 from .core.exceptions import CoinwatchError
 from .utils.logger import LoggerSetup
-from .utils.domain_types import ExchangeName, SymbolName
+from .utils.domain_types import ExchangeName, ServiceStatus, SymbolName
 from .core.models import SymbolInfo
 
 logger = LoggerSetup.setup(__name__)
@@ -38,11 +38,7 @@ class TestApplication:
                 return [s for s in all_symbols if s.name in test_symbols]
 
         # Register test adapter
-        self.test_adapter = TestBybitAdapter(BybitConfig(
-            testnet=True,
-            rate_limit=600,
-            rate_limit_window=300
-        ))
+        self.test_adapter = TestBybitAdapter(BybitConfig(testnet=False))
 
     async def start(self) -> None:
         """Start the test application"""
@@ -75,9 +71,14 @@ class TestApplication:
 
             # Keep application running
             while True:
-                if not market_service.is_healthy:
+                if not market_service._status == ServiceStatus.ERROR:
                     self.logger.error(f"Service unhealthy: {market_service._last_error}")
                     await market_service.handle_error(market_service._last_error)
+
+                # Log service status periodically
+                self.logger.info("\nService Status Report:")
+                self.logger.info(market_service.state_manager.get_status_report())
+
                 await asyncio.sleep(60)
 
         except Exception as e:

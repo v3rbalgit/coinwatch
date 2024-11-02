@@ -7,6 +7,11 @@ from ..core.models import KlineData, SymbolInfo
 class ExchangeAdapter(Protocol):
     """Exchange adapter protocol"""
 
+    @property
+    def kline_limit(self) -> int:
+        """Get maximum number of klines that can be fetched in one request"""
+        ...
+
     async def initialize(self) -> None:
         """Initialize the adapter"""
         ...
@@ -16,9 +21,10 @@ class ExchangeAdapter(Protocol):
         ...
 
     async def get_klines(self,
-                        symbol: SymbolName,
+                        symbol: SymbolInfo,
                         timeframe: Timeframe,
-                        start_time: Optional[Timestamp] = None) -> List[KlineData]:
+                        start_time: Optional[Timestamp] = None,
+                        limit: Optional[int] = None) -> List[KlineData]:
         """Get kline data"""
         ...
 

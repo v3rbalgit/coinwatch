@@ -56,6 +56,8 @@ class DatabaseService(ServiceBase):
         }
         self._pool_monitor_task: Optional[asyncio.Task] = None
 
+        self._transaction_semaphore = asyncio.BoundedSemaphore(config.pool_size)
+
         # Default configuration
         self._config: ConnectionConfig = {
             "pool_size": config.pool_size,
@@ -130,6 +132,7 @@ class DatabaseService(ServiceBase):
             except Exception as e:
                 logger.error(f"Pool monitoring error: {e}")
 
+    # TODO: consider monitoring of the checked-in parameter
     async def _get_pool_stats(self) -> Dict[str, int]:
         """Get current pool statistics"""
         if not self.engine or not hasattr(self.engine, 'sync_engine'):
@@ -170,38 +173,39 @@ class DatabaseService(ServiceBase):
         if not self.session_factory:
             raise ServiceError("Database service not initialized")
 
-        attempt = 0
-        while attempt <= retry_count:
-            async with self.session_factory() as session:
-                try:
-                    if isolation_level:
-                        await session.execute(
-                            text(f"SET TRANSACTION ISOLATION LEVEL {isolation_level.value}")
-                        )
-                    async with session.begin():
-                        yield session
-                    return  # Exit if successful
-                except OperationalError as e:
-                    if "deadlock" in str(e).lower():
-                        if attempt < retry_count:
-                            logger.warning(
-                                f"Deadlock detected, retrying in {retry_delay}s... "
-                                f"({retry_count - attempt} attempts left)"
+        async with self._transaction_semaphore:
+            attempt = 0
+            while attempt <= retry_count:
+                async with self.session_factory() as session:
+                    try:
+                        if isolation_level:
+                            await session.execute(
+                                text(f"SET TRANSACTION ISOLATION LEVEL {isolation_level.value}")
                             )
-                            await asyncio.sleep(retry_delay)
-                            retry_delay *= 2
-                            attempt += 1
-                            continue
+                        async with session.begin():
+                            yield session
+                        return  # Exit if successful
+                    except OperationalError as e:
+                        if "deadlock" in str(e).lower():
+                            if attempt < retry_count:
+                                logger.warning(
+                                    f"Deadlock detected, retrying in {retry_delay}s... "
+                                    f"({retry_count - attempt} attempts left)"
+                                )
+                                await asyncio.sleep(retry_delay)
+                                retry_delay *= 2
+                                attempt += 1
+                                continue
+                            else:
+                                logger.error("Max retries exceeded")
+                                raise
                         else:
-                            logger.error("Max retries exceeded")
+                            logger.error(f"Operational error: {e}")
                             raise
-                    else:
-                        logger.error(f"Operational error: {e}")
+                    except Exception as e:
+                        logger.error(f"Transaction error: {e}")
                         raise
-                except Exception as e:
-                    logger.error(f"Transaction error: {e}")
-                    raise
-            attempt += 1
+                attempt += 1
 
     @asynccontextmanager
     async def savepoint(self, session: AsyncSession):
@@ -259,8 +263,6 @@ class DatabaseService(ServiceBase):
                 logger.info(
                     f"Pool timeout increased to {self._config['pool_timeout']}"
                 )
-
-
 
     async def stop(self) -> None:
         """Cleanup database connections"""

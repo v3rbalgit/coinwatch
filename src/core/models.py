@@ -41,7 +41,7 @@ class KlineData:
             float(self.turnover)
         )
 
-@dataclass
+@dataclass(frozen=True)
 class SymbolInfo:
     """Domain model for symbol information"""
     name: SymbolName
@@ -52,6 +52,47 @@ class SymbolInfo:
     min_order_qty: Decimal
     launch_time: Timestamp
     exchange: ExchangeName = ExchangeName("bybit")
+
+    def __hash__(self) -> int:
+        """Hash based on name and exchange which uniquely identify a symbol"""
+        return hash((self.name, self.exchange))
+
+    def __eq__(self, other: object) -> bool:
+        """Equality based on name and exchange"""
+        if not isinstance(other, SymbolInfo):
+            return NotImplemented
+        return (self.name == other.name and
+                self.exchange == other.exchange)
+
+    def __lt__(self, other: 'SymbolInfo') -> bool:
+        """Enable sorting of symbols by name and exchange"""
+        if not isinstance(other, SymbolInfo):
+            return NotImplemented
+        return (self.name, self.exchange) < (other.name, other.exchange)
+
+    def __str__(self) -> str:
+        """Human-readable string representation"""
+        return f"{self.name} ({self.exchange})"
+
+    def __repr__(self) -> str:
+        """Detailed string representation for debugging"""
+        return (f"SymbolInfo(name='{self.name}', exchange='{self.exchange}', "
+                f"launch_time={self.launch_time}, "
+                f"base='{self.base_asset}', quote='{self.quote_asset}', "
+                f"price_prec={self.price_precision}, qty_prec={self.qty_precision}, "
+                f"min_qty={self.min_order_qty})")
+
+    def __format__(self, format_spec: str) -> str:
+        """Support string formatting"""
+        if format_spec == 'short':
+            return self.__str__()
+        if format_spec == 'pair':
+            return self.trading_pair
+        return self.__repr__()
+
+    def __bool__(self) -> bool:
+        """Consider symbol valid if it has a name and exchange"""
+        return bool(self.name and self.exchange)
 
     @property
     def trading_pair(self) -> str:

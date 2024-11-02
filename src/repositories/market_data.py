@@ -1,17 +1,15 @@
 # src/repositories/market_data.py
 
-from datetime import datetime, timezone
 from typing import List, Tuple
 from sqlalchemy import select, func, and_, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
-from sqlalchemy.exc import IntegrityError
 
 from src.core.models import SymbolInfo
-from src.utils.time import from_timestamp, get_current_timestamp, get_past_timestamp
+from src.utils.time import from_timestamp, get_past_timestamp
 
 from .base import Repository
 from ..models.market import Symbol, Kline
-from ..utils.domain_types import SymbolName, ExchangeName, Timeframe, Timestamp
+from ..utils.domain_types import ExchangeName, Timeframe, Timestamp
 from ..core.exceptions import RepositoryError, ValidationError
 from ..utils.logger import LoggerSetup
 from ..utils.validation import MarketDataValidator
@@ -24,11 +22,11 @@ class SymbolRepository(Repository[Symbol]):
     def __init__(self, session_factory: async_sessionmaker):
         super().__init__(session_factory, Symbol)
 
-    async def get_or_create(self, symbol_info: SymbolInfo, exchange: ExchangeName) -> Symbol:
+    async def get_or_create(self, symbol_info: SymbolInfo) -> Symbol:
         try:
             async with self.get_session() as session:
                 stmt = select(self.model_class).where(
-                    and_(Symbol.name == symbol_info.name, Symbol.exchange == exchange)
+                    and_(Symbol.name == symbol_info.name, Symbol.exchange == symbol_info.exchange)
                 )
                 result = await session.execute(stmt)
                 symbol = result.scalar_one_or_none()
@@ -41,14 +39,14 @@ class SymbolRepository(Repository[Symbol]):
 
                 symbol = Symbol(
                     name=symbol_info.name,
-                    exchange=exchange,
+                    exchange=symbol_info.exchange,
                     first_trade_time=symbol_info.launch_time
                 )
                 session.add(symbol)
                 await session.flush()
                 await session.refresh(symbol)
                 logger.info(
-                    f"Created new symbol: {symbol_info.name} for {exchange} "
+                    f"Created new symbol: {symbol_info.name} for {symbol_info.exchange} "
                     f"with launch time {from_timestamp(symbol_info.launch_time)}"
                 )
                 return symbol
@@ -74,18 +72,17 @@ class KlineRepository(Repository[Kline]):
     def __init__(self, session_factory: async_sessionmaker):
         super().__init__(session_factory, Kline)
         self.validator = MarketDataValidator()
-        self._batch_size = 100
+        self._batch_size = 1000
 
     async def get_latest_timestamp(self,
-                                   symbol: SymbolName,
-                                   timeframe: Timeframe,
-                                   exchange: ExchangeName) -> Timestamp:
+                                   symbol: SymbolInfo,
+                                   timeframe: Timeframe) -> Timestamp:
         """Get latest timestamp to check for updates"""
         try:
             async with self.get_session() as session:
                 # First get the symbol record to check first_trade_time
                 symbol_stmt = select(Symbol).where(
-                    and_(Symbol.name == symbol, Symbol.exchange == exchange)
+                    and_(Symbol.name == symbol.name, Symbol.exchange == symbol.exchange)
                 )
                 symbol_result = await session.execute(symbol_stmt)
                 symbol_record = symbol_result.scalar_one()
@@ -93,20 +90,21 @@ class KlineRepository(Repository[Kline]):
                 # Get latest timestamp we have
                 stmt = select(func.max(Kline.start_time)).join(Symbol).where(
                     and_(
-                        Symbol.name == symbol,
-                        Symbol.exchange == exchange,
+                        Symbol.name == symbol.name,
+                        Symbol.exchange == symbol.exchange,
                         Kline.timeframe == timeframe.value
                     )
                 )
                 result = await session.execute(stmt)
                 latest = result.scalar_one_or_none()
+                logger.debug(f"Latest timestamp in DB for {symbol}: {latest}")
 
                 if latest is None:
                     # Start from first_trade_time if we have it
                     if symbol_record.first_trade_time:
                         start_time = symbol_record.first_trade_time
                         logger.info(
-                            f"No data for {symbol} {timeframe.value}, "
+                            f"No '{timeframe.value}' data for {symbol.name} ({symbol.exchange}), "
                             f"starting from first trade at {from_timestamp(start_time)}"
                         )
                         return Timestamp(start_time)
@@ -126,50 +124,75 @@ class KlineRepository(Repository[Kline]):
             raise RepositoryError(f"Failed to get latest timestamp: {str(e)}")
 
     async def insert_batch(self,
-                           symbol_id: int,
-                           timeframe: Timeframe,
-                           klines: List[Tuple]) -> int:
+                      symbol: SymbolInfo,
+                      timeframe: Timeframe,
+                      klines: List[Tuple]) -> int:
+        """
+        Insert a batch of klines for a symbol.
+
+        Args:
+            symbol: Trading symbol name
+            timeframe: Kline timeframe
+            klines: List of kline data tuples
+
+        Returns:
+            int: Number of klines inserted
+
+        Raises:
+            RepositoryError: If insert fails
+        """
         try:
             inserted_count = 0
-            for i in range(0, len(klines), self._batch_size):
-                batch = klines[i:i + self._batch_size]
-                kline_objects = []
 
-                for k in batch:
-                    try:
-                        if self.validator.validate_kline(*k):
-                            kline_objects.append(
-                                Kline(
-                                    symbol_id=symbol_id,
-                                    timeframe=timeframe.value,
-                                    start_time=k[0],
-                                    open_price=k[1],
-                                    high_price=k[2],
-                                    low_price=k[3],
-                                    close_price=k[4],
-                                    volume=k[5],
-                                    turnover=k[6]
+            # Get the symbol record first
+            async with self.get_session() as session:
+                symbol_stmt = select(Symbol).where(Symbol.name == symbol.name)
+                result = await session.execute(symbol_stmt)
+                symbol_record = result.scalar_one_or_none()
+
+                if not symbol_record:
+                    raise RepositoryError(f"Symbol not found: {symbol}")
+
+                # Process klines in batches
+                for i in range(0, len(klines), self._batch_size):
+                    batch = klines[i:i + self._batch_size]
+                    kline_objects = []
+
+                    for k in batch:
+                        try:
+                            if self.validator.validate_kline(*k):
+                                kline_objects.append(
+                                    Kline(
+                                        symbol_id=symbol_record.id,
+                                        timeframe=timeframe.value,
+                                        start_time=k[0],
+                                        open_price=k[1],
+                                        high_price=k[2],
+                                        low_price=k[3],
+                                        close_price=k[4],
+                                        volume=k[5],
+                                        turnover=k[6]
+                                    )
                                 )
-                            )
-                    except ValidationError as e:
-                        logger.warning(f"Invalid kline data: {e}")
-                        continue
+                        except ValidationError as e:
+                            logger.warning(f"Invalid kline data for {symbol}: {e}")
+                            continue
 
-                if kline_objects:
-                    async with self.get_session() as session:
+                    if kline_objects:
                         session.add_all(kline_objects)
                         await session.flush()
                         inserted_count += len(kline_objects)
-                        logger.debug(f"Inserted batch of {len(kline_objects)} klines for symbol {symbol_id}")
+                        logger.debug(f"Inserted batch of {len(kline_objects)} klines for {symbol}")
 
+                logger.debug(f"Inserted {inserted_count} klines for {symbol}, last timestamp: {klines[-1][0]}")
             return inserted_count
 
         except Exception as e:
-            logger.error(f"Error inserting klines: {e}")
-            raise RepositoryError(f"Failed to insert klines: {str(e)}")
+            logger.error(f"Error inserting klines for {symbol}: {e}")
+            raise RepositoryError(f"Failed to insert klines for {symbol}: {str(e)}")
 
     async def get_data_gaps(self,
-                            symbol: SymbolName,
+                            symbol: SymbolInfo,
                             timeframe: Timeframe,
                             exchange: ExchangeName,
                             start_time: Timestamp,
@@ -197,7 +220,7 @@ class KlineRepository(Repository[Kline]):
                 result = await session.execute(
                     stmt,
                     {
-                        "symbol": symbol,
+                        "symbol": symbol.name,
                         "exchange": exchange,
                         "timeframe": timeframe.value,
                         "start_time": start_time,
@@ -207,8 +230,8 @@ class KlineRepository(Repository[Kline]):
                 )
 
                 gaps = [
-                    (Timestamp(row.start_time + timeframe.to_milliseconds()),
-                     Timestamp(row.next_start))
+                    (Timestamp(row._mapping['start_time'] + timeframe.to_milliseconds()),
+                     Timestamp(row._mapping['next_start']))
                     for row in result
                 ]
 
@@ -221,9 +244,8 @@ class KlineRepository(Repository[Kline]):
             raise RepositoryError(f"Failed to find data gaps: {str(e)}")
 
     async def delete_old_data(self,
-                              symbol: SymbolName,
+                              symbol: SymbolInfo,
                               timeframe: Timeframe,
-                              exchange: ExchangeName,
                               before_timestamp: Timestamp) -> int:
         try:
             async with self.get_session() as session:
@@ -241,8 +263,8 @@ class KlineRepository(Repository[Kline]):
                 result = await session.execute(
                     stmt,
                     {
-                        "symbol": symbol,
-                        "exchange": exchange,
+                        "symbol": symbol.name,
+                        "exchange": symbol.exchange,
                         "timeframe": timeframe.value,
                         "before_timestamp": before_timestamp
                     }

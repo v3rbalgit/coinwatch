@@ -1,9 +1,10 @@
+# src/adapters/bybit.py
+
 import asyncio
 from asyncio import Lock
 import time
 from typing import List, Optional, Dict, Any, Callable, TypeVar, Protocol, cast, Union, overload
 from decimal import Decimal
-import uuid
 from pybit.unified_trading import HTTP
 from functools import partial
 from requests.structures import CaseInsensitiveDict
@@ -57,7 +58,7 @@ class BybitAdapter(ExchangeAdapter):
 
         # Set rate limits from config or use defaults
         self.RATE_LIMIT = self._config.rate_limit if config else 600
-        self.WINDOW_SIZE = self._config.rate_limit_window if config else 300
+        self.WINDOW_SIZE = self._config.rate_limit_window if config else 5
 
         # Store credentials for future use
         self._api_key = self._config.api_key
@@ -68,6 +69,11 @@ class BybitAdapter(ExchangeAdapter):
         self._lock = Lock()
         self._tokens = self.RATE_LIMIT
         self._last_refill = time.time()
+
+    @property
+    def kline_limit(self) -> int:
+        """Get maximum number of klines that can be fetched in one request"""
+        return self._config.kline_limit
 
     def _create_session(self) -> HTTP:
         """Create a new HTTP session for thread-safe operations"""
@@ -261,10 +267,10 @@ class BybitAdapter(ExchangeAdapter):
             raise
 
     async def get_klines(self,
-                        symbol: SymbolName,
+                        symbol: SymbolInfo,
                         timeframe: Timeframe,
                         start_time: Optional[int] = None,
-                        limit: int = 5) -> List[KlineData]:
+                        limit: int = 200) -> List[KlineData]:
         """
         Fetch kline data from Bybit.
         Note: Results are returned in ascending order (oldest first).
@@ -283,11 +289,9 @@ class BybitAdapter(ExchangeAdapter):
             Exception: If API request fails
         """
         try:
-            request_id = uuid.uuid4()
-            logger.debug(f"[{request_id}] Starting klines request for {symbol}")
             params = {
                 "category": "linear",
-                "symbol": symbol,
+                "symbol": symbol.name,
                 "interval": timeframe.value,
                 "limit": limit
             }
@@ -300,9 +304,7 @@ class BybitAdapter(ExchangeAdapter):
                     )
                 params["start"] = start_time
 
-            logger.debug(f"[{request_id}] Executing request with params: {params}")
             response = await self._execute_request(self._get_klines, **params)
-            logger.debug(f"[{request_id}] Received response: {response}")
 
             klines: List[KlineData] = []
             # Process items in reverse order to convert from descending to ascending
@@ -325,11 +327,10 @@ class BybitAdapter(ExchangeAdapter):
                     close_price=Decimal(str(item[4])),
                     volume=Decimal(str(item[5])),
                     turnover=Decimal(str(item[6])),
-                    symbol=symbol,
+                    symbol=symbol.name,
                     timeframe=timeframe.value
                 ))
 
-            logger.debug(f"[{request_id}] Finished processing klines for {symbol}")
             return klines
 
         except Exception as e:
