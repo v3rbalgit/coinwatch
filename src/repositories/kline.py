@@ -1,4 +1,4 @@
-# src/repositories/market_data.py
+# src/repositories/kline.py
 
 from typing import List, Tuple
 from sqlalchemy import select, func, and_, text
@@ -15,56 +15,6 @@ from ..utils.logger import LoggerSetup
 from ..utils.validation import MarketDataValidator
 
 logger = LoggerSetup.setup(__name__)
-
-class SymbolRepository(Repository[Symbol]):
-    """Repository for Symbol operations"""
-
-    def __init__(self, session_factory: async_sessionmaker):
-        super().__init__(session_factory, Symbol)
-
-    async def get_or_create(self, symbol_info: SymbolInfo) -> Symbol:
-        try:
-            async with self.get_session() as session:
-                stmt = select(self.model_class).where(
-                    and_(Symbol.name == symbol_info.name, Symbol.exchange == symbol_info.exchange)
-                )
-                result = await session.execute(stmt)
-                symbol = result.scalar_one_or_none()
-
-                if symbol:
-                    if symbol.first_trade_time is None:
-                        symbol.first_trade_time = symbol_info.launch_time
-                        await session.flush()
-                    return symbol
-
-                symbol = Symbol(
-                    name=symbol_info.name,
-                    exchange=symbol_info.exchange,
-                    first_trade_time=symbol_info.launch_time
-                )
-                session.add(symbol)
-                await session.flush()
-                await session.refresh(symbol)
-                logger.info(
-                    f"Created new symbol: {symbol_info.name} for {symbol_info.exchange} "
-                    f"with launch time {from_timestamp(symbol_info.launch_time)}"
-                )
-                return symbol
-
-        except Exception as e:
-            logger.error(f"Error in get_or_create: {e}")
-            raise RepositoryError(f"Failed to get or create symbol: {str(e)}")
-
-    async def get_by_exchange(self, exchange: ExchangeName) -> List[Symbol]:
-        """Get all symbols for an exchange"""
-        try:
-            async with self.get_session() as session:
-                stmt = select(self.model_class).where(Symbol.exchange == exchange)
-                result = await session.execute(stmt)
-                return list(result.scalars().all())
-        except Exception as e:
-            logger.error(f"Error getting symbols: {e}")
-            raise RepositoryError(f"Failed to get symbols: {str(e)}")
 
 class KlineRepository(Repository[Kline]):
     """Repository for Kline operations"""
@@ -128,7 +78,7 @@ class KlineRepository(Repository[Kline]):
                       timeframe: Timeframe,
                       klines: List[Tuple]) -> int:
         """
-        Insert a batch of klines for a symbol.
+        Insert a batch of klines for a symbol with UPSERT functionality.
 
         Args:
             symbol: Trading symbol name
@@ -136,7 +86,7 @@ class KlineRepository(Repository[Kline]):
             klines: List of kline data tuples
 
         Returns:
-            int: Number of klines inserted
+            int: Number of klines processed
 
         Raises:
             RepositoryError: If insert fails
@@ -144,8 +94,8 @@ class KlineRepository(Repository[Kline]):
         try:
             inserted_count = 0
 
-            # Get the symbol record first
             async with self.get_session() as session:
+                # Get the symbol record first
                 symbol_stmt = select(Symbol).where(Symbol.name == symbol.name)
                 result = await session.execute(symbol_stmt)
                 symbol_record = result.scalar_one_or_none()
@@ -156,36 +106,58 @@ class KlineRepository(Repository[Kline]):
                 # Process klines in batches
                 for i in range(0, len(klines), self._batch_size):
                     batch = klines[i:i + self._batch_size]
-                    kline_objects = []
+                    valid_klines = []
 
+                    # Validate klines first
                     for k in batch:
                         try:
                             if self.validator.validate_kline(*k):
-                                kline_objects.append(
-                                    Kline(
-                                        symbol_id=symbol_record.id,
-                                        timeframe=timeframe.value,
-                                        start_time=k[0],
-                                        open_price=k[1],
-                                        high_price=k[2],
-                                        low_price=k[3],
-                                        close_price=k[4],
-                                        volume=k[5],
-                                        turnover=k[6]
-                                    )
-                                )
+                                valid_klines.append({
+                                    "symbol_id": symbol_record.id,
+                                    "timeframe": timeframe.value,
+                                    "start_time": k[0],
+                                    "open_price": k[1],
+                                    "high_price": k[2],
+                                    "low_price": k[3],
+                                    "close_price": k[4],
+                                    "volume": k[5],
+                                    "turnover": k[6]
+                                })
                         except ValidationError as e:
                             logger.warning(f"Invalid kline data for {symbol}: {e}")
                             continue
 
-                    if kline_objects:
-                        session.add_all(kline_objects)
-                        await session.flush()
-                        inserted_count += len(kline_objects)
-                        logger.debug(f"Inserted batch of {len(kline_objects)} klines for {symbol}")
+                    if valid_klines:
+                        # Use UPSERT statement
+                        stmt = text("""
+                            INSERT INTO kline_data (
+                                symbol_id, timeframe, start_time,
+                                open_price, high_price, low_price, close_price,
+                                volume, turnover
+                            ) VALUES (
+                                :symbol_id, :timeframe, :start_time,
+                                :open_price, :high_price, :low_price, :close_price,
+                                :volume, :turnover
+                            )
+                            ON DUPLICATE KEY UPDATE
+                                open_price = VALUES(open_price),
+                                high_price = VALUES(high_price),
+                                low_price = VALUES(low_price),
+                                close_price = VALUES(close_price),
+                                volume = VALUES(volume),
+                                turnover = VALUES(turnover)
+                        """)
 
-                logger.debug(f"Inserted {inserted_count} klines for {symbol}, last timestamp: {klines[-1][0]}")
-            return inserted_count
+                        # Execute batch upsert
+                        await session.execute(stmt, valid_klines)
+                        await session.flush()
+                        inserted_count += len(valid_klines)
+                        logger.debug(f"Processed batch of {len(valid_klines)} klines for {symbol}")
+
+                if klines:  # Only log if we had data to process
+                    logger.debug(f"Processed {inserted_count} klines for {symbol}, last timestamp: {klines[-1][0]}")
+
+                return inserted_count
 
         except Exception as e:
             logger.error(f"Error inserting klines for {symbol}: {e}")
@@ -194,7 +166,6 @@ class KlineRepository(Repository[Kline]):
     async def get_data_gaps(self,
                             symbol: SymbolInfo,
                             timeframe: Timeframe,
-                            exchange: ExchangeName,
                             start_time: Timestamp,
                             end_time: Timestamp) -> List[Tuple[Timestamp, Timestamp]]:
         try:
@@ -221,7 +192,7 @@ class KlineRepository(Repository[Kline]):
                     stmt,
                     {
                         "symbol": symbol.name,
-                        "exchange": exchange,
+                        "exchange": symbol.exchange,
                         "timeframe": timeframe.value,
                         "start_time": start_time,
                         "end_time": end_time,

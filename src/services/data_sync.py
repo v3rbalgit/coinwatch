@@ -7,7 +7,8 @@ from typing import Optional, Set
 from src.adapters.registry import ExchangeAdapterRegistry
 from src.core.exceptions import ServiceError
 from src.core.symbol_state import SymbolState, SymbolStateManager
-from src.repositories.market_data import KlineRepository, SymbolRepository
+from src.repositories.kline import KlineRepository
+from src.repositories.symbol import SymbolRepository
 from src.utils.time import from_timestamp, get_current_timestamp
 
 from ..core.models import SymbolInfo
@@ -66,11 +67,12 @@ class HistoricalCollector:
         """Add symbol for historical collection with duplicate prevention"""
         async with self._collection_lock:
             if symbol not in self._processing_symbols:
+                await self._state_manager.add_symbol(symbol)
                 self._processing_symbols.add(symbol)
                 await self._collection_queue.put(symbol)
-                logger.info(f"Added {symbol} to historical collection queue")
+                logger.info(f"Added {symbol.name} ({symbol.exchange}) to historical collection queue")
             else:
-                logger.debug(f"Symbol {symbol} already in processing queue")
+                logger.debug(f"Symbol {symbol.name} ({symbol.exchange}) already in processing queue")
 
     async def _process_queue(self) -> None:
         """Process symbols in the queue with proper state management"""
@@ -90,6 +92,7 @@ class HistoricalCollector:
                         symbol,
                         SymbolState.READY
                     )
+                    logger.info(f"Syncing {symbol.name} ({symbol.exchange})...")
                 except Exception as e:
                     await self._state_manager.update_state(
                         symbol,
@@ -117,15 +120,18 @@ class HistoricalCollector:
             try:
                 # First ensure symbol exists in database
                 await self._symbol_repository.get_or_create(symbol)
-                current_time = get_current_timestamp()
 
+                # Get start time based on launch or last data
                 start_time = await self._kline_repository.get_latest_timestamp(symbol, timeframe)
+                current_time = get_current_timestamp()
 
                 if not start_time:
                     start_time = symbol.launch_time
+                else:
+                    start_time += timeframe.to_milliseconds()  # Ensure we start from the next timeframe
 
                 logger.info(
-                    f"Starting historical collection for {symbol.name} "
+                    f"Starting historical collection for {symbol.name} ({symbol.exchange})"
                     f"from {from_timestamp(start_time)} "
                     f"to {from_timestamp(current_time)}"
                 )
@@ -140,7 +146,6 @@ class HistoricalCollector:
                     )
 
                     if not klines:
-                        logger.info(f"No more data available for {symbol.name}")
                         break
 
                     # Store klines and update progress
@@ -157,14 +162,18 @@ class HistoricalCollector:
                         Timestamp(last_timestamp)
                     )
 
+                    # Get symbol progress and update it
+                    progress = await self._state_manager.get_progress(symbol)
+                    if progress:
+                        progress.update_progress(
+                            Timestamp(current_time),
+                            Timestamp(last_timestamp)
+                            )
+                        logger.info(f"Collection progress: {progress}")
+
                     start_time = last_timestamp + timeframe.to_milliseconds()
 
-                    logger.debug(
-                        f"Processed batch for {symbol.name}, "
-                        f"next start_time={from_timestamp(start_time)}"
-                    )
-
-                logger.info(f"Completed historical collection for {symbol.name}")
+                logger.info(f"Completed historical collection for {symbol.name} ({symbol.exchange})")
                 break  # Success - exit retry loop
 
             except Exception as e:
@@ -177,7 +186,7 @@ class HistoricalCollector:
                 delay = delay * (0.5 + random.random())  # Add jitter
                 logger.warning(
                     f"Retry {retry_count}/{self._max_retries} "
-                    f"for {symbol.name} after {delay:.2f}s: {e}"
+                    f"for {symbol.name} ({symbol.exchange}) after {delay:.2f}s: {e}"
                 )
                 await asyncio.sleep(delay)
 
@@ -323,18 +332,43 @@ class BatchSynchronizer:
             if not latest:
                 raise ServiceError(f"No data found for {symbol}")
 
+            # Calculate next timeframe start with safety checks
+            current_time = get_current_timestamp()
+            interval_ms = Timeframe.MINUTE_5.to_milliseconds()
+
+            # Handle case where latest is in future (shouldn't happen, but safety check)
+            if latest > current_time:
+                logger.warning(f"Latest timestamp {from_timestamp(latest)} is in future for {symbol}")
+                latest = current_time - interval_ms
+
+            # Calculate next start time
+            next_start = latest + interval_ms
+
+            # Skip if next_start would be in future
+            if next_start > current_time:
+                logger.debug(f"Next start time {from_timestamp(next_start)} is in future, skipping sync for {symbol}")
+                return
+
             # Get new data from exchange
             adapter = self._adapter_registry.get_adapter(symbol.exchange)
             klines = await adapter.get_klines(
                 symbol=symbol,
                 timeframe=Timeframe.MINUTE_5,
-                start_time=Timestamp(latest + 1),
+                start_time=Timestamp(next_start),
                 limit=50  # Smaller limit for regular updates
             )
 
             if klines:
-                # Store new klines
-                await self._kline_repository.insert_batch(
+                # Check for data continuity
+                first_timestamp = klines[0].timestamp
+                if first_timestamp - next_start > interval_ms:
+                    logger.warning(
+                        f"Data gap detected for {symbol}: "
+                        f"Expected {from_timestamp(next_start)}, got {from_timestamp(first_timestamp)}"
+                    )
+
+                # Store new klines (will use UPSERT for duplicates)
+                processed_count = await self._kline_repository.insert_batch(
                     symbol,
                     Timeframe.MINUTE_5,
                     [k.to_tuple() for k in klines]
@@ -348,12 +382,14 @@ class BatchSynchronizer:
                 )
 
                 logger.debug(
-                    f"Synced {len(klines)} new klines for {symbol} "
-                    f"up to {from_timestamp(last_timestamp)}"
+                    f"Processed {processed_count} klines for {symbol.name} ({symbol.exchange})"
+                    f"from {from_timestamp(first_timestamp)} "
+                    f"to {from_timestamp(last_timestamp)}"
                 )
 
         except Exception as e:
             logger.error(f"Error syncing {symbol}: {e}")
+            raise
             raise
 
     @property

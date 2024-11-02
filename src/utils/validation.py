@@ -189,10 +189,6 @@ class MarketDataValidator:
             cls._validate_price_relationships(open_dec, high_dec, low_dec, close_dec)
 
             dt = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
-            logger.debug(
-                f"Validated kline: {dt} - "
-                f"O:{open_dec}, H:{high_dec}, L:{low_dec}, C:{close_dec}, V:{volume_dec}"
-            )
 
             return True, (open_dec, high_dec, low_dec, close_dec, volume_dec, turnover_dec)
 

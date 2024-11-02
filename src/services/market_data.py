@@ -6,7 +6,8 @@ from typing import Optional
 from src.adapters.registry import ExchangeAdapterRegistry
 from src.config import MarketDataConfig
 from src.core.symbol_state import SymbolState, SymbolStateManager
-from src.repositories.market_data import KlineRepository, SymbolRepository
+from src.repositories.kline import KlineRepository
+from src.repositories.symbol import SymbolRepository
 from src.services.base import ServiceBase
 from src.services.data_sync import BatchSynchronizer, HistoricalCollector
 from src.utils.time import get_current_timestamp
@@ -31,7 +32,6 @@ class MarketDataService(ServiceBase):
         self.exchange_registry = exchange_registry
         self.config = config
 
-        # Initialize components
         self.state_manager = SymbolStateManager()
         self.historical_collector = HistoricalCollector(
             exchange_registry,

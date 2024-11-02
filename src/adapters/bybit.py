@@ -318,7 +318,6 @@ class BybitAdapter(ExchangeAdapter):
                     )
                     continue
 
-                logger.debug(f"Processing kline item: {item}")
                 klines.append(KlineData(
                     timestamp=timestamp,
                     open_price=Decimal(str(item[1])),

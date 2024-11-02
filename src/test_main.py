@@ -1,11 +1,15 @@
+# src/test_main.py
+
 import sys
 import asyncio
 from typing import List
 
+from src.repositories.kline import KlineRepository
+from src.repositories.symbol import SymbolRepository
+
 from .config import BybitConfig, Config
 from .services.database import DatabaseService
 from .services.market_data import MarketDataService
-from .repositories.market_data import SymbolRepository, KlineRepository
 from .adapters.registry import ExchangeAdapterRegistry
 from .adapters.bybit import BybitAdapter
 from .core.exceptions import CoinwatchError
@@ -71,7 +75,7 @@ class TestApplication:
 
             # Keep application running
             while True:
-                if not market_service._status == ServiceStatus.ERROR:
+                if market_service._status == ServiceStatus.ERROR:
                     self.logger.error(f"Service unhealthy: {market_service._last_error}")
                     await market_service.handle_error(market_service._last_error)
 
