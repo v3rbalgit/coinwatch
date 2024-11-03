@@ -7,8 +7,8 @@ from typing import Dict, Optional, List
 
 from ..utils.time import get_current_timestamp
 from ..utils.logger import LoggerSetup
-from ..core.models import SymbolInfo
 from ..utils.domain_types import Timeframe, Timestamp
+from ..core.models import SymbolInfo
 
 logger = LoggerSetup.setup(__name__)
 

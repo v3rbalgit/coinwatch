@@ -13,7 +13,7 @@ from src.core.protocols import ObserverProtocol
 from .base import Action
 from .resource import MemoryRecoveryAction, CPURecoveryAction, DiskRecoveryAction
 from ..observers.base import Observation
-from ...utils.logger import LoggerSetup
+from src.utils.logger import LoggerSetup
 
 logger = LoggerSetup.setup(__name__)
 
