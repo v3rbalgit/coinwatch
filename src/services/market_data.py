@@ -25,7 +25,7 @@ class MarketDataService(ServiceBase):
                  kline_repository: KlineRepository,
                  exchange_registry: ExchangeAdapterRegistry,
                  config: MarketDataConfig):
-        super().__init__()
+        super().__init__(config)
 
         self.symbol_repository = symbol_repository
         self.kline_repository = kline_repository
@@ -105,6 +105,7 @@ class MarketDataService(ServiceBase):
 
                 await asyncio.sleep(self._symbol_check_interval)
 
+            # TODO: handle HTTPSConnectionPool(host='api.bybit.com', port=443): Max retries exceeded with url: /v5/market/instruments-info?category=linear (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x7fd257ea2510>: Failed to establish a new connection: [Errno 111] Connection refused'))
             except Exception as e:
                 logger.error(f"Error monitoring symbols: {e}")
                 await asyncio.sleep(60)

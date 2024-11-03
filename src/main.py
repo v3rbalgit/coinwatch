@@ -58,6 +58,8 @@ class Application:
             # Start service
             await market_service.start()
 
+            # await monitor_service.start()
+
             # Keep application running
             while True:
                 if market_service._status == ServiceStatus.ERROR:

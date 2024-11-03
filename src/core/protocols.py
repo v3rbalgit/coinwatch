@@ -1,8 +1,9 @@
 # src/core/protocols.py
 
 from typing import Protocol, List, Optional
-from ..utils.domain_types import SymbolName, Timeframe, Price, Timestamp
-from ..core.models import KlineData, SymbolInfo
+
+from ..utils.domain_types import Timeframe, Timestamp
+from ..core.models import KlineData, Observation, SymbolInfo
 
 class ExchangeAdapter(Protocol):
     """Exchange adapter protocol"""
@@ -32,11 +33,8 @@ class ExchangeAdapter(Protocol):
         """Close adapter connection"""
         ...
 
-
-class MarketDataProvider(Protocol):
-    """Market data provider protocol"""
-    async def get_latest_price(self, symbol: SymbolName) -> Price: ...
-    async def get_price_history(self,
-                              symbol: SymbolName,
-                              timeframe: Timeframe,
-                              start_time: Timestamp) -> List['Kline']: ...
+class ObserverProtocol(Protocol):
+    """Protocol for system observers"""
+    async def on_observation(self, observation: Observation) -> None:
+        """Handle new observation"""
+        ...

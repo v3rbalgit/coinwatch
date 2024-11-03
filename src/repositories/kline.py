@@ -1,6 +1,6 @@
 # src/repositories/kline.py
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 from sqlalchemy import select, func, and_, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -9,7 +9,7 @@ from src.utils.time import from_timestamp, get_past_timestamp
 
 from .base import Repository
 from ..models.market import Symbol, Kline
-from ..utils.domain_types import ExchangeName, Timeframe, Timestamp
+from ..utils.domain_types import Timeframe, Timestamp
 from ..core.exceptions import RepositoryError, ValidationError
 from ..utils.logger import LoggerSetup
 from ..utils.validation import MarketDataValidator
@@ -152,7 +152,6 @@ class KlineRepository(Repository[Kline]):
                         await session.execute(stmt, valid_klines)
                         await session.flush()
                         inserted_count += len(valid_klines)
-                        logger.debug(f"Processed batch of {len(valid_klines)} klines for {symbol}")
 
                 if klines:  # Only log if we had data to process
                     logger.debug(f"Processed {inserted_count} klines for {symbol}, last timestamp: {klines[-1][0]}")
