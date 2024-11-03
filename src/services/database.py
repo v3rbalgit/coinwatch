@@ -44,7 +44,7 @@ class DatabaseService(ServiceBase):
     """Database service with connection pooling and session management"""
 
     def __init__(self, config: DatabaseConfig):
-        super().__init__()
+        super().__init__(config)
         self.engine: Optional[AsyncEngine] = None
         self._connection_url = config.url
         self._status = ServiceStatus.STOPPED

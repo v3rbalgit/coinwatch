@@ -1,16 +1,19 @@
 # src/services/monitor.py
+
 from collections import deque
 from dataclasses import dataclass
 from typing import Deque, List, Dict, Any, Optional
 import asyncio
 from datetime import datetime, timedelta
 import psutil
+from prometheus_client import generate_latest
 
 from src.config import MonitoringConfig
 from src.core.models import Observation
-from src.monitoring.observers.base import SystemObserver
-from src.monitoring.observers.resource import ResourceObserver
-from src.utils.domain_types import ServiceStatus
+from ..monitoring.metrics import HealthMetrics, MonitoringMetrics
+from ..monitoring.observers.base import SystemObserver
+from ..monitoring.observers.resource import ResourceObserver
+from ..utils.domain_types import ServiceStatus
 
 from ..monitoring.observers.observers import (
     DatabaseObserver,
@@ -26,19 +29,6 @@ from ..services.base import ServiceBase
 from ..utils.logger import LoggerSetup
 
 logger = LoggerSetup.setup(__name__)
-
-@dataclass
-class HealthMetrics:
-    """Detailed health metrics suitable for Prometheus"""
-    status: ServiceStatus
-    uptime_seconds: float
-    active_observers: int
-    total_observations: int
-    last_observation_time: Optional[datetime]
-    error_count: int
-    observer_states: Dict[str, str]
-    memory_usage_mb: float
-    observer_metrics: Dict[str, Dict[str, float]]
 
 @dataclass
 class ObserverHealth:
@@ -74,7 +64,6 @@ class MonitoringEntry:
             'metrics': self.metrics
         }
 
-
 class StateManager:
     """Manages monitoring service state"""
     def __init__(self, config: MonitoringConfig):
@@ -88,9 +77,18 @@ class StateManager:
         self._observer_states: Dict[str, ObserverState] = {}
         self._tasks: Dict[str, asyncio.Task] = {}
 
-        # Calculate metrics history size
-        observations_per_hour = sum(3600 / interval for interval in config.check_intervals.values())
-        maxlen = int(config.retention_hours * observations_per_hour)
+        # Calculate metrics history size with hard limit
+        observations_per_hour = sum(3600 / interval for interval in self._config.check_intervals.values())
+        # Add safety checks
+        if observations_per_hour <= 0:
+            observations_per_hour = 60  # Default to 1 per minute
+        # Calculate desired length
+        desired_length = int(config.retention_hours * observations_per_hour)
+        # Set hard limit based on container considerations:
+        # - 50,000 entries × 300 bytes ≈ 15MB max memory usage
+        # - Allows for 24 hours of data at 35 observations/minute
+        # - Safe for containers with ≥256MB memory
+        maxlen = min(desired_length, 50_000)
         self._metrics_history: Deque[MonitoringEntry] = deque(maxlen=maxlen)
 
     async def set_status(self, status: ServiceStatus, error: Optional[Exception] = None) -> None:
@@ -104,6 +102,8 @@ class StateManager:
                         self._start_time = datetime.now()
         except asyncio.TimeoutError:
             logger.error("Status update timed out")
+            # TODO: Attempt state recovery
+            # await self._recover_state()
             raise
 
     @property
@@ -229,6 +229,17 @@ class MonitoringService(ServiceBase):
         self.dispatcher = ActionDispatcher()
         self._setup_actions()
 
+
+        # Initialize metrics
+        self.metrics = MonitoringMetrics()
+
+        # Update service info
+        self.metrics.service_info.info({
+            'version': '1.0.0',
+            'config_retention_hours': str(self._config.retention_hours),
+            'config_check_intervals': str(self._config.check_intervals)
+        })
+
     def _setup_actions(self) -> None:
         """Setup action mappings"""
         mappings = [
@@ -286,6 +297,9 @@ class MonitoringService(ServiceBase):
             await self._state.set_status(ServiceStatus.STOPPING)
             logger.info("Stopping monitoring service")
 
+            # Add cleanup start timestamp
+            cleanup_start = datetime.now()
+
             # Stop all tasks
             tasks = await self._state.get_tasks()
             for task in tasks:
@@ -318,11 +332,13 @@ class MonitoringService(ServiceBase):
             # Clear state
             await self._state.clear()
             await self._state.set_status(ServiceStatus.STOPPED)
-            logger.info("Monitoring service stopped successfully")
+            # Log cleanup duration
+            cleanup_duration = (datetime.now() - cleanup_start).total_seconds()
+            logger.info(f"Monitoring service stopped successfully in {cleanup_duration:.2f}s")
 
         except Exception as e:
             await self._state.set_status(ServiceStatus.ERROR, e)
-            logger.error(f"Error stopping monitoring service: {e}")
+            logger.error(f"Error stopping monitoring service: {e}", exc_info=True)
             raise
 
     async def _run_observer(self, name: str, observer: SystemObserver) -> None:
@@ -358,6 +374,7 @@ class MonitoringService(ServiceBase):
                 await self._handle_observer_error(name, e)
                 await asyncio.sleep(self._config.base_backoff)
 
+    # TODO: add circuit breaker mechanism based on max error_count
     async def _handle_observer_error(self, name: str, error: Exception) -> None:
         """Handle observer errors with backoff"""
         try:
@@ -480,36 +497,43 @@ class MonitoringService(ServiceBase):
             logger.error(f"Error getting last observation time: {e}")
             return None
 
-    async def get_prometheus_metrics(self) -> List[str]:
+    async def get_prometheus_metrics(self) -> bytes:
         """Get metrics in Prometheus format"""
         try:
             health = await self.get_health_metrics()
 
-            metrics = []
+            # Update Prometheus metrics based on health data
+            self.metrics.service_up.labels(
+                status=health.status.value
+            ).set(1 if health.status == ServiceStatus.RUNNING else 0)
 
             # Basic service metrics
-            metrics.extend([
-                f'monitoring_service_up{{status="{health.status.value}"}} 1',
-                f'monitoring_service_uptime_seconds {health.uptime_seconds}',
-                f'monitoring_service_active_observers {health.active_observers}',
-                f'monitoring_service_total_observations {health.total_observations}',
-                f'monitoring_service_error_count {health.error_count}',
-                f'monitoring_service_memory_usage_mb {health.memory_usage_mb}'
-            ])
+            self.metrics.service_uptime.inc(health.uptime_seconds)
+            self.metrics.active_observers.set(health.active_observers)
+            self.metrics.total_observations.inc()
+            self.metrics.error_count.inc(health.error_count)
+            self.metrics.memory_usage_bytes.set(health.memory_usage_mb * 1024 * 1024)
 
             # Observer-specific metrics
             for observer_name, observer_metrics in health.observer_metrics.items():
-                for metric_name, value in observer_metrics.items():
-                    metrics.append(
-                        f'monitoring_observer_{metric_name}{{observer="{observer_name}"}} {value}'
-                    )
+                if 'success_rate' in observer_metrics:
+                    self.metrics.observer_success_rate.labels(
+                        observer=observer_name
+                    ).set(observer_metrics['success_rate'])
 
-            return metrics
+                if 'seconds_since_success' in observer_metrics:
+                    self.metrics.observer_last_success.labels(
+                        observer=observer_name
+                    ).set(observer_metrics['seconds_since_success'])
+
+            # Let prometheus_client handle the formatting
+            return generate_latest(self.metrics.registry)
 
         except Exception as e:
             logger.error(f"Error generating Prometheus metrics: {e}")
-            # Return basic up/down metric on error
-            return [f'monitoring_service_up{{status="error"}} 0']
+            # Return basic up metric on error
+            self.metrics.service_up.labels(status="error").set(0)
+            return generate_latest(self.metrics.registry)
 
     @property
     def is_healthy(self) -> bool:
