@@ -1,6 +1,6 @@
 # src/config.py
 
-from typing import Optional, List
+from typing import Dict, Optional, List
 from dataclasses import dataclass, field
 import os
 from dotenv import load_dotenv
@@ -61,6 +61,23 @@ class MarketDataConfig:
     )
 
 @dataclass
+class MonitoringConfig:
+    """Configuration for monitoring service"""
+    retention_hours: int = 24
+    health_check_interval: int = 60
+    max_backoff: int = 300
+    base_backoff: int = 5
+    max_error_history: int = 1000
+    lock_timeout: float = 5.0
+    check_intervals: Dict[str, int] = field(
+        default_factory=lambda: {
+            'resource': 30,
+            'database': 60,
+            'network': 60
+        }
+    )
+
+@dataclass
 class LogConfig:
     """Logging configuration"""
     level: str = "INFO"
@@ -79,6 +96,7 @@ class Config:
         self.database = self._init_database_config()
         self.exchanges = self._init_exchange_config()
         self.market_data = self._init_market_data_config()
+        self.monitoring = self._init_monitoring_config()
         self.logging = self._init_log_config()
 
     def _init_database_config(self) -> DatabaseConfig:
@@ -130,6 +148,25 @@ class Config:
             )
         except Exception as e:
             raise ConfigurationError(f"Invalid market data configuration: {e}")
+
+    def _init_monitoring_config(self) -> MonitoringConfig:
+        """Initialize monitoring configuration"""
+        try:
+            return MonitoringConfig(
+                retention_hours=int(os.getenv('MONITORING_RETENTION_HOURS', '24')),
+                health_check_interval=int(os.getenv('MONITORING_HEALTH_CHECK_INTERVAL', '60')),
+                max_backoff=int(os.getenv('MONITORING_MAX_BACKOFF', '300')),
+                base_backoff=int(os.getenv('MONITORING_BASE_BACKOFF', '5')),
+                max_error_history=int(os.getenv('MONITORING_MAX_ERROR_HISTORY', '1000')),
+                lock_timeout=float(os.getenv('MONITORING_LOCK_TIMEOUT', '5.0')),
+                check_intervals={
+                    'resource': int(os.getenv('MONITORING_RESOURCE_INTERVAL', '30')),
+                    'database': int(os.getenv('MONITORING_DATABASE_INTERVAL', '60')),
+                    'network': int(os.getenv('MONITORING_NETWORK_INTERVAL', '60'))
+                }
+            )
+        except Exception as e:
+            raise ConfigurationError(f"Invalid monitoring configuration: {e}")
 
     def _init_log_config(self) -> LogConfig:
         """Initialize logging configuration"""

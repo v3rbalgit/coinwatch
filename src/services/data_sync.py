@@ -124,19 +124,23 @@ class HistoricalCollector:
                 # Get start time based on launch or last data
                 start_time = await self._kline_repository.get_latest_timestamp(symbol, timeframe)
                 current_time = get_current_timestamp()
+                interval_ms = timeframe.to_milliseconds()
+
+                # Adjust current_time to the last completed interval
+                last_complete_interval = current_time - (current_time % interval_ms) - interval_ms
 
                 if not start_time:
                     start_time = symbol.launch_time
                 else:
-                    start_time += timeframe.to_milliseconds()  # Ensure we start from the next timeframe
+                    start_time += interval_ms  # Ensure we start from the next timeframe
 
                 logger.info(
-                    f"Starting historical collection for {symbol.name} ({symbol.exchange})"
+                    f"Starting historical collection for {symbol.name} ({symbol.exchange}) "
                     f"from {from_timestamp(start_time)} "
-                    f"to {from_timestamp(current_time)}"
+                    f"to {from_timestamp(current_time)} "
                 )
 
-                while start_time < current_time:
+                while start_time < last_complete_interval:
                     # Fetch batch of historical data
                     klines = await adapter.get_klines(
                         symbol=symbol,
@@ -147,6 +151,9 @@ class HistoricalCollector:
 
                     if not klines:
                         break
+
+                    # Only store klines up to the last complete interval
+                    klines = [k for k in klines if k.timestamp <= last_complete_interval]
 
                     # Store klines and update progress
                     await self._kline_repository.insert_batch(
@@ -171,9 +178,10 @@ class HistoricalCollector:
                             )
                         logger.info(f"Collection progress: {progress}")
 
-                    start_time = last_timestamp + timeframe.to_milliseconds()
+                    start_time = last_timestamp + interval_ms
 
-                logger.info(f"Completed historical collection for {symbol.name} ({symbol.exchange})")
+                logger.info(f"Completed historical collection for {symbol.name} ({symbol.exchange})"
+                            f"up to {from_timestamp(current_time)}")
                 break  # Success - exit retry loop
 
             except Exception as e:
@@ -336,6 +344,9 @@ class BatchSynchronizer:
             current_time = get_current_timestamp()
             interval_ms = Timeframe.MINUTE_5.to_milliseconds()
 
+            # Calculate the last completed interval
+            last_complete_interval = current_time - (current_time % interval_ms) - interval_ms
+
             # Handle case where latest is in future (shouldn't happen, but safety check)
             if latest > current_time:
                 logger.warning(f"Latest timestamp {from_timestamp(latest)} is in future for {symbol}")
@@ -345,9 +356,11 @@ class BatchSynchronizer:
             next_start = latest + interval_ms
 
             # Skip if next_start would be in future
-            if next_start > current_time:
-                logger.debug(f"Next start time {from_timestamp(next_start)} is in future, skipping sync for {symbol}")
-                return
+            if next_start > last_complete_interval:
+                logger.debug(
+                    f"Next start time {from_timestamp(next_start)} is beyond last complete interval "
+                    f"{from_timestamp(last_complete_interval)}, skipping sync for {symbol.name} ({symbol.exchange})"
+                )
 
             # Get new data from exchange
             adapter = self._adapter_registry.get_adapter(symbol.exchange)
@@ -357,6 +370,9 @@ class BatchSynchronizer:
                 start_time=Timestamp(next_start),
                 limit=50  # Smaller limit for regular updates
             )
+
+            # Only process klines up to the last complete interval
+            klines = [k for k in klines if k.timestamp <= last_complete_interval]
 
             if klines:
                 # Check for data continuity
@@ -382,14 +398,14 @@ class BatchSynchronizer:
                 )
 
                 logger.debug(
-                    f"Processed {processed_count} klines for {symbol.name} ({symbol.exchange})"
+                    f"Processed {processed_count} klines for {symbol.name} ({symbol.exchange}) "
                     f"from {from_timestamp(first_timestamp)} "
                     f"to {from_timestamp(last_timestamp)}"
+                    f"(last complete interval: {from_timestamp(last_complete_interval)})"
                 )
 
         except Exception as e:
             logger.error(f"Error syncing {symbol}: {e}")
-            raise
             raise
 
     @property

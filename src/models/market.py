@@ -44,12 +44,12 @@ class Kline(Base):
     timeframe: Mapped[str] = mapped_column(String(10), index=True)
 
     # Price and volume fields
-    open_price: Mapped[float] = mapped_column(Float(precision=10, decimal_return_scale=8))
-    high_price: Mapped[float] = mapped_column(Float(precision=10, decimal_return_scale=8))
-    low_price: Mapped[float] = mapped_column(Float(precision=10, decimal_return_scale=8))
-    close_price: Mapped[float] = mapped_column(Float(precision=10, decimal_return_scale=8))
-    volume: Mapped[float] = mapped_column(Float(precision=10, decimal_return_scale=8))
-    turnover: Mapped[float] = mapped_column(Float(precision=10, decimal_return_scale=8))
+    open_price: Mapped[float] = mapped_column(Float(precision=18, decimal_return_scale=8))
+    high_price: Mapped[float] = mapped_column(Float(precision=18, decimal_return_scale=8))
+    low_price: Mapped[float] = mapped_column(Float(precision=18, decimal_return_scale=8))
+    close_price: Mapped[float] = mapped_column(Float(precision=18, decimal_return_scale=8))
+    volume: Mapped[float] = mapped_column(Float(precision=18, decimal_return_scale=8))
+    turnover: Mapped[float] = mapped_column(Float(precision=18, decimal_return_scale=8))
 
     # Define the relationship back to Symbol
     symbol: Mapped['Symbol'] = relationship('Symbol', back_populates='klines')

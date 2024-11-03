@@ -8,7 +8,7 @@ from typing import Dict, Optional, List
 from ..utils.time import get_current_timestamp
 from ..utils.logger import LoggerSetup
 from ..core.models import SymbolInfo
-from ..utils.domain_types import Timestamp
+from ..utils.domain_types import Timeframe, Timestamp
 
 logger = LoggerSetup.setup(__name__)
 
@@ -33,15 +33,19 @@ class SymbolProgress:
     total_periods: Optional[int] = None
     processed_periods: Optional[int] = None
 
-    def update_progress(self, current_time: Timestamp, processed_time: Optional[Timestamp] = None) -> None:
+    def update_progress(self,
+                        current_time: Timestamp,
+                        processed_time: Optional[Timestamp] = None,
+                        timeframe: Timeframe = Timeframe.MINUTE_5) -> None:
         """Update historical data collection progress"""
         if self.launch_time and current_time > self.launch_time:
             total_time = current_time - self.launch_time
+            interval_ms = timeframe.to_milliseconds()
 
             if processed_time:
-                collected_time = processed_time - self.launch_time
-                self.processed_periods = int(collected_time / (5 * 60 * 1000))  # for 5-minute candles
-                self.total_periods = int(total_time / (5 * 60 * 1000))
+                collected_time = processed_time - self.launch_time + interval_ms # last candle is incomplete
+                self.processed_periods = int(collected_time / interval_ms)  # for 5-minute candles
+                self.total_periods = int(total_time / interval_ms)
                 self.historical_progress = min(100.0, (collected_time / total_time) * 100)
 
     def __str__(self) -> str:

@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Tuple
+from typing import Any, Dict, Tuple
 from ..utils.domain_types import SymbolName, ExchangeName, Timestamp
 
 @dataclass
@@ -98,3 +98,13 @@ class SymbolInfo:
     def trading_pair(self) -> str:
         """Get base/quote pair"""
         return f"{self.base_asset}/{self.quote_asset}"
+
+
+@dataclass
+class Observation:
+    """Represents a system observation"""
+    timestamp: datetime
+    source: str
+    metrics: Dict[str, Any]
+    severity: str
+    context: Dict[str, Any]

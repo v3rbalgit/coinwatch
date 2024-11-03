@@ -305,10 +305,12 @@ class BybitAdapter(ExchangeAdapter):
                 params["start"] = start_time
 
             response = await self._execute_request(self._get_klines, **params)
+            items = response.get('result', {}).get('list', [])
 
             klines: List[KlineData] = []
+
             # Process items in reverse order to convert from descending to ascending
-            for item in reversed(response.get('result', {}).get('list', [])):
+            for item in reversed(items):
                 timestamp = int(item[0])
 
                 # Skip future timestamps
