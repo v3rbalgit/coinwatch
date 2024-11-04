@@ -3,12 +3,13 @@
 import sys
 import asyncio
 
+from src.core.coordination import ServiceCoordinator
 from src.repositories.kline import KlineRepository
 from src.repositories.symbol import SymbolRepository
 
 from .config import Config
 from .services.database import DatabaseService
-from .services.market_data import MarketDataService
+from .services.market_data.service import MarketDataService
 from .adapters.registry import ExchangeAdapterRegistry
 from .adapters.bybit import BybitAdapter
 from .core.exceptions import CoinwatchError
@@ -31,9 +32,15 @@ class Application:
         self.db_service = DatabaseService(self.config.database)
         self.exchange_registry = ExchangeAdapterRegistry()
 
+        # Initialize coordinator
+        self.coordinator = ServiceCoordinator()
+
     async def start(self) -> None:
         """Start the application"""
         try:
+            # Start coordinator
+            await self.coordinator.start()
+
             # Initialize database
             await self.db_service.start()
 
@@ -52,6 +59,7 @@ class Application:
                 symbol_repo,
                 kline_repo,
                 self.exchange_registry,
+                self.coordinator,
                 self.config.market_data
             )
 
