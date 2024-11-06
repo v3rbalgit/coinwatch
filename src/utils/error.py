@@ -1,4 +1,5 @@
 # src/utils/error.py
+import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set
@@ -30,8 +31,9 @@ class ErrorTracker:
     def __init__(self, window_size: int = 3600):  # 1 hour window
         self._errors: Dict[str, ErrorRecord] = {}
         self._window_size = window_size
+        self._lock = asyncio.Lock()
 
-    def record_error(self,
+    async def record_error(self,
                     error: Exception,
                     entity: Optional[str] = None,
                     **context) -> None:
@@ -46,34 +48,30 @@ class ErrorTracker:
         error_type = error.__class__.__name__
         now = datetime.now(timezone.utc)
 
-        if error_type not in self._errors:
-            self._errors[error_type] = ErrorRecord(
-                error_type=error_type,
-                first_seen=now,
-                last_seen=now
-            )
+        async with self._lock:
+            if error_type not in self._errors:
+                self._errors[error_type] = ErrorRecord(
+                    error_type=error_type,
+                    first_seen=now,
+                    last_seen=now
+                )
 
-        self._errors[error_type].update(entity, **context)
+            self._errors[error_type].update(entity, **context)
 
-    def get_error_frequency(self, error_type: str, window_minutes: Optional[int] = None) -> float:
-        """
-        Get error frequency per hour within specified window
-
-        Args:
-            error_type: Type of error to check
-            window_minutes: Optional custom window size in minutes
-        """
-        if record := self._errors.get(error_type):
-            if record.first_seen and record.last_seen:
-                if window_minutes:
-                    # Check only within specified window
-                    window_start = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
-                    if record.last_seen < window_start:
-                        return 0.0
-
-                duration = (record.last_seen - record.first_seen).total_seconds()
-                if duration > 0:
-                    return (record.count / duration) * 3600
+    async def get_error_frequency(self,
+                                error_type: str,
+                                window_minutes: Optional[int] = None) -> float:
+        """Thread-safe error frequency calculation"""
+        async with self._lock:
+            if record := self._errors.get(error_type):
+                if record.first_seen and record.last_seen:
+                    if window_minutes:
+                        window_start = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+                        if record.last_seen < window_start:
+                            return 0.0
+                    duration = (record.last_seen - record.first_seen).total_seconds()
+                    if duration > 0:
+                        return (record.count / duration) * 3600
         return 0.0
 
     def get_affected_entities(self, error_type: str) -> Set[str]:

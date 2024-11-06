@@ -37,12 +37,13 @@ class BatchSynchronizer:
 
         # Sync management
         self._schedules: Dict[str, SyncSchedule] = {}
-        self._update_lock = asyncio.Lock()
+        self._schedules_lock = asyncio.Lock()
         # Bybit Rate Limit: 600 requests per 5 seconds = 120 requests per second
         # For safety (to account for network latency, response times, etc.):
         # - Let's use 75% of the limit: 120 * 0.75 = 90 requests/second
         # - Round down for extra safety: 80 concurrent updates
         self._max_concurrent_updates = max_concurrent_updates
+        self._update_lock = asyncio.Lock()
         self._sync_semaphore = asyncio.BoundedSemaphore(self._max_concurrent_updates)  # Limit concurrent operations
         self._processing: Set[str] = set()
 
@@ -133,38 +134,40 @@ class BatchSynchronizer:
         while self._active:
             try:
                 current_time = datetime.now(timezone.utc)
+                tasks = []
 
-                # Find symbols that need syncing
-                pending_syncs = [
-                    schedule for schedule in self._schedules.values()
-                    if current_time >= schedule.next_sync
-                    and schedule.symbol.name not in self._processing
-                ]
+                async with self._schedules_lock:
+                    # Get pending syncs and update processing set atomically
+                    pending_syncs = [
+                        schedule for schedule in self._schedules.values()
+                        if current_time >= schedule.next_sync
+                        and schedule.symbol.name not in self._processing
+                    ]
 
-                if pending_syncs:
-                    # Process all pending syncs concurrently
-                    tasks = []
+                    # Update processing set while holding lock
                     for schedule in pending_syncs:
                         self._processing.add(schedule.symbol.name)
                         tasks.append(self._sync_symbol_with_timing(schedule))
 
-                    # Wait for all syncs to complete
+                # Execute tasks outside the lock
+                if tasks:
                     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                    # Process any errors
+                    # Process errors
                     for schedule, result in zip(pending_syncs, results):
                         if isinstance(result, Exception):
-                            self._error_tracker.record_error(
+                            await self._error_tracker.record_error(
                                 result,
                                 schedule.symbol.name,
                                 context="sync"
                             )
 
-                # Calculate time to next sync
-                next_syncs = [s.next_sync for s in self._schedules.values()]
+                # Calculate next sleep interval with protected access
+                async with self._schedules_lock:
+                    next_syncs = [s.next_sync for s in self._schedules.values()]
+
                 if next_syncs:
-                    next_sync = min(next_syncs)
-                    sleep_time = (next_sync - datetime.now(timezone.utc)).total_seconds()
+                    sleep_time = (min(next_syncs) - datetime.now(timezone.utc)).total_seconds()
                     if sleep_time > 0:
                         await asyncio.sleep(sleep_time)
                 else:
@@ -184,6 +187,11 @@ class BatchSynchronizer:
             async with self._sync_semaphore:
                 try:
                     processed_count = await self._perform_sync(schedule)
+
+                    async with self._schedules_lock:
+                        # Update schedule while holding lock
+                        if schedule.symbol.name in self._schedules:
+                            self._schedules[schedule.symbol.name].update(datetime.now(timezone.utc))
 
                     # Report successful sync
                     await self._coordinator.execute(Command(
@@ -205,7 +213,7 @@ class BatchSynchronizer:
                     ))
 
                 except Exception as e:
-                    self._error_tracker.record_error(
+                    await self._error_tracker.record_error(
                         e,
                         schedule.symbol.name,
                         context="sync"
@@ -245,7 +253,8 @@ class BatchSynchronizer:
                     ))
 
         finally:
-            self._processing.remove(schedule.symbol.name)
+            async with self._schedules_lock:
+                self._processing.remove(schedule.symbol.name)
 
     async def _perform_sync(self, schedule: SyncSchedule) -> int:
         """
@@ -346,24 +355,29 @@ class BatchSynchronizer:
             logger.info(f"Adjusted concurrent updates: {old_value} -> {target_value}")
 
     def get_sync_status(self) -> str:
-        """Get detailed synchronization status"""
+        """Get synchronization status with copy of state"""
         current_time = datetime.now(timezone.utc)
+
+        # Take snapshots of state to avoid locks in string formatting
+        schedules_count = len(self._schedules)
+        processing_count = len(self._processing)
+        max_updates = self._max_concurrent_updates
 
         status = [
             "Synchronization Status:",
-            f"Scheduled Symbols: {len(self._schedules)}",
-            f"Active Syncs: {len(self._processing)}",
-            f"Concurrent Limit: {self._max_concurrent_updates}",
+            f"Scheduled Symbols: {schedules_count}",
+            f"Active Syncs: {processing_count}",
+            f"Concurrent Limit: {max_updates}",
             "\nNext Sync Times:"
         ]
 
-        # Show next 5 pending syncs
-        next_syncs = sorted(
+        # Create a sorted copy of schedules for status
+        schedule_items = sorted(
             self._schedules.items(),
             key=lambda x: x[1].next_sync
         )[:5]
 
-        for symbol_name, schedule in next_syncs:
+        for symbol_name, schedule in schedule_items:
             time_until = (schedule.next_sync - current_time).total_seconds()
             status.append(
                 f"  {symbol_name}: {schedule.next_sync.strftime('%H:%M:%S')} "

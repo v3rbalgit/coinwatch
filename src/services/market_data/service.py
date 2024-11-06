@@ -191,91 +191,103 @@ class MarketDataService(ServiceBase):
     async def _handle_collection_start(self, command: Command) -> None:
         """Handle start of historical collection with enhanced context"""
         symbol_name = command.params['symbol']
-        symbol = self._active_symbols[symbol_name]
 
-        # Initialize collection progress
-        self._collection_progress[symbol_name] = CollectionProgress(
-            symbol=symbol,
-            start_time=datetime.fromtimestamp(
-                command.params['start_time'] / 1000,
-                timezone.utc
+        async with self._symbol_lock:
+            symbol = self._active_symbols[symbol_name]
+            # Initialize collection progress atomically
+            self._collection_progress[symbol_name] = CollectionProgress(
+                symbol=symbol,
+                start_time=datetime.fromtimestamp(
+                    command.params['start_time'] / 1000,
+                    timezone.utc
+                )
             )
-        )
 
-        # Log collection parameters
-        context = command.params.get('context', {})
-        logger.info(
-            f"Started historical collection for {symbol_name} "
-            f"with batch size {context.get('batch_size', 'default')}"
-        )
+            # Log collection parameters while holding state
+            context = command.params.get('context', {})
+            logger.info(
+                f"Started historical collection for {symbol_name} "
+                f"with batch size {context.get('batch_size', 'default')}"
+            )
 
     async def _handle_collection_progress(self, command: Command) -> None:
         """Handle collection progress updates with enhanced tracking"""
         symbol_name = command.params['symbol']
-        if progress := self._collection_progress.get(symbol_name):
-            progress.update(
-                processed=command.params['processed'],
-                total=command.params.get('total')
-            )
 
-            context = command.params.get('context', {})
-            timeframe = context.get('timeframe')
-            batch_size = context.get('batch_size')
-            last_timestamp = command.params.get('last_timestamp')
-
-            if last_timestamp:
-                last_time = datetime.fromtimestamp(last_timestamp / 1000, timezone.utc)
-                logger.debug(
-                    f"Collection progress for {symbol_name}: "
-                    f"{progress} at {last_time} "
-                    f"[{timeframe} timeframe, batch size {batch_size}]"
+        async with self._symbol_lock:
+            if progress := self._collection_progress.get(symbol_name):
+                progress.update(
+                    processed=command.params['processed'],
+                    total=command.params.get('total')
                 )
-            else:
-                logger.debug(f"Collection progress for {symbol_name}: {progress}")
+
+                # Get parameters for logging
+                context = command.params.get('context', {})
+                timeframe = context.get('timeframe')
+                batch_size = context.get('batch_size')
+                last_timestamp = command.params.get('last_timestamp')
+
+                if last_timestamp:
+                    last_time = datetime.fromtimestamp(last_timestamp / 1000, timezone.utc)
+                    logger.debug(
+                        f"Collection progress for {symbol_name}: "
+                        f"{progress} at {last_time} "
+                        f"[{timeframe} timeframe, batch size {batch_size}]"
+                    )
+                else:
+                    logger.debug(f"Collection progress for {symbol_name}: {progress}")
 
     async def _handle_collection_complete(self, command: Command) -> None:
         """Handle successful completion of historical collection"""
         symbol_name = command.params['symbol']
-        if symbol := self._active_symbols.get(symbol_name):
-            # Get collection statistics
-            start_time = datetime.fromtimestamp(
-                command.params['start_time'] / 1000,
-                timezone.utc
-            )
-            end_time = datetime.fromtimestamp(
-                command.params['end_time'] / 1000,
-                timezone.utc
-            )
-            duration = (end_time - start_time).total_seconds()
 
-            logger.info(
-                f"Completed historical collection for {symbol_name} "
-                f"({duration:.1f}s elapsed)"
-            )
+        async with self._symbol_lock:
+            if symbol := self._active_symbols.get(symbol_name):
+                # Get collection statistics
+                start_time = datetime.fromtimestamp(
+                    command.params['start_time'] / 1000,
+                    timezone.utc
+                )
+                end_time = datetime.fromtimestamp(
+                    command.params['end_time'] / 1000,
+                    timezone.utc
+                )
+                duration = (end_time - start_time).total_seconds()
 
-            # Clear collection progress
-            self._collection_progress.pop(symbol_name, None)
+                logger.info(
+                    f"Completed historical collection for {symbol_name} "
+                    f"({duration:.1f}s elapsed)"
+                )
 
-            # Schedule for synchronization with base timeframe
-            next_sync = self.batch_synchronizer.calculate_next_sync(
-                timeframe=self.base_timeframe
-            )
+                # Atomic state transition
+                self._collection_progress.pop(symbol_name, None)
 
-            self._sync_schedules[symbol_name] = SyncSchedule(
-                symbol=symbol,
-                timeframe=self.base_timeframe,
-                next_sync=next_sync
-            )
+                # Prepare sync schedule
+                next_sync = self.batch_synchronizer.calculate_next_sync(
+                    timeframe=self.base_timeframe
+                )
 
-            # Start synchronization
+                self._sync_schedules[symbol_name] = SyncSchedule(
+                    symbol=symbol,
+                    timeframe=self.base_timeframe,
+                    next_sync=next_sync
+                )
+
+                # Cache values needed after lock release
+                transition_symbol = symbol
+                transition_timeframe = self.base_timeframe
+
+        # Start synchronization after releasing lock
+        if transition_symbol:
             await self.batch_synchronizer.schedule_symbol(
-                symbol,
-                self.base_timeframe
+                transition_symbol,
+                transition_timeframe
             )
             logger.info(
                 f"Transitioned {symbol_name} to synchronized updates "
                 f"starting at {next_sync}"
             )
+
     async def _handle_collection_error(self, command: Command) -> None:
         """Handle collection errors with enhanced error tracking and recovery"""
         symbol_name = command.params['symbol']
@@ -284,7 +296,7 @@ class MarketDataService(ServiceBase):
         context = command.params.get('context', {})
 
         # Track error with full context
-        self._error_tracker.record_error(
+        await self._error_tracker.record_error(
             Exception(error),
             symbol_name,
             **context
@@ -303,7 +315,7 @@ class MarketDataService(ServiceBase):
             )
 
         # Check error frequency for adaptive handling
-        frequency = self._error_tracker.get_error_frequency(
+        frequency = await self._error_tracker.get_error_frequency(
             error_type,
             window_minutes=60
         )
@@ -333,38 +345,41 @@ class MarketDataService(ServiceBase):
         """Handle sync schedule updates"""
         symbol_name = command.params['symbol']
         next_sync = datetime.fromtimestamp(command.params['next_sync'], timezone.utc)
-        if schedule := self._sync_schedules.get(symbol_name):
-            schedule.next_sync = next_sync
-            logger.debug(f"Updated sync schedule for {symbol_name}: next at {next_sync}")
+
+        async with self._symbol_lock:
+            if schedule := self._sync_schedules.get(symbol_name):
+                schedule.next_sync = next_sync
+                logger.debug(f"Updated sync schedule for {symbol_name}: next at {next_sync}")
 
     async def _handle_sync_complete(self, command: Command) -> None:
         """Handle successful sync completion with progress tracking"""
         symbol_name = command.params['symbol']
         context = command.params['context']
 
-        if schedule := self._sync_schedules.get(symbol_name):
-            schedule.update(datetime.fromtimestamp(
-                command.params['sync_time'],
-                timezone.utc
-            ))
-
-            # Update next sync time if provided
-            if next_sync := context.get('next_sync'):
-                schedule.next_sync = datetime.fromtimestamp(
-                    next_sync,
+        async with self._symbol_lock:
+            if schedule := self._sync_schedules.get(symbol_name):
+                schedule.update(datetime.fromtimestamp(
+                    command.params['sync_time'],
                     timezone.utc
+                ))
+
+                if next_sync := context.get('next_sync'):
+                    schedule.next_sync = datetime.fromtimestamp(
+                        next_sync,
+                        timezone.utc
+                    )
+
+                processed = command.params.get('processed', 0)
+                logger.debug(
+                    f"Completed sync for {symbol_name}: processed {processed} candles, "
+                    f"next sync at {schedule.next_sync}"
                 )
 
-            processed = command.params.get('processed', 0)
-            logger.debug(
-                f"Completed sync for {symbol_name}: processed {processed} candles, "
-                f"next sync at {schedule.next_sync}"
-            )
-
-            # Monitor resource usage
-            resource_usage = context.get('resource_usage', {})
-            if resource_usage.get('concurrent_syncs', 0) > resource_usage.get('max_allowed', 0) * 0.9:
-                logger.warning("High resource usage detected in sync operations")
+                # Monitor resource usage
+                resource_usage = context.get('resource_usage', {})
+                if (resource_usage.get('concurrent_syncs', 0) >
+                    resource_usage.get('max_allowed', 0) * 0.9):
+                    logger.warning("High resource usage detected in sync operations")
 
     async def _handle_sync_error(self, command: Command) -> None:
         """Handle sync errors with enhanced context"""
@@ -373,7 +388,7 @@ class MarketDataService(ServiceBase):
         context = command.params['context']
 
         # Record error with full context
-        self._error_tracker.record_error(
+        await self._error_tracker.record_error(
             Exception(error),
             symbol_name,
             **context
@@ -410,6 +425,7 @@ class MarketDataService(ServiceBase):
     async def _handle_batch_size_command(self, command: Command) -> None:
         """Handle batch size adjustment command"""
         new_size = command.params.get('size')
+
         if new_size:
             await self.batch_synchronizer.set_max_concurrent_updates(new_size)
 
@@ -422,6 +438,7 @@ class MarketDataService(ServiceBase):
     async def _monitor_symbols(self) -> None:
         """Monitor available trading symbols and manage their lifecycle"""
         retry_count = 0
+
         try:
             while self._monitor_running.is_set():
                 try:
@@ -456,7 +473,7 @@ class MarketDataService(ServiceBase):
                                         ))
 
                             except Exception as e:
-                                self._error_tracker.record_error(e, exchange)
+                                await self._error_tracker.record_error(e, exchange)
                                 should_retry, reason = self._retry_strategy.should_retry(retry_count, e)
 
                                 if should_retry:
@@ -485,8 +502,8 @@ class MarketDataService(ServiceBase):
                     await asyncio.sleep(self._symbol_check_interval)
 
                 except Exception as e:
-                    self._error_tracker.record_error(e)
-                    frequency = self._error_tracker.get_error_frequency(
+                    await self._error_tracker.record_error(e)
+                    frequency = await self._error_tracker.get_error_frequency(
                         e.__class__.__name__,
                         window_minutes=60
                     )
@@ -508,7 +525,7 @@ class MarketDataService(ServiceBase):
             logger.error(f"Critical error in symbol monitoring: {e}")
             self._status = ServiceStatus.ERROR
             self._last_error = e
-            self._error_tracker.record_error(e)
+            await self._error_tracker.record_error(e)
             await self.coordinator.execute(Command(
                 type=MarketDataCommand.HANDLE_ERROR,
                 params={
@@ -527,9 +544,9 @@ class MarketDataService(ServiceBase):
 
         try:
             logger.error(f"Handling service error: {error}")
-            self._error_tracker.record_error(error)
+            await self._error_tracker.record_error(error)
 
-            frequency = self._error_tracker.get_error_frequency(
+            frequency = await self._error_tracker.get_error_frequency(
                 error.__class__.__name__,
                 window_minutes=60
             )
@@ -572,7 +589,7 @@ class MarketDataService(ServiceBase):
             logger.info("Service recovered successfully")
 
         except Exception as recovery_error:
-            self._error_tracker.record_error(recovery_error, context="recovery")
+            await self._error_tracker.record_error(recovery_error, context="recovery")
             self._status = ServiceStatus.ERROR
             self._last_error = recovery_error
             logger.error(f"Service recovery failed: {recovery_error}")
