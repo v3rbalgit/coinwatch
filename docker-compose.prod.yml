@@ -1,24 +1,24 @@
 services:
   db:
-    image: mysql:8.4
-    container_name: mysql_prod
+    image: timescale/timescaledb:latest-pg15
+    container_name: postgres_prod
     environment:
-      MYSQL_ROOT_PASSWORD: rootpassword
-      MYSQL_DATABASE: coinwatch
-      MYSQL_USER: user
-      MYSQL_PASSWORD: password
+      POSTGRES_DB: coinwatch
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
     ports:
-      - "3306:3306"
+      - "5432:5432"
     networks:
       - coinwatch_network
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "user", "--password=password"]
+      test: ["CMD-SHELL", "pg_isready -U user -d coinwatch"]
       interval: 10s
-      timeout: 10s
+      timeout: 5s
       retries: 5
       start_period: 30s
+    command: postgres -c 'max_connections=100'
     volumes:
-      - mysql_data:/var/lib/mysql
+      - postgres_data:/var/lib/postgresql/data
 
   app:
     build:
@@ -33,21 +33,24 @@ services:
     environment:
       - PYTHONPATH=/app
       - DB_HOST=db
-      - DB_PORT=3306
+      - DB_PORT=5432
       - DB_USER=user
       - DB_PASSWORD=password
       - DB_NAME=coinwatch
+      - DB_DIALECT=postgresql
+      - DB_DRIVER=asyncpg
       - BYBIT_TESTNET=false
       - LOG_LEVEL=INFO
     command: python -m src.main
     volumes:
       - ./logs:/app/logs
     restart: unless-stopped
+    image: postgres:15-alpine
 
 networks:
   coinwatch_network:
     name: coinwatch_network
 
 volumes:
-  mysql_data:
+  postgres_data:
   logs:
