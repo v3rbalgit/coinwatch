@@ -1,10 +1,8 @@
 # src/services/market_data/collector.py
 
 import asyncio
-import random
 from typing import Optional, Set
 
-from .symbol_state import SymbolState, SymbolStateManager
 from ...adapters.registry import ExchangeAdapterRegistry
 from ...core.coordination import Command, MarketDataCommand, ServiceCoordinator
 from ...repositories.kline import KlineRepository
@@ -13,6 +11,9 @@ from ...utils.logger import LoggerSetup
 from ...utils.time import from_timestamp, get_current_timestamp
 from ...utils.domain_types import Timeframe, Timestamp
 from ...core.models import SymbolInfo
+from ...core.exceptions import ServiceError, ValidationError
+from ...utils.error import ErrorTracker
+from ...utils.retry import RetryConfig, RetryStrategy
 
 logger = LoggerSetup.setup(__name__)
 
@@ -23,78 +24,46 @@ class HistoricalCollector:
                  adapter_registry: ExchangeAdapterRegistry,
                  symbol_repository: SymbolRepository,
                  kline_repository: KlineRepository,
-                 state_manager: SymbolStateManager,
                  coordinator: ServiceCoordinator,
+                 base_timeframe: Timeframe = Timeframe.MINUTE_5,
                  max_retries: int = 3,
                  batch_size: int = 1000):
 
-        self._collection_queue: asyncio.Queue[SymbolInfo] = asyncio.Queue(maxsize=1000)
+        # Core dependencies
         self._adapter_registry = adapter_registry
         self._symbol_repository = symbol_repository
         self._kline_repository = kline_repository
         self._coordinator = coordinator
-        self._state_manager = state_manager
+        self._base_timeframe = base_timeframe
         self._max_retries = max_retries
         self._batch_size = batch_size
 
+        # Task management
         self._active = False
         self._task: Optional[asyncio.Task] = None
 
-        # Add synchronization primitives
-        self._processing_symbols: Set[SymbolInfo] = set()
+        # Collection management
+        self._collection_queue: asyncio.Queue[SymbolInfo] = asyncio.Queue(maxsize=1000)
+        self._processing_symbols: Set[str] = set()
         self._collection_lock = asyncio.Lock()
 
-    async def _register_command_handlers(self) -> None:
-        """Register command handlers"""
-        await self._coordinator.register_handler(
-            MarketDataCommand.ADJUST_BATCH_SIZE,
-            self._handle_batch_size_adjustment
+        # Error handling
+        self._error_tracker = ErrorTracker()
+        self._retry_strategy = RetryStrategy(RetryConfig(
+            base_delay=1.0,
+            max_delay=300.0,
+            max_retries=max_retries
+        ))
+
+        # Configure retry behavior
+        self._retry_strategy.add_retryable_error(
+            ConnectionError,
+            TimeoutError,
+            ServiceError
         )
-        await self._coordinator.register_handler(
-            MarketDataCommand.PAUSE_COLLECTION,
-            self._handle_pause_collection
+        self._retry_strategy.add_non_retryable_error(
+            ValidationError
         )
-        await self._coordinator.register_handler(
-            MarketDataCommand.RESUME_COLLECTION,
-            self._handle_resume_collection
-        )
-
-    async def _handle_batch_size_adjustment(self, command: Command) -> None:
-        """Handle batch size adjustment command"""
-        new_size = command.params.get('size')
-        if new_size:
-            self._batch_size = max(100, min(new_size, 1000))
-            logger.info(f"Adjusted historical collection batch size to {self._batch_size}")
-
-    async def _handle_pause_collection(self, command: Command) -> None:
-        """Handle collection pause command"""
-        symbol_name = command.params.get('symbol')
-        if symbol_name:
-            # Get symbol info from state manager
-            for symbol in self._processing_symbols:
-                if symbol.name == symbol_name:
-                    self._processing_symbols.remove(symbol)
-                    logger.info(f"Paused historical collection for {symbol_name}")
-
-                    # Update state to reflect pause
-                    await self._state_manager.update_state(
-                        symbol,
-                        SymbolState.HISTORICAL,
-                        "Collection paused by command"
-                    )
-                    break
-
-    async def _handle_resume_collection(self, command: Command) -> None:
-        """Handle collection resume command"""
-        symbol_name = command.params.get('symbol')
-        if symbol_name:
-            # Find symbol in state manager
-            symbols = await self._state_manager.get_symbols_by_state(SymbolState.HISTORICAL)
-            for symbol in symbols:
-                if symbol.name == symbol_name:
-                    await self.add_symbol(symbol)
-                    logger.info(f"Resumed historical collection for {symbol_name}")
-                    break
 
     async def start(self) -> None:
         """Start the collector"""
@@ -116,24 +85,16 @@ class HistoricalCollector:
         while not self._collection_queue.empty():
             symbol = await self._collection_queue.get()
             async with self._collection_lock:
-                self._processing_symbols.remove(symbol)
+                self._processing_symbols.remove(symbol.name)
             self._collection_queue.task_done()
         logger.info("Historical collector stopped")
 
     async def add_symbol(self, symbol: SymbolInfo) -> None:
         """Add symbol for historical collection"""
         async with self._collection_lock:
-            if symbol not in self._processing_symbols:
-                await self._state_manager.add_symbol(symbol)
-                self._processing_symbols.add(symbol)
+            if symbol.name not in self._processing_symbols:
+                self._processing_symbols.add(symbol.name)
                 await self._collection_queue.put(symbol)
-
-                # Initialize collection progress
-                await self._state_manager.update_collection_progress(
-                    symbol,
-                    processed=0,
-                    total=None  # Will be calculated when collection starts
-                )
 
                 # Notify about new collection
                 await self._coordinator.execute(Command(
@@ -153,75 +114,76 @@ class HistoricalCollector:
         while self._active:
             try:
                 symbol = await self._collection_queue.get()
-
                 try:
-                    # Update state to HISTORICAL before processing
-                    await self._state_manager.update_state(
-                        symbol,
-                        SymbolState.HISTORICAL
-                    )
+                    await self._collect_historical_data(symbol, self._base_timeframe)
 
-                    await self._collect_historical_data(symbol, Timeframe.MINUTE_5)
-                    await self._state_manager.update_state(
-                        symbol,
-                        SymbolState.READY
-                    )
-                    logger.info(f"Syncing {symbol.name} ({symbol.exchange})...")
+                    # Notify successful completion
+                    await self._coordinator.execute(Command(
+                        type=MarketDataCommand.COLLECTION_COMPLETE,
+                        params={
+                            "symbol": symbol.name,
+                            "start_time": symbol.launch_time,
+                            "end_time": get_current_timestamp()
+                        }
+                    ))
                 except Exception as e:
-                    await self._state_manager.update_state(
-                        symbol,
-                        SymbolState.ERROR,
-                        str(e)
-                    )
+                    self._error_tracker.record_error(e, symbol.name, context="collection")
+                    logger.error(f"Error collecting data for {symbol.name}: {e}")
+
+                    # Notify about collection error
+                    await self._coordinator.execute(Command(
+                        type=MarketDataCommand.COLLECTION_ERROR,
+                        params={
+                            "symbol": symbol.name,
+                            "error": str(e),
+                            "error_type": e.__class__.__name__,
+                            "context": {
+                                "retry_count": self._error_tracker.get_error_frequency(
+                                    e.__class__.__name__,
+                                    window_minutes=60
+                                ),
+                                "process": "historical_collection",
+                                "timestamp": get_current_timestamp()
+                            }
+                        }
+                    ))
+
                 finally:
-                    # Remove from processing set
                     async with self._collection_lock:
-                        self._processing_symbols.remove(symbol)
+                        self._processing_symbols.remove(symbol.name)
                     self._collection_queue.task_done()
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in collection queue processing: {e}")
+                logger.error(f"Critical error in collection queue processing: {e}")
                 await asyncio.sleep(1)
 
     async def _collect_historical_data(self, symbol: SymbolInfo, timeframe: Timeframe) -> None:
-        """Collect historical data using centralized progress tracking"""
-        adapter = self._adapter_registry.get_adapter(symbol.exchange)
+        """Collect historical data with enhanced error handling and progress tracking"""
         retry_count = 0
+        processed_candles = 0
+        total_candles = None
 
-        while retry_count < self._max_retries:
+        while True:
             try:
                 # First ensure symbol exists in database
                 await self._symbol_repository.get_or_create(symbol)
 
-                # Get start time based on launch or last data
+                # Get collection boundaries
                 start_time = await self._kline_repository.get_latest_timestamp(
                     symbol,
                     timeframe
                 )
-
                 current_time = get_current_timestamp()
                 interval_ms = timeframe.to_milliseconds()
 
                 # Adjust to last completed interval
                 last_complete_interval = current_time - (current_time % interval_ms) - interval_ms
-
-                if not start_time:
-                    start_time = symbol.launch_time
-                else:
-                    start_time += interval_ms
+                start_time = symbol.launch_time if not start_time else start_time + interval_ms
 
                 # Calculate total expected candles
                 total_candles = int((last_complete_interval - start_time) // interval_ms)
-                processed_candles = 0
-
-                # Update initial progress
-                await self._state_manager.update_collection_progress(
-                    symbol,
-                    processed=processed_candles,
-                    total=total_candles
-                )
 
                 logger.info(
                     f"Starting historical collection for {symbol.name} "
@@ -230,12 +192,13 @@ class HistoricalCollector:
                 )
 
                 while start_time < last_complete_interval:
-                    # Check if collection was paused
-                    if symbol not in self._processing_symbols:
-                        logger.info(f"Collection paused for {symbol.name}")
+                    # Check if collection was cancelled
+                    if symbol.name not in self._processing_symbols:
+                        logger.info(f"Collection cancelled for {symbol.name}")
                         return
 
                     # Fetch batch of historical data
+                    adapter = self._adapter_registry.get_adapter(symbol.exchange)
                     klines = await adapter.get_klines(
                         symbol=symbol,
                         timeframe=timeframe,
@@ -258,85 +221,52 @@ class HistoricalCollector:
                         )
 
                         # Update progress
-                        last_timestamp = klines[-1].timestamp
                         processed_candles += len(klines)
+                        last_timestamp = klines[-1].timestamp
 
-                        await self._state_manager.update_collection_progress(
-                            symbol,
-                            processed=processed_candles,
-                            total=total_candles
-                        )
-
-                        await self._state_manager.update_sync_time(
-                            symbol,
-                            Timestamp(last_timestamp)
-                        )
-
-                        # Notify about progress
-                        percentage = min(100, (processed_candles / total_candles) * 100)
+                        # Report progress
                         await self._coordinator.execute(Command(
                             type=MarketDataCommand.COLLECTION_PROGRESS,
                             params={
                                 "symbol": symbol.name,
-                                "progress": percentage,
                                 "processed": processed_candles,
-                                "total": total_candles
+                                "total": total_candles,
+                                "last_timestamp": last_timestamp,
+                                "context": {
+                                    "timeframe": timeframe.value,
+                                    "batch_size": self._batch_size
+                                }
                             }
                         ))
 
                         start_time = last_timestamp + interval_ms
 
+                # Collection complete
                 logger.info(
                     f"Completed historical collection for {symbol.name} "
                     f"up to {from_timestamp(last_complete_interval)}"
                 )
-
-                # Collection complete
-                await self._coordinator.execute(Command(
-                    type=MarketDataCommand.COLLECTION_COMPLETE,
-                    params={
-                        "symbol": symbol.name,
-                        "processed_candles": processed_candles,
-                        "start_time": symbol.launch_time,
-                        "end_time": last_complete_interval
-                    }
-                ))
                 break
 
             except Exception as e:
-                retry_count += 1
-
-                # Update error in state manager
-                await self._state_manager.update_collection_progress(
-                    symbol,
-                    processed=processed_candles,
-                    total=total_candles,
-                    error=str(e)
-                )
-
-                if retry_count >= self._max_retries:
+                # Handle retry logic
+                should_retry, reason = self._retry_strategy.should_retry(retry_count, e)
+                if should_retry:
+                    retry_count += 1
+                    delay = self._retry_strategy.get_delay(retry_count)
+                    logger.warning(
+                        f"Retry {retry_count} for {symbol.name} after {delay:.2f}s: {e}"
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(f"Failed to collect data for {symbol.name}: {reason}")
                     raise
 
-                delay = min(30, 2 ** (retry_count - 1))
-                delay = delay * (0.5 + random.random())  # Add jitter
-
-                logger.warning(
-                    f"Retry {retry_count}/{self._max_retries} "
-                    f"for {symbol.name} after {delay:.2f}s: {e}"
-                )
-
-                await asyncio.sleep(delay)
-
     def get_collection_status(self) -> str:
-        """Get collection status using state manager"""
+        """Get current collection status"""
         status = ["Historical Collection Status:"]
-
-        active_collections = len(self._processing_symbols)
-        pending_collections = self._collection_queue.qsize()
-
         status.extend([
-            f"Active Collections: {active_collections}",
-            f"Pending Collections: {pending_collections}"
+            f"Active Collections: {len(self._processing_symbols)}",
+            f"Pending Collections: {self._collection_queue.qsize()}"
         ])
-
         return "\n".join(status)

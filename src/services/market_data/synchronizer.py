@@ -1,72 +1,80 @@
 # src/services/market_data/synchronizer.py
 
 import asyncio
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Set
 
-from .symbol_state import SymbolState, SymbolStateManager
+from src.services.market_data.progress import SyncSchedule
+from src.utils.error import ErrorTracker
+from src.utils.retry import RetryConfig, RetryStrategy
+
 from ...adapters.registry import ExchangeAdapterRegistry
 from ...core.coordination import Command, MarketDataCommand, ServiceCoordinator
 from ...core.models import SymbolInfo
-from ...core.exceptions import ServiceError
+from ...core.exceptions import ServiceError, ValidationError
 from ...repositories.kline import KlineRepository
 from ...utils.logger import LoggerSetup
 from ...utils.domain_types import Timeframe, Timestamp
 
 logger = LoggerSetup.setup(__name__)
 
-@dataclass
-class SyncSchedule:
-    """Tracks sync schedule for a symbol"""
-    symbol: SymbolInfo
-    timeframe: Timeframe
-    next_sync: datetime
-    last_sync: Optional[datetime] = None
-    error_count: int = 0
-
 class BatchSynchronizer:
     """Handles batch synchronization of symbols with complete historical data"""
 
     def __init__(self,
-                 state_manager: SymbolStateManager,
                  adapter_registry: ExchangeAdapterRegistry,
                  kline_repository: KlineRepository,
                  coordinator: ServiceCoordinator,
+                 base_timeframe: Timeframe,
                  max_concurrent_updates: int = 80
                  ):
-        self._state_manager = state_manager
+
+        # Core dependencies
         self._adapter_registry = adapter_registry
         self._kline_repository = kline_repository
         self._coordinator = coordinator
+        self._base_timeframe = base_timeframe
 
-        self._max_concurrent_updates = max_concurrent_updates
-
+        # Sync management
         self._schedules: Dict[str, SyncSchedule] = {}
-        self._active = False
-        self._task: Optional[asyncio.Task] = None
-
+        self._update_lock = asyncio.Lock()
         # Bybit Rate Limit: 600 requests per 5 seconds = 120 requests per second
         # For safety (to account for network latency, response times, etc.):
         # - Let's use 75% of the limit: 120 * 0.75 = 90 requests/second
         # - Round down for extra safety: 80 concurrent updates
-        self._sync_semaphore = asyncio.BoundedSemaphore(self.max_concurrent_updates)  # Limit concurrent operations
-        self._active_updates = 0
-        self._update_lock = asyncio.Lock()
-
-        # Track symbols being processed to prevent duplicates
+        self._max_concurrent_updates = max_concurrent_updates
+        self._sync_semaphore = asyncio.BoundedSemaphore(self._max_concurrent_updates)  # Limit concurrent operations
         self._processing: Set[str] = set()
 
-    def _calculate_next_sync(self, timeframe: Timeframe, current_time: Optional[datetime] = None) -> datetime:
+        # Task management
+        self._active = False
+        self._task: Optional[asyncio.Task] = None
+
+        # Error handling
+        self._error_tracker = ErrorTracker()
+        self._retry_strategy = RetryStrategy(RetryConfig(
+            base_delay=1.0,
+            max_delay=300.0,
+            max_retries=3
+        ))
+
+        # Configure retry behavior
+        self._retry_strategy.add_retryable_error(
+            ConnectionError,
+            TimeoutError,
+            ServiceError
+        )
+        self._retry_strategy.add_non_retryable_error(
+            ValidationError
+        )
+
+    def calculate_next_sync(self, timeframe: Timeframe, current_time: Optional[datetime] = None) -> datetime:
         """Calculate the next sync time based on timeframe"""
         if current_time is None:
             current_time = datetime.now(timezone.utc)
 
-        interval_minutes = timeframe.to_milliseconds() / (1000 * 60)  # Convert to minutes
-
-        # Round down to the last timeframe boundary
-        minutes = current_time.minute
-        boundary_minutes = (minutes // interval_minutes) * interval_minutes
+        interval_minutes = timeframe.to_milliseconds() / (1000 * 60)
+        boundary_minutes = (current_time.minute // interval_minutes) * interval_minutes
 
         next_sync = current_time.replace(
             minute=int(boundary_minutes),
@@ -74,7 +82,6 @@ class BatchSynchronizer:
             microsecond=0
         )
 
-        # If we're past the current interval, move to next one
         if next_sync <= current_time:
             next_sync += timedelta(minutes=int(interval_minutes))
 
@@ -82,7 +89,7 @@ class BatchSynchronizer:
 
     async def schedule_symbol(self, symbol: SymbolInfo, timeframe: Timeframe) -> None:
         """Schedule a symbol for synchronized updates"""
-        next_sync = self._calculate_next_sync(timeframe)
+        next_sync = self.calculate_next_sync(timeframe)
 
         self._schedules[symbol.name] = SyncSchedule(
             symbol=symbol,
@@ -95,7 +102,6 @@ class BatchSynchronizer:
             f"(timeframe: {timeframe.value})"
         )
 
-        # Notify coordinator of new schedule
         await self._coordinator.execute(Command(
             type=MarketDataCommand.SYNC_SCHEDULED,
             params={
@@ -143,7 +149,16 @@ class BatchSynchronizer:
                         tasks.append(self._sync_symbol_with_timing(schedule))
 
                     # Wait for all syncs to complete
-                    await asyncio.gather(*tasks, return_exceptions=True)
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                    # Process any errors
+                    for schedule, result in zip(pending_syncs, results):
+                        if isinstance(result, Exception):
+                            self._error_tracker.record_error(
+                                result,
+                                schedule.symbol.name,
+                                context="sync"
+                            )
 
                 # Calculate time to next sync
                 next_syncs = [s.next_sync for s in self._schedules.values()]
@@ -162,147 +177,197 @@ class BatchSynchronizer:
                 await asyncio.sleep(1)
 
     async def _sync_symbol_with_timing(self, schedule: SyncSchedule) -> None:
-        """Sync a symbol with precise timing"""
+        """Sync a symbol with error tracking and resource management"""
+        retry_count = 0
+
         try:
             async with self._sync_semaphore:
-                async with self._update_lock:
-                    self._active_updates += 1
-
                 try:
-                    # Get latest timestamp from database
-                    latest = await self._kline_repository.get_latest_timestamp(
-                        schedule.symbol,
-                        schedule.timeframe
-                    )
+                    processed_count = await self._perform_sync(schedule)
 
-                    if not latest:
-                        raise ServiceError(f"No data found for {schedule.symbol}")
-
-                    # Calculate exactly what we need
-                    interval_ms = schedule.timeframe.to_milliseconds()
-                    next_start = latest + interval_ms
-
-                    # Get current timestamp at microsecond precision
-                    current_time = datetime.now(timezone.utc)
-                    current_ms = int(current_time.timestamp() * 1000)
-
-                    # Only fetch if we're not asking for future data
-                    if next_start < current_ms:
-                        adapter = self._adapter_registry.get_adapter(schedule.symbol.exchange)
-                        klines = await adapter.get_klines(
-                            symbol=schedule.symbol,
-                            timeframe=schedule.timeframe,
-                            start_time=Timestamp(next_start),
-                            limit=50
-                        )
-
-                        if klines:
-                            # Process only completed candles
-                            klines = [k for k in klines if k.timestamp + interval_ms <= current_ms]
-
-                            if klines:
-                                # Store new klines
-                                processed_count = await self._kline_repository.insert_batch(
-                                    schedule.symbol,
-                                    schedule.timeframe,
-                                    [k.to_tuple() for k in klines]
-                                )
-
-                                # Update sync time
-                                last_timestamp = klines[-1].timestamp
-                                await self._state_manager.update_sync_time(
-                                    schedule.symbol,
-                                    Timestamp(last_timestamp)
-                                )
-
-                                logger.debug(
-                                    f"Processed {processed_count} klines for {schedule.symbol} "
-                                    f"up to {datetime.fromtimestamp(last_timestamp/1000, timezone.utc)}"
-                                )
-
-                    # Schedule next sync
-                    schedule.last_sync = current_time
-                    schedule.next_sync = self._calculate_next_sync(
-                        schedule.timeframe,
-                        current_time
-                    )
-                    schedule.error_count = 0
+                    # Report successful sync
+                    await self._coordinator.execute(Command(
+                        type=MarketDataCommand.SYNC_COMPLETED,
+                        params={
+                            "symbol": schedule.symbol.name,
+                            "timeframe": schedule.timeframe.value,
+                            "sync_time": datetime.now(timezone.utc).timestamp(),
+                            "processed": processed_count,
+                            "context": {
+                                "next_sync": schedule.next_sync.timestamp(),
+                                "active_syncs": len(self._processing),
+                                "resource_usage": {
+                                    "concurrent_syncs": len(self._processing),
+                                    "max_allowed": self._max_concurrent_updates
+                                }
+                            }
+                        }
+                    ))
 
                 except Exception as e:
-                    schedule.error_count += 1
-                    logger.error(f"Error syncing {schedule.symbol}: {e}")
+                    self._error_tracker.record_error(
+                        e,
+                        schedule.symbol.name,
+                        context="sync"
+                    )
 
-                    # Notify coordinator of sync error
+                    # Check if this is a resource-related error
+                    is_resource_error = isinstance(e, (
+                        ConnectionError,
+                        TimeoutError,
+                        ServiceError
+                    ))
+
+                    # Get error frequency for this symbol
+                    error_frequency = self._error_tracker.get_error_frequency(
+                        e.__class__.__name__,
+                        window_minutes=60
+                    )
+
+                    # Notify about sync error with context
                     await self._coordinator.execute(Command(
                         type=MarketDataCommand.SYNC_ERROR,
                         params={
                             "symbol": schedule.symbol.name,
                             "error": str(e),
-                            "error_count": schedule.error_count
-                        }
+                            "error_type": e.__class__.__name__,
+                            "context": {
+                                "is_resource_error": is_resource_error,
+                                "retry_count": retry_count,
+                                "error_frequency": error_frequency,
+                                "active_syncs": len(self._processing),
+                                "concurrent_limit": self._max_concurrent_updates,
+                                "timeframe": schedule.timeframe.value,
+                                "last_sync": schedule.last_sync.timestamp() if schedule.last_sync else None
+                            }
+                        },
+                        priority=1 if is_resource_error else 0
                     ))
 
-                finally:
-                    async with self._update_lock:
-                        self._active_updates -= 1
-                    self._processing.remove(schedule.symbol.name)
+        finally:
+            self._processing.remove(schedule.symbol.name)
 
-        except Exception as e:
-            logger.error(f"Critical error in sync operation: {e}")
-            raise
+    async def _perform_sync(self, schedule: SyncSchedule) -> int:
+        """
+        Perform actual sync with retry logic
+        Returns:
+            int: Number of candles processed
+        """
+        retry_count = 0
+        processed_count = 0
 
-    @property
-    def max_concurrent_updates(self) -> int:
-        return self._max_concurrent_updates
+        while True:
+            try:
+                # Get latest timestamp from database
+                latest = await self._kline_repository.get_latest_timestamp(
+                    schedule.symbol,
+                    schedule.timeframe
+                )
+
+                if not latest:
+                    raise ServiceError(f"No data found for {schedule.symbol}")
+
+                # Calculate sync boundaries
+                interval_ms = schedule.timeframe.to_milliseconds()
+                next_start = latest + interval_ms
+                current_time = datetime.now(timezone.utc)
+                current_ms = int(current_time.timestamp() * 1000)
+
+                if next_start < current_ms:
+                    # Fetch and process data
+                    adapter = self._adapter_registry.get_adapter(schedule.symbol.exchange)
+                    klines = await adapter.get_klines(
+                        symbol=schedule.symbol,
+                        timeframe=schedule.timeframe,
+                        start_time=Timestamp(next_start),
+                        limit=50
+                    )
+
+                    if klines:
+                        # Process only completed candles
+                        klines = [k for k in klines if k.timestamp + interval_ms <= current_ms]
+
+                        if klines:
+                            # Store new klines
+                            processed_count = await self._kline_repository.insert_batch(
+                                schedule.symbol,
+                                schedule.timeframe,
+                                [k.to_tuple() for k in klines]
+                            )
+
+                            last_timestamp = klines[-1].timestamp
+                            logger.debug(
+                                f"Processed {processed_count} klines for {schedule.symbol.name} "
+                                f"up to {datetime.fromtimestamp(last_timestamp/1000, timezone.utc)}"
+                            )
+
+                # Update schedule
+                schedule.update(current_time)
+                schedule.next_sync = self.calculate_next_sync(
+                    schedule.timeframe,
+                    current_time
+                )
+                return processed_count
+
+            except Exception as e:
+                should_retry, reason = self._retry_strategy.should_retry(retry_count, e)
+                if should_retry:
+                    retry_count += 1
+                    delay = self._retry_strategy.get_delay(retry_count)
+                    logger.warning(
+                        f"Sync retry {retry_count} for {schedule.symbol.name} "
+                        f"after {delay:.2f}s: {e}"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                raise ServiceError(
+                    f"Sync failed for {schedule.symbol.name}: {str(e)}"
+                ) from e
 
     async def set_max_concurrent_updates(self, value: int) -> None:
-        """Gradually adjust max concurrent updates"""
+        """Gradually adjust concurrent updates limit"""
         async with self._update_lock:
             old_value = self._max_concurrent_updates
-            if value < old_value:
-                # Reducing limit - do it gradually
-                while self._max_concurrent_updates > value:
-                    # Wait until active updates are below next target
-                    next_target = max(
-                        value,
-                        self._max_concurrent_updates - 10
-                    )
-                    while self._active_updates > next_target:
-                        await asyncio.sleep(1)
+            target_value = max(10, min(value, 100))  # Ensure reasonable bounds
 
-                    # Safe to reduce limit
+            if target_value < old_value:
+                # Reduce gradually
+                while self._max_concurrent_updates > target_value:
+                    next_target = max(target_value, self._max_concurrent_updates - 5)
                     self._max_concurrent_updates = next_target
                     self._sync_semaphore = asyncio.BoundedSemaphore(next_target)
-                    logger.info(f"Gradually reduced concurrent updates to {next_target}")
+                    await asyncio.sleep(1)  # Allow time for adjustments
             else:
-                # Increasing limit - can do immediately
-                self._max_concurrent_updates = value
-                self._sync_semaphore = asyncio.BoundedSemaphore(value)
+                # Increase immediately
+                self._max_concurrent_updates = target_value
+                self._sync_semaphore = asyncio.BoundedSemaphore(target_value)
 
-            logger.info(f"Finished adjusting max concurrent updates: {old_value} -> {value}")
+            logger.info(f"Adjusted concurrent updates: {old_value} -> {target_value}")
 
-    async def get_sync_status(self) -> str:
-        """Get current synchronization status"""
-        ready_count = len(await self._state_manager.get_symbols_by_state(SymbolState.READY))
+    def get_sync_status(self) -> str:
+        """Get detailed synchronization status"""
+        current_time = datetime.now(timezone.utc)
 
         status = [
-            "Synchronizer Status:",
-            f"Ready Symbols: {ready_count}",
-            f"Max Concurrent Updates: {self._max_concurrent_updates}",
-            f"Currently Active Updates: {self._active_updates}",
-            "Resource Utilization:",
-            f"  {self._active_updates}/{self._max_concurrent_updates} slots in use",
-            f"  {(self._active_updates/self._max_concurrent_updates*100):.1f}% capacity utilized",
-            "Active Syncs:"
+            "Synchronization Status:",
+            f"Scheduled Symbols: {len(self._schedules)}",
+            f"Active Syncs: {len(self._processing)}",
+            f"Concurrent Limit: {self._max_concurrent_updates}",
+            "\nNext Sync Times:"
         ]
 
-        if self._active_updates > 0:
-            ready_symbols = await self._state_manager.get_symbols_by_state(SymbolState.READY)
-            for symbol in ready_symbols:
-                progress = await self._state_manager.get_progress(symbol)
-                if progress and progress.state not in (SymbolState.ERROR, SymbolState.DELISTED):
-                    status.append(f"  {progress}")
-        else:
-            status.append("  No active syncs")
+        # Show next 5 pending syncs
+        next_syncs = sorted(
+            self._schedules.items(),
+            key=lambda x: x[1].next_sync
+        )[:5]
+
+        for symbol_name, schedule in next_syncs:
+            time_until = (schedule.next_sync - current_time).total_seconds()
+            status.append(
+                f"  {symbol_name}: {schedule.next_sync.strftime('%H:%M:%S')} "
+                f"({time_until:.1f}s)"
+            )
 
         return "\n".join(status)

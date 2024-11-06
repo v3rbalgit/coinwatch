@@ -71,16 +71,12 @@ class Application:
             # Keep application running
             while True:
                 if market_service._status == ServiceStatus.ERROR:
-                    self.logger.error(
-                        f"Service unhealthy: {market_service._last_error}"
-                    )
-                    await market_service.handle_error(
-                        market_service._last_error
-                    )
+                    self.logger.error(f"Service unhealthy: {market_service._last_error}")
+                    await market_service.handle_error(market_service._last_error)
 
                 # Log service status periodically
                 self.logger.info("\nService Status Report:")
-                self.logger.info(market_service.state_manager.get_status_report())
+                self.logger.info(market_service.get_service_status())
 
                 await asyncio.sleep(60)
 

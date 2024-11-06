@@ -40,7 +40,7 @@ class Timeframe(Enum):
         return mapping[self.value]
 
 # System monitoring types
-CriticalConditionType = Literal["connection_overflow", "connection_timeout", "storage_full", "memory_high"]
+CriticalConditionType = Literal["connection_overflow", "connection_timeout", "storage_full", "memory_high", "service_error"]
 
 class CriticalCondition(TypedDict):
     type: CriticalConditionType
