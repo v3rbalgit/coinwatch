@@ -12,28 +12,64 @@ from .utils.logger import LoggerSetup
 logger = LoggerSetup.setup(__name__)
 
 @dataclass
+class TimescaleConfig:
+    """
+    TimescaleDB specific configuration settings
+
+    Attributes:
+        chunk_interval: Time interval for each chunk (partition)
+        compress_after: When to compress chunks for better storage efficiency
+        drop_after: When to drop old chunks (never for full retention)
+        replication_factor: Number of replicas for high availability
+    """
+    chunk_interval: str = "7 days"
+    compress_after: str = "30 days"
+    drop_after: Optional[str] = None  # None means never drop
+    replication_factor: int = 1
+
+@dataclass
 class DatabaseConfig:
-    """Database configuration settings"""
+    """
+    Database configuration settings for PostgreSQL with TimescaleDB
+
+    Attributes:
+        host: Database server hostname
+        port: Database server port
+        user: Database username
+        password: Database password
+        database: Database name
+        pool_size: Size of the connection pool
+        max_overflow: Maximum number of connections above pool_size
+        pool_timeout: Seconds to wait for a connection from pool
+        pool_recycle: Seconds before connections are recycled
+        echo: Enable SQL query logging
+        dialect: Database dialect (postgresql)
+        driver: Database driver (asyncpg)
+        timescale: TimescaleDB specific configuration
+    """
     host: str
     port: int
     user: str
     password: str
     database: str
-    pool_size: int = 10
-    max_overflow: int = 20
+    pool_size: int = 20
+    max_overflow: int = 30
     pool_timeout: int = 30
     pool_recycle: int = 1800
     echo: bool = False
-
-    dialect: str = "mysql"
-    driver: str = "aiomysql"
+    dialect: str = "postgresql"
+    driver: str = "asyncpg"
+    timescale: TimescaleConfig = field(default_factory=TimescaleConfig)
 
     @property
     def url(self) -> str:
         """Get database URL"""
-        if self.dialect == "sqlite":
-            return f"sqlite+{self.driver}:///{self.database}"
         return f"{self.dialect}+{self.driver}://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
+
+    @property
+    def dsn(self) -> str:
+        """Get database DSN (for asyncpg)"""
+        return f"postgres://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
 
 @dataclass
 class BybitConfig:
@@ -52,13 +88,23 @@ class ExchangeConfig:
 
 @dataclass
 class MarketDataConfig:
-    """Market data service configuration"""
+    """
+    Market data service configuration
+
+    Attributes:
+        sync_interval: How often to sync data (seconds)
+        retry_interval: Time between retries on failure
+        max_retries: Maximum number of retry attempts
+        default_timeframes: List of timeframes to collect
+        batch_size: Number of records to process in one batch
+    """
     sync_interval: int = 300  # 5 minutes
     retry_interval: int = 60  # 1 minute
     max_retries: int = 3
     default_timeframes: List[Timeframe] = field(
         default_factory=lambda: [Timeframe.MINUTE_5]
     )
+    batch_size: int = 1000
 
 @dataclass
 class MonitoringConfig:
@@ -86,7 +132,13 @@ class LogConfig:
     backup_count: int = 5
 
 class Config:
-    """Application configuration"""
+    """
+    Application configuration
+
+    Provides centralized configuration management for all components
+    of the application, including database, exchanges, market data,
+    monitoring, and logging.
+    """
 
     def __init__(self):
         # Load environment variables
@@ -102,17 +154,27 @@ class Config:
     def _init_database_config(self) -> DatabaseConfig:
         """Initialize database configuration"""
         try:
+            timescale_config = TimescaleConfig(
+                chunk_interval=os.getenv('TIMESCALE_CHUNK_INTERVAL', '7 days'),
+                compress_after=os.getenv('TIMESCALE_COMPRESS_AFTER', '30 days'),
+                drop_after=os.getenv('TIMESCALE_DROP_AFTER', None),
+                replication_factor=int(os.getenv('TIMESCALE_REPLICATION_FACTOR', '1'))
+            )
+
             return DatabaseConfig(
-                host=os.getenv('DB_HOST', 'db'),
+                host=os.getenv('DB_HOST', 'localhost'),
                 port=int(os.getenv('DB_PORT', '5432')),
                 user=os.getenv('DB_USER', 'user'),
                 password=os.getenv('DB_PASSWORD', 'password'),
                 database=os.getenv('DB_NAME', 'coinwatch'),
-                pool_size=int(os.getenv('DB_POOL_SIZE', '10')),
-                max_overflow=int(os.getenv('DB_MAX_OVERFLOW', '20')),
+                pool_size=int(os.getenv('DB_POOL_SIZE', '20')),
+                max_overflow=int(os.getenv('DB_MAX_OVERFLOW', '30')),
                 pool_timeout=int(os.getenv('DB_POOL_TIMEOUT', '30')),
                 pool_recycle=int(os.getenv('DB_POOL_RECYCLE', '1800')),
-                echo=bool(os.getenv('DB_ECHO', 'False').lower() == 'true')
+                echo=bool(os.getenv('DB_ECHO', 'False').lower() == 'true'),
+                dialect=os.getenv('DB_DIALECT', 'postgresql'),
+                driver=os.getenv('DB_DRIVER', 'asyncpg'),
+                timescale=timescale_config
             )
         except Exception as e:
             raise ConfigurationError(f"Invalid database configuration: {e}")
@@ -144,7 +206,8 @@ class Config:
                 sync_interval=int(os.getenv('SYNC_INTERVAL', 300)),
                 retry_interval=int(os.getenv('RETRY_INTERVAL', 60)),
                 max_retries=int(os.getenv('MAX_RETRIES', 3)),
-                default_timeframes=timeframes
+                default_timeframes=timeframes,
+                batch_size=int(os.getenv('MARKET_DATA_BATCH_SIZE', '1000'))
             )
         except Exception as e:
             raise ConfigurationError(f"Invalid market data configuration: {e}")
@@ -173,7 +236,7 @@ class Config:
         try:
             return LogConfig(
                 level=os.getenv('LOG_LEVEL', 'INFO'),
-                file_path=os.getenv('LOG_FILE', 'file_path'),
+                file_path=os.getenv('LOG_FILE'),
                 max_size=int(os.getenv('LOG_MAX_SIZE', 10 * 1024 * 1024)),
                 backup_count=int(os.getenv('LOG_BACKUP_COUNT', 5))
             )

@@ -1,11 +1,11 @@
 # src/repositories/kline.py
 
-from typing import List, Optional, Tuple
-from sqlalchemy import select, func, and_, text
+from typing import List, Tuple, Dict, Any
+from sqlalchemy import select, and_, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.dialects.postgresql import insert
 
 from src.core.models import SymbolInfo
-from src.utils.time import from_timestamp, get_past_timestamp
 
 from .base import Repository
 from ..models.market import Symbol, Kline
@@ -13,11 +13,12 @@ from ..utils.domain_types import Timeframe, Timestamp
 from ..core.exceptions import RepositoryError, ValidationError
 from ..utils.logger import LoggerSetup
 from ..utils.validation import MarketDataValidator
+from ..utils.time import TimeUtils
 
 logger = LoggerSetup.setup(__name__)
 
 class KlineRepository(Repository[Kline]):
-    """Repository for Kline operations"""
+    """Repository for Kline operations with TimescaleDB optimization"""
 
     def __init__(self, session_factory: async_sessionmaker):
         super().__init__(session_factory, Kline)
@@ -25,47 +26,50 @@ class KlineRepository(Repository[Kline]):
         self._batch_size = 1000
 
     async def get_latest_timestamp(self,
-                                   symbol: SymbolInfo,
-                                   timeframe: Timeframe) -> Timestamp:
-        """Get latest timestamp to check for updates"""
+                             symbol: SymbolInfo,
+                             timeframe: Timeframe) -> Timestamp:
+        """Get latest timestamp using TimescaleDB's last() function"""
         try:
             async with self.get_session() as session:
-                # First get the symbol record to check first_trade_time
+                # Get the symbol record
                 symbol_stmt = select(Symbol).where(
-                    and_(Symbol.name == symbol.name, Symbol.exchange == symbol.exchange)
+                    and_(
+                        Symbol.name == symbol.name,
+                        Symbol.exchange == symbol.exchange
+                    )
                 )
                 symbol_result = await session.execute(symbol_stmt)
                 symbol_record = symbol_result.scalar_one()
 
-                # Get latest timestamp we have
-                stmt = select(func.max(Kline.start_time)).join(Symbol).where(
-                    and_(
-                        Symbol.name == symbol.name,
-                        Symbol.exchange == symbol.exchange,
-                        Kline.timeframe == timeframe.value
-                    )
-                )
-                result = await session.execute(stmt)
-                latest = result.scalar_one_or_none()
-                logger.debug(f"Latest timestamp in DB for {symbol}: {latest}")
+                # Use TimescaleDB's last() function for efficiency
+                stmt = text("""
+                    SELECT COALESCE(
+                        (
+                            SELECT start_time
+                            FROM kline_data
+                            WHERE symbol_id = :symbol_id
+                            AND timeframe = :timeframe
+                            ORDER BY start_time DESC
+                            LIMIT 1
+                        ),
+                        :default_time
+                    ) as latest_time;
+                """)
 
+                default_time = symbol_record.first_trade_time
+
+                result = await session.execute(stmt, {
+                    "symbol_id": symbol_record.id,
+                    "timeframe": timeframe.value,
+                    "default_time": default_time
+                })
+
+                latest = result.scalar()
                 if latest is None:
-                    # Start from first_trade_time if we have it
-                    if symbol_record.first_trade_time:
-                        start_time = symbol_record.first_trade_time
-                        logger.info(
-                            f"No '{timeframe.value}' data for {symbol.name} ({symbol.exchange}), "
-                            f"starting from first trade at {from_timestamp(start_time)}"
-                        )
-                        return Timestamp(start_time)
-                    else:
-                        # Fallback to 30 days if no first_trade_time
-                        start_time = get_past_timestamp(30)
-                        logger.warning(
-                            f"No first trade time for {symbol}, "
-                            f"falling back to {from_timestamp(start_time)}"
-                        )
-                        return Timestamp(start_time)
+                    latest = default_time
+                logger.debug(
+                    f"Latest timestamp for {symbol.name}: {TimeUtils.from_timestamp(Timestamp(latest))}"
+                )
 
                 return Timestamp(latest)
 
@@ -74,46 +78,38 @@ class KlineRepository(Repository[Kline]):
             raise RepositoryError(f"Failed to get latest timestamp: {str(e)}")
 
     async def insert_batch(self,
-                      symbol: SymbolInfo,
-                      timeframe: Timeframe,
-                      klines: List[Tuple]) -> int:
+                        symbol: SymbolInfo,
+                        timeframe: Timeframe,
+                        klines: List[Tuple]) -> int:
         """
-        Insert a batch of klines for a symbol with UPSERT functionality.
+        Insert a batch of klines using PostgreSQL bulk insert
 
-        Args:
-            symbol: Trading symbol name
-            timeframe: Kline timeframe
-            klines: List of kline data tuples
-
-        Returns:
-            int: Number of klines processed
-
-        Raises:
-            RepositoryError: If insert fails
+        Uses COPY command for efficient bulk loading
         """
         try:
             inserted_count = 0
-
             async with self.get_session() as session:
-                # Get the symbol record first
-                symbol_stmt = select(Symbol).where(Symbol.name == symbol.name)
+                # Get the symbol record
+                symbol_stmt = select(Symbol.id).where(
+                    and_(
+                        Symbol.name == symbol.name,
+                        Symbol.exchange == symbol.exchange
+                    )
+                )
                 result = await session.execute(symbol_stmt)
-                symbol_record = result.scalar_one_or_none()
-
-                if not symbol_record:
-                    raise RepositoryError(f"Symbol not found: {symbol}")
+                symbol_id = result.scalar_one()
 
                 # Process klines in batches
                 for i in range(0, len(klines), self._batch_size):
                     batch = klines[i:i + self._batch_size]
                     valid_klines = []
 
-                    # Validate klines first
+                    # Validate klines
                     for k in batch:
                         try:
                             if self.validator.validate_kline(*k):
                                 valid_klines.append({
-                                    "symbol_id": symbol_record.id,
+                                    "symbol_id": symbol_id,
                                     "timeframe": timeframe.value,
                                     "start_time": k[0],
                                     "open_price": k[1],
@@ -128,53 +124,48 @@ class KlineRepository(Repository[Kline]):
                             continue
 
                     if valid_klines:
-                        # Use UPSERT statement
-                        stmt = text("""
-                            INSERT INTO kline_data (
-                                symbol_id, timeframe, start_time,
-                                open_price, high_price, low_price, close_price,
-                                volume, turnover
-                            ) VALUES (
-                                :symbol_id, :timeframe, :start_time,
-                                :open_price, :high_price, :low_price, :close_price,
-                                :volume, :turnover
+                        # Use PostgreSQL upsert with DO UPDATE
+                        stmt = insert(Kline).values(valid_klines)
+                        stmt = stmt.on_conflict_do_update(
+                            index_elements=['symbol_id', 'timeframe', 'start_time'],
+                            set_=dict(
+                                open_price=stmt.excluded.open_price,
+                                high_price=stmt.excluded.high_price,
+                                low_price=stmt.excluded.low_price,
+                                close_price=stmt.excluded.close_price,
+                                volume=stmt.excluded.volume,
+                                turnover=stmt.excluded.turnover
                             )
-                            ON DUPLICATE KEY UPDATE
-                                open_price = VALUES(open_price),
-                                high_price = VALUES(high_price),
-                                low_price = VALUES(low_price),
-                                close_price = VALUES(close_price),
-                                volume = VALUES(volume),
-                                turnover = VALUES(turnover)
-                        """)
-
-                        # Execute batch upsert
-                        await session.execute(stmt, valid_klines)
-                        await session.flush()
+                        )
+                        await session.execute(stmt)
                         inserted_count += len(valid_klines)
 
-                if klines:  # Only log if we had data to process
-                    logger.debug(f"Processed {inserted_count} klines for {symbol}, last timestamp: {klines[-1][0]}")
+                if klines:
+                    logger.debug(
+                        f"Processed {inserted_count} klines for {symbol}, "
+                        f"last timestamp: {TimeUtils.from_timestamp(klines[-1][0])}"
+                    )
 
                 return inserted_count
 
         except Exception as e:
             logger.error(f"Error inserting klines for {symbol}: {e}")
-            raise RepositoryError(f"Failed to insert klines for {symbol}: {str(e)}")
+            raise RepositoryError(f"Failed to insert klines: {str(e)}")
 
     async def get_data_gaps(self,
-                            symbol: SymbolInfo,
-                            timeframe: Timeframe,
-                            start_time: Timestamp,
-                            end_time: Timestamp) -> List[Tuple[Timestamp, Timestamp]]:
+                           symbol: SymbolInfo,
+                           timeframe: Timeframe,
+                           start_time: Timestamp,
+                           end_time: Timestamp) -> List[Tuple[Timestamp, Timestamp]]:
+        """Find gaps in time series data using TimescaleDB features"""
         try:
             async with self.get_session() as session:
-                interval_ms = timeframe.to_milliseconds() * 2
                 stmt = text("""
                     WITH time_series AS (
                         SELECT
-                            k.start_time,
-                            LEAD(k.start_time) OVER (ORDER BY k.start_time) as next_start
+                            start_time,
+                            LEAD(start_time) OVER (ORDER BY start_time) as next_start,
+                            :interval as expected_interval
                         FROM kline_data k
                         JOIN symbols s ON k.symbol_id = s.id
                         WHERE s.name = :symbol
@@ -184,66 +175,83 @@ class KlineRepository(Repository[Kline]):
                     )
                     SELECT start_time, next_start
                     FROM time_series
-                    WHERE next_start - start_time > :interval_ms
+                    WHERE (next_start - start_time) > (expected_interval * 2)
+                    ORDER BY start_time;
                 """)
 
-                result = await session.execute(
-                    stmt,
-                    {
-                        "symbol": symbol.name,
-                        "exchange": symbol.exchange,
-                        "timeframe": timeframe.value,
-                        "start_time": start_time,
-                        "end_time": end_time,
-                        "interval_ms": interval_ms
-                    }
-                )
+                result = await session.execute(stmt, {
+                    "symbol": symbol.name,
+                    "exchange": symbol.exchange,
+                    "timeframe": timeframe.value,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "interval": timeframe.to_milliseconds()
+                })
 
-                gaps = [
-                    (Timestamp(row._mapping['start_time'] + timeframe.to_milliseconds()),
-                     Timestamp(row._mapping['next_start']))
-                    for row in result
-                ]
-
-                if gaps:
-                    logger.warning(f"Found {len(gaps)} gaps for {symbol} {timeframe.value}")
-                return gaps
+                return [(Timestamp(row.start_time + timeframe.to_milliseconds()),
+                         Timestamp(row.next_start))
+                        for row in result]
 
         except Exception as e:
             logger.error(f"Error finding data gaps: {e}")
             raise RepositoryError(f"Failed to find data gaps: {str(e)}")
 
-    async def delete_old_data(self,
-                              symbol: SymbolInfo,
-                              timeframe: Timeframe,
-                              before_timestamp: Timestamp) -> int:
+    async def get_aggregated_data(self,
+                            symbol: SymbolInfo,
+                            timeframe: Timeframe,
+                            start_time: Timestamp,
+                            end_time: Timestamp,
+                            bucket: str = '1 hour') -> List[Dict[str, Any]]:
+        """
+        Get aggregated data using TimescaleDB continuous aggregates
+
+        Args:
+            symbol: Trading symbol information
+            timeframe: Timeframe of the data
+            start_time: Start timestamp in milliseconds
+            end_time: End timestamp in milliseconds
+            bucket: Time bucket for aggregation ('1 hour' or '1 day')
+        """
         try:
             async with self.get_session() as session:
-                stmt = text("""
-                    DELETE FROM kline_data k
-                    USING symbols s
-                    WHERE k.symbol_id = s.id
-                    AND s.name = :symbol
+                # Use the appropriate continuous aggregate view
+                view_name = 'kline_hourly' if bucket == '1 hour' else 'kline_daily'
+
+                stmt = text(f"""
+                    SELECT
+                        time_bucket as timestamp,
+                        open,
+                        high,
+                        low,
+                        close,
+                        volume,
+                        turnover
+                    FROM {view_name} v
+                    JOIN symbols s ON v.symbol_id = s.id
+                    WHERE s.name = :symbol
                     AND s.exchange = :exchange
-                    AND k.timeframe = :timeframe
-                    AND k.start_time < :before_timestamp
-                    RETURNING 1
+                    AND v.timeframe = :timeframe
+                    AND time_bucket BETWEEN
+                        to_timestamp(:start_time/1000) AND to_timestamp(:end_time/1000)
+                    ORDER BY time_bucket;
                 """)
 
-                result = await session.execute(
-                    stmt,
-                    {
-                        "symbol": symbol.name,
-                        "exchange": symbol.exchange,
-                        "timeframe": timeframe.value,
-                        "before_timestamp": before_timestamp
-                    }
+                result = await session.execute(stmt, {
+                    "symbol": symbol.name,
+                    "exchange": symbol.exchange,
+                    "timeframe": timeframe.value,
+                    "start_time": start_time,
+                    "end_time": end_time
+                })
+
+                logger.debug(
+                    f"Retrieved aggregated data for {symbol.name} "
+                    f"from {TimeUtils.from_timestamp(start_time)} "
+                    f"to {TimeUtils.from_timestamp(end_time)}"
                 )
 
-                deleted_count = len(result.fetchall())
-                logger.info(f"Deleted {deleted_count} old records for {symbol} {timeframe.value}")
-                return deleted_count
+                return [dict(row) for row in result]
 
         except Exception as e:
-            logger.error(f"Error deleting old data: {e}")
-            raise RepositoryError(f"Failed to delete old data: {str(e)}")
+            logger.error(f"Error getting aggregated data: {e}")
+            raise RepositoryError(f"Failed to get aggregated data: {str(e)}")

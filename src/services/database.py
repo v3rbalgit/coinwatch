@@ -2,7 +2,6 @@
 
 import time
 import asyncio
-import re
 from typing import Optional, AsyncGenerator, TypedDict, Dict, TypeVar, Callable, Awaitable
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -13,11 +12,10 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.pool import AsyncAdaptedQueuePool
 from sqlalchemy.exc import OperationalError
 from contextlib import asynccontextmanager
-from sqlalchemy import text
+from sqlalchemy import text, event
 from enum import Enum
 
 from src.config import DatabaseConfig
-
 from src.services.base import ServiceBase
 from ..core.exceptions import ServiceError
 from ..utils.logger import LoggerSetup
@@ -41,7 +39,16 @@ class ConnectionConfig(TypedDict):
     echo: bool
 
 class DatabaseService(ServiceBase):
-    """Database service with connection pooling and session management"""
+    """
+    Database service with connection pooling and session management
+
+    Handles PostgreSQL connections with TimescaleDB support, providing:
+    - Connection pooling
+    - Transaction management
+    - Health monitoring
+    - Error handling
+    - Resource optimization
+    """
 
     def __init__(self, config: DatabaseConfig):
         super().__init__(config)
@@ -58,7 +65,7 @@ class DatabaseService(ServiceBase):
 
         self._transaction_semaphore = asyncio.BoundedSemaphore(config.pool_size)
 
-        # Default configuration
+        # PostgreSQL-specific configuration
         self._config: ConnectionConfig = {
             "pool_size": config.pool_size,
             "max_overflow": config.max_overflow,
@@ -67,18 +74,37 @@ class DatabaseService(ServiceBase):
             "echo": config.echo
         }
 
+        # Store TimescaleDB config for initialization
+        self._timescale_config = config.timescale
+
     def _create_engine(self) -> AsyncEngine:
-        """Create SQLAlchemy engine with optimal settings"""
-        return create_async_engine(
+        """Create SQLAlchemy engine with PostgreSQL optimizations"""
+        engine = create_async_engine(
             self._connection_url,
             poolclass=AsyncAdaptedQueuePool,
+            json_serializer=None,  # Use PostgreSQL native JSON handling
+            json_deserializer=None,
+            pool_pre_ping=True,    # Enable connection health checks
             **self._config
         )
 
+        # Set PostgreSQL-specific session configuration
+        @event.listens_for(engine.sync_engine, "connect")
+        def set_pg_session_config(dbapi_connection, connection_record):
+            # Enable parallel query execution
+            dbapi_connection.set_session(
+                enable_parallel_query=True,
+                statement_timeout=30000  # 30 seconds timeout
+            )
+
+        return engine
+
     async def start(self) -> None:
-        """Start the database service with pool monitoring"""
+        """Start the database service with TimescaleDB initialization"""
         try:
             self._status = ServiceStatus.STARTING
+            logger.info("Starting database service")
+
             self.engine = self._create_engine()
 
             # Create tables if they don't exist
@@ -86,10 +112,20 @@ class DatabaseService(ServiceBase):
                 from ..models.base import Base
                 await conn.run_sync(Base.metadata.create_all)
 
+                # Initialize TimescaleDB extensions
+                await conn.execute(text("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;"))
+
+                # Set chunk interval if specified
+                if self._timescale_config.chunk_interval:
+                    await conn.execute(text(
+                        "SELECT set_chunk_time_interval('kline_data', interval :interval);"
+                    ), {"interval": self._timescale_config.chunk_interval})
+
             self.session_factory = async_sessionmaker(
                 bind=self.engine,
                 class_=AsyncSession,
-                expire_on_commit=False
+                expire_on_commit=False,
+                autoflush=False  # Optimize for bulk operations
             )
 
             # Start pool monitoring
@@ -103,6 +139,7 @@ class DatabaseService(ServiceBase):
 
         except Exception as e:
             self._status = ServiceStatus.ERROR
+            logger.error(f"Failed to start database service: {e}")
             raise ServiceError(f"Database initialization failed: {str(e)}")
 
     async def _monitor_pool(self) -> None:
@@ -110,6 +147,7 @@ class DatabaseService(ServiceBase):
         while True:
             try:
                 stats = await self._get_pool_stats()
+
                 if stats.get('overflow', 0) > 0:
                     await self.handle_critical_condition(
                         CriticalCondition(
@@ -128,48 +166,57 @@ class DatabaseService(ServiceBase):
                             timestamp=time.time()
                         )
                     )
+
+                # Monitor database size
+                async with self.transaction() as session:
+                    result = await session.execute(text("""
+                        SELECT pg_size_pretty(pg_database_size(current_database()));
+                    """))
+                    db_size = result.scalar()
+                    logger.debug(f"Current database size: {db_size}")
+
                 await asyncio.sleep(60)
+
             except Exception as e:
                 logger.error(f"Pool monitoring error: {e}")
+                await asyncio.sleep(5)
 
-    # TODO: consider monitoring of the checked-in parameter
     async def _get_pool_stats(self) -> Dict[str, int]:
-        """Get current pool statistics"""
-        if not self.engine or not hasattr(self.engine, 'sync_engine'):
+        """Get current pool statistics using PostgreSQL system views"""
+        if not self.engine:
             return {'size': 0, 'checked_out': 0, 'overflow': 0}
 
-        pool = self.engine.sync_engine.pool
-        status_str = pool.status()
-        stats = {
-            'size': 0,
-            'checked_out': 0,
-            'overflow': 0
-        }
-
         try:
-            # Adjust the regular expression based on the actual format
-            pattern = (
-                r'Pool size: (?P<size>\d+)\s+'
-                r'Connections in pool: \d+\s+'
-                r'Current Overflow: (?P<overflow>-?\d+)\s+'
-                r'Current Checked out connections: (?P<checked_out>\d+)'
-            )
-            match = re.search(pattern, status_str)
-            if match:
-                stats['size'] = int(match.group('size'))
-                stats['checked_out'] = int(match.group('checked_out'))
-                stats['overflow'] = int(match.group('overflow'))
-        except Exception as e:
-            logger.error(f"Error parsing pool status: {e}")
+            async with self.transaction() as session:
+                result = await session.execute(text("""
+                    SELECT count(*) as connections
+                    FROM pg_stat_activity
+                    WHERE application_name LIKE 'coinwatch%';
+                """))
+                active_connections = result.scalar() or 0
 
-        return stats
+                return {
+                    'size': self._config['pool_size'],
+                    'checked_out': active_connections,
+                    'overflow': max(0, active_connections - self._config['pool_size'])
+                }
+        except Exception as e:
+            logger.error(f"Error getting pool stats: {e}")
+            return {'size': 0, 'checked_out': 0, 'overflow': 0}
 
     @asynccontextmanager
     async def transaction(self,
-                          isolation_level: Optional[IsolationLevel] = None,
-                          retry_count: int = 3,
-                          retry_delay: float = 1.0) -> AsyncGenerator[AsyncSession, None]:
-        """Transaction management with isolation levels and retry logic"""
+                         isolation_level: Optional[IsolationLevel] = None,
+                         retry_count: int = 3,
+                         retry_delay: float = 1.0) -> AsyncGenerator[AsyncSession, None]:
+        """
+        Transaction management with PostgreSQL-specific optimizations
+
+        Args:
+            isolation_level: Transaction isolation level
+            retry_count: Number of retries for deadlocks
+            retry_delay: Delay between retries
+        """
         if not self.session_factory:
             raise ServiceError("Database service not initialized")
 
@@ -182,11 +229,16 @@ class DatabaseService(ServiceBase):
                             await session.execute(
                                 text(f"SET TRANSACTION ISOLATION LEVEL {isolation_level.value}")
                             )
+
+                        # Set statement timeout for this transaction
+                        await session.execute(text("SET statement_timeout = '30s';"))
+
                         async with session.begin():
                             yield session
-                        return  # Exit if successful
+                        return
+
                     except OperationalError as e:
-                        if "deadlock" in str(e).lower():
+                        if "deadlock detected" in str(e).lower():
                             if attempt < retry_count:
                                 logger.warning(
                                     f"Deadlock detected, retrying in {retry_delay}s... "
@@ -209,34 +261,27 @@ class DatabaseService(ServiceBase):
 
     @asynccontextmanager
     async def savepoint(self, session: AsyncSession):
-        """Nested transaction using savepoint"""
+        """Nested transaction using PostgreSQL savepoint"""
         async with session.begin_nested():
             yield
 
     async def execute_in_transaction(self,
-                                     func: Callable[[AsyncSession], Awaitable[T]],
-                                     isolation_level: Optional[IsolationLevel] = None) -> T:
+                                   func: Callable[[AsyncSession], Awaitable[T]],
+                                   isolation_level: Optional[IsolationLevel] = None) -> T:
         """Execute an async function within a transaction"""
         async with self.transaction(isolation_level) as session:
             return await func(session)
 
     async def get_session(self) -> AsyncGenerator[AsyncSession, None]:
-        """Get a session for backward compatibility"""
+        """
+        Get a session for backward compatibility.
+        Wraps the transaction context manager for existing code.
+        """
         async with self.transaction() as session:
             yield session
 
-    async def check_health(self) -> bool:
-        """Check database connection health"""
-        try:
-            async with self.transaction() as session:
-                await session.execute(text("SELECT 1"))
-            return True
-        except Exception as e:
-            logger.error(f"Database health check failed: {e}")
-            return False
-
     async def handle_critical_condition(self, condition: CriticalCondition) -> None:
-        """Handle critical conditions like pool overflow or timeout"""
+        """Handle critical conditions with PostgreSQL-specific recovery"""
         if condition["type"] == "connection_overflow":
             if self.engine:
                 await self.engine.dispose()
@@ -245,7 +290,8 @@ class DatabaseService(ServiceBase):
                 self.session_factory = async_sessionmaker(
                     bind=self.engine,
                     class_=AsyncSession,
-                    expire_on_commit=False
+                    expire_on_commit=False,
+                    autoflush=False
                 )
                 logger.info(
                     f"Connection pool reset and max_overflow increased to {self._config['max_overflow']}"
@@ -258,7 +304,8 @@ class DatabaseService(ServiceBase):
                 self.session_factory = async_sessionmaker(
                     bind=self.engine,
                     class_=AsyncSession,
-                    expire_on_commit=False
+                    expire_on_commit=False,
+                    autoflush=False
                 )
                 logger.info(
                     f"Pool timeout increased to {self._config['pool_timeout']}"
@@ -279,7 +326,6 @@ class DatabaseService(ServiceBase):
             if self.engine:
                 await self.engine.dispose()
                 self.engine = None
-                # self.session_factory = None
 
             self._status = ServiceStatus.STOPPED
             logger.info("Database service stopped")
@@ -289,3 +335,73 @@ class DatabaseService(ServiceBase):
             self._status = ServiceStatus.ERROR
             logger.error(f"Error stopping database service: {e}")
             raise ServiceError(f"Database shutdown failed: {str(e)}")
+
+    async def check_health(self) -> bool:
+        """
+        Comprehensive database health check including TimescaleDB features
+
+        Checks:
+        - Basic connectivity
+        - TimescaleDB extension status
+        - Hypertable configuration
+        - Database size and connection status
+        """
+        try:
+            async with self.transaction() as session:
+                # Basic connectivity check
+                await session.execute(text("SELECT 1"))
+
+                # Check TimescaleDB extension
+                result = await session.execute(text("""
+                    SELECT extname, extversion
+                    FROM pg_extension
+                    WHERE extname = 'timescaledb';
+                """))
+                timescale_info = result.first()
+                if not timescale_info:
+                    logger.warning("TimescaleDB extension not found")
+                    return False
+
+                # Check hypertable configuration
+                result = await session.execute(text("""
+                    SELECT * FROM timescaledb_information.hypertables
+                    WHERE hypertable_name = 'kline_data';
+                """))
+                if not result.first():
+                    logger.warning("Kline hypertable not properly configured")
+                    return False
+
+                # Check database size and connection count
+                result = await session.execute(text("""
+                    SELECT
+                        COALESCE(pg_size_pretty(pg_database_size(current_database())), 'Unknown') as db_size,
+                        COALESCE((SELECT count(*) FROM pg_stat_activity
+                        WHERE datname = current_database()), 0) as connection_count;
+                """))
+                stats = result.first()
+                if stats:
+                    logger.info(
+                        f"Database size: {stats[0]}, "
+                        f"Active connections: {stats[1]}"
+                    )
+
+                # Check chunk information
+                result = await session.execute(text("""
+                    SELECT
+                        COALESCE(count(*), 0) as chunk_count,
+                        COALESCE(pg_size_pretty(sum(total_bytes)), 'Unknown') as total_size
+                    FROM timescaledb_information.chunks
+                    WHERE hypertable_name = 'kline_data';
+                """))
+                chunk_info = result.first()
+                if chunk_info:
+                    logger.info(
+                        f"TimescaleDB chunks: {chunk_info[0]}, "
+                        f"Total size: {chunk_info[1]}"
+                    )
+
+                return True
+
+        except Exception as e:
+            logger.error(f"Database health check failed: {e}")
+            return False
