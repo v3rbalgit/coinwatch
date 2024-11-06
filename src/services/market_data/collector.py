@@ -127,7 +127,7 @@ class HistoricalCollector:
                         }
                     ))
                 except Exception as e:
-                    self._error_tracker.record_error(e, symbol.name, context="collection")
+                    await self._error_tracker.record_error(e, symbol.name, context="collection")
                     logger.error(f"Error collecting data for {symbol.name}: {e}")
 
                     # Notify about collection error
