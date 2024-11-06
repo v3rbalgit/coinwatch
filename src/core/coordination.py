@@ -18,6 +18,8 @@ class MarketDataCommand(Enum):
     HANDLE_ERROR = "handle_error"
 
     # Synchronization
+    PAUSE_SYNC = "pause_sync"
+    RESUME_SYNC = "resume_sync"
     SYNC_ERROR = "sync_error"
     SYNC_SCHEDULED = "sync_scheduled"
     SYNC_COMPLETED = "sync_completed"
@@ -25,15 +27,14 @@ class MarketDataCommand(Enum):
     # Collection
     COLLECTION_STARTED = "collection_started"
     COLLECTION_PROGRESS = "collection_progress"
-    COLLECTION_COMPLETE = "collection_complete"
-    COLLECTION_ERROR = "collection_error"
     PAUSE_COLLECTION = "pause_collection"
     RESUME_COLLECTION = "resume_collection"
-    ADJUST_SYNC_SCHEDULE = "adjust_sync_schedule"
+    COLLECTION_COMPLETE = "collection_complete"
+    COLLECTION_ERROR = "collection_error"
+    SYMBOL_DELISTED = "symbol_delisted"
 
-    # Resource Management
-    REDUCE_RESOURCE_USAGE = "reduce_resource_usage"
-    OPTIMIZE_STORAGE = "optimize_storage"
+    EXCHANGE_ERROR = "exchange_error"
+    MONITOR_ERROR = "monitor_error"
 
 @dataclass
 class Command:
