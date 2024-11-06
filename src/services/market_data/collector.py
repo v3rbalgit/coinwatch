@@ -8,7 +8,7 @@ from ...core.coordination import Command, MarketDataCommand, ServiceCoordinator
 from ...repositories.kline import KlineRepository
 from ...repositories.symbol import SymbolRepository
 from ...utils.logger import LoggerSetup
-from ...utils.time import from_timestamp, get_current_timestamp
+from ...utils.time import TimeUtils
 from ...utils.domain_types import Timeframe, Timestamp
 from ...core.models import SymbolInfo
 from ...core.exceptions import ServiceError, ValidationError
@@ -38,14 +38,12 @@ class HistoricalCollector:
         self._max_retries = max_retries
         self._batch_size = batch_size
 
-        # Task management
-        self._active = False
-        self._task: Optional[asyncio.Task] = None
-
         # Collection management
         self._collection_queue: asyncio.Queue[SymbolInfo] = asyncio.Queue(maxsize=1000)
         self._processing_symbols: Set[str] = set()
         self._collection_lock = asyncio.Lock()
+        self._active = False
+        self._task: Optional[asyncio.Task] = None
 
         # Error handling
         self._error_tracker = ErrorTracker()
@@ -96,12 +94,16 @@ class HistoricalCollector:
                 self._processing_symbols.add(symbol.name)
                 await self._collection_queue.put(symbol)
 
-                # Notify about new collection
                 await self._coordinator.execute(Command(
                     type=MarketDataCommand.COLLECTION_STARTED,
                     params={
                         "symbol": symbol.name,
-                        "start_time": symbol.launch_time
+                        "start_time": symbol.launch_time,
+                        "timestamp": TimeUtils.get_current_timestamp(),
+                        "context": {
+                            "batch_size": self._batch_size,
+                            "timeframe": self._base_timeframe.value
+                        }
                     }
                 ))
 
@@ -115,22 +117,26 @@ class HistoricalCollector:
             try:
                 symbol = await self._collection_queue.get()
                 try:
+                    collection_start = TimeUtils.get_current_timestamp()
                     await self._collect_historical_data(symbol, self._base_timeframe)
+                    collection_end = TimeUtils.get_current_timestamp()
 
-                    # Notify successful completion
+                    # Notify successful completion with timing information
                     await self._coordinator.execute(Command(
                         type=MarketDataCommand.COLLECTION_COMPLETE,
                         params={
                             "symbol": symbol.name,
-                            "start_time": symbol.launch_time,
-                            "end_time": get_current_timestamp()
+                            "start_time": collection_start,
+                            "end_time": collection_end,
+                            "timestamp": TimeUtils.get_current_timestamp()
                         }
                     ))
+
                 except Exception as e:
                     await self._error_tracker.record_error(e, symbol.name, context="collection")
                     logger.error(f"Error collecting data for {symbol.name}: {e}")
 
-                    # Notify about collection error
+                    # Notify about collection error with timing context
                     await self._coordinator.execute(Command(
                         type=MarketDataCommand.COLLECTION_ERROR,
                         params={
@@ -143,7 +149,7 @@ class HistoricalCollector:
                                     window_minutes=60
                                 ),
                                 "process": "historical_collection",
-                                "timestamp": get_current_timestamp()
+                                "timestamp": TimeUtils.get_current_timestamp()
                             }
                         }
                     ))
@@ -170,25 +176,35 @@ class HistoricalCollector:
                 # First ensure symbol exists in database
                 await self._symbol_repository.get_or_create(symbol)
 
-                # Get collection boundaries
+                # Get start time based on latest data or symbol launch
                 start_time = await self._kline_repository.get_latest_timestamp(
                     symbol,
                     timeframe
                 )
-                current_time = get_current_timestamp()
-                interval_ms = timeframe.to_milliseconds()
 
-                # Adjust to last completed interval
-                last_complete_interval = current_time - (current_time % interval_ms) - interval_ms
-                start_time = symbol.launch_time if not start_time else start_time + interval_ms
+                # Calculate collection boundaries
+                interval_ms = timeframe.to_milliseconds()
+                current_time = TimeUtils.get_current_timestamp()
+
+                # Find last completed interval
+                last_complete_interval, _ = TimeUtils.get_interval_boundaries(
+                    Timestamp(current_time - interval_ms),
+                    interval_ms
+                )
+
+                # Set initial start time
+                if not start_time:
+                    start_time = symbol.launch_time
+                else:
+                    start_time = Timestamp(start_time + interval_ms)
 
                 # Calculate total expected candles
                 total_candles = int((last_complete_interval - start_time) // interval_ms)
 
                 logger.info(
                     f"Starting historical collection for {symbol.name} "
-                    f"from {from_timestamp(start_time)} "
-                    f"to {from_timestamp(last_complete_interval)}"
+                    f"from {TimeUtils.from_timestamp(start_time)} "
+                    f"to {TimeUtils.from_timestamp(last_complete_interval)}"
                 )
 
                 while start_time < last_complete_interval:
@@ -202,7 +218,7 @@ class HistoricalCollector:
                     klines = await adapter.get_klines(
                         symbol=symbol,
                         timeframe=timeframe,
-                        start_time=Timestamp(start_time),
+                        start_time=start_time,
                         limit=self._batch_size
                     )
 
@@ -210,18 +226,19 @@ class HistoricalCollector:
                         break
 
                     # Only store completed candles
-                    klines = [k for k in klines if k.timestamp <= last_complete_interval]
+                    klines = [k for k in klines
+                             if TimeUtils.is_complete_interval(Timestamp(k.timestamp), interval_ms)]
 
                     if klines:
                         # Store klines
-                        await self._kline_repository.insert_batch(
+                        processed = await self._kline_repository.insert_batch(
                             symbol,
                             timeframe,
                             [k.to_tuple() for k in klines]
                         )
 
                         # Update progress
-                        processed_candles += len(klines)
+                        processed_candles += processed
                         last_timestamp = klines[-1].timestamp
 
                         # Report progress
@@ -232,6 +249,7 @@ class HistoricalCollector:
                                 "processed": processed_candles,
                                 "total": total_candles,
                                 "last_timestamp": last_timestamp,
+                                "timestamp": TimeUtils.get_current_timestamp(),
                                 "context": {
                                     "timeframe": timeframe.value,
                                     "batch_size": self._batch_size
@@ -239,14 +257,13 @@ class HistoricalCollector:
                             }
                         ))
 
-                        start_time = last_timestamp + interval_ms
+                        start_time = Timestamp(last_timestamp + interval_ms)
 
-                # Collection complete
                 logger.info(
                     f"Completed historical collection for {symbol.name} "
-                    f"up to {from_timestamp(last_complete_interval)}"
+                    f"up to {TimeUtils.from_timestamp(last_complete_interval)}"
                 )
-                break
+                break  # Success - exit retry loop
 
             except Exception as e:
                 # Handle retry logic
@@ -264,9 +281,9 @@ class HistoricalCollector:
 
     def get_collection_status(self) -> str:
         """Get current collection status"""
-        status = ["Historical Collection Status:"]
-        status.extend([
+        status = [
+            "Historical Collection Status:",
             f"Active Collections: {len(self._processing_symbols)}",
             f"Pending Collections: {self._collection_queue.qsize()}"
-        ])
+        ]
         return "\n".join(status)
