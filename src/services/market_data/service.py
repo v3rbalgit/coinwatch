@@ -196,12 +196,18 @@ class MarketDataService(ServiceBase):
         handlers = {
             MarketDataCommand.GAP_DETECTED: self._handle_gap_detected,
             MarketDataCommand.COLLECTION_ERROR: self._handle_collection_error,
-            MarketDataCommand.SYNC_ERROR: self._handle_sync_error
+            MarketDataCommand.SYNC_ERROR: self._handle_sync_error,
+            MarketDataCommand.ADJUST_BATCH_SIZE: self._handle_batch_adjustment
         }
 
         for command, handler in handlers.items():
             await self.coordinator.register_handler(command, handler)
             logger.debug(f"Registered handler for {command.value}")
+
+    async def _handle_batch_adjustment(self, command: Command) -> None:
+        """Forward batch adjustments to components"""
+        await self.data_collector._handle_adjust_batch_size(command)
+        await self.batch_synchronizer._handle_adjust_batch_size(command)
 
     async def _handle_gap_detected(self, command: Command) -> None:
         """Handle detected data gaps"""
@@ -231,7 +237,7 @@ class MarketDataService(ServiceBase):
                 "severity": "warning",
                 "message": f"High gap detection frequency: {frequency}/hour",
                 "timestamp": timestamp,
-                "error_type": "DataGapDetected",
+                "error_type": "TooManyGaps",
                 "context": {
                     "affected_symbols": [symbol],
                     "timeframe": timeframe,

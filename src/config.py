@@ -1,6 +1,6 @@
 # src/config.py
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 import os
 from dotenv import load_dotenv
@@ -9,6 +9,24 @@ from .core.exceptions import ConfigurationError
 from .utils.logger import LoggerSetup
 
 logger = LoggerSetup.setup(__name__)
+
+@dataclass
+class APIConfig:
+    """API service configuration"""
+    host: str = "0.0.0.0"
+    port: int = 8000
+    cors_origins: List[str] = field(default_factory=lambda: ["*"])
+    workers: int = 4
+    reload: bool = False
+    log_level: str = "info"
+    root_path: str = ""
+    docs_url: str = "/docs"
+    openapi_url: str = "/openapi.json"
+
+    # Rate limiting settings
+    rate_limit_enabled: bool = True
+    rate_limit_requests: int = 100
+    rate_limit_window: int = 60  # seconds
 
 @dataclass
 class TimescaleConfig:
@@ -114,9 +132,10 @@ class MonitoringConfig:
     lock_timeout: float = 5.0
     check_intervals: Dict[str, int] = field(
         default_factory=lambda: {
-            'resource': 30,
+            'system': 30,
+            'market': 60,
             'database': 60,
-            'network': 60
+            'cache': 120
         }
     )
 
@@ -147,6 +166,7 @@ class Config:
         self.market_data = self._init_market_data_config()
         self.monitoring = self._init_monitoring_config()
         self.logging = self._init_log_config()
+        self.api = self._init_api_config()
 
     def _init_database_config(self) -> DatabaseConfig:
         """Initialize database configuration"""
@@ -234,3 +254,20 @@ class Config:
             )
         except Exception as e:
             raise ConfigurationError(f"Invalid logging configuration: {e}")
+
+    def _init_api_config(self) -> APIConfig:
+        """Initialize API configuration"""
+        try:
+            return APIConfig(
+                host=os.getenv('API_HOST', '0.0.0.0'),
+                port=int(os.getenv('API_PORT', '8000')),
+                cors_origins=os.getenv('API_CORS_ORIGINS', '*').split(','),
+                workers=int(os.getenv('API_WORKERS', '4')),
+                reload=bool(os.getenv('API_RELOAD', 'false').lower() == 'true'),
+                log_level=os.getenv('API_LOG_LEVEL', 'info'),
+                rate_limit_enabled=bool(os.getenv('API_RATE_LIMIT_ENABLED', 'true').lower() == 'true'),
+                rate_limit_requests=int(os.getenv('API_RATE_LIMIT_REQUESTS', '100')),
+                rate_limit_window=int(os.getenv('API_RATE_LIMIT_WINDOW', '60'))
+            )
+        except Exception as e:
+            raise ConfigurationError(f"Invalid API configuration: {e}")

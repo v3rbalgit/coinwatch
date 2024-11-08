@@ -107,26 +107,11 @@ class RSIResult:
     value: Decimal
 
     @classmethod
-    def from_series(cls, timestamp: Timestamp, value: float) -> 'RSIResult':
-        return cls(timestamp=timestamp, value=Decimal(str(value)))
-
-@dataclass
-class BollingerBandsResult:
-    """Bollinger Bands result"""
-    timestamp: Timestamp
-    upper: Decimal
-    middle: Decimal
-    lower: Decimal
-    bandwidth: Decimal
-
-    @classmethod
-    def from_series(cls, timestamp: Timestamp, bb_dict: Dict[str, float]) -> 'BollingerBandsResult':
+    def from_series(cls, timestamp: Timestamp, value: float, length: int = 14) -> 'RSIResult':
+        # RSI column name format: 'RSI_14'
         return cls(
             timestamp=timestamp,
-            upper=Decimal(str(bb_dict['BBU_20_2.0'])),
-            middle=Decimal(str(bb_dict['BBM_20_2.0'])),
-            lower=Decimal(str(bb_dict['BBL_20_2.0'])),
-            bandwidth=Decimal(str(bb_dict['BBB_20_2.0']))
+            value=Decimal(str(value))
         )
 
 @dataclass
@@ -138,12 +123,37 @@ class MACDResult:
     histogram: Decimal
 
     @classmethod
-    def from_series(cls, timestamp: Timestamp, macd_dict: Dict[str, float]) -> 'MACDResult':
+    def from_series(cls, timestamp: Timestamp, macd_dict: Dict[str, float],
+                   fast: int = 12, slow: int = 26, signal: int = 9) -> 'MACDResult':
+        # MACD column names format: 'MACD_12_26_9', 'MACDs_12_26_9', 'MACDh_12_26_9'
+        suffix = f"_{fast}_{slow}_{signal}"
         return cls(
             timestamp=timestamp,
-            macd=Decimal(str(macd_dict['MACD_12_26_9'])),
-            signal=Decimal(str(macd_dict['MACDs_12_26_9'])),
-            histogram=Decimal(str(macd_dict['MACDh_12_26_9']))
+            macd=Decimal(str(macd_dict[f'MACD{suffix}'])),
+            signal=Decimal(str(macd_dict[f'MACDs{suffix}'])),
+            histogram=Decimal(str(macd_dict[f'MACDh{suffix}']))
+        )
+
+@dataclass
+class BollingerBandsResult:
+    """Bollinger Bands result"""
+    timestamp: Timestamp
+    upper: Decimal
+    middle: Decimal
+    lower: Decimal
+    bandwidth: Decimal
+
+    @classmethod
+    def from_series(cls, timestamp: Timestamp, bb_dict: Dict[str, float],
+                   length: int = 20, std: float = 2.0) -> 'BollingerBandsResult':
+        # BB column names format: 'BBL_20_2.0', 'BBM_20_2.0', 'BBU_20_2.0', 'BBB_20_2.0'
+        suffix = f"_{length}_{std}.0"
+        return cls(
+            timestamp=timestamp,
+            upper=Decimal(str(bb_dict[f'BBU{suffix}'])),
+            middle=Decimal(str(bb_dict[f'BBM{suffix}'])),
+            lower=Decimal(str(bb_dict[f'BBL{suffix}'])),
+            bandwidth=Decimal(str(bb_dict[f'BBB{suffix}']))
         )
 
 @dataclass
@@ -153,8 +163,12 @@ class MAResult:
     value: Decimal
 
     @classmethod
-    def from_series(cls, timestamp: Timestamp, value: float) -> 'MAResult':
-        return cls(timestamp=timestamp, value=Decimal(str(value)))
+    def from_series(cls, timestamp: Timestamp, value: float, length: int = 20) -> 'MAResult':
+        # MA column names format: 'SMA_20' or 'EMA_20'
+        return cls(
+            timestamp=timestamp,
+            value=Decimal(str(value))
+        )
 
 @dataclass
 class OBVResult:
@@ -164,4 +178,8 @@ class OBVResult:
 
     @classmethod
     def from_series(cls, timestamp: Timestamp, value: float) -> 'OBVResult':
-        return cls(timestamp=timestamp, value=Decimal(str(value)))
+        # OBV doesn't have parameters, column name is just 'OBV'
+        return cls(
+            timestamp=timestamp,
+            value=Decimal(str(value))
+        )

@@ -6,16 +6,15 @@ from cachetools import TTLCache
 import pandas as pd
 import pandas_ta as ta
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, cast
 
 from ..core.coordination import Command, MarketDataCommand, ServiceCoordinator
 from ..core.exceptions import ServiceError, ValidationError
 from ..core.models import (
-    KlineData, SymbolInfo,
+    KlineData,
     RSIResult, BollingerBandsResult, MACDResult, MAResult, OBVResult
     )
-from ..managers.timeframe import TimeframeManager
-from ..utils.domain_types import Timeframe, Timestamp
+from ..utils.domain_types import Timestamp
 from ..utils.logger import LoggerSetup
 from ..utils.time import TimeUtils
 from ..utils.retry import RetryConfig, RetryStrategy
@@ -64,14 +63,11 @@ class IndicatorManager:
     """
 
     def __init__(self,
-                 timeframe_manager: TimeframeManager,
                  coordinator: ServiceCoordinator,
                  config: Optional[IndicatorCacheConfig] = None):
-        self.timeframe_manager = timeframe_manager
         self.coordinator = coordinator
         self.config = config or IndicatorCacheConfig()
 
-        self._active_symbols: Set[SymbolInfo] = set()
         self._calculation_lock = asyncio.Lock()
         self._last_reduction_ts = Timestamp(0)
         self._last_adjustment: Optional[CacheAdjustment] = None
@@ -104,7 +100,7 @@ class IndicatorManager:
             ValidationError
         )
     async def _calculate_with_retry(self,
-                                  symbol: SymbolInfo,
+                                  calc_name: str,
                                   calc_func: Callable,
                                   *args: Any,
                                   **kwargs: Any) -> Any:
@@ -122,7 +118,7 @@ class IndicatorManager:
                     retry_count += 1
                     delay = self._retry_strategy.get_delay(retry_count)
                     logger.warning(
-                        f"Retrying {calc_func.__name__} for {symbol} "
+                        f"Retrying {calc_func.__name__} to calculate {calc_name} "
                         f"after {delay:.2f}s (attempt {retry_count}): {e}"
                     )
                     await asyncio.sleep(delay)
@@ -281,7 +277,7 @@ class IndicatorManager:
             self.calculate_obv
         ]:
             if hasattr(method, 'cache_clear'):
-                method.cache_clear()  # type: ignore
+                method.cache_clear()
 
     def get_cache_stats(self) -> Dict[str, Dict[str, Any]]:
         """Get statistics for all indicator caches with pressure metrics"""
@@ -296,7 +292,7 @@ class IndicatorManager:
             ('obv', self.calculate_obv)
         ]:
             if hasattr(method, 'cache_info'):
-                cache_stats = cast(CacheStats, method.cache_info())  # type: ignore
+                cache_stats = cast(CacheStats, method.cache_info())
                 stats[name] = {
                     'stats': cache_stats,
                     'utilization': cache_stats.size / cache_stats.maxsize * 100,
@@ -308,14 +304,22 @@ class IndicatorManager:
     # Resource pressure handlers
     async def _handle_resource_pressure(self, command: Command) -> None:
         """Handle resource pressure notifications."""
-        if not self._should_handle_reduction():
-            return
-
         error_type = command.params.get('error_type')
         severity = command.params.get('severity', 'warning')
         context = command.params.get('context', {})
 
         try:
+            # Handle recovery notification
+            if error_type == 'resource_recovered':
+                logger.info("Received resource recovery notification")
+                # Let the regular recovery monitoring handle the recovery
+                # This avoids potential conflicts with ongoing recovery processes
+                return
+
+            # Only process reductions if enough time has passed
+            if not self._should_handle_reduction():
+                return
+
             async with self._calculation_lock:
                 logger.info(f"Handling resource pressure: {error_type} ({severity})")
 
@@ -395,67 +399,57 @@ class IndicatorManager:
         return df
 
     @async_ttl_cache()
-    async def calculate_rsi(self, symbol: SymbolInfo,
-                          timeframe: Timeframe,
-                          period: int = 14,
-                          start_time: Optional[Timestamp] = None,
-                          end_time: Optional[Timestamp] = None) -> List[RSIResult]:
+    async def calculate_rsi(self,
+                            klines: List[KlineData],
+                            length: int = 14,
+                            ) -> List[RSIResult]:
         """Calculate Relative Strength Index"""
         async def _calc() -> List[RSIResult]:
-            klines = await self.timeframe_manager.get_klines(
-                symbol, timeframe, start_time, end_time
-            )
             self._validate_klines(klines)
             df = self._prepare_dataframe(klines)
 
-            rsi = df.ta.rsi(length=period)
+            rsi = df.ta.rsi(length=length)
             return [
-                RSIResult.from_series(Timestamp(int(idx)), value)
+                RSIResult.from_series(
+                    Timestamp(int(idx)),
+                    value,
+                    length=length
+                )
                 for idx, value in rsi.items()
                 if not pd.isna(value)
             ]
 
-        return await self._calculate_with_retry(symbol, _calc)
+        return await self._calculate_with_retry('RSI', _calc)
 
     @async_ttl_cache()
-    async def calculate_bollinger_bands(self, symbol: SymbolInfo,
-                                      timeframe: Timeframe,
-                                      period: int = 20,
-                                      std_dev: float = 2.0,
-                                      start_time: Optional[Timestamp] = None,
-                                      end_time: Optional[Timestamp] = None
-                                      ) -> List[BollingerBandsResult]:
+    async def calculate_bollinger_bands(self,
+                                        klines: List[KlineData],
+                                        length: int = 20,
+                                        std_dev: float = 2.0,
+                                        ) -> List[BollingerBandsResult]:
         """Calculate Bollinger Bands"""
         async def _calc() -> List[BollingerBandsResult]:
-            klines = await self.timeframe_manager.get_klines(
-                symbol, timeframe, start_time, end_time
-            )
             self._validate_klines(klines)
             df = self._prepare_dataframe(klines)
 
-            bb = df.ta.bbands(length=period, std=std_dev)
+            bb = df.ta.bbands(length=length, std=std_dev)
             return [
                 BollingerBandsResult.from_series(Timestamp(int(idx)), row.to_dict())
                 for idx, row in bb.iterrows()
                 if not row.isna().any()
             ]
 
-        return await self._calculate_with_retry(symbol, _calc)
+        return await self._calculate_with_retry('BB', _calc)
 
     @async_ttl_cache()
-    async def calculate_macd(self, symbol: SymbolInfo,
-                           timeframe: Timeframe,
-                           fast: int = 12,
-                           slow: int = 26,
-                           signal: int = 9,
-                           start_time: Optional[Timestamp] = None,
-                           end_time: Optional[Timestamp] = None
-                           ) -> List[MACDResult]:
+    async def calculate_macd(self,
+                             klines: List[KlineData],
+                             fast: int = 12,
+                             slow: int = 26,
+                             signal: int = 9,
+                             ) -> List[MACDResult]:
         """Calculate MACD"""
         async def _calc() -> List[MACDResult]:
-            klines = await self.timeframe_manager.get_klines(
-                symbol, timeframe, start_time, end_time
-            )
             self._validate_klines(klines)
             df = self._prepare_dataframe(klines)
 
@@ -466,19 +460,15 @@ class IndicatorManager:
                 if not row.isna().any()
             ]
 
-        return await self._calculate_with_retry(symbol, _calc)
+        return await self._calculate_with_retry('MACD', _calc)
 
     @async_ttl_cache()
-    async def calculate_sma(self, symbol: SymbolInfo,
-                          timeframe: Timeframe,
-                          period: int = 20,
-                          start_time: Optional[Timestamp] = None,
-                          end_time: Optional[Timestamp] = None) -> List[MAResult]:
+    async def calculate_sma(self,
+                            klines: List[KlineData],
+                            period: int = 20
+                            ) -> List[MAResult]:
         """Calculate Simple Moving Average"""
         async def _calc() -> List[MAResult]:
-            klines = await self.timeframe_manager.get_klines(
-                symbol, timeframe, start_time, end_time
-            )
             self._validate_klines(klines)
             df = self._prepare_dataframe(klines)
 
@@ -489,19 +479,14 @@ class IndicatorManager:
                 if not pd.isna(value)
             ]
 
-        return await self._calculate_with_retry(symbol, _calc)
+        return await self._calculate_with_retry('SMA', _calc)
 
     @async_ttl_cache()
-    async def calculate_ema(self, symbol: SymbolInfo,
-                          timeframe: Timeframe,
-                          period: int = 20,
-                          start_time: Optional[Timestamp] = None,
-                          end_time: Optional[Timestamp] = None) -> List[MAResult]:
+    async def calculate_ema(self,
+                            klines: List[KlineData],
+                            period: int = 20) -> List[MAResult]:
         """Calculate Exponential Moving Average"""
         async def _calc() -> List[MAResult]:
-            klines = await self.timeframe_manager.get_klines(
-                symbol, timeframe, start_time, end_time
-            )
             self._validate_klines(klines)
             df = self._prepare_dataframe(klines)
 
@@ -512,18 +497,12 @@ class IndicatorManager:
                 if not pd.isna(value)
             ]
 
-        return await self._calculate_with_retry(symbol, _calc)
+        return await self._calculate_with_retry('EMA', _calc)
 
     @async_ttl_cache()
-    async def calculate_obv(self, symbol: SymbolInfo,
-                          timeframe: Timeframe,
-                          start_time: Optional[Timestamp] = None,
-                          end_time: Optional[Timestamp] = None) -> List[OBVResult]:
+    async def calculate_obv(self, klines: List[KlineData]) -> List[OBVResult]:
         """Calculate On Balance Volume"""
         async def _calc() -> List[OBVResult]:
-            klines = await self.timeframe_manager.get_klines(
-                symbol, timeframe, start_time, end_time
-            )
             self._validate_klines(klines)
             df = self._prepare_dataframe(klines)
 
@@ -533,4 +512,4 @@ class IndicatorManager:
                 for idx, value in obv.items()
                 if not pd.isna(value)
             ]
-        return await self._calculate_with_retry(symbol, _calc)
+        return await self._calculate_with_retry('OBV', _calc)

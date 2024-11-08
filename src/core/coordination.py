@@ -2,7 +2,7 @@
 
 from enum import Enum
 from dataclasses import dataclass
-from typing import Any, Coroutine, Dict, Optional, Callable, Set
+from typing import Any, Coroutine, Dict, Optional, Callable, Set, Union
 import asyncio
 import time
 from ..utils.logger import LoggerSetup
@@ -12,10 +12,8 @@ logger = LoggerSetup.setup(__name__)
 class MarketDataCommand(Enum):
     """Initial set of commands for market data service"""
     # Service Control
-    CLEANUP_OLD_DATA = "cleanup_old_data"
     ADJUST_BATCH_SIZE = "adjust_batch_size"
     ADJUST_CACHE = "adjust_cache"
-    HANDLE_ERROR = "handle_error"
 
     # Synchronization
     SYNC_ERROR = "sync_error"
@@ -28,6 +26,14 @@ class MarketDataCommand(Enum):
     COLLECTION_ERROR = "collection_error"
     SYMBOL_DELISTED = "symbol_delisted"
     GAP_DETECTED = "gap_detected"
+
+class MonitoringCommand(Enum):
+    """Monitoring service commands"""
+    RESOURCE_PRESSURE = "resource_pressure"       # System resource issues
+    DATABASE_PRESSURE = "database_pressure"       # Database performance issues
+    MARKET_DATA_ISSUE = "market_data_issue"      # Market data collection issues
+    CACHE_PRESSURE = "cache_pressure"            # Cache performance issues
+    UPDATE_THRESHOLDS = "update_thresholds"      # Update monitoring thresholds
 
 @dataclass
 class Command:
@@ -46,14 +52,14 @@ class ServiceCoordinator:
     """
 
     def __init__(self):
-        self._handlers: Dict[MarketDataCommand, Set[CommandHandler]] = {}
+        self._handlers: Dict[Union[MarketDataCommand, MonitoringCommand], Set[CommandHandler]] = {}
         self._queue: asyncio.Queue[Command] = asyncio.Queue()
         self._running = False
         self._worker_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
 
     async def register_handler(self,
-                             command_type: MarketDataCommand,
+                             command_type: MarketDataCommand | MonitoringCommand,
                              handler: CommandHandler) -> None:
         """Register a handler for a specific command type"""
         async with self._lock:
@@ -63,7 +69,7 @@ class ServiceCoordinator:
             logger.info(f"Registered handler for command: {command_type.value}")
 
     async def unregister_handler(self,
-                                command_type: MarketDataCommand,
+                                command_type: MarketDataCommand | MonitoringCommand,
                                 handler: CommandHandler) -> None:
         """Unregister a command handler"""
         async with self._lock:
