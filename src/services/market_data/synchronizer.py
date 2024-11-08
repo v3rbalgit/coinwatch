@@ -201,6 +201,24 @@ class BatchSynchronizer:
                         f"[Active syncs: {len(self._processing)}/{self._max_concurrent_updates}] "
                         f"(next sync at {next_sync.strftime('%H:%M:%S')})"
                     )
+                    await self._coordinator.execute(Command(
+                        type=MarketDataCommand.SYNC_COMPLETE,
+                        params={
+                            "symbol": schedule.symbol,
+                            "timeframe": schedule.timeframe.value,
+                            "sync_time": TimeUtils.get_current_timestamp(),
+                            "processed": processed_count,
+                            "context": {
+                                "next_sync": TimeUtils.to_timestamp(next_sync),
+                                "active_syncs": len(self._processing),
+                                "resource_usage": {
+                                    "concurrent_syncs": len(self._processing),
+                                    "max_allowed": self._max_concurrent_updates
+                                }
+                            }
+                        }
+                    ))
+
                 break  # Success - exit retry loop
 
             except Exception as e:

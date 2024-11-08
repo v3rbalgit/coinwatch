@@ -209,6 +209,7 @@ class MarketDataService(ServiceBase):
         symbol = command.params["symbol"]
         gaps = command.params["gaps"]
         timeframe = command.params["timeframe"]
+        timestamp = command.params["timestamp"]
 
         # Track gap occurrence
         await self._error_tracker.record_error(
@@ -230,7 +231,7 @@ class MarketDataService(ServiceBase):
                 "type": "collection_failure",
                 "severity": "warning",
                 "message": f"High gap detection frequency: {frequency}/hour",
-                "timestamp": TimeUtils.get_current_timestamp(),
+                "timestamp": timestamp,
                 "error_type": "DataGapDetected",
                 "context": {
                     "affected_symbols": [symbol],
@@ -427,7 +428,8 @@ class MarketDataService(ServiceBase):
                 params={
                     "symbol": symbol,
                     "start_time": condition["context"].get("last_successful"),
-                    "end_time": TimeUtils.get_current_timestamp()
+                    "end_time": TimeUtils.get_current_timestamp(),
+                    "timestamp": TimeUtils.get_current_timestamp()
                 }
             ))
 
@@ -442,7 +444,8 @@ class MarketDataService(ServiceBase):
                 params={
                     "symbol": symbol,
                     "start_time": condition["context"].get("last_sync"),
-                    "end_time": TimeUtils.get_current_timestamp()
+                    "end_time": TimeUtils.get_current_timestamp(),
+                    "timestamp": TimeUtils.get_current_timestamp()
                 }
             ))
 
