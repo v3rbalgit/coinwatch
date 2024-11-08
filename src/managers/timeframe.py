@@ -171,6 +171,58 @@ class TimeframeManager:
             )
             raise
 
+    async def _register_command_handlers(self) -> None:
+        """Register handlers for market data commands"""
+        handlers = {
+            MarketDataCommand.COLLECTION_COMPLETE: self._handle_collection_complete,
+            MarketDataCommand.SYNC_COMPLETE: self._handle_sync_complete
+        }
+
+        for command, handler in handlers.items():
+            await self.coordinator.register_handler(command, handler)
+            logger.debug(f"Registered handler for {command.value}")
+
+    async def _handle_collection_complete(self, command: Command) -> None:
+        """Handle completion of historical data collection"""
+        try:
+            symbol = command.params['symbol']
+            start_time = command.params['start_time']
+            end_time = command.params['end_time']
+
+            # Trigger recalculation of stored timeframes
+            for timeframe in self._stored_timeframes:
+                if timeframe in self.valid_timeframes:
+                    await self._refresh_continuous_aggregate(
+                        symbol,
+                        timeframe,
+                        start_time,
+                        end_time
+                    )
+        except Exception as e:
+            logger.error(f"Error handling collection complete: {e}")
+
+    async def _handle_sync_complete(self, command: Command) -> None:
+        """Handle completion of real-time data sync"""
+        try:
+            symbol = command.params['symbol']
+            sync_time = command.params['sync_time']
+
+            # For real-time updates, we only need to process the latest period
+            interval_ms = self.base_timeframe.to_milliseconds()
+            start_time = Timestamp(sync_time - interval_ms)
+
+            # Refresh stored timeframes
+            for timeframe in self._stored_timeframes:
+                if timeframe in self.valid_timeframes:
+                    await self._refresh_continuous_aggregate(
+                        symbol,
+                        timeframe,
+                        start_time,
+                        sync_time
+                    )
+        except Exception as e:
+            logger.error(f"Error handling sync complete: {e}")
+
     async def _get_stored_klines(self,
                                 symbol: SymbolInfo,
                                 timeframe: Timeframe,
@@ -354,58 +406,6 @@ class TimeframeManager:
                 "timestamp": TimeUtils.get_current_timestamp()
             }
         ))
-
-    async def _register_command_handlers(self) -> None:
-        """Register handlers for market data commands"""
-        handlers = {
-            MarketDataCommand.COLLECTION_COMPLETE: self._handle_collection_complete,
-            MarketDataCommand.SYNC_COMPLETE: self._handle_sync_complete
-        }
-
-        for command, handler in handlers.items():
-            await self.coordinator.register_handler(command, handler)
-            logger.debug(f"Registered handler for {command.value}")
-
-    async def _handle_collection_complete(self, command: Command) -> None:
-        """Handle completion of historical data collection"""
-        try:
-            symbol = command.params['symbol']
-            start_time = command.params['start_time']
-            end_time = command.params['end_time']
-
-            # Trigger recalculation of stored timeframes
-            for timeframe in self._stored_timeframes:
-                if timeframe in self.valid_timeframes:
-                    await self._refresh_continuous_aggregate(
-                        symbol,
-                        timeframe,
-                        start_time,
-                        end_time
-                    )
-        except Exception as e:
-            logger.error(f"Error handling collection complete: {e}")
-
-    async def _handle_sync_complete(self, command: Command) -> None:
-        """Handle completion of real-time data sync"""
-        try:
-            symbol = command.params['symbol']
-            sync_time = command.params['sync_time']
-
-            # For real-time updates, we only need to process the latest period
-            interval_ms = self.base_timeframe.to_milliseconds()
-            start_time = Timestamp(sync_time - interval_ms)
-
-            # Refresh stored timeframes
-            for timeframe in self._stored_timeframes:
-                if timeframe in self.valid_timeframes:
-                    await self._refresh_continuous_aggregate(
-                        symbol,
-                        timeframe,
-                        start_time,
-                        sync_time
-                    )
-        except Exception as e:
-            logger.error(f"Error handling sync complete: {e}")
 
     async def _refresh_continuous_aggregate(self,
                                           symbol: SymbolInfo,

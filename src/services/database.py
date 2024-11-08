@@ -1,6 +1,5 @@
 # src/services/database.py
 
-import time
 import asyncio
 from typing import Optional, AsyncGenerator, TypedDict, Dict, TypeVar, Callable, Awaitable
 from sqlalchemy.ext.asyncio import (
@@ -15,11 +14,12 @@ from contextlib import asynccontextmanager
 from sqlalchemy import text, event
 from enum import Enum
 
-from src.config import DatabaseConfig
-from src.services.base import ServiceBase
+from ..config import DatabaseConfig
+from ..services.base import ServiceBase
 from ..core.exceptions import ServiceError
 from ..utils.logger import LoggerSetup
 from ..utils.domain_types import CriticalCondition, ServiceStatus
+from ..utils.time import TimeUtils
 
 logger = LoggerSetup.setup(__name__)
 
@@ -205,23 +205,23 @@ class DatabaseService(ServiceBase):
                 stats = await self._get_pool_stats()
 
                 if stats.get('overflow', 0) > 0:
-                    await self.handle_critical_condition(
-                        CriticalCondition(
-                            type="connection_overflow",
-                            message=f"Pool overflow: {stats['overflow']}",
-                            severity="warning",
-                            timestamp=time.time()
-                        )
-                    )
+                    await self.handle_critical_condition({
+                        "type": "connection_overflow",
+                        "severity": "critical",
+                        "message": f"Pool overflow: {stats['overflow']}",
+                        "timestamp": TimeUtils.get_current_timestamp(),
+                        "error_type": "ConnectionOverflow",
+                        "context": {}
+                    })
                 if self._pool_stats['timeout_count'] > 0:
-                    await self.handle_critical_condition(
-                        CriticalCondition(
-                            type="connection_timeout",
-                            message=f"Pool timeout count: {self._pool_stats['timeout_count']}",
-                            severity="error",
-                            timestamp=time.time()
-                        )
-                    )
+                    await self.handle_critical_condition({
+                        "type": "connection_timeout",
+                        "severity": "error",
+                        "message": f"Pool timeout count: {self._pool_stats['timeout_count']}",
+                        "timestamp": TimeUtils.get_current_timestamp(),
+                        "error_type": "ConnectionTimeout",
+                        "context": {}
+                    })
 
                 # Monitor database size
                 async with self.transaction() as session:

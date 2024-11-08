@@ -1,7 +1,7 @@
 # src/utils/domain_types.py
 
 from enum import Enum
-from typing import Any, Dict, List, NewType, Literal, TypedDict, NotRequired
+from typing import Any, Dict, NewType, Literal, TypedDict, NotRequired
 
 SymbolName = NewType('SymbolName', str)
 ExchangeName = NewType('ExchangeName', str)
@@ -43,7 +43,9 @@ class Timeframe(Enum):
 CriticalConditionType = Literal[
     "service_error",
     "collection_failure",
-    "sync_failure"
+    "sync_failure",
+    "connection_overflow",
+    "connection_timeout"
 ]
 
 class CriticalCondition(TypedDict):
