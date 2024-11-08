@@ -27,14 +27,13 @@ class MarketDataCommand(Enum):
     # Collection
     COLLECTION_STARTED = "collection_started"
     COLLECTION_PROGRESS = "collection_progress"
-    PAUSE_COLLECTION = "pause_collection"
-    RESUME_COLLECTION = "resume_collection"
     COLLECTION_COMPLETE = "collection_complete"
     COLLECTION_ERROR = "collection_error"
     SYMBOL_DELISTED = "symbol_delisted"
 
     EXCHANGE_ERROR = "exchange_error"
     MONITOR_ERROR = "monitor_error"
+    GAP_DETECTED = "gap_detected"
 
 @dataclass
 class Command:

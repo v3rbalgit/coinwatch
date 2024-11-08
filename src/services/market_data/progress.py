@@ -10,7 +10,7 @@ from ...core.models import SymbolInfo
 
 @dataclass
 class CollectionProgress:
-    """Tracks historical data collection progress"""
+    """Tracks data collection progress of a symbol"""
     symbol: SymbolInfo
     start_time: datetime  # Stored as UTC datetime
     processed_candles: int = 0
@@ -46,10 +46,41 @@ class CollectionProgress:
 
         return " | ".join(status)
 
+    def get_completion_summary(self, end_time: datetime) -> str:
+        """Generate detailed completion summary"""
+        elapsed = (end_time - self.start_time).total_seconds()
+        rate = self.processed_candles / elapsed if elapsed > 0 else 0
+
+        summary = [
+            f"Collection completed for {self.symbol}",
+            f"Processed: {self.processed_candles:,} candles",
+            f"Time range: {self.start_time.strftime('%Y-%m-%d %H:%M:%S')} → {end_time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Duration: {elapsed:.1f}s",
+            f"Rate: {rate:.1f} candles/s"
+        ]
+
+        if self.total_candles:
+            percentage = self.get_percentage()
+            summary.insert(1, f"Progress: {percentage:.1f}% ({self.processed_candles:,}/{self.total_candles:,})")
+
+        return " | ".join(summary)
+
+    def __lt__(self, other: 'SymbolInfo') -> bool:
+      """Enable sorting by symbol"""
+      if not isinstance(other, CollectionProgress):
+          return NotImplemented
+      return self.symbol < other.symbol
+
+    def __eq__(self, other: object) -> bool:
+        """Equality comparison"""
+        if not isinstance(other, CollectionProgress):
+            return NotImplemented
+        return self.symbol == other.symbol
+
 
 @dataclass
 class SyncSchedule:
-    """Tracks synchronization schedule and progress"""
+    """Tracks synchronization schedule of a symbol"""
     symbol: SymbolInfo
     timeframe: Timeframe
     next_sync: datetime  # Stored as UTC datetime

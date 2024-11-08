@@ -25,6 +25,7 @@ class ExchangeAdapter(Protocol):
                         symbol: SymbolInfo,
                         timeframe: Timeframe,
                         start_time: Optional[Timestamp] = None,
+                        end_time: Optional[Timestamp] = None,
                         limit: Optional[int] = None) -> List[KlineData]:
         """Get kline data"""
         ...

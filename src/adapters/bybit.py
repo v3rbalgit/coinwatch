@@ -12,7 +12,7 @@ from datetime import timedelta
 
 from src.config import BybitConfig
 from src.core.exceptions import ValidationError
-from src.utils.time import from_timestamp, get_current_timestamp
+from src.utils.time import TimeUtils
 
 from ..core.models import KlineData, SymbolInfo
 from ..core.protocols import ExchangeAdapter
@@ -267,10 +267,11 @@ class BybitAdapter(ExchangeAdapter):
             raise
 
     async def get_klines(self,
-                        symbol: SymbolInfo,
-                        timeframe: Timeframe,
-                        start_time: Optional[int] = None,
-                        limit: int = 200) -> List[KlineData]:
+                    symbol: SymbolInfo,
+                    timeframe: Timeframe,
+                    start_time: Optional[Timestamp] = None,
+                    end_time: Optional[Timestamp] = None,
+                    limit: Optional[int] = None) -> List[KlineData]:
         """
         Fetch kline data from Bybit.
         Note: Results are returned in ascending order (oldest first).
@@ -279,6 +280,7 @@ class BybitAdapter(ExchangeAdapter):
             symbol: Trading pair symbol
             timeframe: Candle timeframe
             start_time: Optional start timestamp (milliseconds)
+            end_time: Optional end timestamp (milliseconds)
             limit: Maximum number of candles to fetch
 
         Returns:
@@ -293,16 +295,32 @@ class BybitAdapter(ExchangeAdapter):
                 "category": "linear",
                 "symbol": symbol.name,
                 "interval": timeframe.value,
-                "limit": limit
+                "limit": limit or self.kline_limit
             }
 
+            current_time = TimeUtils.get_current_timestamp()
+
+            # Validate timestamps
             if start_time is not None:
-                current_time = get_current_timestamp()
                 if start_time > current_time:
                     raise ValidationError(
-                        f"Cannot request future data: {from_timestamp(start_time)}"
+                        f"Cannot request future data: {TimeUtils.from_timestamp(start_time)}"
                     )
                 params["start"] = start_time
+
+            if end_time is not None:
+                if start_time is not None and end_time <= start_time:
+                    raise ValidationError(
+                        f"Invalid time range: end_time ({TimeUtils.from_timestamp(end_time)}) "
+                        f"must be greater than start_time ({TimeUtils.from_timestamp(start_time)})"
+                    )
+                if end_time > current_time:
+                    logger.warning(
+                        f"Adjusting end_time from future {TimeUtils.from_timestamp(end_time)} "
+                        f"to current {TimeUtils.from_timestamp(current_time)}"
+                    )
+                    end_time = current_time
+                params["end"] = end_time
 
             response = await self._execute_request(self._get_klines, **params)
             items = response.get('result', {}).get('list', [])
@@ -314,10 +332,16 @@ class BybitAdapter(ExchangeAdapter):
                 timestamp = int(item[0])
 
                 # Skip future timestamps
-                if timestamp > get_current_timestamp():
+                if timestamp > current_time:
                     logger.warning(
-                        f"Received future timestamp from API: {from_timestamp(timestamp)}"
+                        f"Received future timestamp from API: {TimeUtils.from_timestamp(Timestamp(timestamp))}"
                     )
+                    continue
+
+                # Skip timestamps outside requested range
+                if end_time and timestamp > end_time:
+                    continue
+                if start_time and timestamp < start_time:
                     continue
 
                 klines.append(KlineData(

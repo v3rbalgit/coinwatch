@@ -1,7 +1,7 @@
 # src/utils/domain_types.py
 
 from enum import Enum
-from typing import NewType, Literal, TypedDict
+from typing import Any, Dict, List, NewType, Literal, TypedDict, NotRequired
 
 SymbolName = NewType('SymbolName', str)
 ExchangeName = NewType('ExchangeName', str)
@@ -40,13 +40,19 @@ class Timeframe(Enum):
         return mapping[self.value]
 
 # System monitoring types
-CriticalConditionType = Literal["connection_overflow", "connection_timeout", "storage_full", "memory_high", "service_error"]
+CriticalConditionType = Literal[
+    "service_error",
+    "collection_failure",
+    "sync_failure"
+]
 
 class CriticalCondition(TypedDict):
     type: CriticalConditionType
-    message: str
     severity: Literal["warning", "error", "critical"]
-    timestamp: float
+    message: str
+    timestamp: int
+    error_type: str
+    context: Dict[str, Any]
 
 # Service status types
 class ServiceStatus(Enum):

@@ -4,6 +4,7 @@ import sys
 import asyncio
 from typing import List
 
+from src.core.coordination import ServiceCoordinator
 from src.repositories.kline import KlineRepository
 from src.repositories.symbol import SymbolRepository
 
@@ -44,6 +45,9 @@ class TestApplication:
         # Register test adapter
         self.test_adapter = TestBybitAdapter(BybitConfig(testnet=False))
 
+        # Initialize coordinator
+        self.coordinator = ServiceCoordinator()
+
     async def start(self) -> None:
         """Start the test application"""
         try:
@@ -65,6 +69,7 @@ class TestApplication:
                 symbol_repo,
                 kline_repo,
                 self.exchange_registry,
+                self.coordinator,
                 self.config.market_data
             )
 
@@ -75,13 +80,9 @@ class TestApplication:
 
             # Keep application running
             while True:
-                if market_service._status == ServiceStatus.ERROR:
-                    self.logger.error(f"Service unhealthy: {market_service._last_error}")
-                    await market_service.handle_error(market_service._last_error)
-
                 # Log service status periodically
                 self.logger.info("\nService Status Report:")
-                self.logger.info(market_service.state_manager.get_status_report())
+                self.logger.info(market_service.get_service_status())
 
                 await asyncio.sleep(60)
 

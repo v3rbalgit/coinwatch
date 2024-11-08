@@ -1,11 +1,10 @@
 # src/config.py
 
-from typing import Dict, Optional, List
+from typing import Dict, Optional
 from dataclasses import dataclass, field
 import os
 from dotenv import load_dotenv
 
-from .utils.domain_types import Timeframe
 from .core.exceptions import ConfigurationError
 from .utils.logger import LoggerSetup
 
@@ -101,9 +100,7 @@ class MarketDataConfig:
     sync_interval: int = 300  # 5 minutes
     retry_interval: int = 60  # 1 minute
     max_retries: int = 3
-    default_timeframes: List[Timeframe] = field(
-        default_factory=lambda: [Timeframe.MINUTE_5]
-    )
+    default_timeframe: str = '5'
     batch_size: int = 1000
 
 @dataclass
@@ -197,16 +194,11 @@ class Config:
     def _init_market_data_config(self) -> MarketDataConfig:
         """Initialize market data configuration"""
         try:
-            timeframes = [
-                Timeframe(tf) for tf in
-                os.getenv('DEFAULT_TIMEFRAMES', '5').split(',')
-            ]
-
             return MarketDataConfig(
                 sync_interval=int(os.getenv('SYNC_INTERVAL', 300)),
                 retry_interval=int(os.getenv('RETRY_INTERVAL', 60)),
                 max_retries=int(os.getenv('MAX_RETRIES', 3)),
-                default_timeframes=timeframes,
+                default_timeframe=os.getenv('DEFAULT_TIMEFRAME', '5'),
                 batch_size=int(os.getenv('MARKET_DATA_BATCH_SIZE', '1000'))
             )
         except Exception as e:
