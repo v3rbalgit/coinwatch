@@ -14,7 +14,7 @@ from .adapters.registry import ExchangeAdapterRegistry
 from .adapters.bybit import BybitAdapter
 from .core.exceptions import CoinwatchError
 from .utils.logger import LoggerSetup
-from .utils.domain_types import ExchangeName, ServiceStatus
+from .utils.domain_types import ExchangeName
 
 logger = LoggerSetup.setup(__name__)
 

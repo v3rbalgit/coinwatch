@@ -140,56 +140,6 @@ class SymbolRepository(Repository[Symbol]):
             logger.error(f"Error getting symbol stats: {e}")
             raise RepositoryError(f"Failed to get symbol statistics: {str(e)}")
 
-    async def get_missing_timeframes(self,
-                                   symbol: SymbolInfo,
-                                   required_timeframes: List[str]) -> List[str]:
-        """
-        Find missing timeframes for a symbol
-
-        Uses efficient EXISTS subquery
-        """
-        try:
-            async with self.get_session() as session:
-                # Get the symbol ID first
-                symbol_stmt = (
-                    select(Symbol.id)
-                    .where(and_(
-                        Symbol.name == symbol.name,
-                        Symbol.exchange == symbol.exchange
-                    ))
-                )
-                symbol_result = await session.execute(symbol_stmt)
-                symbol_id = symbol_result.scalar_one_or_none()
-
-                if not symbol_id:
-                    return required_timeframes
-
-                # Check each timeframe
-                missing = []
-                for timeframe in required_timeframes:
-                    stmt = text("""
-                        SELECT NOT EXISTS (
-                            SELECT 1 FROM kline_data
-                            WHERE symbol_id = :symbol_id
-                            AND timeframe = :timeframe
-                            LIMIT 1
-                        ) as missing;
-                    """)
-
-                    result = await session.execute(stmt, {
-                        "symbol_id": symbol_id,
-                        "timeframe": timeframe
-                    })
-
-                    if result.scalar():
-                        missing.append(timeframe)
-
-                return missing
-
-        except Exception as e:
-            logger.error(f"Error checking timeframes: {e}")
-            raise RepositoryError(f"Failed to check timeframes: {str(e)}")
-
     async def delete(self, symbol: SymbolInfo) -> None:
         """Delete a symbol and its associated data"""
         try:

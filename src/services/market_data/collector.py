@@ -115,16 +115,21 @@ class DataCollector:
         symbol = command.params["symbol"]
         start_time = command.params["start_time"]
         end_time = command.params["end_time"]
+        timestamp = command.params["timestamp"]
+        context = command.params.get("context", {})
 
         async with self._collection_lock:
             if symbol not in self._processing_symbols:
                 self._processing_symbols.add(symbol)
 
-                logger.info(f"Starting data collection for {symbol}")
+                if gap_size := context.get('gap_size'):
+                    logger.info(f"Filling {gap_size} candles for symbol {symbol}")
+                else:
+                    logger.info(f"Started data collection for {symbol}")
 
                 self._symbol_progress[symbol] = CollectionProgress(
                     symbol=symbol,
-                    start_time=TimeUtils.get_current_datetime()
+                    start_time=timestamp
                 )
 
                 # Queue collection request
@@ -271,8 +276,9 @@ class DataCollector:
             processed_candles = 0
 
             # Update progress with total
-            progress = self._symbol_progress[symbol]
-            progress.update(processed_candles, total_candles)
+            async with self._collection_lock:
+                progress = self._symbol_progress[symbol]
+                progress.update(processed_candles, total_candles)
 
             # For historical collection, only collect up to last completed interval
             is_historical = aligned_end >= (current_time - interval_ms)
@@ -329,7 +335,8 @@ class DataCollector:
                         )
 
                         processed_candles += processed
-                        progress.update(processed_candles)
+                        async with self._collection_lock:
+                            progress.update(processed_candles)
                         logger.info(progress)
 
                         # Move to next batch, ensuring no overlap

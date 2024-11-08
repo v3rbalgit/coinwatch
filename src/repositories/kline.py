@@ -31,7 +31,6 @@ class KlineRepository(Repository[Kline]):
         """Get latest timestamp using TimescaleDB's last() function"""
         try:
             async with self.get_session() as session:
-                # Get the symbol record
                 symbol_stmt = select(Symbol).where(
                     and_(
                         Symbol.name == symbol.name,
@@ -41,7 +40,6 @@ class KlineRepository(Repository[Kline]):
                 symbol_result = await session.execute(symbol_stmt)
                 symbol_record = symbol_result.scalar_one()
 
-                # Use TimescaleDB's last() function for efficiency
                 stmt = text("""
                     SELECT COALESCE(
                         (
@@ -89,7 +87,6 @@ class KlineRepository(Repository[Kline]):
         try:
             inserted_count = 0
             async with self.get_session() as session:
-                # Get the symbol record
                 symbol_stmt = select(Symbol.id).where(
                     and_(
                         Symbol.name == symbol.name,
@@ -124,7 +121,6 @@ class KlineRepository(Repository[Kline]):
                             continue
 
                     if valid_klines:
-                        # Use PostgreSQL upsert with DO UPDATE
                         stmt = insert(Kline).values(valid_klines)
                         stmt = stmt.on_conflict_do_update(
                             index_elements=['symbol_id', 'timeframe', 'start_time'],
@@ -195,66 +191,6 @@ class KlineRepository(Repository[Kline]):
         except Exception as e:
             logger.error(f"Error finding data gaps: {e}")
             raise RepositoryError(f"Failed to find data gaps: {str(e)}")
-
-    async def get_aggregated_data(self,
-                            symbol: SymbolInfo,
-                            timeframe: Timeframe,
-                            start_time: Timestamp,
-                            end_time: Timestamp,
-                            bucket: str = '1 hour') -> List[Dict[str, Any]]:
-        """
-        Get aggregated data using TimescaleDB continuous aggregates
-
-        Args:
-            symbol: Trading symbol information
-            timeframe: Timeframe of the data
-            start_time: Start timestamp in milliseconds
-            end_time: End timestamp in milliseconds
-            bucket: Time bucket for aggregation ('1 hour' or '1 day')
-        """
-        try:
-            async with self.get_session() as session:
-                # Use the appropriate continuous aggregate view
-                view_name = 'kline_hourly' if bucket == '1 hour' else 'kline_daily'
-
-                stmt = text(f"""
-                    SELECT
-                        time_bucket as timestamp,
-                        open,
-                        high,
-                        low,
-                        close,
-                        volume,
-                        turnover
-                    FROM {view_name} v
-                    JOIN symbols s ON v.symbol_id = s.id
-                    WHERE s.name = :symbol
-                    AND s.exchange = :exchange
-                    AND v.timeframe = :timeframe
-                    AND time_bucket BETWEEN
-                        to_timestamp(:start_time/1000) AND to_timestamp(:end_time/1000)
-                    ORDER BY time_bucket;
-                """)
-
-                result = await session.execute(stmt, {
-                    "symbol": symbol.name,
-                    "exchange": symbol.exchange,
-                    "timeframe": timeframe.value,
-                    "start_time": start_time,
-                    "end_time": end_time
-                })
-
-                logger.debug(
-                    f"Retrieved aggregated data for {symbol.name} "
-                    f"from {TimeUtils.from_timestamp(start_time)} "
-                    f"to {TimeUtils.from_timestamp(end_time)}"
-                )
-
-                return [dict(row) for row in result]
-
-        except Exception as e:
-            logger.error(f"Error getting aggregated data: {e}")
-            raise RepositoryError(f"Failed to get aggregated data: {str(e)}")
 
     async def delete_symbol_data(self, symbol: SymbolInfo) -> None:
         """Delete all kline data for a symbol"""

@@ -171,7 +171,6 @@ class TimeframeManager:
             )
             raise
 
-
     async def _get_stored_klines(self,
                                 symbol: SymbolInfo,
                                 timeframe: Timeframe,
@@ -224,7 +223,6 @@ class TimeframeManager:
                 }
             )
 
-            # Convert to KlineData objects
             return [
                 KlineData(
                     timestamp=row.start_time,
@@ -299,7 +297,6 @@ class TimeframeManager:
                 }
             )
 
-            # Convert to KlineData objects
             return [
                 KlineData(
                     timestamp=row.start_time,
@@ -362,7 +359,7 @@ class TimeframeManager:
         """Register handlers for market data commands"""
         handlers = {
             MarketDataCommand.COLLECTION_COMPLETE: self._handle_collection_complete,
-            MarketDataCommand.SYNC_COMPLETED: self._handle_sync_complete
+            MarketDataCommand.SYNC_COMPLETE: self._handle_sync_complete
         }
 
         for command, handler in handlers.items():

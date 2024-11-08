@@ -14,25 +14,18 @@ class MarketDataCommand(Enum):
     # Service Control
     CLEANUP_OLD_DATA = "cleanup_old_data"
     ADJUST_BATCH_SIZE = "adjust_batch_size"
-    UPDATE_SYMBOL_STATE = "update_symbol_state"
     HANDLE_ERROR = "handle_error"
 
     # Synchronization
-    PAUSE_SYNC = "pause_sync"
-    RESUME_SYNC = "resume_sync"
     SYNC_ERROR = "sync_error"
     SYNC_SCHEDULED = "sync_scheduled"
-    SYNC_COMPLETED = "sync_completed"
+    SYNC_COMPLETE = "sync_complete"
 
     # Collection
     COLLECTION_STARTED = "collection_started"
-    COLLECTION_PROGRESS = "collection_progress"
     COLLECTION_COMPLETE = "collection_complete"
     COLLECTION_ERROR = "collection_error"
     SYMBOL_DELISTED = "symbol_delisted"
-
-    EXCHANGE_ERROR = "exchange_error"
-    MONITOR_ERROR = "monitor_error"
     GAP_DETECTED = "gap_detected"
 
 @dataclass
