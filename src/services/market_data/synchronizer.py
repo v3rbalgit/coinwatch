@@ -108,12 +108,8 @@ class BatchSynchronizer:
 
     async def _handle_collection_complete(self, command: Command) -> None:
         """Handle completion of historical collection"""
-        collection_type = command.params.get("collection_type", "initial")
-
-        # Only schedule regular syncs for completed initial collections
-        if collection_type == "initial":
-            symbol = command.params["symbol"]
-            await self._schedule_sync(symbol, self._base_timeframe)
+        symbol = command.params["symbol"]
+        await self._schedule_sync(symbol, self._base_timeframe)
 
     async def _handle_adjust_batch_size(self, command: Command) -> None:
         """Handle batch size adjustment command"""
@@ -299,7 +295,7 @@ class BatchSynchronizer:
                     symbol=schedule.symbol,
                     timeframe=schedule.timeframe,
                     start_time=Timestamp(next_start),
-                    limit=50
+                    limit=10
                 )
 
                 if klines:

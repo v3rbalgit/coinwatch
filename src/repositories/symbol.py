@@ -1,9 +1,8 @@
 # src/repositories/symbol.py
 
-from typing import List
+from typing import List, Optional
 from sqlalchemy import select, and_, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
-from sqlalchemy.dialects.postgresql import insert
 
 from src.core.models import SymbolInfo
 
@@ -70,31 +69,36 @@ class SymbolRepository(Repository[Symbol]):
             logger.error(f"Error in get_or_create: {e}")
             raise RepositoryError(f"Failed to get or create symbol: {str(e)}")
 
-    async def get_by_exchange(self, exchange: ExchangeName) -> List[Symbol]:
+    async def get_symbol(self, symbol: SymbolInfo) -> Optional[Symbol]:
         """
-        Get all symbols for an exchange with optimized query
+        Get symbol by name and optionally exchange
 
-        Uses index-only scan when possible
+        Args:
+            symbol_name: The name of the symbol
+            exchange: Optional exchange name to filter by
+
+        Returns:
+            Symbol if found, None otherwise
         """
         try:
             async with self.get_session() as session:
-                # Create optimized query using index
-                stmt = (
-                    select(Symbol)
-                    .where(Symbol.exchange == exchange)
-                    .order_by(Symbol.name)
+                # If exchange provided, get exact match
+                stmt = select(Symbol).where(
+                    and_(
+                        Symbol.name == symbol.name,
+                        Symbol.exchange == symbol.exchange
+                    )
                 )
-
                 result = await session.execute(stmt)
-                return list(result.scalars().all())
+                return result.scalar_one_or_none()
 
         except Exception as e:
-            logger.error(f"Error getting symbols: {e}")
-            raise RepositoryError(f"Failed to get symbols: {str(e)}")
+            logger.error(f"Error getting symbol by name: {e}")
+            raise RepositoryError(f"Failed to get symbol by name: {str(e)}")
 
     async def get_symbols_with_stats(self, exchange: ExchangeName) -> List[dict]:
         """
-        Get symbols with their data statistics
+        Get all symbols from an exchange with their data statistics
 
         Uses TimescaleDB features to gather statistics efficiently
         """
@@ -185,3 +189,28 @@ class SymbolRepository(Repository[Symbol]):
         except Exception as e:
             logger.error(f"Error checking timeframes: {e}")
             raise RepositoryError(f"Failed to check timeframes: {str(e)}")
+
+    async def delete(self, symbol: SymbolInfo) -> None:
+        """Delete a symbol and its associated data"""
+        try:
+            async with self.get_session() as session:
+                # Find the symbol record
+                stmt = select(Symbol).where(
+                    and_(
+                        Symbol.name == symbol.name,
+                        Symbol.exchange == symbol.exchange
+                    )
+                )
+                result = await session.execute(stmt)
+                symbol_record = result.scalar_one_or_none()
+
+                if symbol_record:
+                    await session.delete(symbol_record)
+                    await session.flush()
+                    logger.info(f"Deleted symbol {symbol.name} from {symbol.exchange}")
+                else:
+                    logger.warning(f"Symbol {symbol.name} from {symbol.exchange} not found for deletion")
+
+        except Exception as e:
+            logger.error(f"Error deleting symbol: {e}")
+            raise RepositoryError(f"Failed to delete symbol: {str(e)}")

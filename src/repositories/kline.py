@@ -255,3 +255,34 @@ class KlineRepository(Repository[Kline]):
         except Exception as e:
             logger.error(f"Error getting aggregated data: {e}")
             raise RepositoryError(f"Failed to get aggregated data: {str(e)}")
+
+    async def delete_symbol_data(self, symbol: SymbolInfo) -> None:
+        """Delete all kline data for a symbol"""
+        try:
+            async with self.get_session() as session:
+                # Get the symbol ID first
+                symbol_stmt = select(Symbol.id).where(
+                    and_(
+                        Symbol.name == symbol.name,
+                        Symbol.exchange == symbol.exchange
+                    )
+                )
+                result = await session.execute(symbol_stmt)
+                symbol_id = result.scalar_one_or_none()
+
+                if symbol_id:
+                    # Delete all klines for this symbol
+                    delete_stmt = text("""
+                        DELETE FROM kline_data
+                        WHERE symbol_id = :symbol_id
+                    """)
+                    await session.execute(delete_stmt, {"symbol_id": symbol_id})
+                    await session.flush()
+
+                    logger.info(f"Deleted all kline data for {symbol.name} from {symbol.exchange}")
+                else:
+                    logger.warning(f"No kline data found for {symbol.name} from {symbol.exchange}")
+
+        except Exception as e:
+            logger.error(f"Error deleting kline data: {e}")
+            raise RepositoryError(f"Failed to delete kline data: {str(e)}")
