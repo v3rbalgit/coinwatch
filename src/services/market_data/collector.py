@@ -1,9 +1,10 @@
 # src/services/market_data/collector.py
 
 import asyncio
-from typing import Optional, Set
+from typing import Any, Dict, Set
 
 from ...adapters.registry import ExchangeAdapterRegistry
+from .progress import CollectionProgress
 from ...core.coordination import Command, MarketDataCommand, ServiceCoordinator
 from ...repositories.kline import KlineRepository
 from ...repositories.symbol import SymbolRepository
@@ -12,13 +13,20 @@ from ...utils.time import TimeUtils
 from ...utils.domain_types import Timeframe, Timestamp
 from ...core.models import SymbolInfo
 from ...core.exceptions import ServiceError, ValidationError
-from ...utils.error import ErrorTracker
 from ...utils.retry import RetryConfig, RetryStrategy
 
 logger = LoggerSetup.setup(__name__)
 
-class HistoricalCollector:
-    """Handles historical data collection for symbols"""
+class DataCollector:
+    """
+    Handles all forms of market data collection through command-driven interface.
+
+    Responsibilities:
+    - Collects historical data for new symbols
+    - Fills gaps in existing data
+    - Handles data refresh requests
+    - Reports collection progress
+    """
 
     def __init__(self,
                  adapter_registry: ExchangeAdapterRegistry,
@@ -26,7 +34,6 @@ class HistoricalCollector:
                  kline_repository: KlineRepository,
                  coordinator: ServiceCoordinator,
                  base_timeframe: Timeframe = Timeframe.MINUTE_5,
-                 max_retries: int = 3,
                  batch_size: int = 1000):
 
         # Core dependencies
@@ -35,25 +42,53 @@ class HistoricalCollector:
         self._kline_repository = kline_repository
         self._coordinator = coordinator
         self._base_timeframe = base_timeframe
-        self._max_retries = max_retries
         self._batch_size = batch_size
 
         # Collection management
-        self._collection_queue: asyncio.Queue[SymbolInfo] = asyncio.Queue(maxsize=1000)
-        self._processing_symbols: Set[str] = set()
+        self._collection_queue: asyncio.Queue[Dict[str,Any]] = asyncio.Queue(maxsize=1000)
         self._collection_lock = asyncio.Lock()
-        self._active = False
-        self._task: Optional[asyncio.Task] = None
+        self._symbol_progress: Dict[SymbolInfo, CollectionProgress] = {}
+        self._processing_symbols: Set[SymbolInfo] = set()
 
-        # Error handling
-        self._error_tracker = ErrorTracker()
+        # Retry strategy
         self._retry_strategy = RetryStrategy(RetryConfig(
-            base_delay=1.0,
+            base_delay=5.0,
             max_delay=300.0,
-            max_retries=max_retries
+            max_retries=3
         ))
+        self._configure_retry_strategy()
 
-        # Configure retry behavior
+        self._queue_processor = asyncio.create_task(self._process_queue())
+        self._running = True
+        asyncio.create_task(self._register_command_handlers())
+
+    async def cleanup(self) -> None:
+        """Cleanup background tasks and resources"""
+        logger.info("Cleaning up DataCollector")
+        self._running = False  # Signal process queue to stop
+
+        # Cancel and await queue processor
+        if self._queue_processor:
+            self._queue_processor.cancel()
+            try:
+                await self._queue_processor
+            except asyncio.CancelledError:
+                pass
+            self._queue_processor = None
+
+        # Clear any pending collections
+        while not self._collection_queue.empty():
+            try:
+                self._collection_queue.get_nowait()
+                self._collection_queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+
+        self._processing_symbols.clear()
+        logger.info("DataCollector cleanup completed")
+
+    def _configure_retry_strategy(self) -> None:
+        """Configure retry behavior"""
         self._retry_strategy.add_retryable_error(
             ConnectionError,
             TimeoutError,
@@ -63,227 +98,250 @@ class HistoricalCollector:
             ValidationError
         )
 
-    async def start(self) -> None:
-        """Start the collector"""
-        self._active = True
-        self._task = asyncio.create_task(self._process_queue())
-        logger.info("Historical collector started")
+    async def _register_command_handlers(self) -> None:
+        """Register handlers for collection-related commands"""
+        handlers = {
+            MarketDataCommand.COLLECTION_STARTED: self._handle_collection_start,
+            MarketDataCommand.ADJUST_BATCH_SIZE: self._handle_adjust_batch_size
+        }
 
-    async def stop(self) -> None:
-        """Stop collector with proper cleanup"""
-        self._active = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        for command, handler in handlers.items():
+            await self._coordinator.register_handler(command, handler)
+            logger.debug(f"Registered handler for {command.value}")
 
-        # Clean up any pending items
-        while not self._collection_queue.empty():
-            symbol = await self._collection_queue.get()
-            async with self._collection_lock:
-                self._processing_symbols.remove(symbol.name)
-            self._collection_queue.task_done()
-        logger.info("Historical collector stopped")
+    async def _handle_collection_start(self, command: Command) -> None:
+        """Handle start of data collection request"""
+        symbol = command.params["symbol"]
+        start_time = command.params["start_time"]
+        end_time = command.params["end_time"]
 
-    async def add_symbol(self, symbol: SymbolInfo) -> None:
-        """Add symbol for historical collection"""
         async with self._collection_lock:
-            if symbol.name not in self._processing_symbols:
-                self._processing_symbols.add(symbol.name)
-                await self._collection_queue.put(symbol)
+            if symbol not in self._processing_symbols:
+                self._processing_symbols.add(symbol)
 
-                await self._coordinator.execute(Command(
-                    type=MarketDataCommand.COLLECTION_STARTED,
-                    params={
-                        "symbol": symbol.name,
-                        "start_time": symbol.launch_time,
-                        "timestamp": TimeUtils.get_current_timestamp(),
-                        "context": {
-                            "batch_size": self._batch_size,
-                            "timeframe": self._base_timeframe.value
-                        }
-                    }
-                ))
+                logger.info(f"Starting collection for {symbol}...")
 
-                logger.info(f"Added {symbol.name} to historical collection queue")
+                self._symbol_progress[symbol] = CollectionProgress(
+                    symbol=symbol,
+                    start_time=TimeUtils.get_current_datetime()
+                )
+
+                # Queue collection request
+                await self._collection_queue.put({
+                    "symbol": symbol,
+                    "start_time": start_time,
+                    "end_time": end_time
+                })
             else:
-                logger.debug(f"Symbol {symbol.name} already in processing queue")
+                logger.debug(f"Collection already in progress for {symbol}")
+
+    async def _handle_adjust_batch_size(self, command: Command) -> None:
+        """Handle batch size adjustment request"""
+        new_size = command.params["size"]
+        old_size = self._batch_size
+
+        # Ensure size is within reasonable bounds
+        new_size = max(100, min(new_size, 1000))
+
+        self._batch_size = new_size
+        logger.info(
+            f"Adjusted collection batch size: {old_size} → {new_size} "
+            f"(change: {(new_size - old_size):+d})"
+        )
 
     async def _process_queue(self) -> None:
-        """Process symbols in the queue with proper state management"""
-        while self._active:
+        """Process collection requests from queue"""
+        while True:
             try:
-                symbol = await self._collection_queue.get()
+                request = await self._collection_queue.get()
                 try:
-                    collection_start = TimeUtils.get_current_timestamp()
-                    await self._collect_historical_data(symbol, self._base_timeframe)
-                    collection_end = TimeUtils.get_current_timestamp()
+                    await self._collect_data(
+                        request["symbol"],
+                        request["start_time"],
+                        request["end_time"],
+                        self._batch_size,
+                        self._base_timeframe
+                    )
 
-                    # Notify successful completion with timing information
+                    # Report completion to BatchSynchronizer
                     await self._coordinator.execute(Command(
                         type=MarketDataCommand.COLLECTION_COMPLETE,
                         params={
-                            "symbol": symbol.name,
-                            "start_time": collection_start,
-                            "end_time": collection_end,
+                            "symbol": request["symbol"],
+                            "start_time": request["start_time"],
+                            "end_time": request["end_time"],
                             "timestamp": TimeUtils.get_current_timestamp()
                         }
                     ))
 
                 except Exception as e:
-                    await self._error_tracker.record_error(e, symbol.name, context="collection")
-                    logger.error(f"Error collecting data for {symbol.name}: {e}")
-
-                    # Notify about collection error with timing context
                     await self._coordinator.execute(Command(
                         type=MarketDataCommand.COLLECTION_ERROR,
                         params={
-                            "symbol": symbol.name,
+                            "symbol": request["symbol"],
                             "error": str(e),
                             "error_type": e.__class__.__name__,
+                            "timestamp": TimeUtils.get_current_timestamp(),
+                            "retry_exhausted": True,  # Indicate retries handled internally
                             "context": {
-                                "retry_count": self._error_tracker.get_error_frequency(
-                                    e.__class__.__name__,
-                                    window_minutes=60
-                                ),
-                                "process": "historical_collection",
-                                "timestamp": TimeUtils.get_current_timestamp()
+                                "start_time": request["start_time"],
+                                "end_time": request["end_time"],
+                                "collection_type": request["type"],
+                                "batch_size": self._batch_size,
+                                "timeframe": self._base_timeframe.value
                             }
                         }
                     ))
 
                 finally:
                     async with self._collection_lock:
-                        self._processing_symbols.remove(symbol.name)
+                        self._processing_symbols.remove(request["symbol"])
                     self._collection_queue.task_done()
 
-            except asyncio.CancelledError:
-                break
             except Exception as e:
                 logger.error(f"Critical error in collection queue processing: {e}")
                 await asyncio.sleep(1)
 
-    async def _collect_historical_data(self, symbol: SymbolInfo, timeframe: Timeframe) -> None:
-        """Collect historical data with enhanced error handling and progress tracking"""
-        retry_count = 0
-        processed_candles = 0
-        total_candles = None
+    async def _collect_data(self,
+                       symbol: SymbolInfo,
+                       start_time: Timestamp,
+                       end_time: Timestamp,
+                       limit: int,
+                       timeframe: Timeframe) -> None:
+        """
+        Collect data for specified time range with careful timestamp handling
 
-        while True:
-            try:
-                # First ensure symbol exists in database
-                await self._symbol_repository.get_or_create(symbol)
-
-                # Get start time based on latest data or symbol launch
-                start_time = await self._kline_repository.get_latest_timestamp(
-                    symbol,
-                    timeframe
+        Cases to handle:
+        1. Historical collection (end_time is current time)
+        2. Gap filling (specific start/end range)
+        3. Single interval collection
+        """
+        try:
+            # Validate time range
+            if end_time <= start_time:
+                raise ValidationError(
+                    f"Invalid time range: end_time ({TimeUtils.from_timestamp(end_time)}) "
+                    f"must be greater than start_time ({TimeUtils.from_timestamp(start_time)})"
                 )
 
-                # Calculate collection boundaries
-                interval_ms = timeframe.to_milliseconds()
-                current_time = TimeUtils.get_current_timestamp()
+            # Ensure symbol exists
+            await self._symbol_repository.get_or_create(symbol)
 
-                # Find last completed interval
-                last_complete_interval, _ = TimeUtils.get_interval_boundaries(
-                    Timestamp(current_time - interval_ms),
-                    interval_ms
+            # Calculate intervals
+            interval_ms = timeframe.to_milliseconds()
+            current_time = TimeUtils.get_current_timestamp()
+
+            # Align timestamps to interval boundaries
+            aligned_start = start_time - (start_time % interval_ms)
+            aligned_end = end_time - (end_time % interval_ms)
+
+            # Calculate total candles for progress tracking
+            total_candles = ((aligned_end - aligned_start) // interval_ms) + 1
+            processed_candles = 0
+
+            # Update progress with total
+            progress = self._symbol_progress[symbol]
+            progress.update(processed_candles, total_candles)
+
+            # For historical collection, only collect up to last completed interval
+            is_historical = aligned_end >= (current_time - interval_ms)
+            if is_historical:
+                last_complete = current_time - (current_time % interval_ms) - interval_ms
+                aligned_end = min(aligned_end, last_complete)
+                logger.debug(
+                    f"Adjusted end time for historical collection: "
+                    f"{TimeUtils.from_timestamp(Timestamp(aligned_end))}"
                 )
 
-                # Set initial start time
-                if not start_time:
-                    start_time = symbol.launch_time
-                else:
-                    start_time = Timestamp(start_time + interval_ms)
+            current_start = aligned_start
+            retry_count = 0
 
-                # Calculate total expected candles
-                total_candles = int((last_complete_interval - start_time) // interval_ms)
+            while current_start < aligned_end:
+                try:
+                    # Calculate batch end respecting overall end time
+                    batch_end = min(
+                        aligned_end,
+                        current_start + (limit * interval_ms)
+                    )
 
-                logger.info(
-                    f"Starting historical collection for {symbol.name} "
-                    f"from {TimeUtils.from_timestamp(start_time)} "
-                    f"to {TimeUtils.from_timestamp(last_complete_interval)}"
-                )
-
-                while start_time < last_complete_interval:
-                    # Check if collection was cancelled
-                    if symbol.name not in self._processing_symbols:
-                        logger.info(f"Collection cancelled for {symbol.name}")
+                    # Check for cancellation
+                    if symbol not in self._processing_symbols:
+                        logger.info(f"Collection cancelled for {symbol}")
                         return
 
-                    # Fetch batch of historical data
                     adapter = self._adapter_registry.get_adapter(symbol.exchange)
                     klines = await adapter.get_klines(
                         symbol=symbol,
                         timeframe=timeframe,
-                        start_time=start_time,
-                        limit=self._batch_size
+                        start_time=Timestamp(current_start),
+                        end_time=Timestamp(batch_end),
+                        limit=limit
                     )
 
                     if not klines:
                         break
 
-                    # Only store completed candles
-                    klines = [k for k in klines
-                             if TimeUtils.is_complete_interval(Timestamp(k.timestamp), interval_ms)]
+                    # For historical collection, verify completeness
+                    if is_historical:
+                        klines = [k for k in klines
+                                if TimeUtils.is_complete_interval(
+                                    Timestamp(k.timestamp),
+                                    interval_ms
+                                )]
 
                     if klines:
-                        # Store klines
+                        # Store batch
                         processed = await self._kline_repository.insert_batch(
                             symbol,
                             timeframe,
                             [k.to_tuple() for k in klines]
                         )
 
-                        # Update progress
                         processed_candles += processed
+                        progress.update(processed_candles)
+                        logger.info(progress)
+
+                        # Move to next batch, ensuring no overlap
                         last_timestamp = klines[-1].timestamp
+                        current_start = Timestamp(last_timestamp + interval_ms)
+                    else:
+                        # No valid data in this batch
+                        current_start = batch_end
 
-                        # Report progress
-                        await self._coordinator.execute(Command(
-                            type=MarketDataCommand.COLLECTION_PROGRESS,
-                            params={
-                                "symbol": symbol.name,
-                                "processed": processed_candles,
-                                "total": total_candles,
-                                "last_timestamp": last_timestamp,
-                                "timestamp": TimeUtils.get_current_timestamp(),
-                                "context": {
-                                    "timeframe": timeframe.value,
-                                    "batch_size": self._batch_size
-                                }
-                            }
-                        ))
+                except Exception as e:
+                    should_retry, reason = self._retry_strategy.should_retry(retry_count, e)
+                    if should_retry:
+                        retry_count += 1
+                        delay = self._retry_strategy.get_delay(retry_count)
+                        logger.warning(
+                            f"Retry {retry_count} for {symbol} "
+                            f"batch {TimeUtils.from_timestamp(Timestamp(current_start))} "
+                            f"after {delay:.2f}s: {e}"
+                        )
+                        await asyncio.sleep(delay)
+                        continue  # Retry this batch
+                    raise  # Non-retryable error
 
-                        start_time = Timestamp(last_timestamp + interval_ms)
+            if progress := self._symbol_progress.get(symbol):
+                logger.info(progress.get_completion_summary(TimeUtils.get_current_datetime()))
 
-                logger.info(
-                    f"Completed historical collection for {symbol.name} "
-                    f"up to {TimeUtils.from_timestamp(last_complete_interval)}"
-                )
-                break  # Success - exit retry loop
+            self._symbol_progress.pop(symbol, None)
 
-            except Exception as e:
-                # Handle retry logic
-                should_retry, reason = self._retry_strategy.should_retry(retry_count, e)
-                if should_retry:
-                    retry_count += 1
-                    delay = self._retry_strategy.get_delay(retry_count)
-                    logger.warning(
-                        f"Retry {retry_count} for {symbol.name} after {delay:.2f}s: {e}"
-                    )
-                    await asyncio.sleep(delay)
-                else:
-                    logger.error(f"Failed to collect data for {symbol.name}: {reason}")
-                    raise
+        except Exception as e:
+            logger.error(f"Collection failed for {symbol}: {e}")
+            raise
 
     def get_collection_status(self) -> str:
         """Get current collection status"""
         status = [
             "Historical Collection Status:",
             f"Active Collections: {len(self._processing_symbols)}",
-            f"Pending Collections: {self._collection_queue.qsize()}"
+            f"Pending Collections: {self._collection_queue.qsize()}",
+            "\nActive Progress:"
         ]
+
+        # Add progress for each active collection
+        for progress in sorted(self._symbol_progress.values()):
+            status.append(f"  {progress}")
+
         return "\n".join(status)

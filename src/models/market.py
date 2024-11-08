@@ -1,5 +1,6 @@
 # src/models/market.py
 
+import os
 from typing import List
 import sqlalchemy as sa
 from sqlalchemy import Index, DDL, BigInteger, Float, String, ForeignKey, UniqueConstraint
@@ -36,7 +37,6 @@ class Symbol(Base):
 
     def __repr__(self) -> str:
         return f"Symbol(id={self.id}, name='{self.name}', exchange='{self.exchange}')"
-
 
 class Kline(Base):
     """
@@ -151,61 +151,89 @@ add_compression_policy = DDL("""
     );
 """)
 
-# Create continuous aggregates for common timeframes
-create_hourly_aggregate = DDL("""
-CREATE MATERIALIZED VIEW IF NOT EXISTS kline_hourly
-WITH (timescaledb.continuous) AS
-SELECT
-    time_bucket('1 hour', to_timestamp(start_time/1000)) AS bucket,
-    symbol_id,
-    timeframe,
-    first(open_price, start_time) as open,
-    max(high_price) as high,
-    min(low_price) as low,
-    last(close_price, start_time) as close,
-    sum(volume) as volume,
-    sum(turnover) as turnover
-FROM kline_data
-GROUP BY bucket, symbol_id, timeframe
-WITH NO DATA;
+def get_continuous_aggregate_ddl(default_timeframe: str = '5') -> List[DDL]:
+    """Generate DDL statements with configured base timeframe"""
+    return [
+        DDL("""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS kline_1h
+        WITH (timescaledb.continuous) AS
+        SELECT
+        time_bucket('1 hour', to_timestamp(start_time/1000)) AS bucket,
+        symbol_id,
+        '60' as timeframe,
+        first(open_price, start_time) as open_price,
+        max(high_price) as high_price,
+        min(low_price) as low_price,
+        last(close_price, start_time) as close_price,
+        sum(volume) as volume,
+        sum(turnover) as turnover
+        FROM kline_data
+        WHERE timeframe = '{default_timeframe}'
+        GROUP BY bucket, symbol_id
+        WITH NO DATA;
 
-SELECT add_continuous_aggregate_policy('kline_hourly',
-    start_offset => INTERVAL '1 month',
-    end_offset => INTERVAL '1 hour',
-    schedule_interval => INTERVAL '1 hour');
-""")
+        SELECT add_continuous_aggregate_policy('kline_1h',
+        end_offset => INTERVAL '1 hour',
+        schedule_interval => INTERVAL '5 minutes');
+        """),
+        DDL("""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS kline_4h
+        WITH (timescaledb.continuous) AS
+        SELECT
+        time_bucket('4 hours', to_timestamp(start_time/1000)) AS bucket,
+        symbol_id,
+        '240' as timeframe,
+        first(open_price, start_time) as open_price,
+        max(high_price) as high_price,
+        min(low_price) as low_price,
+        last(close_price, start_time) as close_price,
+        sum(volume) as volume,
+        sum(turnover) as turnover
+        FROM kline_data
+        WHERE timeframe = '{default_timeframe}'
+        GROUP BY bucket, symbol_id
+        WITH NO DATA;
 
-create_daily_aggregate = DDL("""
-CREATE MATERIALIZED VIEW IF NOT EXISTS kline_daily
-WITH (timescaledb.continuous) AS
-SELECT
-    time_bucket('1 day', to_timestamp(start_time/1000)) AS bucket,
-    symbol_id,
-    timeframe,
-    first(open_price, start_time) as open,
-    max(high_price) as high,
-    min(low_price) as low,
-    last(close_price, start_time) as close,
-    sum(volume) as volume,
-    sum(turnover) as turnover
-FROM kline_data
-GROUP BY bucket, symbol_id, timeframe
-WITH NO DATA;
+        SELECT add_continuous_aggregate_policy('kline_4h',
+        end_offset => INTERVAL '4 hours',
+        schedule_interval => INTERVAL '20 minutes');
+        """),
+        DDL("""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS kline_1d
+        WITH (timescaledb.continuous) AS
+        SELECT
+        time_bucket('1 day', to_timestamp(start_time/1000)) AS bucket,
+        symbol_id,
+        'D' as timeframe,
+        first(open_price, start_time) as open_price,
+        max(high_price) as high_price,
+        min(low_price) as low_price,
+        last(close_price, start_time) as close_price,
+        sum(volume) as volume,
+        sum(turnover) as turnover
+        FROM kline_data
+        WHERE timeframe = '{default_timeframe}'
+        GROUP BY bucket, symbol_id
+        WITH NO DATA;
 
-SELECT add_continuous_aggregate_policy('kline_daily',
-    start_offset => INTERVAL '3 months',
-    end_offset => INTERVAL '1 day',
-    schedule_interval => INTERVAL '1 day');
-""")
+        SELECT add_continuous_aggregate_policy('kline_1d',
+        end_offset => INTERVAL '1 day',
+        schedule_interval => INTERVAL '1 hour');
+        """)
+    ]
 
 # Register the DDL commands to run after table creation
 def setup_timescaledb(target, connection, **kw) -> None:
     """Setup TimescaleDB features for the kline_data table"""
+    default_timeframe = os.getenv('DEFAULT_TIMEFRAME', '5')
+    ddl_statements = get_continuous_aggregate_ddl(default_timeframe)
+
     connection.execute(create_hypertable)
     connection.execute(add_compression)
     connection.execute(add_compression_policy)
-    connection.execute(create_hourly_aggregate)
-    connection.execute(create_daily_aggregate)
+
+    for ddl in ddl_statements:
+        connection.execute(ddl)
 
 # Listen for table creation event
 listen(Kline.__table__, 'after_create', setup_timescaledb)

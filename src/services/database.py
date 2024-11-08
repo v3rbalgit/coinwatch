@@ -78,7 +78,22 @@ class DatabaseService(ServiceBase):
         self._timescale_config = config.timescale
 
     def _create_engine(self) -> AsyncEngine:
-        """Create SQLAlchemy engine with PostgreSQL optimizations"""
+        """
+        Create and configure a SQLAlchemy asynchronous engine with PostgreSQL optimizations.
+
+        This method initializes an AsyncEngine with specific configurations for PostgreSQL,
+        including connection pooling, JSON handling, and health checks. It also sets up
+        PostgreSQL-specific session configurations for optimal performance.
+
+        Returns:
+            AsyncEngine: A configured SQLAlchemy asynchronous engine instance optimized for PostgreSQL.
+
+        Note:
+            - Uses AsyncAdaptedQueuePool for connection pooling.
+            - Disables SQLAlchemy's JSON serialization to use PostgreSQL's native JSON handling.
+            - Enables connection health checks with pool_pre_ping.
+            - Sets up PostgreSQL session for parallel query execution and statement timeout.
+        """
         engine = create_async_engine(
             self._connection_url,
             poolclass=AsyncAdaptedQueuePool,
@@ -100,7 +115,28 @@ class DatabaseService(ServiceBase):
         return engine
 
     async def start(self) -> None:
-        """Start the database service with TimescaleDB initialization"""
+        """
+        Start the database service with TimescaleDB initialization.
+
+        This asynchronous method initializes the database engine, creates necessary tables,
+        sets up TimescaleDB extensions, configures the session factory, and starts the
+        connection pool monitoring.
+
+        The method performs the following steps:
+        1. Creates the database engine
+        2. Creates tables if they don't exist
+        3. Initializes TimescaleDB extensions
+        4. Sets chunk interval for TimescaleDB if specified
+        5. Configures the session factory
+        6. Starts the pool monitoring task
+        7. Calls the parent class's start method
+
+        Raises:
+            ServiceError: If there's an error during the database initialization process.
+
+        Returns:
+            None
+        """
         try:
             self._status = ServiceStatus.STARTING
             logger.info("Starting database service")
@@ -143,7 +179,27 @@ class DatabaseService(ServiceBase):
             raise ServiceError(f"Database initialization failed: {str(e)}")
 
     async def _monitor_pool(self) -> None:
-        """Monitor connection pool health"""
+        """
+        Continuously monitor the health of the database connection pool.
+
+        This asynchronous method runs in an infinite loop, periodically checking
+        the connection pool statistics and database size. It handles critical
+        conditions such as connection overflow and timeouts, and logs the current
+        database size for monitoring purposes.
+
+        The method performs the following actions:
+        1. Retrieves current pool statistics.
+        2. Checks for connection overflow and timeouts, handling them as critical conditions.
+        3. Monitors and logs the current database size.
+        4. Sleeps for 60 seconds before the next iteration.
+        5. In case of any errors, logs the error and retries after 5 seconds.
+
+        Returns:
+            None
+
+        Raises:
+            No exceptions are raised; all exceptions are caught and logged.
+        """
         while True:
             try:
                 stats = await self._get_pool_stats()
@@ -182,7 +238,23 @@ class DatabaseService(ServiceBase):
                 await asyncio.sleep(5)
 
     async def _get_pool_stats(self) -> Dict[str, int]:
-        """Get current pool statistics using PostgreSQL system views"""
+        """
+        Retrieve current database connection pool statistics using PostgreSQL system views.
+
+        This asynchronous method queries the PostgreSQL system views to gather information
+        about the current state of the connection pool. It provides details on the pool size,
+        number of checked-out connections, and any overflow connections.
+
+        Returns:
+            Dict[str, int]: A dictionary containing the following keys:
+                - 'size': The configured size of the connection pool.
+                - 'checked_out': The number of currently active connections.
+                - 'overflow': The number of connections exceeding the pool size.
+
+        Note:
+            If the database engine is not initialized or an error occurs during the query,
+            the method returns default values (0) for all statistics.
+        """
         if not self.engine:
             return {'size': 0, 'checked_out': 0, 'overflow': 0}
 

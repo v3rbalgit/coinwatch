@@ -4,9 +4,9 @@ from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import Union, Tuple
 
-from src.utils.time import from_timestamp, get_current_timestamp, to_timestamp
 from .domain_types import Timestamp
 from ..core.exceptions import ValidationError
+from ..utils.time import TimeUtils
 from ..utils.logger import LoggerSetup
 
 logger = LoggerSetup.setup(__name__)
@@ -26,7 +26,7 @@ class MarketDataValidator:
         MAX_FUTURE_TOLERANCE (int): Maximum allowed seconds into future for timestamps
     """
 
-    BYBIT_LAUNCH_DATE = to_timestamp(datetime(2019, 11, 1, tzinfo=timezone.utc))
+    BYBIT_LAUNCH_DATE = TimeUtils.to_timestamp(datetime(2019, 11, 1, tzinfo=timezone.utc))
     MAX_FUTURE_TOLERANCE = 60  # seconds
 
     @classmethod
@@ -55,13 +55,13 @@ class MarketDataValidator:
             launch_date = datetime.fromtimestamp(cls.BYBIT_LAUNCH_DATE/1000, tz=timezone.utc)
             raise ValidationError(f"Timestamp before exchange launch ({launch_date})")
 
-        current_time = get_current_timestamp()
-        dt = from_timestamp(timestamp)
-        max_allowed = from_timestamp(current_time) + timedelta(seconds=cls.MAX_FUTURE_TOLERANCE)
+        current_time = TimeUtils.get_current_timestamp()
+        dt = TimeUtils.from_timestamp(timestamp)
+        max_allowed = TimeUtils.from_timestamp(current_time) + timedelta(seconds=cls.MAX_FUTURE_TOLERANCE)
 
         if dt > max_allowed:
             logger.warning(
-                f"Timestamp too far in future: {(dt - from_timestamp(current_time)).total_seconds()} seconds ahead"
+                f"Timestamp too far in future: {(dt - TimeUtils.from_timestamp(current_time)).total_seconds()} seconds ahead"
             )
             raise ValidationError(
                 f"Future timestamp not allowed: {dt} > {max_allowed}"
