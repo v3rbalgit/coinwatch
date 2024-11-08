@@ -102,7 +102,8 @@ class DataCollector:
         """Register handlers for collection-related commands"""
         handlers = {
             MarketDataCommand.COLLECTION_STARTED: self._handle_collection_start,
-            MarketDataCommand.ADJUST_BATCH_SIZE: self._handle_adjust_batch_size
+            MarketDataCommand.ADJUST_BATCH_SIZE: self._handle_adjust_batch_size,
+            MarketDataCommand.SYMBOL_DELISTED: self._handle_symbol_delisted
         }
 
         for command, handler in handlers.items():
@@ -119,7 +120,7 @@ class DataCollector:
             if symbol not in self._processing_symbols:
                 self._processing_symbols.add(symbol)
 
-                logger.info(f"Starting collection for {symbol}...")
+                logger.info(f"Starting data collection for {symbol}")
 
                 self._symbol_progress[symbol] = CollectionProgress(
                     symbol=symbol,
@@ -149,6 +150,37 @@ class DataCollector:
             f"(change: {(new_size - old_size):+d})"
         )
 
+    async def _handle_symbol_delisted(self, command: Command) -> None:
+        """Handle symbol delisting by cleaning up data and cancelling collections"""
+        symbol: SymbolInfo = command.params["symbol"]
+
+        try:
+            processing_symbol = next((s for s in self._processing_symbols if s.name == symbol.name), None)
+
+            if not processing_symbol:
+                symbol_record = await self._symbol_repository.get_symbol(symbol)
+                if symbol_record:
+                    processing_symbol = symbol
+
+            if processing_symbol:
+                logger.info(f"Processing delisting for {processing_symbol}")
+
+                async with self._collection_lock:
+                    if processing_symbol in self._processing_symbols:
+                        self._processing_symbols.remove(processing_symbol)
+                        logger.info(f"Removed delisted symbol from data collection {processing_symbol}")
+
+                await self._symbol_repository.delete(processing_symbol)
+                await self._kline_repository.delete_symbol_data(processing_symbol)
+
+                logger.info(f"Cleaned up data for delisted symbol {processing_symbol}")
+            else:
+                logger.warning(f"Received delisting command for unknown symbol: {symbol}")
+
+        except Exception as e:
+            logger.error(f"Error handling symbol delisting for {symbol}: {e}")
+            # Don't raise - we want to continue service operation even if cleanup fails
+
     async def _process_queue(self) -> None:
         """Process collection requests from queue"""
         while True:
@@ -162,7 +194,6 @@ class DataCollector:
                         self._batch_size,
                         self._base_timeframe
                     )
-
                     # Report completion to BatchSynchronizer
                     await self._coordinator.execute(Command(
                         type=MarketDataCommand.COLLECTION_COMPLETE,

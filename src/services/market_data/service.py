@@ -480,7 +480,6 @@ class MarketDataService(ServiceBase):
 
                                 for symbol in delisted:
                                     self._active_symbols.remove(symbol)
-                                    # Notify about delisting
                                     await self.coordinator.execute(Command(
                                         type=MarketDataCommand.SYMBOL_DELISTED,
                                         params={
