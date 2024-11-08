@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Dict, Tuple
+from typing import Dict, Tuple
 from ..utils.domain_types import SymbolName, ExchangeName, Timestamp
 
 @dataclass
@@ -99,12 +99,69 @@ class SymbolInfo:
         """Get base/quote pair"""
         return f"{self.base_asset}/{self.quote_asset}"
 
+# Technical Indicator Models
+@dataclass
+class RSIResult:
+    """Relative Strength Index result"""
+    timestamp: Timestamp
+    value: Decimal
+
+    @classmethod
+    def from_series(cls, timestamp: Timestamp, value: float) -> 'RSIResult':
+        return cls(timestamp=timestamp, value=Decimal(str(value)))
 
 @dataclass
-class Observation:
-    """Represents a system observation"""
-    timestamp: datetime
-    source: str
-    metrics: Dict[str, Any]
-    severity: str
-    context: Dict[str, Any]
+class BollingerBandsResult:
+    """Bollinger Bands result"""
+    timestamp: Timestamp
+    upper: Decimal
+    middle: Decimal
+    lower: Decimal
+    bandwidth: Decimal
+
+    @classmethod
+    def from_series(cls, timestamp: Timestamp, bb_dict: Dict[str, float]) -> 'BollingerBandsResult':
+        return cls(
+            timestamp=timestamp,
+            upper=Decimal(str(bb_dict['BBU_20_2.0'])),
+            middle=Decimal(str(bb_dict['BBM_20_2.0'])),
+            lower=Decimal(str(bb_dict['BBL_20_2.0'])),
+            bandwidth=Decimal(str(bb_dict['BBB_20_2.0']))
+        )
+
+@dataclass
+class MACDResult:
+    """MACD result"""
+    timestamp: Timestamp
+    macd: Decimal
+    signal: Decimal
+    histogram: Decimal
+
+    @classmethod
+    def from_series(cls, timestamp: Timestamp, macd_dict: Dict[str, float]) -> 'MACDResult':
+        return cls(
+            timestamp=timestamp,
+            macd=Decimal(str(macd_dict['MACD_12_26_9'])),
+            signal=Decimal(str(macd_dict['MACDs_12_26_9'])),
+            histogram=Decimal(str(macd_dict['MACDh_12_26_9']))
+        )
+
+@dataclass
+class MAResult:
+    """Moving Average result"""
+    timestamp: Timestamp
+    value: Decimal
+
+    @classmethod
+    def from_series(cls, timestamp: Timestamp, value: float) -> 'MAResult':
+        return cls(timestamp=timestamp, value=Decimal(str(value)))
+
+@dataclass
+class OBVResult:
+    """On Balance Volume result"""
+    timestamp: Timestamp
+    value: Decimal
+
+    @classmethod
+    def from_series(cls, timestamp: Timestamp, value: float) -> 'OBVResult':
+        return cls(timestamp=timestamp, value=Decimal(str(value)))

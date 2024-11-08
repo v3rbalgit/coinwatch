@@ -14,6 +14,7 @@ class MarketDataCommand(Enum):
     # Service Control
     CLEANUP_OLD_DATA = "cleanup_old_data"
     ADJUST_BATCH_SIZE = "adjust_batch_size"
+    ADJUST_CACHE = "adjust_cache"
     HANDLE_ERROR = "handle_error"
 
     # Synchronization

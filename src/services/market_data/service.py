@@ -49,7 +49,6 @@ class MarketDataService(ServiceBase):
         self.symbol_repository = symbol_repository
         self.kline_repository = kline_repository
         self.exchange_registry = exchange_registry
-        self.config = config
         self.base_timeframe = Timeframe(config.default_timeframe)
 
         # Core components
@@ -74,7 +73,7 @@ class MarketDataService(ServiceBase):
         self._status = ServiceStatus.STOPPED
         self._last_error: Optional[Exception] = None
         self._symbol_check_interval = 3600  # 1 hour
-        self._symbol_lock = asyncio.Lock()  # Protect symbol state changes
+        self._symbol_lock = asyncio.Lock()
 
         # Task management
         self._monitor_task: Optional[asyncio.Task] = None
@@ -403,7 +402,7 @@ class MarketDataService(ServiceBase):
         await self.batch_synchronizer.cleanup()
 
         # Adaptive retry interval based on error frequency
-        retry_interval = self.config.retry_interval
+        retry_interval = self._config.retry_interval
         if await self._error_tracker.get_error_frequency(
             condition["error_type"],
             window_minutes=60
