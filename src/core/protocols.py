@@ -3,7 +3,7 @@
 from typing import Protocol, List, Optional
 
 from ..utils.domain_types import Timeframe, Timestamp
-from ..core.models import KlineData, Observation, SymbolInfo
+from ..core.models import KlineData, SymbolInfo
 
 class ExchangeAdapter(Protocol):
     """Exchange adapter protocol"""
@@ -32,10 +32,4 @@ class ExchangeAdapter(Protocol):
 
     async def close(self) -> None:
         """Close adapter connection"""
-        ...
-
-class ObserverProtocol(Protocol):
-    """Protocol for system observers"""
-    async def on_observation(self, observation: Observation) -> None:
-        """Handle new observation"""
         ...
