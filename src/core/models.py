@@ -1,7 +1,6 @@
 # src/core/models.py
 
 from dataclasses import dataclass
-from datetime import datetime
 from decimal import Decimal
 from typing import Dict, Tuple
 from ..utils.domain_types import SymbolName, ExchangeName, Timestamp
@@ -18,16 +17,6 @@ class KlineData:
     turnover: Decimal
     symbol: str
     timeframe: str
-
-    @property
-    def datetime(self) -> datetime:
-        """Convert timestamp to datetime"""
-        return datetime.fromtimestamp(self.timestamp / 1000)
-
-    @property
-    def price_range(self) -> Decimal:
-        """Calculate price range"""
-        return self.high_price - self.low_price
 
     def to_tuple(self) -> Tuple[Timestamp, float, float, float, float, float, float]:
         """Convert to tuple format for database storage"""
