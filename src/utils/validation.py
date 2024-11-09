@@ -52,7 +52,7 @@ class MarketDataValidator:
             raise ValidationError(f"Invalid timestamp length: {len(str(abs(timestamp)))}, must be 13 digits")
 
         if timestamp < cls.BYBIT_LAUNCH_DATE:
-            launch_date = datetime.fromtimestamp(cls.BYBIT_LAUNCH_DATE/1000, tz=timezone.utc)
+            launch_date = TimeUtils.from_timestamp(cls.BYBIT_LAUNCH_DATE)
             raise ValidationError(f"Timestamp before exchange launch ({launch_date})")
 
         current_time = TimeUtils.get_current_timestamp()
@@ -188,8 +188,6 @@ class MarketDataValidator:
             # Validate relationships
             cls._validate_price_relationships(open_dec, high_dec, low_dec, close_dec)
 
-            dt = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
-
             return True, (open_dec, high_dec, low_dec, close_dec, volume_dec, turnover_dec)
 
         except ValidationError:
@@ -197,20 +195,3 @@ class MarketDataValidator:
         except Exception as e:
             logger.error("Unexpected validation error", exc_info=e)
             raise ValidationError(f"Validation failed: {str(e)}")
-
-
-# Code for setting the MAX_FUTURE_TOLERANCE dynamically based on observed latency:
-# class MarketDataValidator:
-#     def __init__(self):
-#         self._latency_samples = []
-#         self._max_observed_latency = 0
-
-#     def update_latency(self, latency: float) -> None:
-#         self._latency_samples.append(latency)
-#         if len(self._latency_samples) > 100:
-#             self._latency_samples.pop(0)
-#         self._max_observed_latency = max(self._latency_samples) * 2
-
-#     @property
-#     def future_tolerance(self) -> int:
-#         return max(60, min(300, int(self._max_observed_latency)))

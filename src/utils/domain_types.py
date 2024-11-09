@@ -45,7 +45,12 @@ CriticalConditionType = Literal[
     "collection_failure",
     "sync_failure",
     "connection_overflow",
-    "connection_timeout"
+    "connection_timeout",
+    "deadlock",
+    "maintenance_required",
+    "query_timeout",
+    "replication_lag",
+    "lock_timeout"
 ]
 
 class CriticalCondition(TypedDict):

@@ -129,7 +129,7 @@ class DataCollector:
                 self._processing_symbols.add(symbol)
 
                 if gap_size := context.get('gap_size'):
-                    logger.info(f"Filling {gap_size} candles for symbol {symbol}")
+                    logger.info(f"Filling {gap_size} candles for {symbol}")
                 else:
                     logger.info(f"Started data collection for {symbol}")
 

@@ -45,9 +45,9 @@ class BatchSynchronizer:
         # Sync management
         self._schedules: Dict[SymbolInfo, SyncSchedule] = {}
         self._schedules_lock = asyncio.Lock()
-        self._min_concurrent_updates = 10
         self._default_concurrent_updates = max_concurrent_updates
         self._current_concurrent_updates = max_concurrent_updates
+        self._min_concurrent_updates = 10
         self._update_lock = asyncio.Lock()
         self._recovery_task: Optional[asyncio.Task] = None
         self._sync_semaphore = asyncio.BoundedSemaphore(self._default_concurrent_updates)
