@@ -85,6 +85,14 @@ class DatabaseConfig:
     pool_timeout: int = 30
     pool_recycle: int = 1800
     echo: bool = False
+    pool_use_lifo: bool = True  # LIFO for better connection reuse
+    connect_args: Dict[str, str | int] = field(default_factory=lambda: {
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 5,
+        "application_name": "coinwatch"  # For better monitoring
+    })
     dialect: str = "postgresql"
     driver: str = "asyncpg"
     timescale: TimescaleConfig = field(default_factory=TimescaleConfig)
@@ -238,9 +246,17 @@ class Config:
                 max_overflow=int(os.getenv('DB_MAX_OVERFLOW', '30')),
                 pool_timeout=int(os.getenv('DB_POOL_TIMEOUT', '30')),
                 pool_recycle=int(os.getenv('DB_POOL_RECYCLE', '1800')),
+                pool_use_lifo=True,
                 echo=bool(os.getenv('DB_ECHO', 'False').lower() == 'true'),
                 dialect=os.getenv('DB_DIALECT', 'postgresql'),
                 driver=os.getenv('DB_DRIVER', 'asyncpg'),
+                connect_args={
+                    "keepalives": int(os.getenv('DB_KEEPALIVES', '1')),
+                    "keepalives_idle": int(os.getenv('DB_KEEPALIVES_IDLE', '30')),
+                    "keepalives_interval": int(os.getenv('DB_KEEPALIVES_INTERVAL', '10')),
+                    "keepalives_count": int(os.getenv('DB_KEEPALIVES_COUNT', '5')),
+                    "application_name": "coinwatch"
+                },
                 timescale=timescale_config
             )
         except Exception as e:

@@ -128,7 +128,11 @@ class DatabaseService(ServiceBase):
             # Enable parallel query execution
             dbapi_connection.set_session(
                 enable_parallel_query=True,
-                statement_timeout=30000  # 30 seconds timeout
+                statement_timeout=30000,  # 30 seconds timeout
+                work_mem='64MB',         # Memory for sorting/hash operations
+                maintenance_work_mem='256MB',  # Memory for maintenance operations
+                random_page_cost=1.1,    # Optimize for SSDs
+                effective_cache_size='4GB',  # Assume larger cache for better plans
             )
 
         return engine
@@ -278,51 +282,47 @@ class DatabaseService(ServiceBase):
             raise ServiceError("Database service not initialized")
 
         async with self._transaction_semaphore:
-             attempt = 0
-        last_error = None
+            attempt = 0
 
-        while True:
-            try:
-                async with self.session_factory() as session:
-                    if isolation_level:
-                        await session.execute(
-                            text(f"SET TRANSACTION ISOLATION LEVEL {isolation_level.value}")
-                        )
+            while True:
+                try:
+                    async with self.session_factory() as session:
+                        if isolation_level:
+                            await session.execute(
+                                text(f"SET TRANSACTION ISOLATION LEVEL {isolation_level.value}")
+                            )
 
-                    # Set statement timeout for this transaction
-                    await session.execute(text("SET statement_timeout = '30s';"))
+                        async with session.begin():
+                            yield session
+                            return
 
-                    async with session.begin():
-                        yield session
-                        return
-
-            except Exception as e:
-                # Track error for monitoring
-                await self._error_tracker.record_error(
-                    e,
-                    context={
-                        "isolation_level": isolation_level.value if isolation_level else None,
-                        "attempt": attempt + 1
-                    }
-                )
-
-                # Get retry strategy for this specific error
-                should_retry, reason = self._retry_strategy.should_retry(attempt, e)
-                if should_retry:
-                    attempt += 1
-                    delay = self._retry_strategy.get_delay(attempt, e)
-
-                    logger.warning(
-                        f"Database error, retry {attempt} after {delay:.2f}s: {str(e)}"
+                except Exception as e:
+                    # Track error for monitoring
+                    await self._error_tracker.record_error(
+                        e,
+                        context={
+                            "isolation_level": isolation_level.value if isolation_level else None,
+                            "attempt": attempt + 1
+                        }
                     )
 
-                    await asyncio.sleep(delay)
-                    continue
+                    # Get retry strategy for this specific error
+                    should_retry, reason = self._retry_strategy.should_retry(attempt, e)
+                    if should_retry:
+                        attempt += 1
+                        delay = self._retry_strategy.get_delay(attempt, e)
 
-                logger.error(
-                    f"Database error not retryable ({reason}): {str(e)}"
-                )
-                raise ServiceError(f"Database operation failed: {str(e)}") from e
+                        logger.warning(
+                            f"Database error, retry {attempt} after {delay:.2f}s: {str(e)}"
+                        )
+
+                        await asyncio.sleep(delay)
+                        continue
+
+                    logger.error(
+                        f"Database error not retryable ({reason}): {str(e)}"
+                    )
+                    raise ServiceError(f"Database operation failed: {str(e)}") from e
 
     async def _handle_metrics_report(self, command: Command) -> CommandResult:
         """Handle metrics report command by returning current metrics"""
