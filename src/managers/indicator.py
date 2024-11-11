@@ -1,32 +1,24 @@
 # src/managers/indicator.py
 
 import asyncio
-from enum import Enum
-from cachetools import TTLCache
+import os
 import pandas as pd
 import pandas_ta as ta
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, cast
+from typing import Any, Callable, Dict, List, Optional
 
-from ..core.coordination import Command, MarketDataCommand, ServiceCoordinator
-from ..core.exceptions import ServiceError, ValidationError
+from ..core.coordination import ServiceCoordinator
+from ..core.exceptions import ValidationError
 from ..core.models import (
     KlineData,
     RSIResult, BollingerBandsResult, MACDResult, MAResult, OBVResult
     )
 from ..utils.domain_types import Timestamp
 from ..utils.logger import LoggerSetup
-from ..utils.time import TimeUtils
 from ..utils.retry import RetryConfig, RetryStrategy
-from ..utils.cache import AsyncTTLCache, CacheStats, async_ttl_cache
+from ..utils.cache import AsyncTTLCache, async_ttl_cache
 
 logger = LoggerSetup.setup(__name__)
-
-class CacheAdjustment(Enum):
-    """Type of cache adjustment made"""
-    TTL = "ttl"
-    SIZE = "size"
-    BOTH = "both"
 
 @dataclass
 class CacheConfig:
@@ -42,16 +34,65 @@ class CacheConfig:
 
 @dataclass
 class IndicatorCacheConfig:
-    """Configuration for all indicator caches"""
-    default: CacheConfig = CacheConfig(ttl=300, max_size=1000)  # 5 minutes, 1000 entries
-    critical: CacheConfig = CacheConfig(ttl=600, max_size=100)  # 10 minutes, 100 entries
-    reduced: CacheConfig = CacheConfig(ttl=450, max_size=500)   # 7.5 minutes, 500 entries
+    """Fixed configuration for all indicator caches"""
+    default: CacheConfig
+    fast_indicators: CacheConfig
 
-    # Special configurations for sensitive indicators
-    fast_indicators: CacheConfig = CacheConfig(ttl=60, max_size=1000)  # 1 minute TTL
+    @classmethod
+    def from_memory_limit(cls, memory_limit_mb: int) -> 'IndicatorCacheConfig':
+        """
+        Create cache configuration based on container memory limit.
+        Args:
+            memory_limit_mb: Container memory limit in MB
+        """
+        # Allocate 30% of container memory for caches
+        cache_memory = int(memory_limit_mb * 0.3)
 
-    recovery_delay: int = 300  # 5 minutes before attempting recovery
-    min_reduction_interval: int = 60  # 1 minute between reductions
+        # Calculate cache sizes
+        # Fast indicators (more sensitive to price changes) get 40% of cache memory
+        fast_size = max(1000, int((cache_memory * 0.4) / 0.001))  # Assume ~1KB per cache entry
+        # Default cache gets 60% of cache memory
+        default_size = max(1000, int((cache_memory * 0.6) / 0.001))
+
+        return cls(
+            default=CacheConfig(
+                ttl=300,  # 5 minutes
+                max_size=default_size
+            ),
+            fast_indicators=CacheConfig(
+                ttl=60,  # 1 minute
+                max_size=fast_size
+            )
+        )
+
+    @classmethod
+    def get_container_memory_limit(cls) -> int:
+        """
+        Get container memory limit from environment or cgroups.
+        Returns memory limit in MB.
+        """
+        # Try to get from environment first
+        if memory_limit := os.getenv('MEMORY_LIMIT'):
+            try:
+                # Convert from format like "512Mi" to MB
+                if memory_limit.endswith('Mi'):
+                    return int(memory_limit[:-2])
+                if memory_limit.endswith('Gi'):
+                    return int(memory_limit[:-2]) * 1024
+                return int(memory_limit)
+            except ValueError:
+                logger.warning(f"Invalid MEMORY_LIMIT format: {memory_limit}")
+
+        # Fallback to cgroups
+        try:
+            with open('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'r') as f:
+                memory_bytes = int(f.read().strip())
+                return memory_bytes // (1024 * 1024)  # Convert to MB
+        except (FileNotFoundError, ValueError, IOError):
+            logger.warning("Could not determine container memory limit")
+
+        # Default to 512MB if we can't determine limit
+        return 512
 
 class IndicatorManager:
     """
@@ -66,12 +107,20 @@ class IndicatorManager:
                  coordinator: ServiceCoordinator,
                  config: Optional[IndicatorCacheConfig] = None):
         self.coordinator = coordinator
-        self.config = config or IndicatorCacheConfig()
+
+        # Initialize cache configuration
+        if config is None:
+            memory_limit = IndicatorCacheConfig.get_container_memory_limit()
+            self.config = IndicatorCacheConfig.from_memory_limit(memory_limit)
+            logger.info(
+                f"Initialized cache with memory limit {memory_limit}MB "
+                f"(default: {self.config.default.max_size} entries, "
+                f"fast: {self.config.fast_indicators.max_size} entries)"
+            )
+        else:
+            self.config = config
 
         self._calculation_lock = asyncio.Lock()
-        self._last_reduction_ts = Timestamp(0)
-        self._last_adjustment: Optional[CacheAdjustment] = None
-        self._recovery_task: Optional[asyncio.Task] = None
 
         # Initialize retry strategy
         retry_config = RetryConfig(
@@ -85,9 +134,6 @@ class IndicatorManager:
 
         # Initialize caches with config
         self._setup_indicator_caches()
-
-        # Register command handler
-        asyncio.create_task(self._register_command_handlers())
 
     def _configure_retry_strategy(self) -> None:
         """Configure retry behavior"""
@@ -127,12 +173,12 @@ class IndicatorManager:
                 raise  # Non-retryable error or max retries exceeded
 
     def _setup_indicator_caches(self) -> None:
-        """Apply initial cache configuration to all indicators"""
+        """Apply fixed cache configuration to all indicators"""
         # Fast indicators (more sensitive to price changes)
         self._setup_cache(self.calculate_rsi, self.config.fast_indicators)
         self._setup_cache(self.calculate_obv, self.config.fast_indicators)
 
-        # Standard indicators
+        # Standard indicators with default configuration
         for method in [
             self.calculate_macd,
             self.calculate_bollinger_bands,
@@ -146,10 +192,7 @@ class IndicatorManager:
         if hasattr(method, '__wrapped__'):
             cache_instance = self._get_cache_instance(method)
             if cache_instance:
-                cache_instance.stats.maxsize = config.max_size
-                cache_instance.stats.ttl = config.ttl
-                # Create new cache with config
-                cache_instance.cache = TTLCache(
+                cache_instance.reconfigure(
                     maxsize=config.max_size,
                     ttl=config.ttl
                 )
@@ -165,107 +208,8 @@ class IndicatorManager:
             logger.error(f"Error accessing cache instance: {e}")
         return None
 
-    async def _register_command_handlers(self) -> None:
-        """Register resource management command handler"""
-        await self.coordinator.register_handler(
-            MarketDataCommand.ADJUST_CACHE,
-            self._handle_resource_pressure
-        )
-
-    def _should_handle_reduction(self) -> bool:
-        """Check if enough time has passed since last reduction"""
-        current_ts = TimeUtils.get_current_timestamp()
-        elapsed_ms = current_ts - self._last_reduction_ts
-        return elapsed_ms >= (self.config.min_reduction_interval * 1000)
-
-    async def _adjust_cache_config(self,
-                                 new_config: CacheConfig,
-                                 adjustment_type: CacheAdjustment) -> None:
-        """
-        Adjust cache configuration for all indicators.
-        Creates new cache instances with updated parameters while preserving
-        valid cached entries.
-        """
-        async with self._calculation_lock:
-            logger.info(
-                f"Adjusting cache config: {adjustment_type.value} "
-                f"(TTL: {new_config.ttl}s, Size: {new_config.max_size})"
-            )
-            for method in [
-                self.calculate_rsi,
-                self.calculate_macd,
-                self.calculate_bollinger_bands,
-                self.calculate_sma,
-                self.calculate_ema,
-                self.calculate_obv
-            ]:
-                cache_instance = self._get_cache_instance(method)
-                if cache_instance:
-                    old_cache = cache_instance.cache
-
-                    # Create new cache with updated parameters
-                    cache_instance.cache = TTLCache(
-                        maxsize=new_config.max_size if adjustment_type in (CacheAdjustment.SIZE, CacheAdjustment.BOTH) else old_cache.maxsize,
-                        ttl=new_config.ttl if adjustment_type in (CacheAdjustment.TTL, CacheAdjustment.BOTH) else old_cache.ttl
-                    )
-
-                    # Transfer still-valid entries
-                    for key, value in old_cache.items():
-                        cache_instance.cache[key] = value
-
-            # Store adjustment type for recovery
-            self._last_adjustment = adjustment_type
-
-            # Start recovery monitoring if not already running
-            if not self._recovery_task or self._recovery_task.done():
-                self._recovery_task = asyncio.create_task(
-                    self._monitor_for_recovery(self._last_reduction_ts)
-                )
-
-    async def _monitor_for_recovery(self, reduction_ts: Timestamp) -> None:
-        """
-        Monitor for conditions that would allow cache recovery.
-        """
-        try:
-            if self._recovery_task and self._recovery_task.cancelled():
-                return
-
-            await asyncio.sleep(self.config.recovery_delay)
-
-            # Only recover if no new reductions have occurred
-            if reduction_ts == self._last_reduction_ts:
-                # First try partial recovery
-                await self._adjust_cache_config(
-                    self.config.reduced,
-                    self._last_adjustment or CacheAdjustment.BOTH
-                )
-
-                # Wait another recovery period
-                await asyncio.sleep(self.config.recovery_delay)
-
-                # If still stable, restore default configuration
-                if reduction_ts == self._last_reduction_ts:
-                    await self._adjust_cache_config(
-                        self.config.default,
-                        self._last_adjustment or CacheAdjustment.BOTH
-                    )
-                    logger.info("Cache configuration restored to default")
-                    self._last_adjustment = None
-
-        except Exception as e:
-            logger.error(f"Error during cache recovery: {e}")
-        finally:
-            self._recovery_task = None
-
     async def cleanup(self) -> None:
         """Cleanup resources"""
-        # Cancel recovery task
-        if self._recovery_task:
-            self._recovery_task.cancel()
-            try:
-                await self._recovery_task
-            except asyncio.CancelledError:
-                pass
 
         # Clear all caches
         for method in [
@@ -280,8 +224,8 @@ class IndicatorManager:
                 method.cache_clear()
 
     def get_cache_stats(self) -> Dict[str, Dict[str, Any]]:
-        """Get statistics for all indicator caches with pressure metrics"""
-        stats: Dict[str, Dict[str, Any]] = {}
+        """Get statistics for all indicator caches"""
+        stats = {}
 
         for name, method in [
             ('rsi', self.calculate_rsi),
@@ -292,88 +236,17 @@ class IndicatorManager:
             ('obv', self.calculate_obv)
         ]:
             if hasattr(method, 'cache_info'):
-                cache_stats = cast(CacheStats, method.cache_info())
+                cache_stats = method.cache_info()
                 stats[name] = {
-                    'stats': cache_stats,
-                    'utilization': cache_stats.size / cache_stats.maxsize * 100,
+                    'size': cache_stats.size,
+                    'maxsize': cache_stats.maxsize,
+                    'ttl': cache_stats.ttl,
+                    'hits': cache_stats.hits,
+                    'misses': cache_stats.misses,
                     'hit_ratio': cache_stats.hit_ratio
                 }
 
         return stats
-
-    # Resource pressure handlers
-    async def _handle_resource_pressure(self, command: Command) -> None:
-        """Handle resource pressure notifications."""
-        error_type = command.params.get('error_type')
-        severity = command.params.get('severity', 'warning')
-        context = command.params.get('context', {})
-
-        try:
-            # Handle recovery notification
-            if error_type == 'resource_recovered':
-                logger.info("Received resource recovery notification")
-                # Let the regular recovery monitoring handle the recovery
-                # This avoids potential conflicts with ongoing recovery processes
-                return
-
-            # Only process reductions if enough time has passed
-            if not self._should_handle_reduction():
-                return
-
-            async with self._calculation_lock:
-                logger.info(f"Handling resource pressure: {error_type} ({severity})")
-
-                if error_type == 'memory_pressure':
-                    await self._handle_memory_pressure(severity, context)
-                elif error_type == 'cpu_pressure':
-                    await self._handle_cpu_pressure(severity, context)
-                elif error_type == 'disk_pressure':
-                    await self._handle_disk_pressure(severity, context)
-
-                self._last_reduction_ts = TimeUtils.get_current_timestamp()
-
-        except Exception as e:
-            logger.error(f"Error handling resource pressure: {e}")
-            raise ServiceError(f"Resource handling failed: {str(e)}")
-
-    async def _handle_memory_pressure(self, severity: str, context: Dict[str, Any]) -> None:
-        """Handle memory pressure by reducing cache size"""
-        if severity == 'critical':
-            await self._adjust_cache_config(
-                self.config.critical,
-                CacheAdjustment.SIZE
-            )
-        else:
-            await self._adjust_cache_config(
-                self.config.reduced,
-                CacheAdjustment.SIZE
-            )
-
-    async def _handle_cpu_pressure(self, severity: str, context: Dict[str, Any]) -> None:
-        """Handle CPU pressure by adjusting TTL"""
-        if severity == 'critical':
-            await self._adjust_cache_config(
-                self.config.critical,
-                CacheAdjustment.TTL
-            )
-        else:
-            await self._adjust_cache_config(
-                self.config.reduced,
-                CacheAdjustment.TTL
-            )
-
-    async def _handle_disk_pressure(self, severity: str, context: Dict[str, Any]) -> None:
-        """Handle disk pressure by adjusting both TTL and size"""
-        if severity == 'critical':
-            await self._adjust_cache_config(
-                self.config.critical,
-                CacheAdjustment.BOTH
-            )
-        else:
-            await self._adjust_cache_config(
-                self.config.reduced,
-                CacheAdjustment.BOTH
-            )
 
     def _validate_klines(self, klines: List[KlineData]) -> None:
         """Validate kline data for indicator calculation"""

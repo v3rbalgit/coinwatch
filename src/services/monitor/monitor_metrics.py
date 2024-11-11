@@ -1,7 +1,7 @@
 # src/services/monitor/monitor_metrics.py
 
 from typing import Optional
-from prometheus_client import Counter, Gauge, Info, Summary, CollectorRegistry
+from prometheus_client import Counter, Gauge, CollectorRegistry
 
 class MonitoringMetrics:
     """Prometheus metrics for monitoring service"""
@@ -13,6 +13,13 @@ class MonitoringMetrics:
             'monitoring_service_up',
             'Current status of the monitoring service',
             ['status'],
+            registry=self.registry
+        )
+
+        self.service_uptime = Gauge(
+            'service_uptime_seconds',
+            'Service uptime in seconds',
+            ['service'],
             registry=self.registry
         )
 
@@ -32,8 +39,33 @@ class MonitoringMetrics:
             'System disk usage percentage',
             registry=self.registry
         )
+        self.system_disk_free = Gauge(
+            'system_disk_free_gb',
+            'Free disk space in gigabytes',
+            registry=self.registry
+        )
+        self.system_network_rx = Gauge(
+            'system_network_rx_bytes',
+            'Network bytes received',
+            registry=self.registry
+        )
+        self.system_network_tx = Gauge(
+            'system_network_tx_bytes',
+            'Network bytes transmitted',
+            registry=self.registry
+        )
+        self.system_process_count = Gauge(
+            'system_process_count',
+            'Number of running processes',
+            registry=self.registry
+        )
 
         # Market data metrics
+        self.market_active_symbols = Gauge(
+            'market_active_symbols',
+            'Number of active trading symbols',
+            registry=self.registry
+        )
         self.market_active_collections = Gauge(
             'market_active_collections',
             'Number of active data collections',
@@ -54,6 +86,21 @@ class MonitoringMetrics:
             'Current batch size for collections',
             registry=self.registry
         )
+        self.market_collection_errors = Gauge(
+            'market_collection_errors',
+            'Number of collection errors',
+            registry=self.registry
+        )
+        self.market_sync_errors = Gauge(
+            'market_sync_errors',
+            'Number of synchronization errors',
+            registry=self.registry
+        )
+        self.market_data_gaps = Gauge(
+            'market_data_gaps',
+            'Number of detected data gaps',
+            registry=self.registry
+        )
 
         # Database metrics
         self.db_active_connections = Gauge(
@@ -66,58 +113,30 @@ class MonitoringMetrics:
             'Database connection pool usage percentage',
             registry=self.registry
         )
+        self.db_deadlocks = Gauge(
+            'db_deadlocks',
+            'Number of detected deadlocks',
+            registry=self.registry
+        )
+        self.db_long_queries = Gauge(
+            'db_long_queries',
+            'Number of long-running queries',
+            registry=self.registry
+        )
+        self.db_maintenance_due = Gauge(
+            'db_maintenance_due',
+            'Database maintenance status (1 if due)',
+            registry=self.registry
+        )
+        self.db_replication_lag = Gauge(
+            'db_replication_lag_seconds',
+            'Database replication lag in seconds',
+            registry=self.registry
+        )
 
-        # Cache metrics
-        self.cache_hit_ratio = Gauge(
-            'cache_hit_ratio',
-            'Cache hit ratio',
-            ['cache_type'],
-            registry=self.registry
-        )
-        self.cache_size = Gauge(
-            'cache_size',
-            'Current cache size',
-            ['cache_type'],
-            registry=self.registry
-        )
-        self.cache_memory_usage = Gauge(
-            'cache_memory_usage_bytes',
-            'Cache memory usage in bytes',
-            ['cache_type'],
-            registry=self.registry
-        )
-
-        # Error tracking
         self.error_count = Counter(
             'monitoring_error_count_total',
             'Total number of errors by component',
             ['component', 'severity'],
-            registry=self.registry
-        )
-
-        # Performance metrics
-        self.collection_duration = Summary(
-            'market_collection_duration_seconds',
-            'Time spent collecting market data',
-            registry=self.registry
-        )
-        self.sync_duration = Summary(
-            'market_sync_duration_seconds',
-            'Time spent synchronizing market data',
-            registry=self.registry
-        )
-
-        # Resource pressure events
-        self.resource_pressure_events = Counter(
-            'resource_pressure_events_total',
-            'Number of resource pressure events',
-            ['resource_type', 'severity'],
-            registry=self.registry
-        )
-
-        # Service info
-        self.service_info = Info(
-            'monitoring_service',
-            'Monitoring service information',
             registry=self.registry
         )

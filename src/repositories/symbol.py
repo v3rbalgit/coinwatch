@@ -2,10 +2,9 @@
 
 from typing import List, Optional
 from sqlalchemy import select, and_, text
-from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from src.core.models import SymbolInfo
-
+from ..core.models import SymbolInfo
+from ..services.database import DatabaseService, IsolationLevel
 from .base import Repository
 from ..models.market import Symbol
 from ..utils.domain_types import ExchangeName
@@ -18,22 +17,22 @@ logger = LoggerSetup.setup(__name__)
 class SymbolRepository(Repository[Symbol]):
     """Repository for Symbol operations with PostgreSQL optimization"""
 
-    def __init__(self, session_factory: async_sessionmaker):
-        super().__init__(session_factory, Symbol)
+    def __init__(self, db_service: DatabaseService):
+        super().__init__(db_service, Symbol)
 
-    async def get_or_create(self, symbol_info: SymbolInfo) -> Symbol:
+    async def get_or_create(self, symbol: SymbolInfo) -> Symbol:
         """
         Get or create a symbol using PostgreSQL upsert
 
         Uses INSERT ... ON CONFLICT DO UPDATE for atomic operation
         """
         try:
-            async with self.get_session() as session:
+            async with self.db_service.get_session(isolation_level=IsolationLevel.SERIALIZABLE) as session:
                 # First try to get existing symbol
                 existing_stmt = select(Symbol).where(
                     and_(
-                        Symbol.name == symbol_info.name,
-                        Symbol.exchange == symbol_info.exchange
+                        Symbol.name == symbol.name,
+                        Symbol.exchange == symbol.exchange
                     )
                 )
                 result = await session.execute(existing_stmt)
@@ -41,27 +40,27 @@ class SymbolRepository(Repository[Symbol]):
 
                 if existing_symbol:
                     if existing_symbol.first_trade_time is None:
-                        existing_symbol.first_trade_time = symbol_info.launch_time
+                        existing_symbol.first_trade_time = symbol.launch_time
                         await session.flush()
                     logger.debug(
-                        f"Retrieved symbol {symbol_info.name} for {symbol_info.exchange} "
-                        f"with launch time {TimeUtils.from_timestamp(symbol_info.launch_time)}"
+                        f"Retrieved symbol {symbol.name} for {symbol.exchange} "
+                        f"with launch time {TimeUtils.from_timestamp(symbol.launch_time)}"
                     )
                     return existing_symbol
 
                 # Create new symbol
                 new_symbol = Symbol(
-                    name=symbol_info.name,
-                    exchange=symbol_info.exchange,
-                    first_trade_time=symbol_info.launch_time
+                    name=symbol.name,
+                    exchange=symbol.exchange,
+                    first_trade_time=symbol.launch_time
                 )
                 session.add(new_symbol)
                 await session.flush()
                 await session.refresh(new_symbol)
 
                 logger.debug(
-                    f"Created new symbol {symbol_info.name} for {symbol_info.exchange} "
-                    f"with launch time {TimeUtils.from_timestamp(symbol_info.launch_time)}"
+                    f"Created new symbol {symbol.name} for {symbol.exchange} "
+                    f"with launch time {TimeUtils.from_timestamp(symbol.launch_time)}"
                 )
                 return new_symbol
 
@@ -81,7 +80,7 @@ class SymbolRepository(Repository[Symbol]):
             Symbol if found, None otherwise
         """
         try:
-            async with self.get_session() as session:
+            async with self.db_service.get_session() as session:
                 # If exchange provided, get exact match
                 stmt = select(Symbol).where(
                     and_(
@@ -103,7 +102,7 @@ class SymbolRepository(Repository[Symbol]):
         Uses TimescaleDB features to gather statistics efficiently
         """
         try:
-            async with self.get_session() as session:
+            async with self.db_service.get_session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
                 stmt = text("""
                     WITH stats AS (
                         SELECT
@@ -143,7 +142,7 @@ class SymbolRepository(Repository[Symbol]):
     async def delete(self, symbol: SymbolInfo) -> None:
         """Delete a symbol and its associated data"""
         try:
-            async with self.get_session() as session:
+            async with self.db_service.get_session(isolation_level=IsolationLevel.SERIALIZABLE) as session:
                 # Find the symbol record
                 stmt = select(Symbol).where(
                     and_(

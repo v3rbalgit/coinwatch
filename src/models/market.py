@@ -226,12 +226,23 @@ def get_continuous_aggregate_ddl(default_timeframe: str = '5') -> List[DDL]:
 def setup_timescaledb(target, connection, **kw) -> None:
     """Setup TimescaleDB features for the kline_data table"""
     default_timeframe = os.getenv('DEFAULT_TIMEFRAME', '5')
-    ddl_statements = get_continuous_aggregate_ddl(default_timeframe)
+    retention_days = os.getenv('TIMESCALE_RETENTION_DAYS', '0')
 
     connection.execute(create_hypertable)
     connection.execute(add_compression)
     connection.execute(add_compression_policy)
 
+    if int(retention_days):
+        retention_policy = DDL(f"""
+            SELECT add_retention_policy(
+                'kline_data',
+                INTERVAL '{retention_days} days',
+                if_not_exists => TRUE
+            );
+        """)
+        connection.execute(retention_policy)
+
+    ddl_statements = get_continuous_aggregate_ddl(default_timeframe)
     for ddl in ddl_statements:
         connection.execute(ddl)
 

@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Dict, Tuple
+
+from ..utils.time import TimeUtils
 from ..utils.domain_types import SymbolName, ExchangeName, Timestamp
 
 @dataclass
@@ -41,6 +43,24 @@ class SymbolInfo:
     min_order_qty: Decimal
     launch_time: Timestamp
     exchange: ExchangeName = ExchangeName("bybit")
+
+    def check_retention_time(self, retention_days: int) -> 'SymbolInfo':
+        """Create new instance with adjusted launch time based on retention period"""
+        if retention_days > 0:
+            retention_start = TimeUtils.get_current_timestamp() - (retention_days * 24 * 60 * 60 * 1000)
+            new_launch_time = Timestamp(max(self.launch_time, retention_start))
+
+            return SymbolInfo(
+                name=self.name,
+                base_asset=self.base_asset,
+                quote_asset=self.quote_asset,
+                price_precision=self.price_precision,
+                qty_precision=self.qty_precision,
+                min_order_qty=self.min_order_qty,
+                launch_time=new_launch_time,
+                exchange=self.exchange
+            )
+        return self
 
     def __hash__(self) -> int:
         """Hash based on name and exchange which uniquely identify a symbol"""

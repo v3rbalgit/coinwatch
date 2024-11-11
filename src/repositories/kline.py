@@ -1,12 +1,11 @@
 # src/repositories/kline.py
 
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple
 from sqlalchemy import select, and_, text
-from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy.dialects.postgresql import insert
 
-from src.core.models import SymbolInfo
-
+from..core.models import SymbolInfo
+from ..services.database import DatabaseService, IsolationLevel
 from .base import Repository
 from ..models.market import Symbol, Kline
 from ..utils.domain_types import Timeframe, Timestamp
@@ -20,8 +19,8 @@ logger = LoggerSetup.setup(__name__)
 class KlineRepository(Repository[Kline]):
     """Repository for Kline operations with TimescaleDB optimization"""
 
-    def __init__(self, session_factory: async_sessionmaker):
-        super().__init__(session_factory, Kline)
+    def __init__(self, db_service: DatabaseService):
+        super().__init__(db_service, Kline)
         self.validator = MarketDataValidator()
         self._batch_size = 1000
 
@@ -30,7 +29,7 @@ class KlineRepository(Repository[Kline]):
                              timeframe: Timeframe) -> Timestamp:
         """Get latest timestamp using TimescaleDB's last() function"""
         try:
-            async with self.get_session() as session:
+            async with self.db_service.get_session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
                 symbol_stmt = select(Symbol).where(
                     and_(
                         Symbol.name == symbol.name,
@@ -86,7 +85,7 @@ class KlineRepository(Repository[Kline]):
         """
         try:
             inserted_count = 0
-            async with self.get_session() as session:
+            async with self.db_service.get_session() as session:
                 symbol_stmt = select(Symbol.id).where(
                     and_(
                         Symbol.name == symbol.name,
@@ -155,7 +154,7 @@ class KlineRepository(Repository[Kline]):
                            end_time: Timestamp) -> List[Tuple[Timestamp, Timestamp]]:
         """Find gaps in time series data using TimescaleDB features"""
         try:
-            async with self.get_session() as session:
+            async with self.db_service.get_session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
                 stmt = text("""
                     WITH time_series AS (
                         SELECT
@@ -195,7 +194,7 @@ class KlineRepository(Repository[Kline]):
     async def delete_symbol_data(self, symbol: SymbolInfo) -> None:
         """Delete all kline data for a symbol"""
         try:
-            async with self.get_session() as session:
+            async with self.db_service.get_session() as session:
                 # Get the symbol ID first
                 symbol_stmt = select(Symbol.id).where(
                     and_(

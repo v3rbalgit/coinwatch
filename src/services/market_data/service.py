@@ -1,5 +1,6 @@
 # src/services/market_data/service.py
 
+import os
 import asyncio
 from typing import Optional, Set
 
@@ -9,7 +10,8 @@ from .synchronizer import BatchSynchronizer
 from ...adapters.registry import ExchangeAdapterRegistry
 from ...config import MarketDataConfig
 from ...core.models import SymbolInfo
-from ...core.coordination import Command, MarketDataCommand, ServiceCoordinator
+from ...core.monitoring import MarketDataMetrics
+from ...core.coordination import Command, CommandResult, MarketDataCommand, MonitoringCommand, ServiceCoordinator
 from ...core.exceptions import ServiceError, ValidationError
 from ...repositories.kline import KlineRepository
 from ...repositories.symbol import SymbolRepository
@@ -19,7 +21,6 @@ from ...utils.domain_types import CriticalCondition, ServiceStatus, Timeframe
 from ...utils.time import TimeUtils
 from ...utils.error import ErrorTracker
 from ...utils.retry import RetryConfig, RetryStrategy
-
 
 logger = LoggerSetup.setup(__name__)
 
@@ -50,6 +51,7 @@ class MarketDataService(ServiceBase):
         self.kline_repository = kline_repository
         self.exchange_registry = exchange_registry
         self.base_timeframe = Timeframe(config.default_timeframe)
+        self._retention_days = int(os.getenv('TIMESCALE_RETENTION_DAYS', '0'))
 
         # Core components
         self.data_collector = DataCollector(
@@ -71,6 +73,7 @@ class MarketDataService(ServiceBase):
 
         # Service state
         self._status = ServiceStatus.STOPPED
+        self._start_time: Optional[int] = None
         self._last_error: Optional[Exception] = None
         self._symbol_check_interval = 3600  # 1 hour
         self._symbol_lock = asyncio.Lock()
@@ -101,6 +104,7 @@ class MarketDataService(ServiceBase):
         """Start market data service"""
         try:
             self._status = ServiceStatus.STARTING
+            self._start_time = TimeUtils.get_current_timestamp()
             logger.info("Starting market data service")
 
             await self._register_command_handlers()
@@ -124,6 +128,8 @@ class MarketDataService(ServiceBase):
       try:
           self._status = ServiceStatus.STOPPING
           logger.info("Stopping market data service")
+
+          await self._unregister_command_handlers()
 
           # Stop monitoring first
           self._monitor_running.clear()
@@ -197,17 +203,25 @@ class MarketDataService(ServiceBase):
             MarketDataCommand.GAP_DETECTED: self._handle_gap_detected,
             MarketDataCommand.COLLECTION_ERROR: self._handle_collection_error,
             MarketDataCommand.SYNC_ERROR: self._handle_sync_error,
-            MarketDataCommand.ADJUST_BATCH_SIZE: self._handle_batch_adjustment
+            MonitoringCommand.REPORT_METRICS: self._handle_metrics_report
         }
 
         for command, handler in handlers.items():
             await self.coordinator.register_handler(command, handler)
             logger.debug(f"Registered handler for {command.value}")
 
-    async def _handle_batch_adjustment(self, command: Command) -> None:
-        """Forward batch adjustments to components"""
-        await self.data_collector._handle_adjust_batch_size(command)
-        await self.batch_synchronizer._handle_adjust_batch_size(command)
+    async def _unregister_command_handlers(self) -> None:
+        """Register command handlers for service monitoring"""
+        handlers = {
+            MarketDataCommand.GAP_DETECTED: self._handle_gap_detected,
+            MarketDataCommand.COLLECTION_ERROR: self._handle_collection_error,
+            MarketDataCommand.SYNC_ERROR: self._handle_sync_error,
+            MonitoringCommand.REPORT_METRICS: self._handle_metrics_report
+        }
+
+        for command, handler in handlers.items():
+            await self.coordinator.unregister_handler(command, handler)
+            logger.debug(f"Unregistered handler for {command.value}")
 
     async def _handle_gap_detected(self, command: Command) -> None:
         """Handle detected data gaps"""
@@ -249,7 +263,7 @@ class MarketDataService(ServiceBase):
         # Request collection for each gap
         for start, end in gaps:
             await self.coordinator.execute(Command(
-                type=MarketDataCommand.COLLECTION_STARTED,
+                type=MarketDataCommand.COLLECTION_START,
                 params={
                     "symbol": symbol,
                     "start_time": start,
@@ -367,6 +381,56 @@ class MarketDataService(ServiceBase):
                 }
             })
 
+    async def _handle_metrics_report(self, command: Command) -> CommandResult:
+        """Handle metrics report command"""
+        try:
+            # Calculate uptime
+            uptime = 0.0
+            if self._start_time is not None:
+                uptime = (TimeUtils.get_current_timestamp() - self._start_time) / 1000
+
+            # Get recent errors categorized by type
+            recent_errors = self._error_tracker.get_recent_errors(60)
+            sync_errors = len([e for e in recent_errors
+                            if "sync" in str(e).lower()])
+            collection_errors = len([e for e in recent_errors
+                                if "collection" in str(e).lower()])
+            gap_errors = len([e for e in recent_errors
+                            if "gap" in str(e).lower()])
+
+            # Get stats from collectors and synchronizers
+            metrics = MarketDataMetrics(
+                service_name="market_data",
+                status=self._status.value,
+                uptime_seconds=uptime,
+                last_error=str(self._last_error) if self._last_error else None,
+                error_count=len(recent_errors),
+                warning_count=len([e for e in recent_errors
+                                if "warning" in str(e).lower()]),
+                timestamp=TimeUtils.get_current_datetime(),
+                additional_metrics={
+                    'base_timeframe': self.base_timeframe.value,
+                    'sync_interval': self._config.sync_interval,
+                    'retry_interval': self._config.retry_interval,
+                },
+                # Data collection metrics
+                active_symbols=len(self._active_symbols),
+                active_collections=len(self.data_collector._processing_symbols),
+                pending_collections=self.data_collector._collection_queue.qsize(),
+                # Sync metrics
+                active_syncs=len(self.batch_synchronizer._processing),
+                sync_errors=sync_errors,
+                collection_errors=collection_errors,
+                batch_size=self.data_collector._batch_size,
+                data_gaps=gap_errors
+            )
+
+            return CommandResult.success(metrics)
+
+        except Exception as e:
+            logger.error(f"Error collecting market data metrics: {e}")
+            return CommandResult.error(f"Failed to collect market data metrics: {str(e)}")
+
     async def _handle_service_recovery(self, condition: CriticalCondition) -> None:
         """Handle service-wide recovery based on condition context"""
         severity = condition["severity"]
@@ -429,7 +493,7 @@ class MarketDataService(ServiceBase):
 
         for symbol in affected_symbols:
             await self.coordinator.execute(Command(
-                type=MarketDataCommand.COLLECTION_STARTED,
+                type=MarketDataCommand.COLLECTION_START,
                 params={
                     "symbol": symbol,
                     "start_time": condition["context"].get("last_successful"),
@@ -445,7 +509,7 @@ class MarketDataService(ServiceBase):
 
         for symbol in affected_symbols:
             await self.coordinator.execute(Command(
-                type=MarketDataCommand.COLLECTION_STARTED,
+                type=MarketDataCommand.COLLECTION_START,
                 params={
                     "symbol": symbol,
                     "start_time": condition["context"].get("last_sync"),
@@ -471,13 +535,14 @@ class MarketDataService(ServiceBase):
                                 # Process new symbols
                                 for symbol in symbols:
                                     if symbol not in self._active_symbols:
-                                        self._active_symbols.add(symbol)
+                                        checked_symbol = symbol.check_retention_time(self._retention_days)
+                                        self._active_symbols.add(checked_symbol)
                                         # Start collection via command
                                         await self.coordinator.execute(Command(
-                                            type=MarketDataCommand.COLLECTION_STARTED,
+                                            type=MarketDataCommand.COLLECTION_START,
                                             params={
-                                                "symbol": symbol,
-                                                "start_time": symbol.launch_time,
+                                                "symbol": checked_symbol,
+                                                "start_time": checked_symbol.launch_time,
                                                 "end_time": TimeUtils.get_current_timestamp(),
                                                 "timestamp": TimeUtils.get_current_timestamp()
                                             }

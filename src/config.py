@@ -37,12 +37,23 @@ class TimescaleConfig:
         chunk_interval: Time interval for each chunk (partition)
         compress_after: When to compress chunks for better storage efficiency
         drop_after: When to drop old chunks (never for full retention)
+        retention_days: Number of days to keep historical data
         replication_factor: Number of replicas for high availability
     """
     chunk_interval: str = "7 days"
     compress_after: str = "30 days"
     drop_after: Optional[str] = None  # None means never drop
+    retention_days: Optional[int] = None  # None means keep all history
     replication_factor: int = 1
+
+    def __post_init__(self):
+        # Convert retention days from env if provided
+        retention_str = os.getenv('TIMESCALE_RETENTION_DAYS', '0')
+        if int(retention_str):
+            try:
+                self.retention_days = int(retention_str)
+            except ValueError:
+                raise ConfigurationError(f"Invalid retention days value: {retention_str}")
 
 @dataclass
 class DatabaseConfig:
@@ -88,15 +99,43 @@ class DatabaseConfig:
         """Get database DSN (for asyncpg)"""
         return f"postgres://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
 
+    def __post_init__(self) -> None:
+        """Validate database configuration"""
+        if not self.host:
+            raise ConfigurationError("Database host must be specified")
+        if self.port <= 0:
+            raise ConfigurationError("Invalid port number")
+        if not self.user or not self.password:
+            raise ConfigurationError("Database credentials must be specified")
+        if not self.database:
+            raise ConfigurationError("Database name must be specified")
+        if self.pool_size <= 0:
+            raise ConfigurationError("Pool size must be positive")
+        if self.max_overflow < 0:
+            raise ConfigurationError("Max overflow cannot be negative")
+        if self.pool_timeout <= 0:
+            raise ConfigurationError("Pool timeout must be positive")
+        if self.pool_recycle <= 0:
+            raise ConfigurationError("Pool recycle interval must be positive")
+
 @dataclass
 class BybitConfig:
     """Bybit-specific configuration"""
     api_key: Optional[str] = None
     api_secret: Optional[str] = None
     testnet: bool = False
-    kline_limit: int = 200
+    kline_limit: int = 1000
     rate_limit: int = 600       # requests per window
     rate_limit_window: int = 5  # seconds
+
+    def __post_init__(self) -> None:
+        """Validate Bybit configuration"""
+        if self.kline_limit <= 0 or self.kline_limit > 1000:
+            raise ConfigurationError("Kline limit must be between 1 and 1000")
+        if self.rate_limit <= 0:
+            raise ConfigurationError("Rate limit must be positive")
+        if self.rate_limit_window <= 0:
+            raise ConfigurationError("Rate limit window must be positive")
 
 @dataclass
 class ExchangeConfig:
@@ -121,23 +160,34 @@ class MarketDataConfig:
     default_timeframe: str = '5'
     batch_size: int = 1000
 
+    def __post_init__(self) -> None:
+        """Validate market data configuration"""
+        if self.sync_interval < 60:
+            raise ConfigurationError("Sync interval must be at least 60 seconds")
+        if self.retry_interval <= 0:
+            raise ConfigurationError("Retry interval must be positive")
+        if self.max_retries <= 0:
+            raise ConfigurationError("Max retries must be positive")
+        if self.batch_size <= 0:
+            raise ConfigurationError("Batch size must be positive")
+        if self.default_timeframe not in {'1', '3', '5', '15', '30', '60', '120', '240', '360', '720', 'D', 'W'}:
+            raise ConfigurationError("Invalid default timeframe")
+
 @dataclass
 class MonitoringConfig:
     """Configuration for monitoring service"""
-    retention_hours: int = 24
-    health_check_interval: int = 60
-    max_backoff: int = 300
-    base_backoff: int = 5
-    max_error_history: int = 1000
-    lock_timeout: float = 5.0
     check_intervals: Dict[str, int] = field(
         default_factory=lambda: {
-            'system': 30,
-            'market': 60,
-            'database': 60,
-            'cache': 120
+            'system': 30,      # System metrics need frequent updates
+            'market': 120,      # Market data metrics can be less frequent
+            'database': 60,    # Database metrics can be less frequent
         }
     )
+
+    def __post_init__(self) -> None:
+        """Validate configuration values"""
+        if any([v < 10 for k, v in self.check_intervals.items()]):
+            raise ConfigurationError("Collection interval must be at least 10 seconds")
 
 @dataclass
 class LogConfig:
@@ -203,7 +253,7 @@ class Config:
                 api_key=os.getenv('BYBIT_API_KEY'),
                 api_secret=os.getenv('BYBIT_API_SECRET'),
                 testnet=bool(os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'),
-                kline_limit=int(os.getenv('BYBIT_KLINE_LIMIT', '200')),
+                kline_limit=int(os.getenv('BYBIT_KLINE_LIMIT', '1000')),
                 rate_limit=int(os.getenv('BYBIT_RATE_LIMIT', '600')),
                 rate_limit_window=int(os.getenv('BYBIT_RATE_LIMIT_WINDOW', '300'))
             )
@@ -227,19 +277,7 @@ class Config:
     def _init_monitoring_config(self) -> MonitoringConfig:
         """Initialize monitoring configuration"""
         try:
-            return MonitoringConfig(
-                retention_hours=int(os.getenv('MONITORING_RETENTION_HOURS', '24')),
-                health_check_interval=int(os.getenv('MONITORING_HEALTH_CHECK_INTERVAL', '60')),
-                max_backoff=int(os.getenv('MONITORING_MAX_BACKOFF', '300')),
-                base_backoff=int(os.getenv('MONITORING_BASE_BACKOFF', '5')),
-                max_error_history=int(os.getenv('MONITORING_MAX_ERROR_HISTORY', '1000')),
-                lock_timeout=float(os.getenv('MONITORING_LOCK_TIMEOUT', '5.0')),
-                check_intervals={
-                    'resource': int(os.getenv('MONITORING_RESOURCE_INTERVAL', '30')),
-                    'database': int(os.getenv('MONITORING_DATABASE_INTERVAL', '60')),
-                    'network': int(os.getenv('MONITORING_NETWORK_INTERVAL', '60'))
-                }
-            )
+            return MonitoringConfig()
         except Exception as e:
             raise ConfigurationError(f"Invalid monitoring configuration: {e}")
 

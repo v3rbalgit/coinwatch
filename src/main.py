@@ -6,6 +6,7 @@ import asyncio
 from src.core.coordination import ServiceCoordinator
 from src.repositories.kline import KlineRepository
 from src.repositories.symbol import SymbolRepository
+from src.services.monitor.service import MonitoringService
 
 from .config import Config
 from .services.database import DatabaseService
@@ -22,18 +23,29 @@ class Application:
     """Main application class demonstrating component usage"""
 
     def __init__(self):
-        # Load configuration
-        self.config = Config()
-
         # Setup logging
         self.logger = LoggerSetup.setup(f"{__name__}.Application")
 
-        # Initialize services
-        self.db_service = DatabaseService(self.config.database)
-        self.exchange_registry = ExchangeAdapterRegistry()
+        # Load configuration
+        self.config = Config()
 
         # Initialize coordinator
         self.coordinator = ServiceCoordinator()
+
+        # Initialize database service
+        self.db_service = DatabaseService(
+            self.coordinator,
+            self.config.database
+        )
+
+        # Initialize monitoring service
+        self.monitor_service = MonitoringService(
+            self.coordinator,
+            self.config.monitoring
+        )
+
+        # Initialize exchange registry
+        self.exchange_registry = ExchangeAdapterRegistry()
 
     async def start(self) -> None:
         """Start the application"""
@@ -51,8 +63,8 @@ class Application:
                 )
 
             # Create repositories without a transaction
-            symbol_repo = SymbolRepository(self.db_service.session_factory)
-            kline_repo = KlineRepository(self.db_service.session_factory)
+            symbol_repo = SymbolRepository(self.db_service)
+            kline_repo = KlineRepository(self.db_service)
 
             # Setup market data service
             market_service = MarketDataService(
@@ -63,16 +75,15 @@ class Application:
                 self.config.market_data
             )
 
-            # Start service
+            # Start services
             await market_service.start()
-
-            # await monitor_service.start()
+            await self.monitor_service.start()
 
             # Keep application running
             while True:
                 # Log service status periodically
                 self.logger.info("\nService Status Report:")
-                self.logger.info(market_service.get_service_status())
+                self.logger.info(self.monitor_service.get_service_status())
 
                 await asyncio.sleep(60)
 
@@ -83,6 +94,7 @@ class Application:
 
     async def stop(self) -> None:
         """Stop the application"""
+        await self.monitor_service.stop()
         await self.db_service.stop()
 
 async def main():
