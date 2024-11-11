@@ -2,7 +2,7 @@
 
 import asyncio
 from datetime import datetime
-from typing import Dict, Optional, Set
+from typing import Dict, Set
 
 from src.services.market_data.progress import SyncSchedule
 from src.utils.retry import RetryConfig, RetryStrategy
@@ -41,16 +41,13 @@ class BatchSynchronizer:
         self._kline_repository = kline_repository
         self._coordinator = coordinator
         self._base_timeframe = base_timeframe
+        self._max_concurrent_updates = max_concurrent_updates
 
         # Sync management
         self._schedules: Dict[SymbolInfo, SyncSchedule] = {}
         self._schedules_lock = asyncio.Lock()
-        self._default_concurrent_updates = max_concurrent_updates
-        self._current_concurrent_updates = max_concurrent_updates
-        self._min_concurrent_updates = 10
         self._update_lock = asyncio.Lock()
-        self._recovery_task: Optional[asyncio.Task] = None
-        self._sync_semaphore = asyncio.BoundedSemaphore(self._default_concurrent_updates)
+        self._sync_semaphore = asyncio.BoundedSemaphore(max_concurrent_updates)
         self._processing: Set[SymbolInfo] = set()
 
         # Error handling
@@ -80,13 +77,6 @@ class BatchSynchronizer:
                 pass
             self._sync_task = None
 
-        if self._recovery_task and not self._recovery_task.done():
-            self._recovery_task.cancel()
-            try:
-                await self._recovery_task
-            except asyncio.CancelledError:
-                pass
-
         # Clear schedules and processing sets
         async with self._schedules_lock:
             self._schedules.clear()
@@ -108,8 +98,7 @@ class BatchSynchronizer:
     async def _register_command_handlers(self) -> None:
         """Register handlers for sync-related commands"""
         handlers = {
-            MarketDataCommand.COLLECTION_COMPLETE: self._handle_collection_complete,
-            MarketDataCommand.ADJUST_BATCH_SIZE: self._handle_adjust_batch_size
+            MarketDataCommand.COLLECTION_COMPLETE: self._handle_collection_complete
         }
 
         for command, handler in handlers.items():
@@ -120,69 +109,6 @@ class BatchSynchronizer:
         """Handle completion of historical collection"""
         symbol = command.params["symbol"]
         await self._schedule_sync(symbol, self._base_timeframe)
-
-    async def _handle_adjust_batch_size(self, command: Command) -> None:
-        """Handle batch size adjustment with recovery capability"""
-        try:
-            new_size = command.params.get("size")
-            context = command.params.get("context", {})
-            is_recovery = context.get("recovered", False)
-
-            if is_recovery:
-                # Start recovery process if we're not at default capacity
-                if self._current_concurrent_updates < self._default_concurrent_updates:
-                    if not self._recovery_task or self._recovery_task.done():
-                        self._recovery_task = asyncio.create_task(
-                            self._recover_concurrent_updates()
-                        )
-            else:
-                # Calculate proportional reduction for synchronizer
-                # If collector is reducing to 20% of default, we'll do similar
-                if new_size:
-                    reduction_ratio = new_size / 1000  # Assuming 1000 is collector's default
-                    new_concurrent = max(
-                        self._min_concurrent_updates,
-                        int(self._default_concurrent_updates * reduction_ratio)
-                    )
-                    await self.set_max_concurrent_updates(new_concurrent)
-
-        except Exception as e:
-            logger.error(f"Error adjusting concurrent updates: {e}")
-
-    async def _recover_concurrent_updates(self) -> None:
-        """
-        Gradually recover concurrent updates capacity to default.
-        Uses progressive increases with monitoring.
-        """
-        try:
-            while self._current_concurrent_updates < self._default_concurrent_updates:
-                async with self._update_lock:
-                    # Calculate next size (25% increase)
-                    increase = max(
-                        5,  # Minimum increase of 5 concurrent updates
-                        int(self._current_concurrent_updates * 0.25)  # 25% increase
-                    )
-                    new_size = min(
-                        self._current_concurrent_updates + increase,
-                        self._default_concurrent_updates
-                    )
-
-                    old_size = self._current_concurrent_updates
-                    await self.set_max_concurrent_updates(new_size)
-
-                    logger.info(
-                        f"Recovering concurrent updates: {old_size} → {new_size} "
-                        f"(change: {new_size - old_size:+d})"
-                    )
-
-                # Wait and monitor performance before next increase
-                await asyncio.sleep(60)  # 1 minute between increases
-
-        except asyncio.CancelledError:
-            logger.info("Concurrent updates recovery cancelled")
-            raise
-        except Exception as e:
-            logger.error(f"Error during concurrent updates recovery: {e}")
 
     def _calculate_next_sync(self, timeframe: Timeframe) -> datetime:
         """Calculate the next sync time based on timeframe."""
@@ -266,10 +192,11 @@ class BatchSynchronizer:
                     next_sync = await self._update_schedule(schedule)
                     logger.info(
                         f"Completed sync for {schedule.symbol}: processed {processed_count} candles "
-                        f"[Active syncs: {len(self._processing)}/{self._current_concurrent_updates}] "
+                        f"[Active syncs: {len(self._processing)}/{self._max_concurrent_updates}] "
                         f"(next sync at {next_sync.strftime('%H:%M:%S')})"
                     )
                     await self._coordinator.execute(Command(
+                        # Notify timeframe manager to update the aggregated timeframes
                         type=MarketDataCommand.SYNC_COMPLETE,
                         params={
                             "symbol": schedule.symbol,
@@ -281,7 +208,7 @@ class BatchSynchronizer:
                                 "active_syncs": len(self._processing),
                                 "resource_usage": {
                                     "concurrent_syncs": len(self._processing),
-                                    "max_allowed": self._current_concurrent_updates
+                                    "max_allowed": self._max_concurrent_updates
                                 }
                             }
                         }
@@ -421,35 +348,6 @@ class BatchSynchronizer:
                     f"Sync failed for {schedule.symbol}: {str(e)}"
                 ) from e
 
-    async def set_max_concurrent_updates(self, value: int) -> None:
-        """Safely adjust concurrent updates limit"""
-        async with self._update_lock:
-            old_value = self._current_concurrent_updates
-            target_value = max(self._min_concurrent_updates,
-                             min(value, self._default_concurrent_updates))
-
-            if target_value < old_value:
-                # Reduce gradually
-                while self._current_concurrent_updates > target_value:
-                    next_target = max(target_value, self._current_concurrent_updates - 5)
-                    self._current_concurrent_updates = next_target
-                    self._sync_semaphore = asyncio.BoundedSemaphore(next_target)
-                    await asyncio.sleep(1)  # Allow time for adjustments
-            else:
-                # Increase immediately
-                self._current_concurrent_updates = target_value
-                self._sync_semaphore = asyncio.BoundedSemaphore(target_value)
-
-            # Cancel any ongoing recovery if we're reducing capacity
-            if target_value < old_value and self._recovery_task and not self._recovery_task.done():
-                self._recovery_task.cancel()
-                try:
-                    await self._recovery_task
-                except asyncio.CancelledError:
-                    pass
-
-            logger.info(f"Adjusted concurrent updates: {old_value} -> {target_value}")
-
     def get_sync_status(self) -> str:
         """Get synchronization status with copy of state."""
 
@@ -457,12 +355,7 @@ class BatchSynchronizer:
             "Synchronization Status:",
             f"Scheduled Symbols: {len(self._schedules)}",
             f"Active Syncs: {len(self._processing)}",
-            f"Concurrent Limit: {self._current_concurrent_updates}/{self._default_concurrent_updates}",
-            "Recovery Status: " + (
-                "In Progress" if (self._recovery_task and not self._recovery_task.done())
-                else "Complete" if self._current_concurrent_updates >= self._default_concurrent_updates
-                else "Reduced Capacity"
-            ),
+            f"Concurrent Limit: {self._max_concurrent_updates}",
             "\nNext Sync Times:"
         ]
 

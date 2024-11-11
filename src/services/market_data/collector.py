@@ -1,7 +1,7 @@
 # src/services/market_data/collector.py
 
 import asyncio
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Set
 
 from ...adapters.registry import ExchangeAdapterRegistry
 from .progress import CollectionProgress
@@ -42,19 +42,13 @@ class DataCollector:
         self._kline_repository = kline_repository
         self._coordinator = coordinator
         self._base_timeframe = base_timeframe
+        self._batch_size = batch_size
 
         # Collection management
         self._collection_queue: asyncio.Queue[Dict[str,Any]] = asyncio.Queue(maxsize=1000)
         self._collection_lock = asyncio.Lock()
         self._symbol_progress: Dict[SymbolInfo, CollectionProgress] = {}
         self._processing_symbols: Set[SymbolInfo] = set()
-
-        # Batch size management
-        self._default_batch_size = batch_size
-        self._current_batch_size = batch_size
-        self._min_batch_size = 200
-        self._batch_lock = asyncio.Lock()
-        self._recovery_task: Optional[asyncio.Task] = None
 
         # Retry strategy
         self._retry_strategy = RetryStrategy(RetryConfig(
@@ -107,8 +101,7 @@ class DataCollector:
     async def _register_command_handlers(self) -> None:
         """Register handlers for collection-related commands"""
         handlers = {
-            MarketDataCommand.COLLECTION_STARTED: self._handle_collection_start,
-            MarketDataCommand.ADJUST_BATCH_SIZE: self._handle_adjust_batch_size,
+            MarketDataCommand.COLLECTION_START: self._handle_collection_start,
             MarketDataCommand.SYMBOL_DELISTED: self._handle_symbol_delisted
         }
 
@@ -146,73 +139,6 @@ class DataCollector:
                 })
             else:
                 logger.debug(f"Collection already in progress for {symbol}")
-
-    async def _handle_adjust_batch_size(self, command: Command) -> None:
-        """Handle batch size adjustment with recovery capability"""
-        try:
-            new_size = command.params.get("size")
-            context = command.params.get("context", {})
-            is_recovery = context.get("recovered", False)
-
-            async with self._batch_lock:
-                if is_recovery:
-                    # Start recovery process if we're not at default size
-                    if self._current_batch_size < self._default_batch_size:
-                        if not self._recovery_task or self._recovery_task.done():
-                            self._recovery_task = asyncio.create_task(
-                                self._recover_batch_size()
-                            )
-                else:
-                    # Handle resource pressure
-                    if new_size and self._min_batch_size <= new_size <= self._default_batch_size:
-                        old_size = self._current_batch_size
-                        self._current_batch_size = new_size
-
-                        # Cancel any ongoing recovery
-                        if self._recovery_task and not self._recovery_task.done():
-                            self._recovery_task.cancel()
-                            try:
-                                await self._recovery_task
-                            except asyncio.CancelledError:
-                                pass
-
-                        logger.info(
-                            f"Adjusted collector batch size: {old_size} → {new_size} "
-                            f"(change: {new_size - old_size:+d})"
-                        )
-
-        except Exception as e:
-            logger.error(f"Error adjusting batch size: {e}")
-
-    async def _recover_batch_size(self) -> None:
-        """Gradually recover batch size to default"""
-        try:
-            while self._current_batch_size < self._default_batch_size:
-                async with self._batch_lock:
-                    increase = max(
-                        100,  # Minimum increase
-                        int(self._current_batch_size * 0.25)  # 25% increase
-                    )
-                    new_size = min(
-                        self._current_batch_size + increase,
-                        self._default_batch_size
-                    )
-
-                    old_size = self._current_batch_size
-                    self._current_batch_size = new_size
-
-                    logger.info(
-                        f"Recovering collector batch size: {old_size} → {new_size} "
-                        f"(change: {new_size - old_size:+d})"
-                    )
-
-                await asyncio.sleep(60)  # 1 minute between increases
-
-        except asyncio.CancelledError:
-            logger.info("Batch size recovery cancelled")
-            raise
-        except Exception as e:
-            logger.error(f"Error during batch size recovery: {e}")
 
     async def _handle_symbol_delisted(self, command: Command) -> None:
         """Handle symbol delisting by cleaning up data and cancelling collections"""
@@ -255,7 +181,7 @@ class DataCollector:
                         request["symbol"],
                         request["start_time"],
                         request["end_time"],
-                        self._current_batch_size,
+                        self._batch_size,
                         self._base_timeframe
                     )
                     # Report completion to BatchSynchronizer
@@ -282,7 +208,7 @@ class DataCollector:
                                 "start_time": request["start_time"],
                                 "end_time": request["end_time"],
                                 "collection_type": request["type"],
-                                "batch_size": self._current_batch_size,
+                                "batch_size": self._batch_size,
                                 "timeframe": self._base_timeframe.value
                             }
                         }
@@ -434,12 +360,7 @@ class DataCollector:
             "Historical Collection Status:",
             f"Active Collections: {len(self._processing_symbols)}",
             f"Pending Collections: {self._collection_queue.qsize()}",
-            f"Batch Size: {self._current_batch_size}/{self._default_batch_size}",
-            "Recovery Status: " + (
-                "In Progress" if (self._recovery_task and not self._recovery_task.done())
-                else "Complete" if self._current_batch_size >= self._default_batch_size
-                else "Reduced Capacity"
-            ),
+            f"Batch Size: {self._batch_size}",
             "\nActive Progress:"
         ]
 

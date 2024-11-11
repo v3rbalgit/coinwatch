@@ -14,10 +14,11 @@ from contextlib import asynccontextmanager
 from sqlalchemy import text, event
 from enum import Enum
 
-
+from ..core.monitoring import DatabaseMetrics
+from ..core.coordination import Command, CommandResult, MonitoringCommand, ServiceCoordinator
+from ..core.exceptions import ServiceError
 from ..config import DatabaseConfig
 from ..services.base import ServiceBase
-from ..core.exceptions import ServiceError
 from ..utils.logger import LoggerSetup
 from ..utils.domain_types import CriticalCondition, ServiceStatus
 from ..utils.error import ErrorTracker
@@ -40,7 +41,6 @@ class DatabaseErrorType(str, Enum):
     CONNECTION_TIMEOUT = "connection_timeout"
     DEADLOCK = "deadlock"
     QUERY_TIMEOUT = "query_timeout"
-    DISK_FULL = "disk_full"
     REPLICATION_LAG = "replication_lag"
     LOCK_TIMEOUT = "lock_timeout"
     MAINTENANCE_REQUIRED = "maintenance_required"
@@ -57,20 +57,18 @@ class DatabaseService(ServiceBase):
     - Resource optimization
     """
 
-    def __init__(self, config: DatabaseConfig):
+    def __init__(self, coordinator: ServiceCoordinator, config: DatabaseConfig):
         super().__init__(config)
+        self.coordinator = coordinator
         self.engine: Optional[AsyncEngine] = None
         self._connection_url = config.url
         self._status = ServiceStatus.STOPPED
-        self._pool_stats = {
-            'checkout_count': 0,
-            'checkin_count': 0,
-            'overflow_count': 0,
-            'timeout_count': 0
-        }
+        self._start_time: Optional[int] = None
+
         # Enhanced error tracking and recovery
-        self._pool_monitor_task: Optional[asyncio.Task] = None
         self._error_tracker = ErrorTracker()
+        self._last_error: Optional[Exception] = None
+        self._pool_monitor_task: Optional[asyncio.Task] = None
         self._recovery_lock = asyncio.Lock()
         self._pool_lock = asyncio.Lock()
         self._maintenance_lock = asyncio.Lock()
@@ -98,6 +96,8 @@ class DatabaseService(ServiceBase):
         # Recovery task management
         self._recovery_tasks: Dict[DatabaseErrorType, asyncio.Task] = {}
         self._recovery_lock = asyncio.Lock()
+
+        asyncio.create_task(self._register_command_handlers())
 
     def _create_engine(self) -> AsyncEngine:
         """
@@ -161,6 +161,7 @@ class DatabaseService(ServiceBase):
         """
         try:
             self._status = ServiceStatus.STARTING
+            self._start_time = TimeUtils.get_current_timestamp()
             logger.info("Starting database service")
 
             self.engine = self._create_engine()
@@ -186,6 +187,8 @@ class DatabaseService(ServiceBase):
                 autoflush=False  # Optimize for bulk operations
             )
 
+            await self._register_command_handlers()
+
             # Start pool monitoring
             self._pool_monitor_task = asyncio.create_task(self._monitor_database())
 
@@ -195,6 +198,7 @@ class DatabaseService(ServiceBase):
 
         except Exception as e:
             self._status = ServiceStatus.ERROR
+            self._last_error = e
             logger.error(f"Failed to start database service: {e}")
             raise ServiceError(f"Database initialization failed: {str(e)}")
 
@@ -202,6 +206,8 @@ class DatabaseService(ServiceBase):
         """Cleanup database connections"""
         try:
             self._status = ServiceStatus.STOPPING
+
+            await self._unregister_command_handlers()
 
             # Cancel all recovery tasks
             async with self._recovery_lock:
@@ -234,6 +240,111 @@ class DatabaseService(ServiceBase):
             logger.error(f"Error stopping database service: {e}")
             raise ServiceError(f"Database shutdown failed: {str(e)}")
 
+    async def _register_command_handlers(self) -> None:
+        """Register command handlers for service monitoring"""
+        handlers = {
+            MonitoringCommand.REPORT_METRICS: self._handle_metrics_report
+        }
+
+        for command, handler in handlers.items():
+            await self.coordinator.register_handler(command, handler)
+            logger.debug(f"Registered handler for {command.value}")
+
+    async def _unregister_command_handlers(self) -> None:
+        """Register command handlers for service monitoring"""
+        handlers = {
+            MonitoringCommand.REPORT_METRICS: self._handle_metrics_report
+        }
+
+        for command, handler in handlers.items():
+            await self.coordinator.unregister_handler(command, handler)
+            logger.debug(f"Unregistered handler for {command.value}")
+
+    async def _handle_metrics_report(self, command: Command) -> CommandResult:
+        """Handle metrics report command by returning current metrics"""
+        try:
+            metrics = await self._collect_metrics()
+            return CommandResult.success(metrics)
+        except Exception as e:
+            logger.error(f"Error handling metrics report: {e}")
+            return CommandResult.error(f"Failed to collect database metrics: {str(e)}")
+
+    async def _collect_metrics(self) -> DatabaseMetrics:
+        """Collect comprehensive database metrics"""
+        try:
+            async with self.get_session() as session:
+                # Get connection stats
+                result = await session.execute(text("""
+                    SELECT count(*) as active_connections
+                    FROM pg_stat_activity
+                    WHERE application_name LIKE 'coinwatch%'
+                    AND state = 'active';
+                """))
+                active_connections = result.scalar() or 0
+
+                # Get deadlock stats
+                result = await session.execute(text("""
+                    SELECT count(*) as deadlock_count
+                    FROM pg_locks blocked_locks
+                    JOIN pg_stat_activity blocked_activity ON blocked_activity.pid = blocked_locks.pid
+                    JOIN pg_locks blocking_locks
+                        ON blocking_locks.pid != blocked_locks.pid
+                        AND blocking_locks.granted
+                    WHERE NOT blocked_locks.granted;
+                """))
+                deadlocks = result.scalar() or 0
+
+                # Get long-running queries
+                result = await session.execute(text("""
+                    SELECT count(*) as long_running_count
+                    FROM pg_stat_activity
+                    WHERE application_name LIKE 'coinwatch%'
+                    AND state = 'active'
+                    AND NOW() - query_start > INTERVAL '25 seconds';
+                """))
+                long_queries = result.scalar() or 0
+
+                # Add replication lag query
+                result = await session.execute(text("""
+                    SELECT EXTRACT(EPOCH FROM (NOW() - pg_last_xact_replay_timestamp()))::INT
+                    AS lag_seconds
+                    WHERE pg_last_xact_replay_timestamp() IS NOT NULL;
+                """))
+                replication_lag = result.scalar() or 0
+
+                # Calculate uptime
+                uptime = 0.0
+                if self._start_time is not None:
+                    uptime = (TimeUtils.get_current_timestamp() - self._start_time) / 1000
+
+                return DatabaseMetrics(
+                    service_name="database",
+                    status=self._status.value,
+                    uptime_seconds=uptime,
+                    last_error=str(self._last_error) if self._last_error else None,
+                    error_count=len(self._error_tracker.get_recent_errors(60)),
+                    warning_count=len([e for e in self._error_tracker.get_recent_errors(60)
+                                    if 'warning' in str(e).lower()]),
+                    timestamp=TimeUtils.get_current_datetime(),
+                    additional_metrics={
+                        'pool_recycle': self._config.pool_recycle,
+                        'pool_timeout': self._config.pool_timeout,
+                        'maintenance_window': self._config.maintenance_window
+                    },
+                    active_connections=active_connections,
+                    pool_size=self._config.pool_size,
+                    max_overflow=self._config.max_overflow,
+                    available_connections=self._config.pool_size - active_connections,
+                    deadlocks=deadlocks,
+                    long_queries=long_queries,
+                    maintenance_due=self._maintenance_due,
+                    replication_lag_seconds=replication_lag
+                )
+
+        except Exception as e:
+            logger.error(f"Error collecting database metrics: {e}")
+            raise
+
     async def _monitor_database(self) -> None:
         """
         Comprehensive database monitoring checking all critical health metrics.
@@ -244,136 +355,77 @@ class DatabaseService(ServiceBase):
                     await asyncio.sleep(1)
                     continue
 
-                async with self.transaction() as session:
-                    # Check connection usage
-                    result = await session.execute(text("""
-                        SELECT count(*) as active_connections
-                        FROM pg_stat_activity
-                        WHERE application_name LIKE 'coinwatch%'
-                        AND state = 'active';
-                    """))
-                    active_connections = result.scalar() or 0
+                # Collect metrics
+                metrics = await self._collect_metrics()
 
-                    # Check for connection overflow
-                    if active_connections >= self._config["pool_size"]:
-                        await self.handle_critical_condition({
-                            "type": DatabaseErrorType.CONNECTION_OVERFLOW,
-                            "severity": "warning",
-                            "message": f"High connection usage: {active_connections}/{self._config['pool_size']}",
-                            "timestamp": TimeUtils.get_current_timestamp(),
-                            "error_type": DatabaseErrorType.CONNECTION_OVERFLOW,
-                            "context": {
-                                "active_connections": active_connections,
-                                "pool_size": self._config["pool_size"]
-                            }
-                        })
+                # Check for critical conditions
+                if metrics.active_connections >= self._config.pool_size:
+                    await self.handle_critical_condition({
+                        "type": DatabaseErrorType.CONNECTION_OVERFLOW,
+                        "severity": "warning",
+                        "message": (
+                            f"High connection usage: "
+                            f"{metrics.active_connections}/{metrics.pool_size}"
+                        ),
+                        "timestamp": TimeUtils.get_current_timestamp(),
+                        "error_type": DatabaseErrorType.CONNECTION_OVERFLOW,
+                        "context": {
+                            "active_connections": metrics.active_connections,
+                            "pool_size": metrics.pool_size
+                        }
+                    })
 
-                    # Check for deadlocks
-                    result = await session.execute(text("""
-                        SELECT count(*) as deadlock_count
-                        FROM pg_locks blocked_locks
-                        JOIN pg_stat_activity blocked_activity ON blocked_activity.pid = blocked_locks.pid
-                        JOIN pg_locks blocking_locks
-                            ON blocking_locks.pid != blocked_locks.pid
-                            AND blocking_locks.granted
-                        WHERE NOT blocked_locks.granted;
-                    """))
-                    deadlock_count = result.scalar() or 0
+                if metrics.deadlocks > 0:
+                    await self.handle_critical_condition({
+                        "type": DatabaseErrorType.DEADLOCK,
+                        "severity": "warning" if metrics.deadlocks < 5 else "critical",
+                        "message": f"Detected {metrics.deadlocks} deadlocks",
+                        "timestamp": TimeUtils.get_current_timestamp(),
+                        "error_type": DatabaseErrorType.DEADLOCK,
+                        "context": {
+                            "deadlock_count": metrics.deadlocks
+                        }
+                    })
 
-                    if deadlock_count > 0:
-                        await self.handle_critical_condition({
-                            "type": DatabaseErrorType.DEADLOCK,
-                            "severity": "warning" if deadlock_count < 5 else "critical",
-                            "message": f"Detected {deadlock_count} deadlocks",
-                            "timestamp": TimeUtils.get_current_timestamp(),
-                            "error_type": DatabaseErrorType.DEADLOCK,
-                            "context": {
-                                "deadlock_count": deadlock_count
-                            }
-                        })
+                if metrics.long_queries > 0:
+                    await self.handle_critical_condition({
+                        "type": DatabaseErrorType.QUERY_TIMEOUT,
+                        "severity": "warning",
+                        "message": f"Detected {metrics.long_queries} queries approaching timeout",
+                        "timestamp": TimeUtils.get_current_timestamp(),
+                        "error_type": DatabaseErrorType.QUERY_TIMEOUT,
+                        "context": {
+                            "query_count": metrics.long_queries,
+                            "current_timeout": 30  # Our default timeout
+                        }
+                    })
 
-                    # Check for long-running queries (potential timeouts)
-                    result = await session.execute(text("""
-                        SELECT count(*) as long_running_count
-                        FROM pg_stat_activity
-                        WHERE application_name LIKE 'coinwatch%'
-                        AND state = 'active'
-                        AND NOW() - query_start > INTERVAL '25 seconds';
-                    """))
-                    long_running_count = result.scalar() or 0
+                if metrics.replication_lag_seconds > 60:  # More than 1 minute lag
+                    await self.handle_critical_condition({
+                        "type": DatabaseErrorType.REPLICATION_LAG,
+                        "severity": "warning" if metrics.replication_lag_seconds < 300 else "critical",
+                        "message": f"Replication lag of {metrics.replication_lag_seconds} seconds detected",
+                        "timestamp": TimeUtils.get_current_timestamp(),
+                        "error_type": DatabaseErrorType.REPLICATION_LAG,
+                        "context": {
+                            "lag_seconds": metrics.replication_lag_seconds,
+                            "sync_state": "async"  # Current replication state
+                        }
+                    })
 
-                    if long_running_count > 0:
-                        await self.handle_critical_condition({
-                            "type": DatabaseErrorType.QUERY_TIMEOUT,
-                            "severity": "warning",
-                            "message": f"Detected {long_running_count} queries approaching timeout",
-                            "timestamp": TimeUtils.get_current_timestamp(),
-                            "error_type": DatabaseErrorType.QUERY_TIMEOUT,
-                            "context": {
-                                "query_count": long_running_count,
-                                "current_timeout": 30  # Our default timeout
-                            }
-                        })
-
-                    # Check for lock timeouts
-                    result = await session.execute(text("""
-                        SELECT count(*) as lock_wait_count
-                        FROM pg_stat_activity
-                        WHERE application_name LIKE 'coinwatch%'
-                        AND wait_event_type = 'Lock'
-                        AND state = 'active'
-                        AND NOW() - state_change > INTERVAL '5 seconds';
-                    """))
-                    lock_wait_count = result.scalar() or 0
-
-                    if lock_wait_count > 0:
-                        await self.handle_critical_condition({
-                            "type": DatabaseErrorType.LOCK_TIMEOUT,
-                            "severity": "warning",
-                            "message": f"Detected {lock_wait_count} queries waiting for locks",
-                            "timestamp": TimeUtils.get_current_timestamp(),
-                            "error_type": DatabaseErrorType.LOCK_TIMEOUT,
-                            "context": {
-                                "wait_count": lock_wait_count,
-                                "current_lock_timeout": 30  # Our default lock timeout
-                            }
-                        })
-
-                    # Check replication lag
-                    result = await session.execute(text("""
-                        SELECT EXTRACT(EPOCH FROM (NOW() - pg_last_xact_replay_timestamp()))::INT
-                        AS lag_seconds
-                        WHERE pg_last_xact_replay_timestamp() IS NOT NULL;
-                    """))
-                    lag_seconds = result.scalar()
-
-                    if lag_seconds and lag_seconds > 60:  # More than 1 minute lag
-                        await self.handle_critical_condition({
-                            "type": DatabaseErrorType.REPLICATION_LAG,
-                            "severity": "warning" if lag_seconds < 300 else "critical",
-                            "message": f"Replication lag of {lag_seconds} seconds detected",
-                            "timestamp": TimeUtils.get_current_timestamp(),
-                            "error_type": DatabaseErrorType.REPLICATION_LAG,
-                            "context": {
-                                "lag_seconds": lag_seconds,
-                                "sync_state": "async"  # Current replication state
-                            }
-                        })
-
-                    # Check for maintenance needs
-                    current_time = TimeUtils.get_current_timestamp()
-                    if (not self._last_maintenance or
-                        current_time - self._last_maintenance > 24 * 60 * 60 * 1000):
-                        await self.handle_critical_condition({
-                            "type": DatabaseErrorType.MAINTENANCE_REQUIRED,
-                            "severity": "warning",
-                            "message": "Database maintenance required",
-                            "timestamp": current_time,
-                            "error_type": DatabaseErrorType.MAINTENANCE_REQUIRED,
-                            "context": {
-                                "last_maintenance": self._last_maintenance
-                            }
-                        })
+                # Check for maintenance needs
+                if (not self._last_maintenance or
+                    TimeUtils.get_current_timestamp() - self._last_maintenance > 24 * 60 * 60 * 1000):
+                    await self.handle_critical_condition({
+                        "type": DatabaseErrorType.MAINTENANCE_REQUIRED,
+                        "severity": "warning",
+                        "message": "Database maintenance required",
+                        "timestamp": TimeUtils.get_current_timestamp(),
+                        "error_type": DatabaseErrorType.MAINTENANCE_REQUIRED,
+                        "context": {
+                            "last_maintenance": self._last_maintenance
+                        }
+                    })
 
                 await asyncio.sleep(60)  # Check every minute
 
@@ -382,7 +434,7 @@ class DatabaseService(ServiceBase):
                 await asyncio.sleep(5)
 
     @asynccontextmanager
-    async def transaction(self,
+    async def get_session(self,
                          isolation_level: Optional[IsolationLevel] = None,
                          retry_count: int = 3,
                          retry_delay: float = 1.0) -> AsyncGenerator[AsyncSession, None]:
@@ -435,27 +487,6 @@ class DatabaseService(ServiceBase):
                         logger.error(f"Transaction error: {e}")
                         raise
                 attempt += 1
-
-    @asynccontextmanager
-    async def savepoint(self, session: AsyncSession):
-        """Nested transaction using PostgreSQL savepoint"""
-        async with session.begin_nested():
-            yield
-
-    async def execute_in_transaction(self,
-                                   func: Callable[[AsyncSession], Awaitable[T]],
-                                   isolation_level: Optional[IsolationLevel] = None) -> T:
-        """Execute an async function within a transaction"""
-        async with self.transaction(isolation_level) as session:
-            return await func(session)
-
-    async def get_session(self) -> AsyncGenerator[AsyncSession, None]:
-        """
-        Get a session for backward compatibility.
-        Wraps the transaction context manager for existing code.
-        """
-        async with self.transaction() as session:
-            yield session
 
     def _configure_retry_strategy(self) -> None:
         """Configure retry behavior for database operations"""
@@ -626,7 +657,7 @@ class DatabaseService(ServiceBase):
                 )
 
                 # Analyze deadlocks
-                async with self.transaction() as session:
+                async with self.get_session() as session:
                     result = await session.execute(text("""
                         SELECT blocked_locks.pid AS blocked_pid,
                                blocking_locks.pid AS blocking_pid,
@@ -680,7 +711,7 @@ class DatabaseService(ServiceBase):
                     f"Critical query timeout situation: {condition['message']}, "
                     f"{query_count} queries approaching timeout"
                 )
-                async with self.transaction() as session:
+                async with self.get_session() as session:
                     # Kill long-running queries
                     await session.execute(text("""
                         SELECT pg_terminate_backend(pid)
@@ -718,7 +749,7 @@ class DatabaseService(ServiceBase):
                     f"Critical lock timeout situation: {condition['message']}, "
                     f"{wait_count} queries waiting for locks"
                 )
-                async with self.transaction() as session:
+                async with self.get_session() as session:
                     # Kill oldest blocking transactions
                     await session.execute(text("""
                         SELECT pg_terminate_backend(blocked_locks.pid)
@@ -752,7 +783,7 @@ class DatabaseService(ServiceBase):
                     f"Critical replication lag: {condition['message']}, "
                     f"lag: {lag_seconds} seconds"
                 )
-                async with self.transaction() as session:
+                async with self.get_session() as session:
                     # Enable synchronous replication
                     await session.execute(text("""
                         ALTER SYSTEM SET synchronous_commit TO 'on';
@@ -778,7 +809,7 @@ class DatabaseService(ServiceBase):
 
                 logger.info(f"Starting maintenance: {condition['message']}")
                 try:
-                    async with self.transaction() as session:
+                    async with self.get_session(isolation_level=IsolationLevel.SERIALIZABLE) as session:
                         # Run VACUUM ANALYZE on critical tables
                         await session.execute(text("""
                             VACUUM ANALYZE kline_data;
@@ -825,7 +856,7 @@ class DatabaseService(ServiceBase):
                 if error_count == 0:
                     # Gradually increase timeout
                     new_timeout = min(original_timeout, current_timeout * 2)
-                    async with self.transaction() as session:
+                    async with self.get_session() as session:
                         await session.execute(text(f"SET statement_timeout = '{new_timeout}s';"))
                     current_timeout = new_timeout
 
@@ -848,7 +879,7 @@ class DatabaseService(ServiceBase):
                 if error_count == 0:
                     # Gradually increase timeout
                     new_timeout = min(original_lock_timeout, current_timeout * 2)
-                    async with self.transaction() as session:
+                    async with self.get_session() as session:
                         await session.execute(text(f"SET lock_timeout = '{new_timeout}s';"))
                     current_timeout = new_timeout
 
@@ -866,7 +897,7 @@ class DatabaseService(ServiceBase):
             while True:
                 await asyncio.sleep(60)  # Check every minute
 
-                async with self.transaction() as session:
+                async with self.get_session() as session:
                     result = await session.execute(text("""
                         SELECT EXTRACT(EPOCH FROM (NOW() - pg_last_xact_replay_timestamp()))::INT
                         AS lag_seconds;
@@ -965,7 +996,7 @@ class DatabaseService(ServiceBase):
                 )
 
                 # Verify database connection
-                async with self.transaction() as session:
+                async with self.get_session() as session:
                     await session.execute(text("SELECT 1"))
 
                 self._status = ServiceStatus.RUNNING
@@ -980,7 +1011,9 @@ class DatabaseService(ServiceBase):
         """Enhanced critical condition handling with multiple recovery tasks"""
         try:
             severity = condition["severity"]
-            error_type = condition["error_type"]
+            if severity == "error" or severity == "critical":
+                self._last_error = Exception(condition["message"])
+                error_type = condition["error_type"]
 
             # Track error frequency for adaptive response
             await self._error_tracker.record_error(
@@ -1006,6 +1039,7 @@ class DatabaseService(ServiceBase):
                 await self._handle_maintenance_required(condition)
 
         except Exception as e:
+            self._last_error = e
             logger.error(f"Error in critical condition handler: {e}")
             if severity == "critical":
                 await self._initiate_emergency_recovery(str(e))

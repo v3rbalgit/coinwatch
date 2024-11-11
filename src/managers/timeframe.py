@@ -5,6 +5,7 @@ from decimal import Decimal
 from typing import List, Optional, Set
 from sqlalchemy import text
 
+from ..services.database import IsolationLevel
 from ..core.coordination import Command, MarketDataCommand, ServiceCoordinator
 from ..core.exceptions import ValidationError
 from ..core.models import KlineData, SymbolInfo
@@ -242,7 +243,7 @@ class TimeframeManager:
         Returns:
             List[KlineData]: Kline data in ascending order
         """
-        async with self.kline_repository.get_session() as session:
+        async with self.kline_repository.db_service.get_session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
             # Query the appropriate continuous aggregate view
             stmt = text("""
                 SELECT
@@ -309,7 +310,7 @@ class TimeframeManager:
         Returns:
             List[KlineData]: Kline data in ascending order
         """
-        async with self.kline_repository.get_session() as session:
+        async with self.kline_repository.db_service.get_session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
             stmt = text("""
                 WITH aggregated AS (
                     SELECT
@@ -413,7 +414,7 @@ class TimeframeManager:
                                           start_time: Timestamp,
                                           end_time: Timestamp) -> None:
         """Refresh TimescaleDB continuous aggregate for given period"""
-        async with self.kline_repository.get_session() as session:
+        async with self.kline_repository.db_service.get_session(isolation_level=IsolationLevel.SERIALIZABLE) as session:
             start_dt = TimeUtils.from_timestamp(start_time)
             end_dt = TimeUtils.from_timestamp(end_time)
 
