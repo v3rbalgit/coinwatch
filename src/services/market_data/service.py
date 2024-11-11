@@ -84,21 +84,13 @@ class MarketDataService(ServiceBase):
 
         # Initialize error tracking and retry strategy
         self._error_tracker = ErrorTracker()
-        retry_config = RetryConfig(
+        self._retry_strategy = RetryStrategy(RetryConfig(
             base_delay=5.0,
             max_delay=300.0,
             max_retries=3,
             jitter_factor=0.25
-        )
-        self._retry_strategy = RetryStrategy(retry_config)
-        self._retry_strategy.add_retryable_error(
-            ConnectionError,
-            TimeoutError,
-            ServiceError
-        )
-        self._retry_strategy.add_non_retryable_error(
-            ValidationError
-        )
+        ))
+        self._configure_retry_strategy()
 
     async def start(self) -> None:
         """Start market data service"""
@@ -196,6 +188,40 @@ class MarketDataService(ServiceBase):
                 self._status = ServiceStatus.ERROR
                 self._last_error = e
                 raise ServiceError(f"Critical recovery failed: {str(e)}")
+
+    def _configure_retry_strategy(self) -> None:
+        """Configure retry behavior for market data service"""
+        # Basic retryable errors
+        self._retry_strategy.add_retryable_error(
+            ConnectionError,
+            TimeoutError,
+            ServiceError
+        )
+        self._retry_strategy.add_non_retryable_error(
+            ValidationError
+        )
+
+        # Configure specific delays for different error types
+        self._retry_strategy.configure_error_delays({
+            ConnectionError: RetryConfig(
+                base_delay=5.0,      # Moderate base delay for connection issues
+                max_delay=180.0,
+                max_retries=4,
+                jitter_factor=0.25
+            ),
+            TimeoutError: RetryConfig(
+                base_delay=3.0,      # Balanced delay for timeouts
+                max_delay=90.0,
+                max_retries=3,
+                jitter_factor=0.2
+            ),
+            ServiceError: RetryConfig(
+                base_delay=2.0,      # Quick retry for service errors
+                max_delay=45.0,
+                max_retries=4,
+                jitter_factor=0.15
+            )
+        })
 
     async def _register_command_handlers(self) -> None:
         """Register command handlers for service monitoring"""

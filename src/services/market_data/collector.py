@@ -88,7 +88,8 @@ class DataCollector:
         logger.info("DataCollector cleanup completed")
 
     def _configure_retry_strategy(self) -> None:
-        """Configure retry behavior"""
+        """Configure retry behavior for data collection"""
+        # Basic retryable errors
         self._retry_strategy.add_retryable_error(
             ConnectionError,
             TimeoutError,
@@ -97,6 +98,28 @@ class DataCollector:
         self._retry_strategy.add_non_retryable_error(
             ValidationError
         )
+
+        # Configure specific delays for different error types
+        self._retry_strategy.configure_error_delays({
+            ConnectionError: RetryConfig(
+                base_delay=10.0,     # Higher base delay for connection issues
+                max_delay=300.0,
+                max_retries=5,
+                jitter_factor=0.2
+            ),
+            TimeoutError: RetryConfig(
+                base_delay=5.0,      # Moderate delay for timeouts
+                max_delay=120.0,
+                max_retries=3,
+                jitter_factor=0.1
+            ),
+            ServiceError: RetryConfig(
+                base_delay=2.0,      # Fast retry for service errors
+                max_delay=60.0,
+                max_retries=3,
+                jitter_factor=0.1
+            )
+        })
 
     async def _register_command_handlers(self) -> None:
         """Register handlers for collection-related commands"""
@@ -276,7 +299,7 @@ class DataCollector:
                 )
 
             current_start = aligned_start
-            retry_count = 0
+            attempt = 0
 
             while current_start < aligned_end:
                 try:
@@ -331,19 +354,23 @@ class DataCollector:
                         # No valid data in this batch
                         current_start = batch_end
 
+
                 except Exception as e:
-                    should_retry, reason = self._retry_strategy.should_retry(retry_count, e)
+                    should_retry, reason = self._retry_strategy.should_retry(attempt, e)
                     if should_retry:
-                        retry_count += 1
-                        delay = self._retry_strategy.get_delay(retry_count)
+                        attempt += 1
+                        # Get error-specific delay
+                        delay = self._retry_strategy.get_delay(attempt, e)
+
                         logger.warning(
-                            f"Retry {retry_count} for {symbol} "
+                            f"Retry {attempt} for {symbol} "
                             f"batch {TimeUtils.from_timestamp(Timestamp(current_start))} "
                             f"after {delay:.2f}s: {e}"
                         )
                         await asyncio.sleep(delay)
-                        continue  # Retry this batch
-                    raise  # Non-retryable error
+                        continue
+
+                    raise  # Non-retryable error occurred
 
             if progress := self._symbol_progress.get(symbol):
                 logger.info(progress.get_completion_summary(TimeUtils.get_current_datetime()))
