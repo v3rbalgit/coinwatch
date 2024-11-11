@@ -1,7 +1,7 @@
 # src/services/database.py
 
 import asyncio
-from typing import Optional, AsyncGenerator, Set, Dict, TypeVar, Callable, Awaitable, Union
+from typing import Optional, AsyncGenerator, Dict, TypeVar, Callable, Union
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     create_async_engine,
@@ -9,14 +9,13 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker
 )
 from sqlalchemy.pool import AsyncAdaptedQueuePool
-from sqlalchemy.exc import OperationalError, DBAPIError
 from contextlib import asynccontextmanager
 from sqlalchemy import text, event
 from enum import Enum
 
 from ..core.monitoring import DatabaseMetrics
 from ..core.coordination import Command, CommandResult, MonitoringCommand, ServiceCoordinator
-from ..core.exceptions import ServiceError
+from ..core.exceptions import ServiceError, ValidationError
 from ..config import DatabaseConfig
 from ..services.base import ServiceBase
 from ..utils.logger import LoggerSetup
@@ -68,12 +67,10 @@ class DatabaseService(ServiceBase):
         # Enhanced error tracking and recovery
         self._error_tracker = ErrorTracker()
         self._last_error: Optional[Exception] = None
-        self._pool_monitor_task: Optional[asyncio.Task] = None
+        self._monitor_task: Optional[asyncio.Task] = None
         self._recovery_lock = asyncio.Lock()
         self._pool_lock = asyncio.Lock()
         self._maintenance_lock = asyncio.Lock()
-        self._active_sessions: Set[AsyncSession] = set()
-        self._session_lock = asyncio.Lock()
 
         # Configure retry strategy
         retry_config = RetryConfig(
@@ -190,7 +187,7 @@ class DatabaseService(ServiceBase):
             await self._register_command_handlers()
 
             # Start pool monitoring
-            self._pool_monitor_task = asyncio.create_task(self._monitor_database())
+            self._monitor_task = asyncio.create_task(self._monitor_database())
 
             await super().start()
             self._status = ServiceStatus.RUNNING
@@ -220,14 +217,20 @@ class DatabaseService(ServiceBase):
                     pass
                 self._recovery_tasks.clear()
 
-            if self._pool_monitor_task:
-                self._pool_monitor_task.cancel()
+            # Cancel pool monitor
+            if self._monitor_task:
+                self._monitor_task.cancel()
                 try:
-                    await self._pool_monitor_task
+                    await self._monitor_task
                 except asyncio.CancelledError:
                     pass
 
+            # Cleanup pool
             if self.engine:
+                # Wait for active transactions to complete
+                async with self._transaction_semaphore:
+                    pass
+                # Dispose engine
                 await self.engine.dispose()
                 self.engine = None
 
@@ -259,6 +262,67 @@ class DatabaseService(ServiceBase):
         for command, handler in handlers.items():
             await self.coordinator.unregister_handler(command, handler)
             logger.debug(f"Unregistered handler for {command.value}")
+
+
+    @asynccontextmanager
+    async def get_session(self, isolation_level: Optional[IsolationLevel] = None) -> AsyncGenerator[AsyncSession, None]:
+        """
+        Transaction management with PostgreSQL-specific optimizations
+
+        Args:
+            isolation_level: Transaction isolation level
+            retry_count: Number of retries for deadlocks
+            retry_delay: Delay between retries
+        """
+        if not self.session_factory:
+            raise ServiceError("Database service not initialized")
+
+        async with self._transaction_semaphore:
+             attempt = 0
+        last_error = None
+
+        while True:
+            try:
+                async with self.session_factory() as session:
+                    if isolation_level:
+                        await session.execute(
+                            text(f"SET TRANSACTION ISOLATION LEVEL {isolation_level.value}")
+                        )
+
+                    # Set statement timeout for this transaction
+                    await session.execute(text("SET statement_timeout = '30s';"))
+
+                    async with session.begin():
+                        yield session
+                        return
+
+            except Exception as e:
+                # Track error for monitoring
+                await self._error_tracker.record_error(
+                    e,
+                    context={
+                        "isolation_level": isolation_level.value if isolation_level else None,
+                        "attempt": attempt + 1
+                    }
+                )
+
+                # Get retry strategy for this specific error
+                should_retry, reason = self._retry_strategy.should_retry(attempt, e)
+                if should_retry:
+                    attempt += 1
+                    delay = self._retry_strategy.get_delay(attempt, e)
+
+                    logger.warning(
+                        f"Database error, retry {attempt} after {delay:.2f}s: {str(e)}"
+                    )
+
+                    await asyncio.sleep(delay)
+                    continue
+
+                logger.error(
+                    f"Database error not retryable ({reason}): {str(e)}"
+                )
+                raise ServiceError(f"Database operation failed: {str(e)}") from e
 
     async def _handle_metrics_report(self, command: Command) -> CommandResult:
         """Handle metrics report command by returning current metrics"""
@@ -433,71 +497,43 @@ class DatabaseService(ServiceBase):
                 logger.error(f"Database monitoring error: {e}")
                 await asyncio.sleep(5)
 
-    @asynccontextmanager
-    async def get_session(self,
-                         isolation_level: Optional[IsolationLevel] = None,
-                         retry_count: int = 3,
-                         retry_delay: float = 1.0) -> AsyncGenerator[AsyncSession, None]:
-        """
-        Transaction management with PostgreSQL-specific optimizations
-
-        Args:
-            isolation_level: Transaction isolation level
-            retry_count: Number of retries for deadlocks
-            retry_delay: Delay between retries
-        """
-        if not self.session_factory:
-            raise ServiceError("Database service not initialized")
-
-        async with self._transaction_semaphore:
-            attempt = 0
-            while attempt <= retry_count:
-                async with self.session_factory() as session:
-                    try:
-                        if isolation_level:
-                            await session.execute(
-                                text(f"SET TRANSACTION ISOLATION LEVEL {isolation_level.value}")
-                            )
-
-                        # Set statement timeout for this transaction
-                        await session.execute(text("SET statement_timeout = '30s';"))
-
-                        async with session.begin():
-                            yield session
-                        return
-
-                    except OperationalError as e:
-                        if "deadlock detected" in str(e).lower():
-                            if attempt < retry_count:
-                                logger.warning(
-                                    f"Deadlock detected, retrying in {retry_delay}s... "
-                                    f"({retry_count - attempt} attempts left)"
-                                )
-                                await asyncio.sleep(retry_delay)
-                                retry_delay *= 2
-                                attempt += 1
-                                continue
-                            else:
-                                logger.error("Max retries exceeded")
-                                raise
-                        else:
-                            logger.error(f"Operational error: {e}")
-                            raise
-                    except Exception as e:
-                        logger.error(f"Transaction error: {e}")
-                        raise
-                attempt += 1
-
     def _configure_retry_strategy(self) -> None:
-        """Configure retry behavior for database operations"""
-        self._retry_strategy.add_retryable_error(
+        """Configure retry behavior with PostgreSQL-specific error handling"""
+        from sqlalchemy.exc import (
             OperationalError,
-            DBAPIError,
-            ConnectionError,
+            InternalError,
+            DisconnectionError,
             TimeoutError
         )
+
+        # Retryable errors with specific handling
+        self._retry_strategy.add_retryable_error(
+            OperationalError,        # Covers most PostgreSQL errors
+            DisconnectionError,      # Connection issues
+            TimeoutError            # Statement timeout
+        )
+
+        # Configure specific delays for different error types
+        self._retry_strategy.configure_error_delays({
+            OperationalError: RetryConfig(
+                base_delay=0.1,        # Fast retry for operational errors
+                max_delay=5.0,
+                max_retries=5,
+                jitter_factor=0.1
+            ),
+            DisconnectionError: RetryConfig(
+                base_delay=2.0,        # Longer delay for connection issues
+                max_delay=30.0,
+                max_retries=3,
+                jitter_factor=0.25
+            )
+        })
+
+        # Non-retryable errors
         self._retry_strategy.add_non_retryable_error(
-            ServiceError
+            ServiceError,              # Application errors
+            ValidationError,           # Data validation errors
+            InternalError              # Serious SQLAlchemy internal errors
         )
 
     async def _handle_connection_overflow(self, condition: CriticalCondition) -> None:
@@ -808,25 +844,44 @@ class DatabaseService(ServiceBase):
                 current_time - last_maintenance > 24 * 60 * 60 * 1000):
 
                 logger.info(f"Starting maintenance: {condition['message']}")
-                try:
-                    async with self.get_session(isolation_level=IsolationLevel.SERIALIZABLE) as session:
-                        # Run VACUUM ANALYZE on critical tables
-                        await session.execute(text("""
-                            VACUUM ANALYZE kline_data;
-                            VACUUM ANALYZE symbols;
-                        """))
+                attempt = 0
 
-                        # Update table statistics
-                        await session.execute(text("ANALYZE;"))
+                while True:
+                    try:
+                        async with self.get_session(isolation_level=IsolationLevel.SERIALIZABLE) as session:
+                            # Run VACUUM ANALYZE on critical tables
+                            await session.execute(text("""
+                                VACUUM ANALYZE kline_data;
+                                VACUUM ANALYZE symbols;
+                            """))
 
-                        self._last_maintenance = current_time
-                        self._maintenance_due = False
-                        logger.info("Database maintenance completed successfully")
+                            # Update table statistics
+                            await session.execute(text("ANALYZE;"))
 
-                except Exception as e:
-                    logger.error(f"Maintenance failed: {e}")
-                    self._maintenance_due = True
-                    raise ServiceError(f"Database maintenance failed: {str(e)}")
+                            self._last_maintenance = current_time
+                            self._maintenance_due = False
+                            logger.info("Database maintenance completed successfully")
+                            return
+
+                    except Exception as e:
+                        should_retry, reason = self._retry_strategy.should_retry(attempt, e)
+                        if should_retry:
+                            attempt += 1
+                            delay = self._retry_strategy.get_delay(attempt, e)
+
+                            logger.warning(
+                                f"Maintenance error, "
+                                f"retry {attempt} after {delay:.2f}s: {str(e)}"
+                            )
+
+                            # For maintenance operations, we can be more patient
+                            delay = min(delay * 2, 300)  # Max 5 minutes
+                            await asyncio.sleep(delay)
+                            continue
+
+                        logger.error(f"Maintenance failed: {e}")
+                        self._maintenance_due = True
+                        raise ServiceError(f"Database maintenance failed: {str(e)}")
 
     async def _start_recovery_task(self, error_type: DatabaseErrorType, coro: Callable) -> None:
         """Safely start or restart a recovery task"""
@@ -925,39 +980,56 @@ class DatabaseService(ServiceBase):
 
     async def _reconfigure_pool(self, **config_updates: Union[int, bool]) -> None:
         """
-        Safely reconfigure connection pool with type-safe updates.
-
-        Args:
-            **config_updates: Updates to pool configuration (pool_size, max_overflow, etc.)
+        Safely reconfigure connection pool with enhanced error handling
         """
         async with self._pool_lock:
             old_engine = self.engine
-            try:
-                # Type-safe config update
-                validated_updates = {
-                    k: v for k, v in config_updates.items()
-                    if k in self._config
-                }
-                self._config.update(validated_updates)  # type: ignore
+            attempt = 0
 
-                # Create new engine with updated config
-                self.engine = self._create_engine()
-                self.session_factory = async_sessionmaker(
-                    bind=self.engine,
-                    class_=AsyncSession,
-                    expire_on_commit=False,
-                    autoflush=False
-                )
+            while True:
+                try:
+                    validated_updates = {
+                        k: v for k, v in config_updates.items()
+                        if k in self._config
+                    }
+                    self._config.update(validated_updates)  # type: ignore
 
-                if old_engine:
-                    await old_engine.dispose()
+                    # Create new engine with updated config
+                    self.engine = self._create_engine()
+                    self.session_factory = async_sessionmaker(
+                        bind=self.engine,
+                        class_=AsyncSession,
+                        expire_on_commit=False,
+                        autoflush=False
+                    )
 
-                logger.info(f"Pool reconfigured with {validated_updates}")
+                    # Verify new configuration
+                    async with self.get_session() as session:
+                        await session.execute(text("SELECT 1"))
 
-            except Exception as e:
-                self.engine = old_engine
-                logger.error(f"Pool reconfiguration failed: {e}")
-                raise ServiceError(f"Pool reconfiguration failed: {str(e)}")
+                    if old_engine:
+                        await old_engine.dispose()
+
+                    logger.info(f"Pool reconfigured with {validated_updates}")
+                    return
+
+                except Exception as e:
+                    should_retry, reason = self._retry_strategy.should_retry(attempt, e)
+                    if should_retry:
+                        attempt += 1
+                        delay = self._retry_strategy.get_delay(attempt, e)
+
+                        logger.warning(
+                            f"Pool reconfiguration error, "
+                            f"retry {attempt} after {delay:.2f}s: {str(e)}"
+                        )
+
+                        await asyncio.sleep(delay)
+                        continue
+
+                    self.engine = old_engine
+                    logger.error(f"Pool reconfiguration failed: {e}")
+                    raise ServiceError(f"Pool reconfiguration failed: {str(e)}")
 
     async def _initiate_emergency_recovery(self, reason: str) -> None:
         """Emergency recovery procedure"""
@@ -967,12 +1039,6 @@ class DatabaseService(ServiceBase):
             try:
                 # Stop accepting new connections
                 self._status = ServiceStatus.STOPPING
-
-                # Close all active sessions
-                async with self._session_lock:
-                    for session in self._active_sessions:
-                        await session.close()
-                    self._active_sessions.clear()
 
                 # Dispose current engine
                 if self.engine:
@@ -1055,8 +1121,6 @@ class DatabaseService(ServiceBase):
             f"  Pool Size: {self._config['pool_size']}",
             f"  Max Overflow: {self._config['max_overflow']}",
             f"  Timeout: {self._config['pool_timeout']}s",
-            f"Active Sessions: {len(self._active_sessions)}",
-            "",
             "Critical Errors (Last Hour):"
         ]
 

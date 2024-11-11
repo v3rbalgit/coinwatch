@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from ..core.coordination import ServiceCoordinator
-from ..core.exceptions import ValidationError
+from ..core.exceptions import ServiceError, ValidationError
 from ..core.models import (
     KlineData,
     RSIResult, BollingerBandsResult, MACDResult, MAResult, OBVResult
@@ -136,15 +136,44 @@ class IndicatorManager:
         self._setup_indicator_caches()
 
     def _configure_retry_strategy(self) -> None:
-        """Configure retry behavior"""
+        """Configure retry behavior for indicator calculations"""
+        from pandas.errors import EmptyDataError
+
+        # Basic retryable errors
         self._retry_strategy.add_retryable_error(
-            ConnectionError,
-            TimeoutError,
-            pd.errors.EmptyDataError
+            ConnectionError,      # Network/connection issues
+            TimeoutError,        # Timeout issues
+            EmptyDataError       # Pandas empty data issues
         )
+
         self._retry_strategy.add_non_retryable_error(
-            ValidationError
+            ValidationError,     # Data validation errors
+            ValueError,         # Invalid values
+            ServiceError       # Application errors
         )
+
+        # Configure specific delays for different error types
+        self._retry_strategy.configure_error_delays({
+            EmptyDataError: RetryConfig(
+                base_delay=1.0,    # Quick retry for empty data
+                max_delay=10.0,
+                max_retries=2,
+                jitter_factor=0.1
+            ),
+            ConnectionError: RetryConfig(
+                base_delay=2.0,    # Longer delay for connection issues
+                max_delay=30.0,
+                max_retries=3,
+                jitter_factor=0.2
+            ),
+            TimeoutError: RetryConfig(
+                base_delay=3.0,    # Even longer for timeouts
+                max_delay=45.0,
+                max_retries=3,
+                jitter_factor=0.2
+            )
+        })
+
     async def _calculate_with_retry(self,
                                   calc_name: str,
                                   calc_func: Callable,
