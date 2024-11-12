@@ -18,16 +18,14 @@ logger = LoggerSetup.setup(__name__)
 
 class MonitoringService(ServiceBase):
     """
-    Centralized monitoring service using ServiceCoordinator
+    Centralized monitoring service that collects and aggregates metrics from all system components.
 
-    Responsibilities:
-    - System resource monitoring (CPU, memory, disk)
-    - Database performance monitoring
-    - Market data service monitoring
-    - Cache performance monitoring
-    - Metrics collection and reporting
-    - Health check endpoint
-    - Prometheus metrics endpoint
+    Provides real-time monitoring of:
+    - System resources (CPU, memory, disk, network)
+    - Database performance metrics
+    - Market data service metrics
+
+    All metrics are exposed through Prometheus for external monitoring and alerting.
     """
 
     def __init__(self,
@@ -48,7 +46,11 @@ class MonitoringService(ServiceBase):
         }
 
     async def start(self) -> None:
-        """Start monitoring service"""
+        """
+        Start the monitoring service and begin metrics collection.
+
+        Initializes metrics collectors and starts background tasks for periodic collection.
+        """
         try:
             self._status = ServiceStatus.STARTING
             logger.info("Starting monitoring service")
@@ -65,7 +67,11 @@ class MonitoringService(ServiceBase):
             raise
 
     async def stop(self) -> None:
-        """Stop monitoring service"""
+        """
+        Stop the monitoring service and cleanup resources.
+
+        Cancels all background collection tasks and ensures proper shutdown.
+        """
         if self._collection_task:
             self._collection_task.cancel()
             try:
@@ -74,8 +80,14 @@ class MonitoringService(ServiceBase):
                 pass
 
     async def _collect_metrics_loop(self) -> None:
-        """Continuously collect metrics from all services"""
-        """Continuously collect metrics with different intervals per service"""
+        """
+        Continuously collect metrics from all services at configured intervals.
+
+        Collection frequencies are customized per metric type:
+        - System metrics: 30s
+        - Database metrics: 60s
+        - Market data metrics: 120s
+        """
         while True:
             try:
                 current_time = TimeUtils.get_current_timestamp()
@@ -116,7 +128,12 @@ class MonitoringService(ServiceBase):
                 await asyncio.sleep(5)
 
     def _update_prometheus_metrics(self, metrics: Dict[str, MetricsType]) -> None:
-        """Update Prometheus metrics with collected data"""
+        """
+        Update Prometheus metrics with latest collected data.
+
+        Args:
+            metrics: Dictionary of metrics by service name
+        """
         try:
             # Update service status
             self.metrics.service_up.labels(
@@ -184,11 +201,26 @@ class MonitoringService(ServiceBase):
             logger.error(f"Error updating Prometheus metrics: {e}")
 
     async def get_prometheus_metrics(self) -> bytes:
-        """Generate Prometheus metrics"""
+        """
+        Generate Prometheus metrics output.
+
+        Returns:
+            bytes: Prometheus-formatted metrics data
+        """
         return generate_latest(self.metrics.registry)
 
     def get_service_status(self) -> str:
-        """Get comprehensive monitoring service status"""
+        """
+        Get comprehensive monitoring service status report.
+
+        Returns:
+            str: Multi-line status report including:
+            - Service state
+            - Collection intervals
+            - Last collection times
+            - Resource metrics
+            - Component health status
+        """
         metrics = {}  # Will store last collected metrics
         try:
             metrics = self.collector._last_metrics

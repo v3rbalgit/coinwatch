@@ -1,7 +1,7 @@
 # src/utils/domain_types.py
 
 from enum import Enum
-from typing import Any, Dict, NewType, Literal, TypedDict, NotRequired
+from typing import Any, Dict, NewType, Literal, Optional, TypedDict, NotRequired
 
 SymbolName = NewType('SymbolName', str)
 ExchangeName = NewType('ExchangeName', str)
@@ -21,6 +21,31 @@ class Timeframe(Enum):
     HOUR_12 = "720"
     DAY_1 = "D"
     WEEK_1 = "W"
+
+    @property
+    def continuous_aggregate_view(self) -> Optional[str]:
+        """Get the corresponding continuous aggregate view name if it exists"""
+        view_mapping = {
+            self.HOUR_1: "kline_1h",
+            self.HOUR_4: "kline_4h",
+            self.DAY_1: "kline_1d"
+        }
+        return view_mapping.get(self)
+
+    def is_stored_timeframe(self) -> bool:
+        """Check if this timeframe has a continuous aggregate view"""
+        return self.continuous_aggregate_view is not None
+
+    def get_bucket_interval(self) -> str:
+        """Get the appropriate bucket interval for TimescaleDB time_bucket function"""
+        if self == self.DAY_1:
+            return '1 day'
+        elif self == self.WEEK_1:
+            return '7 days'
+        else:
+            # Convert minutes to seconds for sub-day timeframes
+            minutes = int(self.value) if self.value.isdigit() else 0
+            return f'{minutes * 60} seconds'
 
     def to_milliseconds(self) -> int:
         """Convert timeframe to milliseconds"""

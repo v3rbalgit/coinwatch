@@ -1,18 +1,22 @@
 # src/services/database.py
 
 import asyncio
-from typing import Optional, AsyncGenerator, Dict, TypeVar, Callable, Union
+import os
+from typing import Optional, AsyncGenerator, Dict, Callable, Union
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     create_async_engine,
     AsyncEngine,
     async_sessionmaker
 )
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.pool import AsyncAdaptedQueuePool
 from contextlib import asynccontextmanager
-from sqlalchemy import text, event
+from sqlalchemy import text
 from enum import Enum
 
+from ..models.base import Base
+from ..models.market import Kline, Symbol
 from ..core.monitoring import DatabaseMetrics
 from ..core.coordination import Command, CommandResult, MonitoringCommand, ServiceCoordinator
 from ..core.exceptions import ServiceError, ValidationError
@@ -26,10 +30,8 @@ from ..utils.time import TimeUtils
 
 logger = LoggerSetup.setup(__name__)
 
-T = TypeVar('T')
-
 class IsolationLevel(str, Enum):
-    READ_UNCOMMITTED = "READ UNCOMMITTED"
+    READ_UNCOMMITTED = "READ COMMITTED"
     READ_COMMITTED = "READ COMMITTED"
     REPEATABLE_READ = "REPEATABLE READ"
     SERIALIZABLE = "SERIALIZABLE"
@@ -63,6 +65,7 @@ class DatabaseService(ServiceBase):
         self._connection_url = config.url
         self._status = ServiceStatus.STOPPED
         self._start_time: Optional[int] = None
+        self._timescale_config = config.timescale
 
         # Enhanced error tracking and recovery
         self._error_tracker = ErrorTracker()
@@ -71,6 +74,7 @@ class DatabaseService(ServiceBase):
         self._recovery_lock = asyncio.Lock()
         self._pool_lock = asyncio.Lock()
         self._maintenance_lock = asyncio.Lock()
+        self._transaction_semaphore = asyncio.BoundedSemaphore(config.pool_size)
 
         # Configure retry strategy
         retry_config = RetryConfig(
@@ -82,9 +86,22 @@ class DatabaseService(ServiceBase):
         self._retry_strategy = RetryStrategy(retry_config)
         self._configure_retry_strategy()
 
-        self._transaction_semaphore = asyncio.BoundedSemaphore(config.pool_size)
-
-        self._timescale_config = config.timescale
+        # Convert config to SQLAlchemy engine options
+        self._engine_options = {
+            'poolclass': AsyncAdaptedQueuePool,
+            'pool_size': config.pool_size,
+            'max_overflow': config.max_overflow,
+            'pool_timeout': config.pool_timeout,
+            'pool_recycle': config.pool_recycle,
+            'echo': config.echo,
+            'connect_args': {
+                'server_settings': {
+                    'statement_timeout': '30000',  # 30 seconds
+                    'idle_in_transaction_session_timeout': '60000',  # 1 minute
+                    'lock_timeout': '10000'  # 10 seconds
+                }
+            }
+        }
 
         # Track maintenance windows
         self._last_maintenance: Optional[int] = None
@@ -96,46 +113,44 @@ class DatabaseService(ServiceBase):
 
         asyncio.create_task(self._register_command_handlers())
 
-    def _create_engine(self) -> AsyncEngine:
-        """
-        Create and configure a SQLAlchemy asynchronous engine with PostgreSQL optimizations.
-
-        This method initializes an AsyncEngine with specific configurations for PostgreSQL,
-        including connection pooling, JSON handling, and health checks. It also sets up
-        PostgreSQL-specific session configurations for optimal performance.
-
-        Returns:
-            AsyncEngine: A configured SQLAlchemy asynchronous engine instance optimized for PostgreSQL.
-
-        Note:
-            - Uses AsyncAdaptedQueuePool for connection pooling.
-            - Disables SQLAlchemy's JSON serialization to use PostgreSQL's native JSON handling.
-            - Enables connection health checks with pool_pre_ping.
-            - Sets up PostgreSQL session for parallel query execution and statement timeout.
-        """
-        engine = create_async_engine(
-            self._connection_url,
-            poolclass=AsyncAdaptedQueuePool,
-            json_serializer=None,  # Use PostgreSQL native JSON handling
-            json_deserializer=None,
-            pool_pre_ping=True,    # Enable connection health checks
-            **self._config
+    def _configure_retry_strategy(self) -> None:
+        """Configure retry behavior with PostgreSQL-specific error handling"""
+        from sqlalchemy.exc import (
+            OperationalError,
+            InternalError,
+            DisconnectionError,
+            TimeoutError
         )
 
-        # Set PostgreSQL-specific session configuration
-        @event.listens_for(engine.sync_engine, "connect")
-        def set_pg_session_config(dbapi_connection, connection_record):
-            # Enable parallel query execution
-            dbapi_connection.set_session(
-                enable_parallel_query=True,
-                statement_timeout=30000,  # 30 seconds timeout
-                work_mem='64MB',         # Memory for sorting/hash operations
-                maintenance_work_mem='256MB',  # Memory for maintenance operations
-                random_page_cost=1.1,    # Optimize for SSDs
-                effective_cache_size='4GB',  # Assume larger cache for better plans
-            )
+        # Retryable errors with specific handling
+        self._retry_strategy.add_retryable_error(
+            OperationalError,        # Covers most PostgreSQL errors
+            DisconnectionError,      # Connection issues
+            TimeoutError            # Statement timeout
+        )
 
-        return engine
+        # Configure specific delays for different error types
+        self._retry_strategy.configure_error_delays({
+            OperationalError: RetryConfig(
+                base_delay=0.1,        # Fast retry for operational errors
+                max_delay=5.0,
+                max_retries=5,
+                jitter_factor=0.1
+            ),
+            DisconnectionError: RetryConfig(
+                base_delay=2.0,        # Longer delay for connection issues
+                max_delay=30.0,
+                max_retries=3,
+                jitter_factor=0.25
+            )
+        })
+
+        # Non-retryable errors
+        self._retry_strategy.add_non_retryable_error(
+            ServiceError,              # Application errors
+            ValidationError,           # Data validation errors
+            InternalError              # Serious SQLAlchemy internal errors
+        )
 
     async def start(self) -> None:
         """
@@ -169,17 +184,17 @@ class DatabaseService(ServiceBase):
 
             # Create tables if they don't exist
             async with self.engine.begin() as conn:
-                from ..models.base import Base
-                await conn.run_sync(Base.metadata.create_all)
+                try:
+                    # Initialize TimescaleDB extensions
+                    await conn.execute(text("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;"))
+                    await conn.run_sync(Base.metadata.create_all)
 
-                # Initialize TimescaleDB extensions
-                await conn.execute(text("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;"))
+                    logger.info("Database tables created successfully")
+                except Exception as table_error:
+                    logger.error(f"Error creating tables: {table_error}")
+                    raise
 
-                # Set chunk interval if specified
-                if self._timescale_config.chunk_interval:
-                    await conn.execute(text(
-                        "SELECT set_chunk_time_interval('kline_data', interval :interval);"
-                    ), {"interval": self._timescale_config.chunk_interval})
+            await self._setup_timescaledb(self.engine)
 
             self.session_factory = async_sessionmaker(
                 bind=self.engine,
@@ -247,36 +262,19 @@ class DatabaseService(ServiceBase):
             logger.error(f"Error stopping database service: {e}")
             raise ServiceError(f"Database shutdown failed: {str(e)}")
 
-    async def _register_command_handlers(self) -> None:
-        """Register command handlers for service monitoring"""
-        handlers = {
-            MonitoringCommand.REPORT_METRICS: self._handle_metrics_report
-        }
-
-        for command, handler in handlers.items():
-            await self.coordinator.register_handler(command, handler)
-            logger.debug(f"Registered handler for {command.value}")
-
-    async def _unregister_command_handlers(self) -> None:
-        """Register command handlers for service monitoring"""
-        handlers = {
-            MonitoringCommand.REPORT_METRICS: self._handle_metrics_report
-        }
-
-        for command, handler in handlers.items():
-            await self.coordinator.unregister_handler(command, handler)
-            logger.debug(f"Unregistered handler for {command.value}")
-
-
     @asynccontextmanager
     async def get_session(self, isolation_level: Optional[IsolationLevel] = None) -> AsyncGenerator[AsyncSession, None]:
         """
         Transaction management with PostgreSQL-specific optimizations
 
         Args:
-            isolation_level: Transaction isolation level
-            retry_count: Number of retries for deadlocks
-            retry_delay: Delay between retries
+            isolation_level: Transaction isolation level (READ COMMITTED, REPEATABLE READ, etc.)
+
+        Returns:
+            AsyncGenerator yielding an AsyncSession
+
+        Raises:
+            ServiceError: If database is not initialized or operation fails
         """
         if not self.session_factory:
             raise ServiceError("Database service not initialized")
@@ -287,12 +285,12 @@ class DatabaseService(ServiceBase):
             while True:
                 try:
                     async with self.session_factory() as session:
-                        if isolation_level:
-                            await session.execute(
-                                text(f"SET TRANSACTION ISOLATION LEVEL {isolation_level.value}")
-                            )
-
+                    # Start transaction with specified isolation level
                         async with session.begin():
+                            if isolation_level:
+                                await session.execute(
+                                    text(f"SET TRANSACTION ISOLATION LEVEL {isolation_level.value}")
+                                )
                             yield session
                             return
 
@@ -323,6 +321,246 @@ class DatabaseService(ServiceBase):
                         f"Database error not retryable ({reason}): {str(e)}"
                     )
                     raise ServiceError(f"Database operation failed: {str(e)}") from e
+
+    def _create_engine(self) -> AsyncEngine:
+        """
+        Create and configure a SQLAlchemy asynchronous engine with PostgreSQL optimizations.
+
+        This method initializes an AsyncEngine with specific configurations for PostgreSQL,
+        including connection pooling, JSON handling, and health checks. It also sets up
+        PostgreSQL-specific session configurations for optimal performance.
+
+        Returns:
+            AsyncEngine: A configured SQLAlchemy asynchronous engine instance optimized for PostgreSQL.
+
+        Note:
+            - Uses AsyncAdaptedQueuePool for connection pooling.
+            - Disables SQLAlchemy's JSON serialization to use PostgreSQL's native JSON handling.
+            - Enables connection health checks with pool_pre_ping.
+            - Sets up PostgreSQL session for parallel query execution and statement timeout.
+        """
+        return create_async_engine(
+            self._connection_url,
+            pool_pre_ping=True,    # Enable connection health checks
+            json_serializer=None,  # Use PostgreSQL native JSON handling
+            json_deserializer=None,
+            **self._engine_options
+        )
+
+    async def _setup_timescaledb(self, engine: AsyncEngine) -> None:
+        """Setup TimescaleDB features with separate transactions"""
+        try:
+            # Create hypertable if not exists
+            await self._create_hypertable(engine)
+
+            # Setup compression if not already set
+            await self._setup_compression(engine)
+
+            # Setup retention policy if configured and not already set
+            await self._setup_retention(engine)
+
+            # Create materialized views if not exists
+            await self._create_materialized_views(engine)
+
+            # Setup continuous aggregate policies if not already set
+            await self._setup_continuous_aggregate_policies(engine)
+
+            logger.info("TimescaleDB setup completed successfully")
+
+        except Exception as e:
+            logger.error(f"Error setting up TimescaleDB: {e}")
+            raise
+
+    async def _create_hypertable(self, engine: AsyncEngine) -> None:
+        """Create hypertable if it does not already exist"""
+        async with engine.begin() as conn:
+            try:
+                await conn.execute(text("""
+                    SELECT create_hypertable(
+                        'kline_data',
+                        'timestamp',
+                        chunk_time_interval => INTERVAL '1 week',
+                        if_not_exists => TRUE,
+                        migrate_data => TRUE
+                    );
+                """))
+                logger.info("Hypertable created or already exists")
+            except Exception as e:
+                logger.error(f"Error creating hypertable: {e}")
+                raise
+
+    async def _setup_compression(self, engine: AsyncEngine) -> None:
+        """Setup compression policies if not already set"""
+        async with engine.begin() as conn:
+            try:
+                # Enable compression on the table
+                await conn.execute(text("""
+                    ALTER TABLE kline_data SET (
+                        timescaledb.compress,
+                        timescaledb.compress_orderby = 'timestamp',
+                        timescaledb.compress_segmentby = 'symbol_id,timeframe'
+                    );
+                """))
+                logger.info("Compression settings applied to kline_data table")
+
+                # Add compression policy
+                await conn.execute(text("""
+                    SELECT add_compression_policy(
+                        'kline_data',
+                        INTERVAL '30 days',
+                        if_not_exists => TRUE
+                    );
+                """))
+                logger.info("Compression policy updated")
+            except Exception as e:
+                logger.error(f"Error setting up compression: {e}")
+                raise
+
+    async def _setup_retention(self, engine: AsyncEngine) -> None:
+        """Setup retention policies if configured and not already set"""
+        if self._timescale_config.retention_days and self._timescale_config.retention_days > 0:
+            async with engine.begin() as conn:
+                try:
+                    # Add retention policy
+                    await conn.execute(text("""
+                        SELECT add_retention_policy(
+                            'kline_data',
+                            INTERVAL :days_interval,
+                            if_not_exists => TRUE
+                        );
+                    """), {
+                        "days_interval": f"{self._timescale_config.retention_days} days"
+                    })
+                    logger.info("Retention policy updated")
+                except Exception as e:
+                    logger.error(f"Error setting up retention policy: {e}")
+                    raise
+        else:
+            logger.info("Retention policy not configured")
+
+    async def _create_materialized_views(self, engine: AsyncEngine) -> None:
+        """Create materialized views if they do not already exist"""
+        default_timeframe = os.getenv('DEFAULT_TIMEFRAME', '5')
+        view_definitions = [
+            {
+                "name": "kline_1h",
+                "bucket": "1 hour",
+                "timeframe": "60",
+                "end_interval": "1 hour",
+                "schedule_interval": "5 minutes"
+            },
+            {
+                "name": "kline_4h",
+                "bucket": "4 hours",
+                "timeframe": "240",
+                "end_interval": "4 hours",
+                "schedule_interval": "20 minutes"
+            },
+            {
+                "name": "kline_1d",
+                "bucket": "1 day",
+                "timeframe": "D",
+                "end_interval": "1 day",
+                "schedule_interval": "1 hour"
+            }
+        ]
+
+        async with engine.begin() as conn:
+            for view in view_definitions:
+                try:
+                    # Create materialized view if it does not exist
+                    await conn.execute(text(f"""
+                        CREATE MATERIALIZED VIEW IF NOT EXISTS {view['name']}
+                        WITH (timescaledb.continuous) AS
+                        SELECT
+                            time_bucket('{view['bucket']}', timestamp, 'UTC') AS bucket,
+                            symbol_id,
+                            '{view['timeframe']}' as timeframe,
+                            first(open_price, timestamp) as open_price,
+                            max(high_price) as high_price,
+                            min(low_price) as low_price,
+                            last(close_price, timestamp) as close_price,
+                            sum(volume) as volume,
+                            sum(turnover) as turnover
+                        FROM kline_data
+                        WHERE
+                            timeframe = '{default_timeframe}'
+                            AND timestamp < time_bucket('{view['bucket']}', now(), 'UTC')
+                        GROUP BY
+                            time_bucket('{view['bucket']}', timestamp, 'UTC'),
+                            symbol_id
+                        WITH NO DATA;
+                    """))
+                    logger.info(f"Materialized view '{view['name']}' created or already exists")
+                except ProgrammingError as pe:
+                    if 'already exists' in str(pe):
+                        logger.warning(f"Materialized view '{view['name']}' already exists.")
+                    else:
+                        logger.error(f"Programming error while creating materialized view '{view['name']}': {pe}")
+                        raise
+                except Exception as e:
+                    logger.error(f"Error creating materialized view '{view['name']}': {e}")
+                    raise
+
+    async def _setup_continuous_aggregate_policies(self, engine: AsyncEngine) -> None:
+        """Setup continuous aggregate policies if not already set"""
+        policies = [
+            {
+                "view_name": "kline_1h",
+                "start_offset": "3 hours",
+                "end_offset": "1 hour",
+                "schedule_interval": "5 minutes"
+            },
+            {
+                "view_name": "kline_4h",
+                "start_offset": "12 hours",
+                "end_offset": "4 hours",
+                "schedule_interval": "20 minutes"
+            },
+            {
+                "view_name": "kline_1d",
+                "start_offset": "3 days",
+                "end_offset": "1 day",
+                "schedule_interval": "1 hour"
+            }
+        ]
+
+        async with engine.begin() as conn:
+            for policy in policies:
+                try:
+                    # Add continuous aggregate policy
+                    await conn.execute(text(f"""
+                        SELECT add_continuous_aggregate_policy('{policy['view_name']}',
+                            start_offset => INTERVAL '{policy['start_offset']}',
+                            end_offset => INTERVAL '{policy['end_offset']}',
+                            schedule_interval => INTERVAL '{policy['schedule_interval']}',
+                            if_not_exists => TRUE
+                        );
+                    """))
+                    logger.info(f"Continuous aggregate policy for {policy['view_name']} updated")
+                except Exception as e:
+                    logger.error(f"Error setting up continuous aggregate policy for {policy['view_name']}: {e}")
+                    raise
+
+    async def _register_command_handlers(self) -> None:
+        """Register command handlers for service monitoring"""
+        handlers = {
+            MonitoringCommand.REPORT_METRICS: self._handle_metrics_report
+        }
+
+        for command, handler in handlers.items():
+            await self.coordinator.register_handler(command, handler)
+            logger.debug(f"Registered handler for {command.value}")
+
+    async def _unregister_command_handlers(self) -> None:
+        """Register command handlers for service monitoring"""
+        handlers = {
+            MonitoringCommand.REPORT_METRICS: self._handle_metrics_report
+        }
+
+        for command, handler in handlers.items():
+            await self.coordinator.unregister_handler(command, handler)
+            logger.debug(f"Unregistered handler for {command.value}")
 
     async def _handle_metrics_report(self, command: Command) -> CommandResult:
         """Handle metrics report command by returning current metrics"""
@@ -479,7 +717,7 @@ class DatabaseService(ServiceBase):
 
                 # Check for maintenance needs
                 if (not self._last_maintenance or
-                    TimeUtils.get_current_timestamp() - self._last_maintenance > 24 * 60 * 60 * 1000):
+                    TimeUtils.get_current_timestamp() - self._last_maintenance > self._config.maintenance_window * 1000):
                     await self.handle_critical_condition({
                         "type": DatabaseErrorType.MAINTENANCE_REQUIRED,
                         "severity": "warning",
@@ -496,45 +734,6 @@ class DatabaseService(ServiceBase):
             except Exception as e:
                 logger.error(f"Database monitoring error: {e}")
                 await asyncio.sleep(5)
-
-    def _configure_retry_strategy(self) -> None:
-        """Configure retry behavior with PostgreSQL-specific error handling"""
-        from sqlalchemy.exc import (
-            OperationalError,
-            InternalError,
-            DisconnectionError,
-            TimeoutError
-        )
-
-        # Retryable errors with specific handling
-        self._retry_strategy.add_retryable_error(
-            OperationalError,        # Covers most PostgreSQL errors
-            DisconnectionError,      # Connection issues
-            TimeoutError            # Statement timeout
-        )
-
-        # Configure specific delays for different error types
-        self._retry_strategy.configure_error_delays({
-            OperationalError: RetryConfig(
-                base_delay=0.1,        # Fast retry for operational errors
-                max_delay=5.0,
-                max_retries=5,
-                jitter_factor=0.1
-            ),
-            DisconnectionError: RetryConfig(
-                base_delay=2.0,        # Longer delay for connection issues
-                max_delay=30.0,
-                max_retries=3,
-                jitter_factor=0.25
-            )
-        })
-
-        # Non-retryable errors
-        self._retry_strategy.add_non_retryable_error(
-            ServiceError,              # Application errors
-            ValidationError,           # Data validation errors
-            InternalError              # Serious SQLAlchemy internal errors
-        )
 
     async def _handle_connection_overflow(self, condition: CriticalCondition) -> None:
         """Progressive connection overflow handling with backoff"""
@@ -837,51 +1036,48 @@ class DatabaseService(ServiceBase):
     async def _handle_maintenance_required(self, condition: CriticalCondition) -> None:
         """Handle maintenance requirements"""
         async with self._maintenance_lock:
-            last_maintenance = condition["context"].get("last_maintenance")
             current_time = TimeUtils.get_current_timestamp()
 
-            if (not last_maintenance or
-                current_time - last_maintenance > 24 * 60 * 60 * 1000):
 
-                logger.info(f"Starting maintenance: {condition['message']}")
-                attempt = 0
+            logger.info(f"Starting maintenance: {condition['message']}")
+            attempt = 0
 
-                while True:
-                    try:
-                        async with self.get_session(isolation_level=IsolationLevel.SERIALIZABLE) as session:
-                            # Run VACUUM ANALYZE on critical tables
-                            await session.execute(text("""
-                                VACUUM ANALYZE kline_data;
-                                VACUUM ANALYZE symbols;
-                            """))
+            while True:
+                try:
+                    async with self.get_session(isolation_level=IsolationLevel.SERIALIZABLE) as session:
+                        # Run VACUUM ANALYZE on critical tables
+                        await session.execute(text("""
+                            VACUUM ANALYZE kline_data;
+                            VACUUM ANALYZE symbols;
+                        """))
 
-                            # Update table statistics
-                            await session.execute(text("ANALYZE;"))
+                        # Update table statistics
+                        await session.execute(text("ANALYZE;"))
 
-                            self._last_maintenance = current_time
-                            self._maintenance_due = False
-                            logger.info("Database maintenance completed successfully")
-                            return
+                        self._last_maintenance = current_time
+                        self._maintenance_due = False
+                        logger.info("Database maintenance completed successfully")
+                        return
 
-                    except Exception as e:
-                        should_retry, reason = self._retry_strategy.should_retry(attempt, e)
-                        if should_retry:
-                            attempt += 1
-                            delay = self._retry_strategy.get_delay(attempt, e)
+                except Exception as e:
+                    should_retry, reason = self._retry_strategy.should_retry(attempt, e)
+                    if should_retry:
+                        attempt += 1
+                        delay = self._retry_strategy.get_delay(attempt, e)
 
-                            logger.warning(
-                                f"Maintenance error, "
-                                f"retry {attempt} after {delay:.2f}s: {str(e)}"
-                            )
+                        logger.warning(
+                            f"Maintenance error, "
+                            f"retry {attempt} after {delay:.2f}s: {str(e)}"
+                        )
 
-                            # For maintenance operations, we can be more patient
-                            delay = min(delay * 2, 300)  # Max 5 minutes
-                            await asyncio.sleep(delay)
-                            continue
+                        # For maintenance operations, we can be more patient
+                        delay = min(delay * 2, 300)  # Max 5 minutes
+                        await asyncio.sleep(delay)
+                        continue
 
-                        logger.error(f"Maintenance failed: {e}")
-                        self._maintenance_due = True
-                        raise ServiceError(f"Database maintenance failed: {str(e)}")
+                    logger.error(f"Maintenance failed: {e}")
+                    self._maintenance_due = True
+                    raise ServiceError(f"Database maintenance failed: {str(e)}")
 
     async def _start_recovery_task(self, error_type: DatabaseErrorType, coro: Callable) -> None:
         """Safely start or restart a recovery task"""

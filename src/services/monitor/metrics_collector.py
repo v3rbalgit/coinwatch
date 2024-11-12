@@ -14,7 +14,15 @@ logger = LoggerSetup.setup(__name__)
 MetricsType = Union[DatabaseMetrics, MarketDataMetrics, SystemMetrics]
 
 class MetricsCollector:
-    """Collects and aggregates metrics from all services"""
+    """
+    Collects and aggregates metrics from all services in the system.
+
+    Responsible for:
+    - Gathering metrics from individual services
+    - Collecting system-wide resource metrics
+    - Aggregating metrics into standardized formats
+    - Handling collection errors
+    """
 
     def __init__(self, coordinator: ServiceCoordinator):
         self.coordinator = coordinator
@@ -22,7 +30,12 @@ class MetricsCollector:
         self._collection_lock = asyncio.Lock()
 
     async def collect_metrics(self) -> Dict[str, MetricsType]:
-        """Collect metrics from all services"""
+        """
+        Collect metrics from all services and system resources.
+
+        Returns:
+            Dict[str, MetricsType]: Collected metrics mapped by service name
+        """
         async with self._collection_lock:
             # Request metrics from each service
             db_metrics = await self._request_service_metrics("database")
@@ -39,7 +52,18 @@ class MetricsCollector:
             return metrics
 
     async def _request_service_metrics(self, service: str) -> ServiceMetrics:
-        """Request metrics from a specific service"""
+        """
+        Request metrics from a specific service through the coordinator.
+
+        Args:
+            service: Name of the service to collect metrics from
+
+        Returns:
+            ServiceMetrics: Service-specific metrics, or error metrics if collection fails
+
+        Note:
+            Returns appropriate metrics type (DatabaseMetrics, MarketDataMetrics) based on service
+        """
         try:
             result = await self.coordinator.execute(Command(
                 type=MonitoringCommand.REPORT_METRICS,
@@ -111,7 +135,17 @@ class MetricsCollector:
                 )
 
     async def collect_system_metrics(self) -> SystemMetrics:
-        """Collect system resource metrics"""
+        """
+        Collect system resource metrics using psutil.
+
+        Returns:
+            SystemMetrics: System metrics including:
+            - CPU usage
+            - Memory usage
+            - Disk usage and free space
+            - Network I/O
+            - Process count
+        """
         try:
             cpu = psutil.cpu_percent(interval=1) / 100.0
             memory = psutil.virtual_memory()

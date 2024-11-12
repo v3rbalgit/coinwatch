@@ -7,6 +7,7 @@ from typing import List
 from src.core.coordination import ServiceCoordinator
 from src.repositories.kline import KlineRepository
 from src.repositories.symbol import SymbolRepository
+from src.services.monitor.service import MonitoringService
 
 from .config import BybitConfig, Config
 from .services.database import DatabaseService
@@ -24,15 +25,28 @@ class TestApplication:
     """Test version of the application that only processes specific symbols"""
 
     def __init__(self, test_symbols: List[SymbolName]):
+        # Setup logging
+        self.logger = LoggerSetup.setup(f"{__name__}.Application")
+
         # Load configuration
         self.config = Config()
-        self.test_symbols = test_symbols
 
-        # Setup logging
-        self.logger = LoggerSetup.setup(f"{__name__}.TestApplication")
+        # Initialize coordinator
+        self.coordinator = ServiceCoordinator()
 
-        # Initialize services
-        self.db_service = DatabaseService(self.config.database)
+        # Initialize database service
+        self.db_service = DatabaseService(
+            self.coordinator,
+            self.config.database
+        )
+
+        # Initialize monitoring service
+        self.monitor_service = MonitoringService(
+            self.coordinator,
+            self.config.monitoring
+        )
+
+        # Initialize exchange registry
         self.exchange_registry = ExchangeAdapterRegistry()
 
         # Override BybitAdapter's get_symbols method
@@ -44,13 +58,14 @@ class TestApplication:
 
         # Register test adapter
         self.test_adapter = TestBybitAdapter(BybitConfig(testnet=False))
-
-        # Initialize coordinator
-        self.coordinator = ServiceCoordinator()
+        self.test_symbols = test_symbols
 
     async def start(self) -> None:
         """Start the test application"""
         try:
+            # Start coordinator
+            await self.coordinator.start()
+
             # Initialize database
             await self.db_service.start()
 
@@ -61,8 +76,8 @@ class TestApplication:
             )
 
             # Create repositories
-            symbol_repo = SymbolRepository(self.db_service.session_factory)
-            kline_repo = KlineRepository(self.db_service.session_factory)
+            symbol_repo = SymbolRepository(self.db_service)
+            kline_repo = KlineRepository(self.db_service)
 
             # Setup market data service
             market_service = MarketDataService(
@@ -75,6 +90,7 @@ class TestApplication:
 
             # Start service
             await market_service.start()
+            await self.monitor_service.start()
 
             self.logger.info(f"Test application started with symbols: {self.test_symbols}")
 
@@ -82,7 +98,7 @@ class TestApplication:
             while True:
                 # Log service status periodically
                 self.logger.info("\nService Status Report:")
-                self.logger.info(market_service.get_service_status())
+                self.logger.info(self.monitor_service.get_service_status())
 
                 await asyncio.sleep(60)
 

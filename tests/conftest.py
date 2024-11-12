@@ -1,271 +1,131 @@
 # tests/conftest.py
-import pytest
+
 import os
-import logging
+import pytest
 import asyncio
-from decimal import Decimal
-from datetime import datetime, timezone
-from typing import AsyncGenerator, List, Optional, Generator
+from typing import AsyncGenerator
+import asyncpg
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
+import logging
 
-from src.core.protocols import ExchangeAdapter
-from src.config import Config, DatabaseConfig
-from src.models.base import Base
-from src.services.database import DatabaseService
-from src.repositories.market_data import SymbolRepository, KlineRepository
-from src.adapters.registry import ExchangeAdapterRegistry
-from src.utils.domain_types import SymbolName, Timeframe, ExchangeName, Timestamp
-from src.core.models import KlineData, SymbolInfo
-from src.config import Config, DatabaseConfig
+# Setup logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
-class TestConfigBase(Config):
-  """Base test configuration with common settings"""
-  def _init_log_config(self):
-      config = super()._init_log_config()
-      test_log_dir = os.path.join(os.path.dirname(__file__), 'test_logs')
-      os.makedirs(test_log_dir, exist_ok=True)
+# Database configuration
+def get_db_config():
+    config = {
+        'host': os.getenv('DB_HOST', 'localhost'),
+        'port': int(os.getenv('DB_PORT', '5433')),
+        'user': os.getenv('DB_USER', 'test_user'),
+        'password': os.getenv('DB_PASSWORD', 'test_password'),
+        'database': os.getenv('DB_NAME', 'coinwatch_test')
+    }
+    logger.debug(f"Database configuration (without password): {dict(config, password='*****')}")
+    return config
 
-      # Create a file handler
-      file_handler = logging.FileHandler(
-          os.path.join(test_log_dir, 'test.log'),
-          mode='w'
-      )
-      file_handler.setLevel(logging.DEBUG)
-      file_handler.setFormatter(logging.Formatter(
-          '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-      ))
+db_config = get_db_config()
 
-      # Add handler to root logger
-      logging.getLogger().addHandler(file_handler)
+async def wait_for_database(max_attempts: int = 30, delay: float = 1.0) -> None:
+    """Wait for database to become available"""
+    attempt = 0
+    last_error = None
 
-      return config
+    logger.info(f"Attempting to connect to database at {db_config['host']}:{db_config['port']}")
 
-class SQLiteTestConfig(TestConfigBase):
-  """SQLite configuration for unit tests"""
-  def __init__(self):
-      super().__init__()
-      self.database = DatabaseConfig(
-          host="",
-          port=0,
-          user="",
-          password="",
-          database="test_db.sqlite",
-          pool_size=5,
-          max_overflow=10,
-          pool_timeout=30,
-          pool_recycle=1800,
-          echo=True,
-          dialect="sqlite",
-          driver="aiosqlite"
-      )
-
-class MySQLTestConfig(TestConfigBase):
-  """MySQL configuration for integration tests"""
-  def __init__(self):
-      super().__init__()
-      self.database = DatabaseConfig(
-          host="localhost",
-          port=3306,
-          user="test",
-          password="test",
-          database="test_db",
-          pool_size=5,
-          max_overflow=10,
-          pool_timeout=30,
-          pool_recycle=1800,
-          echo=True,
-          dialect="mysql",
-          driver="aiomysql"
-      )
-
-# Mock Bybit Adapter for testing
-class MockBybitAdapter(ExchangeAdapter):
-  async def initialize(self) -> None:
-      pass
-
-  async def get_symbols(self) -> List[SymbolInfo]:
-      return [
-          SymbolInfo(
-              name=SymbolName("BTCUSDT"),
-              base_asset="BTC",
-              quote_asset="USDT",
-              price_precision=2,
-              qty_precision=6,
-              min_order_qty=Decimal("0.001")
-          ),
-          SymbolInfo(
-              name=SymbolName("ETHUSDT"),
-              base_asset="ETH",
-              quote_asset="USDT",
-              price_precision=2,
-              qty_precision=5,
-              min_order_qty=Decimal("0.01")
-          )
-      ]
-
-  async def get_klines(self,
-                      symbol: SymbolName,
-                      timeframe: Timeframe,
-                      start_time: Optional[Timestamp] = None) -> List[KlineData]:
-      current_time = Timestamp(int(datetime.now(timezone.utc).timestamp() * 1000))
-      interval = timeframe.to_milliseconds()
-
-      klines = []
-      for i in range(10):  # Generate 10 klines for testing
-          timestamp = current_time - (i * interval)
-          klines.append(KlineData(
-              timestamp=timestamp,
-              open_price=Decimal("50000.00"),
-              high_price=Decimal("51000.00"),
-              low_price=Decimal("49000.00"),
-              close_price=Decimal("50500.00"),
-              volume=Decimal("10.5"),
-              turnover=Decimal("525000.00"),
-              symbol=symbol,
-              timeframe=timeframe.value
-          ))
-      return klines
-
-  async def close(self) -> None:
-      pass
-
-def pytest_configure(config):
-    """Configure pytest for async testing"""
-    config.addinivalue_line(
-        "markers",
-        "asyncio: mark test as async"
-    )
-
-# Fixtures
-@pytest.fixture(scope="function")
-def event_loop():
-    """Create new event loop for each test"""
-    policy = asyncio.get_event_loop_policy()
-    loop = policy.new_event_loop()
-    yield loop
-    # Clean up
-    if loop.is_running():
-        loop.stop()
-    pending = asyncio.all_tasks(loop)
-    for task in pending:
-        task.cancel()
-    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-    loop.run_until_complete(loop.shutdown_asyncgens())
-    loop.close()
-
-@pytest.fixture(autouse=True)
-async def setup_test_loop(event_loop):
-    """Ensure event loop is properly set for each test"""
-    asyncio.set_event_loop(event_loop)
-    yield
-    # Cleanup any pending tasks
-    pending = [t for t in asyncio.all_tasks(event_loop) if not t.done()]
-    for task in pending:
-        task.cancel()
+    while attempt < max_attempts:
         try:
-            await asyncio.gather(task, return_exceptions=True)
-        except asyncio.CancelledError:
-            pass
+            logger.debug(f"Connection attempt {attempt + 1}/{max_attempts}")
+            conn = await asyncpg.connect(
+                host=db_config['host'],
+                port=db_config['port'],
+                user=db_config['user'],
+                password=db_config['password'],
+                database=db_config['database']
+            )
+            await conn.execute('SELECT 1')
+            await conn.close()
+            logger.info("Successfully connected to database")
+            return
+        except Exception as e:
+            last_error = e
+            attempt += 1
+            logger.warning(f"Database connection attempt {attempt} failed: {str(e)}")
+            await asyncio.sleep(delay)
 
-@pytest.fixture(autouse=True)
-async def clean_loop():
-    yield
-    loop = asyncio.get_event_loop()
-    tasks = [t for t in asyncio.all_tasks(loop) if not t.done()]
-    for task in tasks:
-        task.cancel()
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+    raise Exception(f"Database not available after {max_attempts} attempts. Last error: {last_error}")
 
-@pytest.fixture(scope="session")
-async def sqlite_config() -> Config:
-  return SQLiteTestConfig()
-
-@pytest.fixture(scope="session")
-async def mysql_config() -> Config:
-  return MySQLTestConfig()
-
+# Changed scope to function to match event_loop scope
 @pytest.fixture
-async def sqlite_db(sqlite_config: Config) -> AsyncGenerator[DatabaseService, None]:
-    db_service = DatabaseService(sqlite_config.database)
-    try:
-        await db_service.start()
+async def database_url() -> str:
+    """Get database URL for testing"""
+    url = f"postgresql+asyncpg://{db_config['user']}:{db_config['password']}@{db_config['host']}:{db_config['port']}/{db_config['database']}"
+    logger.debug(f"Database URL (without password): {url.replace(db_config['password'], '*****')}")
+    return url
 
-        if db_service.engine is None:
-            raise RuntimeError("Database engine not initialized")
-
-        async with db_service.engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        yield db_service
-    finally:
-        if db_service.engine is not None:
-            async with db_service.engine.begin() as conn:
-                await conn.run_sync(Base.metadata.drop_all)
-            await db_service.stop()
-
+# Changed scope to function to match event_loop scope
 @pytest.fixture
-async def mysql_db(mysql_config: Config) -> AsyncGenerator[DatabaseService, None]:
-  db_service = DatabaseService(mysql_config.database)
-  await db_service.start()
-
-  if db_service.engine is None:
-      raise RuntimeError("Database engine not initialized")
-
-  async with db_service.engine.begin() as conn:
-      await conn.run_sync(Base.metadata.create_all)
-
-  yield db_service
-
-  if db_service.engine is not None:
-      async with db_service.engine.begin() as conn:
-          await conn.run_sync(Base.metadata.drop_all)
-
-  for task in asyncio.all_tasks():
-        if task != asyncio.current_task():
-            task.cancel()
-
-  await db_service.stop()
-
-@pytest.fixture
-async def test_registry() -> AsyncGenerator[ExchangeAdapterRegistry, None]:
-  registry = ExchangeAdapterRegistry()
-  mock_adapter: ExchangeAdapter = MockBybitAdapter()
-  await registry.register(ExchangeName("bybit"), mock_adapter)
-  await registry.initialize_all()
-  yield registry
-
-@pytest.fixture(autouse=True)
-async def cleanup_registry():
-    """Cleanup any registered adapters after each test"""
-    yield
-    ExchangeAdapterRegistry()._adapters.clear()
-    ExchangeAdapterRegistry()._initialized_adapters.clear()
-
-@pytest.fixture
-def mock_current_time(monkeypatch):
-    """Mock current time for predictable timestamps"""
-    fixed_time = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    monkeypatch.setattr(
-        'src.utils.time.get_current_timestamp',
-        lambda: int(fixed_time.timestamp() * 1000)
+async def db_engine(database_url: str) -> AsyncGenerator[AsyncEngine, None]:
+    """Create database engine for testing"""
+    logger.info("Creating database engine")
+    engine = create_async_engine(
+        database_url,
+        echo=True,
+        pool_size=5,
+        max_overflow=10
     )
-    return fixed_time
+
+    try:
+        await wait_for_database()
+
+        # Create tables
+        async with engine.begin() as conn:
+            from src.models.base import Base
+            logger.info("Creating database tables")
+            await conn.run_sync(Base.metadata.create_all)
+
+        yield engine
+    except Exception as e:
+        logger.error(f"Error setting up database engine: {str(e)}")
+        raise
+    finally:
+        logger.info("Disposing database engine")
+        await engine.dispose()
 
 @pytest.fixture
-async def symbol_repo(sqlite_db: DatabaseService) -> AsyncGenerator[SymbolRepository, None]:
-  repo = SymbolRepository(sqlite_db.session_factory)
-  yield repo
+async def cleanup_database(db_engine: AsyncEngine) -> AsyncGenerator[None, None]:
+    """Clean up database after each test"""
+    logger.info("Starting database cleanup")
+    yield
+    async with db_engine.begin() as conn:
+        # First remove the policies
+        await conn.execute(text("""
+            DO $$
+            BEGIN
+                -- Remove policies if they exist
+                PERFORM remove_continuous_aggregate_policy('kline_1h');
+                PERFORM remove_continuous_aggregate_policy('kline_4h');
+                PERFORM remove_continuous_aggregate_policy('kline_1d');
+            EXCEPTION
+                WHEN undefined_object THEN
+                    NULL;
+            END $$;
+        """))
+        logger.debug("Removed continuous aggregate policies")
 
-@pytest.fixture
-async def mysql_symbol_repo(mysql_db: DatabaseService) -> AsyncGenerator[SymbolRepository, None]:
-  repo = SymbolRepository(mysql_db.session_factory)
-  yield repo
+        # Then drop the materialized views
+        await conn.execute(text("""
+            DROP MATERIALIZED VIEW IF EXISTS kline_1d;
+            DROP MATERIALIZED VIEW IF EXISTS kline_4h;
+            DROP MATERIALIZED VIEW IF EXISTS kline_1h;
+        """))
+        logger.debug("Dropped materialized views")
 
-@pytest.fixture
-async def kline_repo(sqlite_db: DatabaseService) -> AsyncGenerator[KlineRepository, None]:
-  repo = KlineRepository(sqlite_db.session_factory)
-  yield repo
+        # Finally truncate the tables
+        tables = ['symbols', 'kline_data']
+        for table in tables:
+            logger.debug(f"Truncating table: {table}")
+            await conn.execute(text(f'TRUNCATE TABLE {table} CASCADE;'))
 
-@pytest.fixture
-async def mysql_kline_repo(mysql_db: DatabaseService) -> AsyncGenerator[KlineRepository, None]:
-  repo = KlineRepository(mysql_db.session_factory)
-  yield repo
+    logger.info("Database cleanup completed")

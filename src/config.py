@@ -48,12 +48,8 @@ class TimescaleConfig:
 
     def __post_init__(self):
         # Convert retention days from env if provided
-        retention_str = os.getenv('TIMESCALE_RETENTION_DAYS', '0')
-        if int(retention_str):
-            try:
-                self.retention_days = int(retention_str)
-            except ValueError:
-                raise ConfigurationError(f"Invalid retention days value: {retention_str}")
+        if self.retention_days and self.retention_days < 0:
+            raise ConfigurationError(f"Invalid retention days value: {self.retention_days}")
 
 @dataclass
 class DatabaseConfig:
@@ -84,6 +80,7 @@ class DatabaseConfig:
     max_overflow: int = 30
     pool_timeout: int = 30
     pool_recycle: int = 1800
+    maintenance_window: int = 3600
     echo: bool = False
     pool_use_lifo: bool = True  # LIFO for better connection reuse
     connect_args: Dict[str, str | int] = field(default_factory=lambda: {
@@ -233,12 +230,13 @@ class Config:
                 chunk_interval=os.getenv('TIMESCALE_CHUNK_INTERVAL', '7 days'),
                 compress_after=os.getenv('TIMESCALE_COMPRESS_AFTER', '30 days'),
                 drop_after=os.getenv('TIMESCALE_DROP_AFTER', None),
+                retention_days=int(os.getenv('TIMESCALE_RETENTION_DAYS', '0')),
                 replication_factor=int(os.getenv('TIMESCALE_REPLICATION_FACTOR', '1'))
             )
 
             return DatabaseConfig(
                 host=os.getenv('DB_HOST', 'localhost'),
-                port=int(os.getenv('DB_PORT', '5432')),
+                port=int(os.getenv('DB_PORT', '5433')),
                 user=os.getenv('DB_USER', 'user'),
                 password=os.getenv('DB_PASSWORD', 'password'),
                 database=os.getenv('DB_NAME', 'coinwatch'),
