@@ -345,15 +345,15 @@ class BybitAdapter(ExchangeAdapter):
                     continue
 
                 klines.append(KlineData(
-                    timestamp=timestamp,
+                    timestamp=Timestamp(timestamp),
                     open_price=Decimal(str(item[1])),
                     high_price=Decimal(str(item[2])),
                     low_price=Decimal(str(item[3])),
                     close_price=Decimal(str(item[4])),
                     volume=Decimal(str(item[5])),
                     turnover=Decimal(str(item[6])),
-                    symbol=symbol.name,
-                    timeframe=timeframe.value
+                    symbol=symbol,
+                    timeframe=timeframe
                 ))
 
             return klines

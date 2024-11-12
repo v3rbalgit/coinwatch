@@ -1,6 +1,7 @@
 # src/managers/timeframe.py
 
 import asyncio
+from datetime import timedelta
 from decimal import Decimal
 from typing import List, Optional, Set
 from sqlalchemy import text
@@ -41,9 +42,7 @@ class TimeframeManager:
 
         # Common timeframes stored as continuous aggregates
         self._stored_timeframes = {
-            Timeframe.HOUR_1,
-            Timeframe.HOUR_4,
-            Timeframe.DAY_1
+            tf for tf in Timeframe if tf.is_stored_timeframe()
         }
 
         # Cache of valid higher timeframes
@@ -244,49 +243,82 @@ class TimeframeManager:
             List[KlineData]: Kline data in ascending order
         """
         async with self.kline_repository.db_service.get_session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
-            # Query the appropriate continuous aggregate view
-            stmt = text("""
+            start_dt = TimeUtils.from_timestamp(start_time)
+            end_dt = TimeUtils.from_timestamp(end_time)
+
+            stmt = text(f"""
+                WITH aligned_klines AS (
+                    SELECT
+                        time_bucket(:bucket, timestamp) as bucket_timestamp,
+                        first(open_price, timestamp) as open_price,
+                        max(high_price) as high_price,
+                        min(low_price) as low_price,
+                        last(close_price, timestamp) as close_price,
+                        sum(volume) as volume,
+                        sum(turnover) as turnover,
+                        s.name as symbol_name,
+                        s.exchange as symbol_exchange,  -- Add exchange to uniquely identify symbol
+                        k.timeframe
+                    FROM {timeframe.continuous_aggregate_view} k
+                    JOIN symbols s ON k.symbol_id = s.id
+                    WHERE s.name = :symbol_name
+                    AND s.exchange = :exchange  -- Add exchange filter
+                    AND k.timestamp BETWEEN :start_time AND :end_time
+                    GROUP BY
+                        time_bucket(:bucket, timestamp),
+                        s.name,
+                        s.exchange,  -- Include exchange in GROUP BY
+                        k.timeframe
+                    ORDER BY bucket_timestamp DESC
+                    LIMIT :limit
+                )
                 SELECT
-                    k.start_time,
-                    k.open_price,
-                    k.high_price,
-                    k.low_price,
-                    k.close_price,
-                    k.volume,
-                    k.turnover,
-                    s.name as symbol,
-                    k.timeframe
-                FROM kline_data k
-                JOIN symbols s ON k.symbol_id = s.id
-                WHERE s.name = :symbol
-                AND k.timeframe = :timeframe
-                AND k.start_time BETWEEN :start_time AND :end_time
-                ORDER BY k.start_time DESC
-                LIMIT :limit
+                    EXTRACT(EPOCH FROM bucket_timestamp) * 1000 as timestamp,
+                    open_price,
+                    high_price,
+                    low_price,
+                    close_price,
+                    volume,
+                    turnover,
+                    symbol_name,
+                    symbol_exchange,
+                    timeframe
+                FROM aligned_klines
+                ORDER BY bucket_timestamp DESC;
             """)
 
             result = await session.execute(
                 stmt,
                 {
-                    "symbol": symbol.name,
-                    "timeframe": timeframe.value,
-                    "start_time": start_time,
-                    "end_time": end_time,
+                    "symbol_name": symbol.name,
+                    "exchange": symbol.exchange,  # Add exchange parameter
+                    "start_time": start_dt,
+                    "end_time": end_dt,
+                    "bucket": timeframe.get_bucket_interval(),
                     "limit": limit or 2147483647
                 }
             )
 
             return [
                 KlineData(
-                    timestamp=row.start_time,
+                    timestamp=Timestamp(row.timestamp),
                     open_price=Decimal(str(row.open_price)),
                     high_price=Decimal(str(row.high_price)),
                     low_price=Decimal(str(row.low_price)),
                     close_price=Decimal(str(row.close_price)),
                     volume=Decimal(str(row.volume)),
                     turnover=Decimal(str(row.turnover)),
-                    symbol=row.symbol,
-                    timeframe=row.timeframe
+                    symbol=SymbolInfo(  # Reconstruct full SymbolInfo
+                        name=row.symbol_name,
+                        exchange=row.symbol_exchange,
+                        base_asset=symbol.base_asset,  # Use from original symbol
+                        quote_asset=symbol.quote_asset,
+                        price_precision=symbol.price_precision,
+                        qty_precision=symbol.qty_precision,
+                        min_order_qty=symbol.min_order_qty,
+                        launch_time=symbol.launch_time
+                    ),
+                    timeframe=Timeframe(row.timeframe)
                 )
                 for row in result
             ]
@@ -311,56 +343,90 @@ class TimeframeManager:
             List[KlineData]: Kline data in ascending order
         """
         async with self.kline_repository.db_service.get_session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
+            start_dt = TimeUtils.from_timestamp(start_time)
+            end_dt = TimeUtils.from_timestamp(end_time)
+
             stmt = text("""
-                WITH aggregated AS (
+                WITH base_aligned AS (
                     SELECT
-                        (EXTRACT(EPOCH FROM time_bucket(:bucket, to_timestamp(start_time/1000))) * 1000)::bigint as start_time,
-                        first(open_price, start_time) as open_price,
+                        time_bucket(:bucket, k.timestamp) as bucket_timestamp,
+                        first(open_price, timestamp) as open_price,
                         max(high_price) as high_price,
                         min(low_price) as low_price,
-                        last(close_price, start_time) as close_price,
+                        last(close_price, timestamp) as close_price,
                         sum(volume) as volume,
-                        sum(turnover) as turnover
+                        sum(turnover) as turnover,
+                        s.name as symbol_name,
+                        s.exchange as symbol_exchange,  -- Add exchange to uniquely identify symbol
+                        :target_timeframe as timeframe,
+                        count(*) as candle_count
                     FROM kline_data k
                     JOIN symbols s ON k.symbol_id = s.id
-                    WHERE s.name = :symbol
+                    WHERE s.name = :symbol_name
+                    AND s.exchange = :exchange  -- Add exchange filter
                     AND k.timeframe = :base_timeframe
-                    AND k.start_time BETWEEN :start_time AND :end_time
-                    GROUP BY time_bucket(:bucket, to_timestamp(start_time/1000))
+                    AND k.timestamp BETWEEN :start_time AND :end_time
+                    GROUP BY
+                        time_bucket(:bucket, k.timestamp),
+                        s.name,
+                        s.exchange  -- Include exchange in GROUP BY
+                    HAVING count(*) >= :min_candles
+                    ORDER BY bucket_timestamp DESC
+                    LIMIT :limit
                 )
                 SELECT
-                    a.*,
-                    :symbol as symbol,
-                    :timeframe as timeframe
-                FROM aggregated a
-                ORDER BY start_time DESC
-                LIMIT :limit
+                    EXTRACT(EPOCH FROM bucket_timestamp) * 1000 as timestamp,
+                    open_price,
+                    high_price,
+                    low_price,
+                    close_price,
+                    volume,
+                    turnover,
+                    symbol_name,
+                    symbol_exchange,
+                    timeframe,
+                    candle_count
+                FROM base_aligned
+                ORDER BY bucket_timestamp DESC;
             """)
+
+            min_candles = timeframe.to_milliseconds() // self.base_timeframe.to_milliseconds()
 
             result = await session.execute(
                 stmt,
                 {
-                    "symbol": symbol.name,
-                    "timeframe": timeframe.value,
+                    "symbol_name": symbol.name,
+                    "exchange": symbol.exchange,  # Add exchange parameter
                     "base_timeframe": self.base_timeframe.value,
-                    "start_time": start_time,
-                    "end_time": end_time,
-                    "bucket": f"{timeframe.to_milliseconds() // 1000} seconds",
-                    "limit": limit or 2147483647  # 2^31 - 1 (max postgres integer limit)
+                    "target_timeframe": timeframe.value,
+                    "start_time": start_dt,
+                    "end_time": end_dt,
+                    "bucket": timeframe.get_bucket_interval(),
+                    "min_candles": min_candles,
+                    "limit": limit or 2147483647
                 }
             )
 
             return [
                 KlineData(
-                    timestamp=row.start_time,
+                    timestamp=Timestamp(row.timestamp),
                     open_price=Decimal(str(row.open_price)),
                     high_price=Decimal(str(row.high_price)),
                     low_price=Decimal(str(row.low_price)),
                     close_price=Decimal(str(row.close_price)),
                     volume=Decimal(str(row.volume)),
                     turnover=Decimal(str(row.turnover)),
-                    symbol=row.symbol,
-                    timeframe=row.timeframe
+                    symbol=SymbolInfo(  # Reconstruct full SymbolInfo
+                        name=row.symbol_name,
+                        exchange=row.symbol_exchange,
+                        base_asset=symbol.base_asset,  # Use from original symbol
+                        quote_asset=symbol.quote_asset,
+                        price_precision=symbol.price_precision,
+                        qty_precision=symbol.qty_precision,
+                        min_order_qty=symbol.min_order_qty,
+                        launch_time=symbol.launch_time
+                    ),
+                    timeframe=Timeframe(row.timeframe)
                 )
                 for row in result
             ]
@@ -369,17 +435,52 @@ class TimeframeManager:
                            timestamp: Optional[Timestamp],
                            timeframe: Timeframe,
                            round_up: bool = False) -> Optional[Timestamp]:
-        """Align timestamp to timeframe boundary"""
+        """
+        Align timestamp to timeframe boundary ensuring proper interval alignment.
+
+        Examples:
+        - 15min: :00, :15, :30, :45
+        - 30min: :00, :30
+        - 1h: :00
+        - 4h: :00, 04:00, 08:00, etc.
+        - 1d: 00:00 UTC
+        """
         if timestamp is None:
             return None
 
-        interval_ms = timeframe.to_milliseconds()
-        ts = timestamp - (timestamp % interval_ms)
+        # Convert to datetime for easier manipulation
+        dt = TimeUtils.from_timestamp(timestamp)
 
-        if round_up and ts < timestamp:
-            ts += interval_ms
+        if timeframe == Timeframe.DAY_1:
+            # Align to UTC midnight
+            aligned = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        elif timeframe == Timeframe.WEEK_1:
+            # Align to UTC midnight Monday
+            aligned = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            days_since_monday = dt.weekday()
+            aligned -= timedelta(days=days_since_monday)
+        else:
+            # For minute-based timeframes
+            minutes = int(timeframe.value) if timeframe.value.isdigit() else 0
+            total_minutes = dt.hour * 60 + dt.minute
+            aligned_minutes = (total_minutes // minutes) * minutes
 
-        return Timestamp(ts)
+            aligned = dt.replace(
+                hour=aligned_minutes // 60,
+                minute=aligned_minutes % 60,
+                second=0,
+                microsecond=0
+            )
+
+        if round_up and aligned < dt:
+            if timeframe == Timeframe.WEEK_1:
+                aligned += timedelta(days=7)
+            elif timeframe == Timeframe.DAY_1:
+                aligned += timedelta(days=1)
+            else:
+                aligned += timedelta(minutes=minutes)
+
+        return TimeUtils.to_timestamp(aligned)
 
     async def _check_data_gaps(self,
                               symbol: SymbolInfo,
@@ -414,20 +515,37 @@ class TimeframeManager:
                                           start_time: Timestamp,
                                           end_time: Timestamp) -> None:
         """Refresh TimescaleDB continuous aggregate for given period"""
-        async with self.kline_repository.db_service.get_session(isolation_level=IsolationLevel.SERIALIZABLE) as session:
-            start_dt = TimeUtils.from_timestamp(start_time)
-            end_dt = TimeUtils.from_timestamp(end_time)
+        if not timeframe.is_stored_timeframe():
+            logger.debug(f"Skipping refresh for non-stored timeframe: {timeframe.value}")
+            return
 
-            await session.execute(
-                text(f"""
-                CALL refresh_continuous_aggregate(
-                    'kline_{timeframe.value}',
-                    :start_dt,
-                    :end_dt
-                );
-                """),
-                {
-                    "start_dt": start_dt,
-                    "end_dt": end_dt
-                }
-            )
+        async with self.kline_repository.db_service.get_session(isolation_level=IsolationLevel.SERIALIZABLE) as session:
+            # Align to timeframe boundaries
+            aligned_start = self._align_to_timeframe(start_time, timeframe, round_up=False)
+            aligned_end = self._align_to_timeframe(end_time, timeframe, round_up=True)
+
+            # Only proceed if we have valid timestamps
+            if aligned_start is not None and aligned_end is not None:
+                start_dt = TimeUtils.from_timestamp(aligned_start)
+                end_dt = TimeUtils.from_timestamp(aligned_end)
+
+                view_name = timeframe.continuous_aggregate_view
+                if view_name:
+                    await session.execute(
+                        text("""
+                        CALL refresh_continuous_aggregate(
+                            :view_name,
+                            :start_dt,
+                            :end_dt
+                        );
+                        """),
+                        {
+                            "view_name": view_name,
+                            "start_dt": start_dt,
+                            "end_dt": end_dt
+                        }
+                    )
+                    logger.debug(f"Refreshed continuous aggregate {view_name} for period "
+                            f"{start_dt} to {end_dt}")
+            else:
+                logger.warning("Skipping continuous aggregate refresh due to invalid timestamps")

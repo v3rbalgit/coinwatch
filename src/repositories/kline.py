@@ -41,16 +41,12 @@ class KlineRepository(Repository[Kline]):
 
                 stmt = text("""
                     SELECT COALESCE(
-                        (
-                            SELECT start_time
-                            FROM kline_data
-                            WHERE symbol_id = :symbol_id
-                            AND timeframe = :timeframe
-                            ORDER BY start_time DESC
-                            LIMIT 1
-                        ),
+                        EXTRACT(EPOCH FROM MAX(timestamp)) * 1000,
                         :default_time
-                    ) as latest_time;
+                    )::BIGINT as latest_time
+                    FROM kline_data
+                    WHERE symbol_id = :symbol_id
+                    AND timeframe = :timeframe;
                 """)
 
                 default_time = symbol_record.first_trade_time
@@ -107,7 +103,7 @@ class KlineRepository(Repository[Kline]):
                                 valid_klines.append({
                                     "symbol_id": symbol_id,
                                     "timeframe": timeframe.value,
-                                    "start_time": k[0],
+                                    "timestamp": TimeUtils.from_timestamp(Timestamp(k[0])),  # Convert to datetime
                                     "open_price": k[1],
                                     "high_price": k[2],
                                     "low_price": k[3],
@@ -122,7 +118,7 @@ class KlineRepository(Repository[Kline]):
                     if valid_klines:
                         stmt = insert(Kline).values(valid_klines)
                         stmt = stmt.on_conflict_do_update(
-                            index_elements=['symbol_id', 'timeframe', 'start_time'],
+                            index_elements=['symbol_id', 'timeframe', 'timestamp'],
                             set_=dict(
                                 open_price=stmt.excluded.open_price,
                                 high_price=stmt.excluded.high_price,
@@ -155,36 +151,40 @@ class KlineRepository(Repository[Kline]):
         """Find gaps in time series data using TimescaleDB features"""
         try:
             async with self.db_service.get_session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
+                # Convert timestamps to datetime for the query
+                start_dt = TimeUtils.from_timestamp(start_time)
+                end_dt = TimeUtils.from_timestamp(end_time)
+
                 stmt = text("""
                     WITH time_series AS (
                         SELECT
-                            start_time,
-                            LEAD(start_time) OVER (ORDER BY start_time) as next_start,
+                            EXTRACT(EPOCH FROM timestamp) * 1000 as ts_start,
+                            EXTRACT(EPOCH FROM lead(timestamp) OVER (ORDER BY timestamp)) * 1000 as ts_next,
                             :interval as expected_interval
                         FROM kline_data k
                         JOIN symbols s ON k.symbol_id = s.id
                         WHERE s.name = :symbol
                         AND s.exchange = :exchange
                         AND k.timeframe = :timeframe
-                        AND k.start_time BETWEEN :start_time AND :end_time
+                        AND k.timestamp BETWEEN :start_time AND :end_time
                     )
-                    SELECT start_time, next_start
+                    SELECT ts_start, ts_next
                     FROM time_series
-                    WHERE (next_start - start_time) > (expected_interval * 2)
-                    ORDER BY start_time;
+                    WHERE (ts_next - ts_start) > (expected_interval * 2)
+                    ORDER BY ts_start;
                 """)
 
                 result = await session.execute(stmt, {
                     "symbol": symbol.name,
                     "exchange": symbol.exchange,
                     "timeframe": timeframe.value,
-                    "start_time": start_time,
-                    "end_time": end_time,
+                    "start_time": start_dt,
+                    "end_time": end_dt,
                     "interval": timeframe.to_milliseconds()
                 })
 
-                return [(Timestamp(row.start_time + timeframe.to_milliseconds()),
-                         Timestamp(row.next_start))
+                return [(Timestamp(int(row.ts_start + timeframe.to_milliseconds())),
+                         Timestamp(int(row.ts_next)))
                         for row in result]
 
         except Exception as e:
