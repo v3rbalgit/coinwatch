@@ -7,15 +7,15 @@ from typing import Optional, Set
 from .collector import DataCollector
 from .synchronizer import BatchSynchronizer
 
-from ...adapters.registry import ExchangeAdapterRegistry
 from ...config import MarketDataConfig
 from ...core.models import SymbolInfo
 from ...core.monitoring import MarketDataMetrics
 from ...core.coordination import Command, CommandResult, MarketDataCommand, MonitoringCommand, ServiceCoordinator
 from ...core.exceptions import ServiceError, ValidationError
+from ...services.base import ServiceBase
+from ...adapters.registry import ExchangeAdapterRegistry
 from ...repositories.kline import KlineRepository
 from ...repositories.symbol import SymbolRepository
-from ...services.base import ServiceBase
 from ...utils.logger import LoggerSetup
 from ...utils.domain_types import CriticalCondition, ServiceStatus, Timeframe
 from ...utils.time import TimeUtils
