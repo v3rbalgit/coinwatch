@@ -10,7 +10,6 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker
 )
 from sqlalchemy.exc import ProgrammingError
-from sqlalchemy.pool import AsyncAdaptedQueuePool
 from contextlib import asynccontextmanager
 from sqlalchemy import text
 from enum import Enum
@@ -74,7 +73,7 @@ class DatabaseService(ServiceBase):
         self._recovery_lock = asyncio.Lock()
         self._pool_lock = asyncio.Lock()
         self._maintenance_lock = asyncio.Lock()
-        self._transaction_semaphore = asyncio.BoundedSemaphore(config.pool_size)
+        self._session_semaphore = asyncio.BoundedSemaphore(config.pool_size)
 
         # Configure retry strategy
         retry_config = RetryConfig(
@@ -87,21 +86,7 @@ class DatabaseService(ServiceBase):
         self._configure_retry_strategy()
 
         # Convert config to SQLAlchemy engine options
-        self._engine_options = {
-            'poolclass': AsyncAdaptedQueuePool,
-            'pool_size': config.pool_size,
-            'max_overflow': config.max_overflow,
-            'pool_timeout': config.pool_timeout,
-            'pool_recycle': config.pool_recycle,
-            'echo': config.echo,
-            'connect_args': {
-                'server_settings': {
-                    'statement_timeout': '30000',  # 30 seconds
-                    'idle_in_transaction_session_timeout': '60000',  # 1 minute
-                    'lock_timeout': '10000'  # 10 seconds
-                }
-            }
-        }
+        self._engine_options = config.get_engine_options()
 
         # Track maintenance windows
         self._last_maintenance: Optional[int] = None
@@ -126,7 +111,7 @@ class DatabaseService(ServiceBase):
         self._retry_strategy.add_retryable_error(
             OperationalError,        # Covers most PostgreSQL errors
             DisconnectionError,      # Connection issues
-            TimeoutError            # Statement timeout
+            TimeoutError             # Statement timeout
         )
 
         # Configure specific delays for different error types
@@ -247,7 +232,7 @@ class DatabaseService(ServiceBase):
             # Cleanup pool
             if self.engine:
                 # Wait for active transactions to complete
-                async with self._transaction_semaphore:
+                async with self._session_semaphore:
                     pass
                 # Dispose engine
                 await self.engine.dispose()
@@ -263,12 +248,15 @@ class DatabaseService(ServiceBase):
             raise ServiceError(f"Database shutdown failed: {str(e)}")
 
     @asynccontextmanager
-    async def get_session(self, isolation_level: Optional[IsolationLevel] = None) -> AsyncGenerator[AsyncSession, None]:
+    async def get_session(self,
+                          isolation_level: Optional[IsolationLevel] = None,
+                          use_transaction: bool = True) -> AsyncGenerator[AsyncSession, None]:
         """
         Transaction management with PostgreSQL-specific optimizations
 
         Args:
             isolation_level: Transaction isolation level (READ COMMITTED, REPEATABLE READ, etc.)
+            use_transaction: Whether to wrap session in a transaction (default: True)
 
         Returns:
             AsyncGenerator yielding an AsyncSession
@@ -279,20 +267,28 @@ class DatabaseService(ServiceBase):
         if not self.session_factory:
             raise ServiceError("Database service not initialized")
 
-        async with self._transaction_semaphore:
+        async with self._session_semaphore:
             attempt = 0
 
             while True:
                 try:
-                    async with self.session_factory() as session:
-                    # Start transaction with specified isolation level
-                        async with session.begin():
+                    session = self.session_factory()
+                    try:
+                        if use_transaction:
+                            async with session.begin():
+                                if isolation_level:
+                                    await session.execute(
+                                        text(f"SET TRANSACTION ISOLATION LEVEL {isolation_level.value}")
+                                    )
+                                yield session
+                        else:
+                            # Use session without transaction
                             if isolation_level:
-                                await session.execute(
-                                    text(f"SET TRANSACTION ISOLATION LEVEL {isolation_level.value}")
-                                )
+                                logger.warning("Isolation level ignored for non-transactional session")
                             yield session
-                            return
+                    finally:
+                        await session.close()
+                    break
 
                 except Exception as e:
                     # Track error for monitoring
@@ -807,73 +803,6 @@ class DatabaseService(ServiceBase):
             DatabaseErrorType.CONNECTION_TIMEOUT
         )
 
-    async def _adjust_pool_setting(self,
-                                 setting: str,
-                                 new_value: int,
-                                 error_type: DatabaseErrorType) -> None:
-        """
-        Adjust pool setting with recovery handling
-
-        Args:
-            setting: Configuration key to adjust ('max_overflow' or 'pool_timeout')
-            new_value: New value for the setting
-            error_type: Type of error being handled
-        """
-        async with self._recovery_lock:
-            if new_value == self._config[setting]:
-                return
-
-            original_value = self._config[setting]
-            logger.info(f"Adjusting {setting} from {original_value} to {new_value}")
-
-            await self._reconfigure_pool(**{setting: new_value})
-
-            # Start recovery process if we increased the value
-            if new_value > original_value:
-                await self._start_recovery_task(
-                    error_type,
-                    lambda: self._recover_pool_setting(setting, original_value)
-                )
-
-    async def _recover_pool_setting(self, setting: str, target_value: int) -> None:
-        """
-        Gradually recover a pool setting to its original value
-
-        Args:
-            setting: Configuration key to recover
-            target_value: Original value to recover to
-        """
-        try:
-            while True:
-                await asyncio.sleep(300)  # Check every 5 minutes
-
-                # Check if errors have subsided
-                error_count = len(self._error_tracker.get_recent_errors(window_minutes=5))
-
-                if error_count == 0:
-                    current_value = self._config[setting]
-                    if current_value <= target_value:
-                        break
-
-                    # Gradually decrease value
-                    step = 5 if setting == 'pool_timeout' else 5  # Adjust step size as needed
-                    new_value = max(target_value, current_value - step)
-                    await self._reconfigure_pool(**{setting: new_value})
-
-                    if new_value == target_value:
-                        break
-
-        except asyncio.CancelledError:
-            logger.info(f"{setting} recovery cancelled")
-        except Exception as e:
-            logger.error(f"Error during {setting} recovery: {e}")
-        finally:
-            async with self._recovery_lock:
-                error_type = {
-                    'max_overflow': DatabaseErrorType.CONNECTION_OVERFLOW,
-                    'pool_timeout': DatabaseErrorType.CONNECTION_TIMEOUT
-                }[setting]
-                self._recovery_tasks.pop(error_type, None)
 
     async def _handle_deadlock(self, condition: CriticalCondition) -> None:
         """Handle deadlock conditions with analysis"""
@@ -1015,21 +944,26 @@ class DatabaseService(ServiceBase):
 
             if condition["severity"] == "critical" or lag_seconds > 300:  # 5 minutes lag
                 logger.warning(
-                    f"Critical replication lag: {condition['message']}, "
-                    f"lag: {lag_seconds} seconds"
+                    f"{condition['message']}: "
+                    f"{lag_seconds} seconds"
                 )
-                async with self.get_session() as session:
+                async with self.get_session(use_transaction=False) as session:
                     # Enable synchronous replication
+                    await session.execute(text("COMMIT"))
                     await session.execute(text("""
                         ALTER SYSTEM SET synchronous_commit TO 'on';
+                    """))
+
+                async with self.get_session() as session:
+                    await session.execute(text("""
                         SELECT pg_reload_conf();
                     """))
 
-                    logger.info("Enabled synchronous replication to handle lag")
-                    await self._start_recovery_task(
-                        DatabaseErrorType.REPLICATION_LAG,
-                        lambda: self._monitor_replication_recovery(lag_seconds)
-                    )
+                logger.info("Enabled synchronous replication to handle lag")
+                await self._start_recovery_task(
+                    DatabaseErrorType.REPLICATION_LAG,
+                    lambda: self._monitor_replication_recovery(lag_seconds)
+                )
             else:
                 logger.info(f"Replication lag warning: {condition['message']}")
 
@@ -1038,26 +972,27 @@ class DatabaseService(ServiceBase):
         async with self._maintenance_lock:
             current_time = TimeUtils.get_current_timestamp()
 
-
             logger.info(f"Starting maintenance: {condition['message']}")
             attempt = 0
 
             while True:
                 try:
-                    async with self.get_session(isolation_level=IsolationLevel.SERIALIZABLE) as session:
-                        # Run VACUUM ANALYZE on critical tables
-                        await session.execute(text("""
-                            VACUUM ANALYZE kline_data;
-                            VACUUM ANALYZE symbols;
-                        """))
+                    # Use non-transactional session for VACUUM operations
+                    async with self.get_session(use_transaction=False) as session:
+                        logger.info("Running VACUUM ANALYZE on critical tables")
+                        await session.execute(text("COMMIT"))  # Ensure no active transaction
+                        await session.execute(text("VACUUM ANALYZE kline_data"))
+                        await session.execute(text("VACUUM ANALYZE symbols"))
 
-                        # Update table statistics
-                        await session.execute(text("ANALYZE;"))
+                    # Use transactional session for regular ANALYZE
+                    async with self.get_session() as session:
+                        logger.info("Updating table statistics")
+                        await session.execute(text("ANALYZE"))
 
-                        self._last_maintenance = current_time
-                        self._maintenance_due = False
-                        logger.info("Database maintenance completed successfully")
-                        return
+                    self._last_maintenance = current_time
+                    self._maintenance_due = False
+                    logger.info("Database maintenance completed successfully")
+                    return
 
                 except Exception as e:
                     should_retry, reason = self._retry_strategy.should_retry(attempt, e)
@@ -1093,6 +1028,152 @@ class DatabaseService(ServiceBase):
 
             # Start new recovery task
             self._recovery_tasks[error_type] = asyncio.create_task(coro())
+
+    async def _update_session_semaphore(self, new_size: int) -> None:
+        """
+        Safely update the session semaphore size
+
+        Args:
+            new_size: New maximum number of concurrent sessions
+        """
+        if new_size <= 0:
+            raise ValueError("Semaphore size must be positive")
+
+        # Create new semaphore with updated size
+        new_semaphore = asyncio.BoundedSemaphore(new_size)
+
+        # Wait for all current operations to complete
+        async with self._pool_lock:
+            # Wait for any ongoing operations to complete
+            async with self._session_semaphore:
+                self._session_semaphore = new_semaphore
+                logger.info(f"Session semaphore updated to {new_size} concurrent sessions")
+
+    async def _adjust_pool_setting(self,
+                           setting: str,
+                           new_value: int,
+                           error_type: DatabaseErrorType) -> None:
+        """
+        Adjust pool setting with recovery handling
+
+        Args:
+            setting: Configuration key to adjust ('max_overflow' or 'pool_timeout')
+            new_value: New value for the setting
+            error_type: Type of error being handled
+        """
+        async with self._recovery_lock:
+            current_value = getattr(self._config, setting)
+            if new_value == current_value:
+                return
+
+            logger.info(f"Adjusting {setting} from {current_value} to {new_value}")
+
+            await self._reconfigure_pool(**{setting: new_value})
+
+            # Start recovery process if we increased the value
+            if new_value > current_value:
+                await self._start_recovery_task(
+                    error_type,
+                    lambda: self._recover_pool_setting(setting, current_value)
+                )
+
+    async def _reconfigure_pool(self, **config_updates: Union[int, bool]) -> None:
+        """
+        Safely reconfigure connection pool with enhanced error handling
+
+        Args:
+            **config_updates: Configuration updates as keyword arguments
+        """
+        async with self._pool_lock:
+            old_engine = self.engine
+            attempt = 0
+
+            while True:
+                try:
+                    # Create dictionary of valid updates
+                    validated_updates = {
+                        k: v for k, v in config_updates.items()
+                        if hasattr(self._config, k)
+                    }
+
+                    # Update configuration using the update method
+                    self._config.update(validated_updates)
+
+                    # Create new engine with updated config
+                    self.engine = self._create_engine()
+                    self.session_factory = async_sessionmaker(
+                        bind=self.engine,
+                        class_=AsyncSession,
+                        expire_on_commit=False,
+                        autoflush=False
+                    )
+
+                    # Verify new configuration
+                    async with self.get_session() as session:
+                        await session.execute(text("SELECT 1"))
+
+                    if old_engine:
+                        await old_engine.dispose()
+
+                    logger.info(f"Pool reconfigured with {validated_updates}")
+                    return
+
+                except Exception as e:
+                    should_retry, reason = self._retry_strategy.should_retry(attempt, e)
+                    if should_retry:
+                        attempt += 1
+                        delay = self._retry_strategy.get_delay(attempt, e)
+
+                        logger.warning(
+                            f"Pool reconfiguration error, "
+                            f"retry {attempt} after {delay:.2f}s: {str(e)}"
+                        )
+
+                        await asyncio.sleep(delay)
+                        continue
+
+                    self.engine = old_engine
+                    logger.error(f"Pool reconfiguration failed: {e}")
+                    raise ServiceError(f"Pool reconfiguration failed: {str(e)}")
+
+    async def _recover_pool_setting(self, setting: str, target_value: int) -> None:
+        """
+        Gradually recover a pool setting to its original value
+
+        Args:
+            setting: Configuration key to recover
+            target_value: Original value to recover to
+        """
+        try:
+            while True:
+                await asyncio.sleep(300)
+
+                current_value = getattr(self._config, setting)
+                if current_value <= target_value:
+                    break
+
+                # Only proceed with adjustment if no recent errors
+                error_count = len(self._error_tracker.get_recent_errors(window_minutes=5))
+                if error_count == 0:
+                    # Gradually decrease value
+                    step = 5 if setting == 'pool_timeout' else 5  # Adjust step size as needed
+                    new_value = max(target_value, current_value - step)
+                    await self._reconfigure_pool(**{setting: new_value})
+
+                    if new_value == target_value:
+                        break
+
+        except asyncio.CancelledError:
+            logger.info(f"{setting} recovery cancelled")
+        except Exception as e:
+            logger.error(f"Error during {setting} recovery: {e}")
+        finally:
+            async with self._recovery_lock:
+                error_type = {
+                    'max_overflow': DatabaseErrorType.CONNECTION_OVERFLOW,
+                    'pool_timeout': DatabaseErrorType.CONNECTION_TIMEOUT
+                }[setting]
+                self._recovery_tasks.pop(error_type, None)
 
     async def _recover_timeout_settings(self, original_timeout: int) -> None:
         """Gradually recover timeout settings"""
@@ -1147,7 +1228,6 @@ class DatabaseService(ServiceBase):
         try:
             while True:
                 await asyncio.sleep(60)  # Check every minute
-
                 async with self.get_session() as session:
                     result = await session.execute(text("""
                         SELECT EXTRACT(EPOCH FROM (NOW() - pg_last_xact_replay_timestamp()))::INT
@@ -1155,10 +1235,14 @@ class DatabaseService(ServiceBase):
                     """))
                     current_lag = result.scalar() or 0
 
+                async with self.get_session(use_transaction=False) as session:
                     if current_lag < 60:  # Less than 1 minute lag
                         # Restore normal settings
+                        await session.execute(text("COMMIT"))
                         await session.execute(text("""
                             ALTER SYSTEM SET synchronous_commit TO 'off';
+                        """))
+                        await session.execute(text("""
                             SELECT pg_reload_conf();
                         """))
                         break
@@ -1174,59 +1258,6 @@ class DatabaseService(ServiceBase):
             async with self._recovery_lock:
                 self._recovery_tasks.pop(DatabaseErrorType.REPLICATION_LAG, None)
 
-    async def _reconfigure_pool(self, **config_updates: Union[int, bool]) -> None:
-        """
-        Safely reconfigure connection pool with enhanced error handling
-        """
-        async with self._pool_lock:
-            old_engine = self.engine
-            attempt = 0
-
-            while True:
-                try:
-                    validated_updates = {
-                        k: v for k, v in config_updates.items()
-                        if k in self._config
-                    }
-                    self._config.update(validated_updates)  # type: ignore
-
-                    # Create new engine with updated config
-                    self.engine = self._create_engine()
-                    self.session_factory = async_sessionmaker(
-                        bind=self.engine,
-                        class_=AsyncSession,
-                        expire_on_commit=False,
-                        autoflush=False
-                    )
-
-                    # Verify new configuration
-                    async with self.get_session() as session:
-                        await session.execute(text("SELECT 1"))
-
-                    if old_engine:
-                        await old_engine.dispose()
-
-                    logger.info(f"Pool reconfigured with {validated_updates}")
-                    return
-
-                except Exception as e:
-                    should_retry, reason = self._retry_strategy.should_retry(attempt, e)
-                    if should_retry:
-                        attempt += 1
-                        delay = self._retry_strategy.get_delay(attempt, e)
-
-                        logger.warning(
-                            f"Pool reconfiguration error, "
-                            f"retry {attempt} after {delay:.2f}s: {str(e)}"
-                        )
-
-                        await asyncio.sleep(delay)
-                        continue
-
-                    self.engine = old_engine
-                    logger.error(f"Pool reconfiguration failed: {e}")
-                    raise ServiceError(f"Pool reconfiguration failed: {str(e)}")
-
     async def _initiate_emergency_recovery(self, reason: str) -> None:
         """Emergency recovery procedure"""
         logger.critical(f"Initiating emergency recovery: {reason}")
@@ -1241,12 +1272,21 @@ class DatabaseService(ServiceBase):
                     await self.engine.dispose()
 
                 # Reset configuration to conservative values
-                self._config.update({
-                    "pool_size": max(5, self._config["pool_size"] // 2),
-                    "max_overflow": 5,
-                    "pool_timeout": 10,
-                    "pool_recycle": 300
-                })
+                self._config = DatabaseConfig(
+                    host=self._config.host,
+                    port=self._config.port,
+                    user=self._config.user,
+                    password=self._config.password,
+                    database=self._config.database,
+                    pool_size=max(5, self._config.pool_size // 2),
+                    max_overflow=5,
+                    pool_timeout=10,
+                    pool_recycle=300,
+                    echo=self._config.echo,
+                    dialect=self._config.dialect,
+                    driver=self._config.driver,
+                    timescale=self._config.timescale
+                )
 
                 # Reinitialize engine and session factory
                 self.engine = self._create_engine()
@@ -1266,6 +1306,7 @@ class DatabaseService(ServiceBase):
 
             except Exception as e:
                 self._status = ServiceStatus.ERROR
+                self._last_error = e
                 logger.critical(f"Emergency recovery failed: {e}")
                 raise ServiceError(f"Emergency recovery failed: {str(e)}")
 
@@ -1273,9 +1314,10 @@ class DatabaseService(ServiceBase):
         """Enhanced critical condition handling with multiple recovery tasks"""
         try:
             severity = condition["severity"]
+            error_type = condition["error_type"]
+
             if severity == "error" or severity == "critical":
                 self._last_error = Exception(condition["message"])
-                error_type = condition["error_type"]
 
             # Track error frequency for adaptive response
             await self._error_tracker.record_error(
@@ -1314,9 +1356,9 @@ class DatabaseService(ServiceBase):
             "Database Service Status:",
             f"Status: {self._status.value}",
             f"Pool Configuration:",
-            f"  Pool Size: {self._config['pool_size']}",
-            f"  Max Overflow: {self._config['max_overflow']}",
-            f"  Timeout: {self._config['pool_timeout']}s",
+            f"  Pool Size: {self._config.pool_size}",
+            f"  Max Overflow: {self._config.max_overflow}",
+            f"  Timeout: {self._config.pool_timeout}s",
             "Critical Errors (Last Hour):"
         ]
 

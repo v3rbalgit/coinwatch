@@ -1,9 +1,10 @@
 # src/config.py
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 import os
 from dotenv import load_dotenv
+from sqlalchemy import AsyncAdaptedQueuePool
 
 from .core.exceptions import ConfigurationError
 from .utils.logger import LoggerSetup
@@ -66,9 +67,17 @@ class DatabaseConfig:
         max_overflow: Maximum number of connections above pool_size
         pool_timeout: Seconds to wait for a connection from pool
         pool_recycle: Seconds before connections are recycled
+        pool_use_lifo: Use LIFO (last in, first out) ordering for pooled connections
         echo: Enable SQL query logging
         dialect: Database dialect (postgresql)
         driver: Database driver (asyncpg)
+        statement_timeout: Statement timeout in milliseconds
+        idle_transaction_timeout: Idle transaction timeout in milliseconds
+        lock_timeout: Lock timeout in milliseconds
+        keepalives: Enable TCP keepalives
+        keepalives_idle: Seconds between TCP keepalive packets
+        keepalives_interval: Seconds between TCP keepalive retransmits
+        keepalives_count: Maximum number of TCP keepalive retransmits
         timescale: TimescaleDB specific configuration
     """
     host: str
@@ -81,17 +90,13 @@ class DatabaseConfig:
     pool_timeout: int = 30
     pool_recycle: int = 1800
     maintenance_window: int = 3600
+    pool_use_lifo: bool = True
     echo: bool = False
-    pool_use_lifo: bool = True  # LIFO for better connection reuse
-    connect_args: Dict[str, str | int] = field(default_factory=lambda: {
-        "keepalives": 1,
-        "keepalives_idle": 30,
-        "keepalives_interval": 10,
-        "keepalives_count": 5,
-        "application_name": "coinwatch"  # For better monitoring
-    })
     dialect: str = "postgresql"
     driver: str = "asyncpg"
+    statement_timeout: int = 30000  # 30 seconds
+    idle_transaction_timeout: int = 60000  # 1 minute
+    lock_timeout: int = 10000  # 10 seconds
     timescale: TimescaleConfig = field(default_factory=TimescaleConfig)
 
     @property
@@ -103,6 +108,51 @@ class DatabaseConfig:
     def dsn(self) -> str:
         """Get database DSN (for asyncpg)"""
         return f"postgres://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
+
+    def get_engine_options(self) -> Dict[str, Any]:
+        """
+        Get SQLAlchemy engine options formatted for create_engine.
+
+        Returns a dictionary with all engine configuration options including:
+        - Connection pooling settings
+        - Timeouts and other PostgreSQL-specific settings
+        - TCP keepalive settings
+        - Connection arguments
+
+        Returns:
+            Dict[str, Any]: Engine configuration options
+        """
+        return {
+            'poolclass': AsyncAdaptedQueuePool,
+            'pool_size': self.pool_size,
+            'max_overflow': self.max_overflow,
+            'pool_timeout': self.pool_timeout,
+            'pool_recycle': self.pool_recycle,
+            'pool_use_lifo': self.pool_use_lifo,
+            'echo': self.echo,
+            'connect_args': {
+                'server_settings': {
+                    'statement_timeout': str(self.statement_timeout),
+                    'idle_in_transaction_session_timeout': str(self.idle_transaction_timeout),
+                    'lock_timeout': str(self.lock_timeout)
+                }
+            }
+        }
+
+    def update(self, updates: Dict[str, Any]) -> None:
+        """
+        Update configuration attributes safely
+
+        Args:
+            updates: Dictionary of attribute updates
+        """
+        for key, value in updates.items():
+            if hasattr(self, key):
+                setattr(self, key, value)
+                # Optionally validate after each update
+                self.__post_init__()
+            else:
+                raise ConfigurationError(f"Invalid configuration parameter: {key}")
 
     def __post_init__(self) -> None:
         """Validate database configuration"""
@@ -122,6 +172,12 @@ class DatabaseConfig:
             raise ConfigurationError("Pool timeout must be positive")
         if self.pool_recycle <= 0:
             raise ConfigurationError("Pool recycle interval must be positive")
+        if self.statement_timeout <= 0:
+            raise ConfigurationError("Statement timeout must be positive")
+        if self.idle_transaction_timeout <= 0:
+            raise ConfigurationError("Idle transaction timeout must be positive")
+        if self.lock_timeout <= 0:
+            raise ConfigurationError("Lock timeout must be positive")
 
 @dataclass
 class BybitConfig:
@@ -230,13 +286,12 @@ class Config:
                 chunk_interval=os.getenv('TIMESCALE_CHUNK_INTERVAL', '7 days'),
                 compress_after=os.getenv('TIMESCALE_COMPRESS_AFTER', '30 days'),
                 drop_after=os.getenv('TIMESCALE_DROP_AFTER', None),
-                retention_days=int(os.getenv('TIMESCALE_RETENTION_DAYS', '0')),
                 replication_factor=int(os.getenv('TIMESCALE_REPLICATION_FACTOR', '1'))
             )
 
             return DatabaseConfig(
                 host=os.getenv('DB_HOST', 'localhost'),
-                port=int(os.getenv('DB_PORT', '5433')),
+                port=int(os.getenv('DB_PORT', '5432')),
                 user=os.getenv('DB_USER', 'user'),
                 password=os.getenv('DB_PASSWORD', 'password'),
                 database=os.getenv('DB_NAME', 'coinwatch'),
@@ -244,17 +299,13 @@ class Config:
                 max_overflow=int(os.getenv('DB_MAX_OVERFLOW', '30')),
                 pool_timeout=int(os.getenv('DB_POOL_TIMEOUT', '30')),
                 pool_recycle=int(os.getenv('DB_POOL_RECYCLE', '1800')),
-                pool_use_lifo=True,
+                pool_use_lifo=bool(os.getenv('DB_POOL_USE_LIFO', 'true').lower() == 'true'),
                 echo=bool(os.getenv('DB_ECHO', 'False').lower() == 'true'),
                 dialect=os.getenv('DB_DIALECT', 'postgresql'),
                 driver=os.getenv('DB_DRIVER', 'asyncpg'),
-                connect_args={
-                    "keepalives": int(os.getenv('DB_KEEPALIVES', '1')),
-                    "keepalives_idle": int(os.getenv('DB_KEEPALIVES_IDLE', '30')),
-                    "keepalives_interval": int(os.getenv('DB_KEEPALIVES_INTERVAL', '10')),
-                    "keepalives_count": int(os.getenv('DB_KEEPALIVES_COUNT', '5')),
-                    "application_name": "coinwatch"
-                },
+                statement_timeout=int(os.getenv('DB_STATEMENT_TIMEOUT', '30000')),
+                idle_transaction_timeout=int(os.getenv('DB_IDLE_TRANSACTION_TIMEOUT', '60000')),
+                lock_timeout=int(os.getenv('DB_LOCK_TIMEOUT', '10000')),
                 timescale=timescale_config
             )
         except Exception as e:

@@ -2,11 +2,8 @@
 
 import asyncio
 from datetime import timedelta
-from decimal import Decimal
 from typing import List, Optional, Set
-from sqlalchemy import text
 
-from ..services.database import IsolationLevel
 from ..core.coordination import Command, MarketDataCommand, ServiceCoordinator
 from ..core.exceptions import ValidationError
 from ..core.models import KlineData, SymbolInfo
@@ -137,33 +134,40 @@ class TimeframeManager:
             assert aligned_start is not None and aligned_end is not None
 
             # Check for data gaps
-            gaps = await self._check_data_gaps(
-                symbol,
-                aligned_start,
-                aligned_end
-            )
+            gaps = await self._check_data_gaps(symbol, aligned_start, aligned_end)
 
             if gaps:
                 await self._handle_data_gaps(symbol, gaps)
 
-            # Check if this is a stored timeframe
-            if timeframe in self._stored_timeframes:
-                return await self._get_stored_klines(
+            # Choose appropriate repository method based on timeframe
+            if timeframe == self.base_timeframe:
+                # Get base timeframe data directly
+                return await self.kline_repository.get_base_klines(
                     symbol,
                     timeframe,
                     aligned_start,
                     aligned_end,
                     limit
                 )
-
-            # For non-stored timeframes, calculate on demand
-            return await self._calculate_klines(
-                symbol,
-                timeframe,
-                aligned_start,
-                aligned_end,
-                limit
-            )
+            elif timeframe in self._stored_timeframes:
+                # Get data from continuous aggregates
+                return await self.kline_repository.get_stored_klines(
+                    symbol,
+                    timeframe,
+                    aligned_start,
+                    aligned_end,
+                    limit
+                )
+            else:
+                # Calculate timeframe on demand
+                return await self.kline_repository.get_calculated_klines(
+                    symbol,
+                    timeframe,
+                    self.base_timeframe,
+                    aligned_start,
+                    aligned_end,
+                    limit
+                )
 
         except Exception as e:
             logger.error(
@@ -185,7 +189,6 @@ class TimeframeManager:
     async def _handle_collection_complete(self, command: Command) -> None:
         """Handle completion of historical data collection"""
         try:
-            symbol = command.params['symbol']
             start_time = command.params['start_time']
             end_time = command.params['end_time']
 
@@ -193,7 +196,6 @@ class TimeframeManager:
             for timeframe in self._stored_timeframes:
                 if timeframe in self.valid_timeframes:
                     await self._refresh_continuous_aggregate(
-                        symbol,
                         timeframe,
                         start_time,
                         end_time
@@ -204,7 +206,6 @@ class TimeframeManager:
     async def _handle_sync_complete(self, command: Command) -> None:
         """Handle completion of real-time data sync"""
         try:
-            symbol = command.params['symbol']
             sync_time = command.params['sync_time']
 
             # For real-time updates, we only need to process the latest period
@@ -215,221 +216,12 @@ class TimeframeManager:
             for timeframe in self._stored_timeframes:
                 if timeframe in self.valid_timeframes:
                     await self._refresh_continuous_aggregate(
-                        symbol,
                         timeframe,
                         start_time,
                         sync_time
                     )
         except Exception as e:
             logger.error(f"Error handling sync complete: {e}")
-
-    async def _get_stored_klines(self,
-                                symbol: SymbolInfo,
-                                timeframe: Timeframe,
-                                start_time: Timestamp,
-                                end_time: Timestamp,
-                                limit: Optional[int] = None) -> List[KlineData]:
-        """
-        Get klines from continuous aggregate views.
-
-        Args:
-            symbol: Symbol to get data for
-            timeframe: Target timeframe
-            start_time: Start timestamp
-            end_time: End timestamp
-            limit: Optional limit on number of klines
-
-        Returns:
-            List[KlineData]: Kline data in ascending order
-        """
-        async with self.kline_repository.db_service.get_session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
-            start_dt = TimeUtils.from_timestamp(start_time)
-            end_dt = TimeUtils.from_timestamp(end_time)
-
-            stmt = text(f"""
-                WITH aligned_klines AS (
-                    SELECT
-                        time_bucket(:bucket, timestamp) as bucket_timestamp,
-                        first(open_price, timestamp) as open_price,
-                        max(high_price) as high_price,
-                        min(low_price) as low_price,
-                        last(close_price, timestamp) as close_price,
-                        sum(volume) as volume,
-                        sum(turnover) as turnover,
-                        s.name as symbol_name,
-                        s.exchange as symbol_exchange,  -- Add exchange to uniquely identify symbol
-                        k.timeframe
-                    FROM {timeframe.continuous_aggregate_view} k
-                    JOIN symbols s ON k.symbol_id = s.id
-                    WHERE s.name = :symbol_name
-                    AND s.exchange = :exchange  -- Add exchange filter
-                    AND k.timestamp BETWEEN :start_time AND :end_time
-                    GROUP BY
-                        time_bucket(:bucket, timestamp),
-                        s.name,
-                        s.exchange,  -- Include exchange in GROUP BY
-                        k.timeframe
-                    ORDER BY bucket_timestamp DESC
-                    LIMIT :limit
-                )
-                SELECT
-                    EXTRACT(EPOCH FROM bucket_timestamp) * 1000 as timestamp,
-                    open_price,
-                    high_price,
-                    low_price,
-                    close_price,
-                    volume,
-                    turnover,
-                    symbol_name,
-                    symbol_exchange,
-                    timeframe
-                FROM aligned_klines
-                ORDER BY bucket_timestamp DESC;
-            """)
-
-            result = await session.execute(
-                stmt,
-                {
-                    "symbol_name": symbol.name,
-                    "exchange": symbol.exchange,  # Add exchange parameter
-                    "start_time": start_dt,
-                    "end_time": end_dt,
-                    "bucket": timeframe.get_bucket_interval(),
-                    "limit": limit or 2147483647
-                }
-            )
-
-            return [
-                KlineData(
-                    timestamp=Timestamp(row.timestamp),
-                    open_price=Decimal(str(row.open_price)),
-                    high_price=Decimal(str(row.high_price)),
-                    low_price=Decimal(str(row.low_price)),
-                    close_price=Decimal(str(row.close_price)),
-                    volume=Decimal(str(row.volume)),
-                    turnover=Decimal(str(row.turnover)),
-                    symbol=SymbolInfo(  # Reconstruct full SymbolInfo
-                        name=row.symbol_name,
-                        exchange=row.symbol_exchange,
-                        base_asset=symbol.base_asset,  # Use from original symbol
-                        quote_asset=symbol.quote_asset,
-                        price_precision=symbol.price_precision,
-                        qty_precision=symbol.qty_precision,
-                        min_order_qty=symbol.min_order_qty,
-                        launch_time=symbol.launch_time
-                    ),
-                    timeframe=Timeframe(row.timeframe)
-                )
-                for row in result
-            ]
-
-    async def _calculate_klines(self,
-                              symbol: SymbolInfo,
-                              timeframe: Timeframe,
-                              start_time: Timestamp,
-                              end_time: Timestamp,
-                              limit: Optional[int] = None) -> List[KlineData]:
-        """
-        Calculate klines on demand for non-stored timeframes.
-
-        Args:
-            symbol: Symbol to get data for
-            timeframe: Target timeframe
-            start_time: Start timestamp
-            end_time: End timestamp
-            limit: Optional limit on number of klines
-
-        Returns:
-            List[KlineData]: Kline data in ascending order
-        """
-        async with self.kline_repository.db_service.get_session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
-            start_dt = TimeUtils.from_timestamp(start_time)
-            end_dt = TimeUtils.from_timestamp(end_time)
-
-            stmt = text("""
-                WITH base_aligned AS (
-                    SELECT
-                        time_bucket(:bucket, k.timestamp) as bucket_timestamp,
-                        first(open_price, timestamp) as open_price,
-                        max(high_price) as high_price,
-                        min(low_price) as low_price,
-                        last(close_price, timestamp) as close_price,
-                        sum(volume) as volume,
-                        sum(turnover) as turnover,
-                        s.name as symbol_name,
-                        s.exchange as symbol_exchange,  -- Add exchange to uniquely identify symbol
-                        :target_timeframe as timeframe,
-                        count(*) as candle_count
-                    FROM kline_data k
-                    JOIN symbols s ON k.symbol_id = s.id
-                    WHERE s.name = :symbol_name
-                    AND s.exchange = :exchange  -- Add exchange filter
-                    AND k.timeframe = :base_timeframe
-                    AND k.timestamp BETWEEN :start_time AND :end_time
-                    GROUP BY
-                        time_bucket(:bucket, k.timestamp),
-                        s.name,
-                        s.exchange  -- Include exchange in GROUP BY
-                    HAVING count(*) >= :min_candles
-                    ORDER BY bucket_timestamp DESC
-                    LIMIT :limit
-                )
-                SELECT
-                    EXTRACT(EPOCH FROM bucket_timestamp) * 1000 as timestamp,
-                    open_price,
-                    high_price,
-                    low_price,
-                    close_price,
-                    volume,
-                    turnover,
-                    symbol_name,
-                    symbol_exchange,
-                    timeframe,
-                    candle_count
-                FROM base_aligned
-                ORDER BY bucket_timestamp DESC;
-            """)
-
-            min_candles = timeframe.to_milliseconds() // self.base_timeframe.to_milliseconds()
-
-            result = await session.execute(
-                stmt,
-                {
-                    "symbol_name": symbol.name,
-                    "exchange": symbol.exchange,  # Add exchange parameter
-                    "base_timeframe": self.base_timeframe.value,
-                    "target_timeframe": timeframe.value,
-                    "start_time": start_dt,
-                    "end_time": end_dt,
-                    "bucket": timeframe.get_bucket_interval(),
-                    "min_candles": min_candles,
-                    "limit": limit or 2147483647
-                }
-            )
-
-            return [
-                KlineData(
-                    timestamp=Timestamp(row.timestamp),
-                    open_price=Decimal(str(row.open_price)),
-                    high_price=Decimal(str(row.high_price)),
-                    low_price=Decimal(str(row.low_price)),
-                    close_price=Decimal(str(row.close_price)),
-                    volume=Decimal(str(row.volume)),
-                    turnover=Decimal(str(row.turnover)),
-                    symbol=SymbolInfo(  # Reconstruct full SymbolInfo
-                        name=row.symbol_name,
-                        exchange=row.symbol_exchange,
-                        base_asset=symbol.base_asset,  # Use from original symbol
-                        quote_asset=symbol.quote_asset,
-                        price_precision=symbol.price_precision,
-                        qty_precision=symbol.qty_precision,
-                        min_order_qty=symbol.min_order_qty,
-                        launch_time=symbol.launch_time
-                    ),
-                    timeframe=Timeframe(row.timeframe)
-                )
-                for row in result
-            ]
 
     def _align_to_timeframe(self,
                            timestamp: Optional[Timestamp],
@@ -510,7 +302,6 @@ class TimeframeManager:
         ))
 
     async def _refresh_continuous_aggregate(self,
-                                          symbol: SymbolInfo,
                                           timeframe: Timeframe,
                                           start_time: Timestamp,
                                           end_time: Timestamp) -> None:
@@ -519,33 +310,19 @@ class TimeframeManager:
             logger.debug(f"Skipping refresh for non-stored timeframe: {timeframe.value}")
             return
 
-        async with self.kline_repository.db_service.get_session(isolation_level=IsolationLevel.SERIALIZABLE) as session:
-            # Align to timeframe boundaries
-            aligned_start = self._align_to_timeframe(start_time, timeframe, round_up=False)
-            aligned_end = self._align_to_timeframe(end_time, timeframe, round_up=True)
+        # Align to timeframe boundaries
+        aligned_start = self._align_to_timeframe(start_time, timeframe, round_up=False)
+        aligned_end = self._align_to_timeframe(end_time, timeframe, round_up=True)
 
-            # Only proceed if we have valid timestamps
-            if aligned_start is not None and aligned_end is not None:
-                start_dt = TimeUtils.from_timestamp(aligned_start)
-                end_dt = TimeUtils.from_timestamp(aligned_end)
+        # Only proceed if we have valid timestamps
+        if aligned_start is not None and aligned_end is not None:
+            start_dt = TimeUtils.from_timestamp(aligned_start)
+            end_dt = TimeUtils.from_timestamp(aligned_end)
 
-                view_name = timeframe.continuous_aggregate_view
-                if view_name:
-                    await session.execute(
-                        text("""
-                        CALL refresh_continuous_aggregate(
-                            :view_name,
-                            :start_dt,
-                            :end_dt
-                        );
-                        """),
-                        {
-                            "view_name": view_name,
-                            "start_dt": start_dt,
-                            "end_dt": end_dt
-                        }
-                    )
-                    logger.debug(f"Refreshed continuous aggregate {view_name} for period "
-                            f"{start_dt} to {end_dt}")
-            else:
-                logger.warning("Skipping continuous aggregate refresh due to invalid timestamps")
+            await self.kline_repository.refresh_continuous_aggregate(
+                timeframe,
+                start_dt,
+                end_dt
+            )
+        else:
+            logger.warning("Skipping continuous aggregate refresh due to invalid timestamps")

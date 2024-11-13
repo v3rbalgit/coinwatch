@@ -9,6 +9,9 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 import logging
 
+from src.services.database import DatabaseService
+from src.utils.error import ErrorTracker
+
 # Setup logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -92,6 +95,94 @@ async def db_engine(database_url: str) -> AsyncGenerator[AsyncEngine, None]:
     finally:
         logger.info("Disposing database engine")
         await engine.dispose()
+
+@pytest.fixture
+async def setup_test_data(db_engine: AsyncEngine) -> AsyncGenerator[None, None]:
+    """Setup test data for database tests"""
+    async with db_engine.begin() as conn:
+        # Create test symbol
+        await conn.execute(text("""
+            INSERT INTO symbols (name, exchange, first_trade_time)
+            VALUES ('BTCUSDT', 'bybit', extract(epoch from now()) * 1000)
+            ON CONFLICT DO NOTHING
+        """))
+
+        # Get symbol id
+        result = await conn.execute(text(
+            "SELECT id FROM symbols WHERE name = 'BTCUSDT'"
+        ))
+        symbol_id = result.scalar()
+
+        # Insert test kline data
+        if symbol_id:
+            await conn.execute(text("""
+                INSERT INTO kline_data (
+                    symbol_id, timestamp, timeframe,
+                    open_price, high_price, low_price, close_price,
+                    volume, turnover
+                )
+                SELECT
+                    :symbol_id,
+                    generate_series(
+                        now() - interval '1 day',
+                        now(),
+                        interval '5 minutes'
+                    ),
+                    '5',
+                    100.0, 101.0, 99.0, 100.5,
+                    1000.0, 100000.0
+            """), {"symbol_id": symbol_id})
+
+    yield
+
+    # Cleanup happens in cleanup_database fixture
+
+@pytest.fixture
+def mock_time_utils(monkeypatch):
+    """Mock TimeUtils for consistent timestamps in tests"""
+    class MockTimeUtils:
+        @staticmethod
+        def get_current_timestamp():
+            return 1637000000000  # Fixed timestamp for testing
+
+        @staticmethod
+        def get_current_datetime():
+            from datetime import datetime, timezone
+            return datetime.fromtimestamp(1637000000, tz=timezone.utc)
+
+    monkeypatch.setattr('src.utils.time.TimeUtils', MockTimeUtils)
+
+@pytest.fixture
+async def cleanup_service_resources(db_service: DatabaseService) -> AsyncGenerator[None, None]:
+    """Ensure proper cleanup of service resources after tests"""
+    yield
+
+    # Reset any semaphores
+    try:
+        if hasattr(db_service, '_session_semaphore'):
+            # Release any waiting operations
+            while True:
+                try:
+                    db_service._session_semaphore.release()
+                except ValueError:
+                    break
+
+            # Create fresh semaphore
+            db_service._session_semaphore = asyncio.BoundedSemaphore(db_service._config.pool_size)
+    except Exception as e:
+        logger.warning(f"Error cleaning up semaphores: {e}")
+
+    # Cancel any monitoring tasks
+    if db_service._monitor_task and not db_service._monitor_task.done():
+        db_service._monitor_task.cancel()
+        try:
+            await db_service._monitor_task
+        except asyncio.CancelledError:
+            pass
+
+    # Reset error tracker
+    db_service._error_tracker = ErrorTracker()
+
 
 @pytest.fixture
 async def cleanup_database(db_engine: AsyncEngine) -> AsyncGenerator[None, None]:
