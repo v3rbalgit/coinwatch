@@ -1,13 +1,15 @@
 # src/utils/domain_types.py
 
 from enum import Enum
-from typing import Any, Dict, NewType, Literal, Optional, TypedDict, NotRequired
+from typing import Any, Dict, NewType, Literal, Optional, TypedDict
 
+# Universal domain types
 SymbolName = NewType('SymbolName', str)
 ExchangeName = NewType('ExchangeName', str)
 Timestamp = NewType('Timestamp', int)
 Price = NewType('Price', float)
 
+# Timeframe type
 class Timeframe(Enum):
     MINUTE_1 = "1"
     MINUTE_3 = "3"
@@ -78,6 +80,7 @@ CriticalConditionType = Literal[
     "lock_timeout"
 ]
 
+# Critical condition
 class CriticalCondition(TypedDict):
     type: CriticalConditionType
     severity: Literal["warning", "error", "critical"]
@@ -93,3 +96,22 @@ class ServiceStatus(Enum):
     STOPPING = "stopping"
     STOPPED = "stopped"
     ERROR = "error"
+
+# Isolation level types
+class IsolationLevel(str, Enum):
+    READ_UNCOMMITTED = "READ COMMITTED"
+    READ_COMMITTED = "READ COMMITTED"
+    REPEATABLE_READ = "REPEATABLE READ"
+    SERIALIZABLE = "SERIALIZABLE"
+
+# Database error types
+class DatabaseErrorType(str, Enum):
+    """Specific database error categories"""
+    CONNECTION_OVERFLOW = "connection_overflow"
+    CONNECTION_TIMEOUT = "connection_timeout"
+    DEADLOCK = "deadlock"
+    QUERY_TIMEOUT = "query_timeout"
+    REPLICATION_LAG = "replication_lag"
+    LOCK_TIMEOUT = "lock_timeout"
+    MAINTENANCE_REQUIRED = "maintenance_required"
+    EMERGENCY = "emergency"

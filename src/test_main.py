@@ -10,13 +10,13 @@ from src.repositories.symbol import SymbolRepository
 from src.services.monitor.service import MonitoringService
 
 from .config import BybitConfig, Config
-from .services.database import DatabaseService
+from .services.database.service import DatabaseService
 from .services.market_data import MarketDataService
 from .adapters.registry import ExchangeAdapterRegistry
 from .adapters.bybit import BybitAdapter
 from .core.exceptions import CoinwatchError
 from .utils.logger import LoggerSetup
-from .utils.domain_types import ExchangeName, ServiceStatus, SymbolName
+from .utils.domain_types import ExchangeName, SymbolName
 from .core.models import SymbolInfo
 
 logger = LoggerSetup.setup(__name__)

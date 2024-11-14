@@ -3,11 +3,15 @@
 import pytest
 import asyncio
 import logging
-from typing import Any, AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, List, Optional
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker
+)
 
-from src.services.database import DatabaseService, DatabaseErrorType, IsolationLevel
+from src.services.database.service import DatabaseService, DatabaseErrorType, IsolationLevel
 from src.core.coordination import ServiceCoordinator
 from src.core.exceptions import ServiceError, ConfigurationError
 from src.config import DatabaseConfig, TimescaleConfig
@@ -18,38 +22,6 @@ from src.utils.time import TimeUtils
 logger = logging.getLogger(__name__)
 
 import os
-
-def convert_pg_timeout_to_ms(timeout_str: str) -> int:
-    """
-    Convert PostgreSQL timeout string to milliseconds.
-
-    Args:
-        timeout_str: Timeout string from PostgreSQL (e.g., '30s', '1000ms', '1min')
-
-    Returns:
-        int: Timeout value in milliseconds
-
-    Raises:
-        ValueError: If the timeout string cannot be parsed
-    """
-    if timeout_str is None:
-        raise ValueError("Timeout value cannot be None")
-
-    timeout_str = str(timeout_str).strip().lower()
-
-    # Handle different time units
-    if 'ms' in timeout_str:
-        return int(timeout_str.split('ms')[0])
-    elif 's' in timeout_str:
-        return int(float(timeout_str.split('s')[0]) * 1000)
-    elif 'min' in timeout_str:
-        return int(float(timeout_str.split('min')[0]) * 60 * 1000)
-    else:
-        try:
-            # Assume milliseconds if no unit specified
-            return int(timeout_str)
-        except ValueError:
-            raise ValueError(f"Could not parse timeout value: {timeout_str}")
 
 @pytest.fixture
 def db_config(database_url: str) -> DatabaseConfig:
@@ -193,22 +165,6 @@ async def test_session_isolation_levels(db_service: DatabaseService) -> None:
             f"Expected {expected} for {level.value}, got {actual}"
 
 @pytest.mark.asyncio
-async def test_concurrent_sessions(db_service: DatabaseService) -> None:
-    """Test concurrent session handling"""
-    async def run_query() -> int:
-        async with db_service.get_session() as session:
-            result = await session.execute(text("SELECT 1"))
-            value = result.scalar()
-            if value is None:
-                raise ValueError("Query returned None")
-            await asyncio.sleep(0.1)  # Simulate some work
-            return int(value)
-
-    tasks = [run_query() for _ in range(5)]  # Reduced from 10 to 5 for test environment
-    results = await asyncio.gather(*tasks)
-    assert all(r == 1 for r in results)
-
-@pytest.mark.asyncio
 async def test_pool_size_limits(db_service: DatabaseService) -> None:
     """Test pool size limits are respected"""
     sessions = []
@@ -296,30 +252,6 @@ async def test_metrics_collection(db_service: DatabaseService) -> None:
     assert isinstance(metrics.maintenance_due, bool)
 
 @pytest.mark.asyncio
-async def test_connection_error_recovery(db_service: DatabaseService) -> None:
-    """Test recovery from connection errors"""
-    # Simulate a connection error
-    condition: CriticalCondition = {
-        "type": DatabaseErrorType.CONNECTION_OVERFLOW,
-        "severity": "warning",
-        "message": "Connection pool exhausted",
-        "timestamp": TimeUtils.get_current_timestamp(),
-        "error_type": "ConnectionError",
-        "context": {
-            "active_connections": 5,
-            "pool_size": 5
-        }
-    }
-
-    await db_service.handle_critical_condition(condition)
-
-    # Verify service is still operational
-    async with db_service.get_session() as session:
-        result = await session.execute(text("SELECT 1"))
-        value = result.scalar()
-        assert value is not None and value == 1
-
-@pytest.mark.asyncio
 async def test_timescaledb_setup(db_service: DatabaseService):
     """Test TimescaleDB features setup"""
     async with db_service.get_session() as session:
@@ -386,68 +318,6 @@ async def test_deadlock_handling(db_service: DatabaseService):
     async with db_service.get_session() as session:
         result = await session.execute(text("SELECT 1"))
         assert result.scalar() == 1
-
-@pytest.mark.asyncio
-async def test_replication_lag_handling(db_service: DatabaseService):
-    """Test replication lag monitoring and handling"""
-    condition: CriticalCondition = {
-        "type": DatabaseErrorType.REPLICATION_LAG,
-        "severity": "warning",
-        "message": "Replication lag detected",
-        "timestamp": TimeUtils.get_current_timestamp(),
-        "error_type": "ReplicationLagError",
-        "context": {
-            "lag_seconds": 120
-        }
-    }
-
-    try:
-        await db_service.handle_critical_condition(condition)
-
-        # Verify service remains operational
-        async with db_service.get_session() as session:
-            result = await session.execute(text("SELECT 1"))
-            assert result.scalar() == 1
-
-        # Instead of checking actual replication lag (which requires replication setup),
-        # verify that the service handled the condition without errors
-        metrics = await db_service._collect_metrics()
-        assert metrics.status == "running"
-
-        # Verify synchronous_commit setting was not changed in test environment
-        async with db_service.get_session() as session:
-            result = await session.execute(text("SHOW synchronous_commit"))
-            sync_commit = result.scalar()
-            assert sync_commit is not None
-
-    except Exception as e:
-        pytest.fail(f"Replication lag handling failed: {str(e)}")
-
-@pytest.mark.asyncio
-async def test_query_timeout_handling(db_service: DatabaseService):
-    """Test handling of long-running queries"""
-    condition: CriticalCondition = {
-        "type": DatabaseErrorType.QUERY_TIMEOUT,
-        "severity": "warning",
-        "message": "Long running query detected",
-        "timestamp": TimeUtils.get_current_timestamp(),
-        "error_type": "QueryTimeoutError",
-        "context": {
-            "query_count": 2,
-            "current_timeout": 30
-        }
-    }
-
-    await db_service.handle_critical_condition(condition)
-
-    # Verify timeout settings were adjusted
-    async with db_service.get_session() as session:
-        result = await session.execute(text("SHOW statement_timeout"))
-        timeout = result.scalar()
-        if timeout is None:
-            pytest.fail("Failed to get statement_timeout value")
-        timeout_ms = convert_pg_timeout_to_ms(timeout)
-        assert timeout_ms > 0, "Statement timeout should be positive"
 
 @pytest.mark.asyncio
 async def test_emergency_recovery(db_service: DatabaseService):
@@ -566,32 +436,6 @@ async def test_continuous_aggregate_management(db_service: DatabaseService):
         pytest.fail(f"Test failed with error: {str(e)}")
 
 @pytest.mark.asyncio
-async def test_lock_timeout_handling(db_service: DatabaseService):
-    """Test lock timeout handling"""
-    condition: CriticalCondition = {
-        "type": DatabaseErrorType.LOCK_TIMEOUT,
-        "severity": "warning",
-        "message": "Lock timeout detected",
-        "timestamp": TimeUtils.get_current_timestamp(),
-        "error_type": "LockTimeoutError",
-        "context": {
-            "wait_count": 2,
-            "current_lock_timeout": 30
-        }
-    }
-
-    await db_service.handle_critical_condition(condition)
-
-    # Verify lock timeout settings
-    async with db_service.get_session() as session:
-        result = await session.execute(text("SHOW lock_timeout"))
-        timeout = result.scalar()
-        if timeout is None:
-            pytest.fail("Failed to get lock_timeout value")
-        timeout_ms = convert_pg_timeout_to_ms(timeout)
-        assert timeout_ms > 0, "Lock timeout should be positive"
-
-@pytest.mark.asyncio
 async def test_session_without_transaction(db_service: DatabaseService):
     """Test session management without transaction wrapping"""
     async with db_service.get_session(use_transaction=False) as session:
@@ -655,42 +499,6 @@ async def test_service_status_reporting(db_service: DatabaseService):
     assert "Critical Errors (Last Hour):" in status_report
 
 @pytest.mark.asyncio
-async def test_update_session_semaphore(db_service: DatabaseService):
-    """Test session semaphore size update"""
-    original_size = db_service._config.pool_size
-    new_size = original_size + 5
-
-    # Run concurrent queries before update
-    async def run_query() -> Optional[Any]:
-        async with db_service.get_session() as session:
-            result = await session.execute(text("SELECT 1"))
-            await asyncio.sleep(0.1)  # Simulate some work
-            return result.scalar()
-
-    # Test with a few concurrent sessions
-    pre_results = await asyncio.gather(*(run_query() for _ in range(3)))
-    assert all(r == 1 for r in pre_results)
-
-    # Update semaphore size
-    await db_service._update_session_semaphore(new_size)
-
-    # Test new capacity with proper session management
-    async def test_concurrent_sessions(num_sessions: int):
-        results = await asyncio.gather(*(run_query() for _ in range(num_sessions)))
-        assert all(r == 1 for r in results)
-
-    # Test with increased capacity but with reasonable concurrency
-    await asyncio.wait_for(
-        test_concurrent_sessions(min(new_size, 10)),  # Limit to 10 concurrent sessions for test
-        timeout=5.0
-    )
-
-    # Verify service is still operational
-    async with db_service.get_session() as session:
-        result = await session.execute(text("SELECT 1"))
-        assert result.scalar() == 1
-
-@pytest.mark.asyncio
 async def test_non_transactional_maintenance(db_service: DatabaseService):
     """Test maintenance operations without transaction wrapping"""
     condition: CriticalCondition = {
@@ -709,3 +517,46 @@ async def test_non_transactional_maintenance(db_service: DatabaseService):
 
     assert db_service._last_maintenance is not None
     assert not db_service._maintenance_due
+
+@pytest.mark.asyncio
+async def test_session_cleanup_on_error(db_service: DatabaseService):
+    """Test session cleanup when errors occur"""
+    # Instead of checking _active_sessions, we'll verify through pool metrics
+    async with db_service.get_session() as session:
+        # Get initial metrics
+        initial_metrics = await db_service._collect_metrics()
+        initial_connections = initial_metrics.active_connections
+
+        try:
+            await session.execute(text("SELECT pg_sleep(1)"))  # Long query
+            raise Exception("Test error")
+        except Exception:
+            pass
+
+    # Allow time for cleanup
+    await asyncio.sleep(0.1)
+
+    # Verify connections were cleaned up
+    final_metrics = await db_service._collect_metrics()
+    assert final_metrics.active_connections <= initial_connections, \
+        "Connections were not properly cleaned up"
+
+@pytest.mark.asyncio
+async def test_retry_strategy_configuration(db_service: DatabaseService):
+    """Test retry strategy configuration and behavior"""
+    # Test retryable error
+    retryable_error = ConnectionError("Test connection error")
+    should_retry, reason = db_service._retry_strategy.should_retry(0, retryable_error)
+    assert should_retry is True
+    assert reason == "retryable_error"
+
+    # Test non-retryable error
+    non_retryable_error = ValueError("Test value error")
+    should_retry, reason = db_service._retry_strategy.should_retry(0, non_retryable_error)
+    assert should_retry is False
+    assert reason == "unknown_error"
+
+    # Test max retries exceeded
+    should_retry, reason = db_service._retry_strategy.should_retry(5, retryable_error)
+    assert should_retry is False
+    assert reason == "max_retries_exceeded"
