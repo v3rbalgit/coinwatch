@@ -7,7 +7,7 @@ from sqlalchemy import select, and_, text
 from sqlalchemy.dialects.postgresql import insert
 
 from..core.models import KlineData, SymbolInfo
-from ..services.database import DatabaseService, IsolationLevel
+from ..services.database.service import DatabaseService, IsolationLevel
 from .base import Repository
 from ..models.market import Symbol, Kline
 from ..utils.domain_types import Timeframe, Timestamp

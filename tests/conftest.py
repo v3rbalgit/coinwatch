@@ -9,7 +9,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 import logging
 
-from src.services.database import DatabaseService
+from src.services.database.service import DatabaseService
 from src.utils.error import ErrorTracker
 
 # Setup logging
@@ -156,22 +156,6 @@ def mock_time_utils(monkeypatch):
 async def cleanup_service_resources(db_service: DatabaseService) -> AsyncGenerator[None, None]:
     """Ensure proper cleanup of service resources after tests"""
     yield
-
-    # Reset any semaphores
-    try:
-        if hasattr(db_service, '_session_semaphore'):
-            # Release any waiting operations
-            while True:
-                try:
-                    db_service._session_semaphore.release()
-                except ValueError:
-                    break
-
-            # Create fresh semaphore
-            db_service._session_semaphore = asyncio.BoundedSemaphore(db_service._config.pool_size)
-    except Exception as e:
-        logger.warning(f"Error cleaning up semaphores: {e}")
-
     # Cancel any monitoring tasks
     if db_service._monitor_task and not db_service._monitor_task.done():
         db_service._monitor_task.cancel()

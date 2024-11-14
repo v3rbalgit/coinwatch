@@ -9,7 +9,7 @@ from src.repositories.symbol import SymbolRepository
 from src.services.monitor.service import MonitoringService
 
 from .config import Config
-from .services.database import DatabaseService
+from .services.database.service import DatabaseService
 from .services.market_data.service import MarketDataService
 from .adapters.registry import ExchangeAdapterRegistry
 from .adapters.bybit import BybitAdapter

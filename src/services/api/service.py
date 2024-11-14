@@ -12,7 +12,7 @@ from ...config import APIConfig
 from ...utils.logger import LoggerSetup
 from ...utils.domain_types import ServiceStatus
 from ..market_data.service import MarketDataService
-from ..database import DatabaseService
+from ..database.service import DatabaseService
 from .routers import market_data, indicators, system
 
 logger = LoggerSetup.setup(__name__)
