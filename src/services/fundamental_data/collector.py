@@ -5,37 +5,41 @@ from typing import Dict, Set, Any
 import asyncio
 
 from ...core.models import SymbolInfo
-from ...core.coordination import ServiceCoordinator
 from ...utils.retry import RetryConfig, RetryStrategy
 from ...utils.domain_types import Timestamp
 from ...utils.time import TimeUtils
 from ...utils.logger import LoggerSetup
-from ...config import MarketDataConfig
-from ..market_data.progress import CollectionProgress
+from ...utils.progress import FundamentalDataProgress
 
 logger = LoggerSetup.setup(__name__)
 
+
 class FundamentalCollector(ABC):
     """
-    Base class for fundamental data collectors.
+    Abstract base class for fundamental data collectors.
 
-    Each collector type (metadata, market, blockchain, sentiment)
-    will implement this interface for its specific metrics.
+    Implements common functionality for collecting and managing fundamental data
+    for different types of metrics (metadata, market, blockchain, sentiment).
     """
 
     def __init__(self,
-                 coordinator: ServiceCoordinator,
-                 config: MarketDataConfig):
-        self.coordinator = coordinator
-        self.config = config
+                 collection_interval: int,
+                 batch_size: int):
+        """
+        Initialize the FundamentalCollector.
+
+        Args:
+            collection_interval (int): Time interval between collections in seconds.
+            batch_size (int): Number of symbols to process concurrently.
+        """
+        self._collection_interval = collection_interval
+        self._batch_size = batch_size
 
         # Collection management
         self._collection_queue: asyncio.Queue[SymbolInfo] = asyncio.Queue()
         self._collection_lock = asyncio.Lock()
         self._processing: Set[SymbolInfo] = set()
-        self._progress: Dict[SymbolInfo, CollectionProgress] = {}
-
-        # Status tracking
+        self._progress: Dict[SymbolInfo, FundamentalDataProgress] = {}
         self._last_collection: Dict[SymbolInfo, Timestamp] = {}
 
         # Initialize retry strategy
@@ -52,7 +56,12 @@ class FundamentalCollector(ABC):
     @property
     @abstractmethod
     def collector_type(self) -> str:
-        """Return the type of collector (e.g., 'metadata', 'market', etc.)"""
+        """
+        Return the type of collector (e.g., 'metadata', 'market', etc.).
+
+        Returns:
+            str: The collector type.
+        """
         pass
 
     @abstractmethod
@@ -61,10 +70,10 @@ class FundamentalCollector(ABC):
         Collect fundamental data for a specific symbol.
 
         Args:
-            symbol: Symbol to collect data for
+            symbol (SymbolInfo): Symbol to collect data for.
 
         Returns:
-            Dict containing collected metrics
+            Dict[str, Any]: Collected metric data.
         """
         pass
 
@@ -74,13 +83,13 @@ class FundamentalCollector(ABC):
         Store collected data for a symbol.
 
         Args:
-            symbol: Symbol the data belongs to
-            data: Collected metric data
+            symbol (SymbolInfo): Symbol the data belongs to.
+            data (Dict[str, Any]): Collected metric data.
         """
         pass
 
     async def cleanup(self) -> None:
-        """Cleanup resources"""
+        """Clean up resources and cancel ongoing tasks."""
         if self._queue_processor:
             self._queue_processor.cancel()
             try:
@@ -102,15 +111,25 @@ class FundamentalCollector(ABC):
                 break
 
     async def schedule_collection(self, symbol: SymbolInfo) -> None:
-        """Schedule data collection for a symbol"""
-        if symbol not in self._processing:
-            await self._collection_queue.put(symbol)
+        """
+        Schedule data collection for a symbol if enough time has passed.
+
+        Args:
+            symbol (SymbolInfo): Symbol to schedule for collection.
+        """
+        current_time = TimeUtils.get_current_timestamp()
+        last_collection = self._last_collection.get(symbol)
+
+        if (not last_collection or
+            current_time - last_collection >= self._collection_interval * 1000):
+            if symbol not in self._processing:
+                await self._collection_queue.put(symbol)
 
     async def _collection_worker(self) -> None:
-        """Main collection loop"""
+        """Main collection loop processing symbols from the queue."""
         while True:
             try:
-                async with asyncio.Semaphore(self.config.batch_size):
+                async with asyncio.Semaphore(self._batch_size):
                     symbol = await self._collection_queue.get()
                     try:
                         await self._process_symbol(symbol)
@@ -125,15 +144,21 @@ class FundamentalCollector(ABC):
                 await asyncio.sleep(1)
 
     async def _process_symbol(self, symbol: SymbolInfo) -> None:
-        """Process a single symbol"""
+        """
+        Process a single symbol by collecting and storing its data.
+
+        Args:
+            symbol (SymbolInfo): Symbol to process.
+        """
         async with self._collection_lock:
             if symbol in self._processing:
                 return
             self._processing.add(symbol)
 
         try:
-            progress = CollectionProgress(
+            progress = FundamentalDataProgress(
                 symbol=symbol,
+                collector_type=self.collector_type,
                 start_time=TimeUtils.get_current_datetime()
             )
             self._progress[symbol] = progress
@@ -142,15 +167,16 @@ class FundamentalCollector(ABC):
             data = await self.collect_symbol_data(symbol)
             await self.store_symbol_data(symbol, data)
 
-            # Update collection time
+            # Update progress and collection time
+            progress.status = "completed"
             self._last_collection[symbol] = TimeUtils.get_current_timestamp()
 
-            if progress := self._progress.get(symbol):
-                logger.info(progress.get_completion_summary(
-                    TimeUtils.get_current_datetime()
-                ))
+            logger.info(progress.get_completion_summary(TimeUtils.get_current_datetime()))
 
         except Exception as e:
+            if progress := self._progress.get(symbol):
+                progress.status = "error"
+                progress.error = str(e)
             logger.error(f"Error processing {symbol}: {e}")
             raise
 
@@ -160,7 +186,12 @@ class FundamentalCollector(ABC):
                 self._progress.pop(symbol, None)
 
     def get_collection_status(self) -> str:
-        """Get collector status summary"""
+        """
+        Get a summary of the collector's current status.
+
+        Returns:
+            str: A formatted string with collection status information.
+        """
         return (
             f"Active Collections: {len(self._processing)}\n"
             f"Queued Collections: {self._collection_queue.qsize()}\n"

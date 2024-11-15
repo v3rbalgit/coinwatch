@@ -238,7 +238,7 @@ class MarketDataService(ServiceBase):
             logger.debug(f"Registered handler for {command.value}")
 
     async def _unregister_command_handlers(self) -> None:
-        """Register command handlers for service monitoring"""
+        """Unregister command handlers for service monitoring"""
         handlers = {
             MarketDataCommand.GAP_DETECTED: self._handle_gap_detected,
             MarketDataCommand.COLLECTION_ERROR: self._handle_collection_error,

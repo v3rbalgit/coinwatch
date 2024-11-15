@@ -4,7 +4,7 @@ import asyncio
 from typing import Any, Dict, Set
 
 from ...adapters.registry import ExchangeAdapterRegistry
-from .progress import CollectionProgress
+from ...utils.progress import MarketDataProgress
 from ...core.coordination import Command, MarketDataCommand, ServiceCoordinator
 from ...repositories.kline import KlineRepository
 from ...repositories.symbol import SymbolRepository
@@ -47,7 +47,7 @@ class DataCollector:
         # Collection management
         self._collection_queue: asyncio.Queue[Dict[str,Any]] = asyncio.Queue(maxsize=1000)
         self._collection_lock = asyncio.Lock()
-        self._symbol_progress: Dict[SymbolInfo, CollectionProgress] = {}
+        self._symbol_progress: Dict[SymbolInfo, MarketDataProgress] = {}
         self._processing_symbols: Set[SymbolInfo] = set()
 
         # Retry strategy
@@ -149,7 +149,7 @@ class DataCollector:
                 else:
                     logger.info(f"Started data collection for {symbol}")
 
-                self._symbol_progress[symbol] = CollectionProgress(
+                self._symbol_progress[symbol] = MarketDataProgress(
                     symbol=symbol,
                     start_time=timestamp
                 )

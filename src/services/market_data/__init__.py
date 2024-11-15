@@ -3,12 +3,12 @@
 from .service import MarketDataService
 from .collector import DataCollector
 from .synchronizer import BatchSynchronizer
-from .progress import CollectionProgress, SyncSchedule
+from ...utils.progress import MarketDataProgress, SyncSchedule
 
 __all__ = [
     'MarketDataService',
     'DataCollector',
     'BatchSynchronizer',
     'SyncSchedule',
-    'CollectionProgress'
+    'MarketDataProgress'
 ]

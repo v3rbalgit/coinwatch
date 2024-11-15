@@ -63,10 +63,8 @@ class BybitAdapter(ExchangeAdapter):
         if not self._api_key or not self._api_secret:
             raise AdapterError("API credentials not configured")
 
-        # Create parameter string in correct order
         param_str = str(timestamp) + self._api_key + str(self._config.recv_window) + str(params)
 
-        # Generate HMAC SHA256 signature
         return hmac.new(
             self._api_secret.encode('utf-8'),
             param_str.encode('utf-8'),
