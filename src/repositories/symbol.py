@@ -6,7 +6,7 @@ from sqlalchemy import select, and_, text
 from ..core.models import SymbolInfo
 from ..services.database.service import DatabaseService, IsolationLevel
 from .base import Repository
-from ..models.market import Symbol
+from ..models import Symbol
 from ..utils.domain_types import ExchangeName
 from ..core.exceptions import RepositoryError
 from ..utils.logger import LoggerSetup

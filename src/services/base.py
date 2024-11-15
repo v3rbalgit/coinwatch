@@ -11,19 +11,20 @@ ConfigType = TypeVar('ConfigType', MarketDataConfig, MonitoringConfig, DatabaseC
 class ServiceBase(ABC, Generic[ConfigType]):
     """Base class for all services"""
     def __init__(self, config: ConfigType):
-        self._initialized: bool = False
         self._config: ConfigType = config or {}
 
     @abstractmethod
     async def start(self) -> None:
         """Start the service"""
-        self._initialized = True
 
     @abstractmethod
     async def stop(self) -> None:
         """Stop the service"""
-        self._initialized = False
 
     async def handle_critical_condition(self, condition: CriticalCondition) -> None:
         """Handle critical system conditions"""
+        pass
+
+    def get_service_status(self):
+        """Generate detailed statistics for a service"""
         pass

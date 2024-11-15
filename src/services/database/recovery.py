@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from enum import Enum
 import asyncio
-from typing import Dict, Any, Union, Protocol
+from typing import Dict, Any
 from sqlalchemy import text
 
 from ...core.monitoring import DatabaseMetrics
@@ -28,10 +28,6 @@ class CircuitState(Enum):
     WARNING = "warning"
     ERROR = "error"
     CRITICAL = "critical"
-
-class RecoveryAction(Protocol):
-    """Protocol for recovery action callables"""
-    async def __call__(self, value: float) -> None: ...
 
 class DatabaseRecovery:
     """
@@ -82,7 +78,7 @@ class DatabaseRecovery:
         }
 
         # Configure recovery actions for each state and metric
-        self.recovery_actions: Dict[str, Dict[str, Union[Dict[str, Any], RecoveryAction]]] = {
+        self.recovery_actions: Dict[str, Dict[str, Dict[str, int | str]]] = {
             "connection_usage": {
                 "warning": {"max_overflow": 10, "pool_timeout": 15},
                 "error": {"max_overflow": 20, "pool_timeout": 20},
@@ -112,7 +108,7 @@ class DatabaseRecovery:
 
     async def check_and_recover(self, metrics: DatabaseMetrics) -> None:
         """
-        Check all metrics and handle recovery, including deadlocks and maintenance.
+        Check all metrics and handle recovery.
 
         Args:
             metrics: DatabaseMetrics containing current database state
@@ -193,17 +189,14 @@ class DatabaseRecovery:
             if not actions:
                 return
 
-            if isinstance(actions, dict):
-                # Handle configuration changes
-                if metric in ("connection_usage", "connection_timeout"):
-                    await self.db_service._reconfigure_pool(**actions)
-                else:
-                    async with self.db_service.get_session() as session:
-                        for setting, value in actions.items():
-                            await session.execute(text(f"SET {setting} = '{value}s'"))
+            # Handle configuration changes
+            if metric in ("connection_usage", "connection_timeout"):
+                await self.db_service._reconfigure_pool(**actions)
             else:
-                # Handle callable recovery actions (deadlocks, maintenance)
-                await actions(current_value)
+                async with self.db_service.get_session() as session:
+                    for setting, value in actions.items():
+                        await session.execute(text(f"SET {setting} = '{value}s'"))
+
 
             logger.info(
                 f"State transition for {metric}: {old_state.value} -> {new_state.value} "

@@ -195,7 +195,21 @@ class DataCollector:
             # Don't raise - we want to continue service operation even if cleanup fails
 
     async def _process_queue(self) -> None:
-        """Process collection requests from queue"""
+        """
+        Continuously processes market data collection requests from the queue.
+
+        Handles each request by:
+        - Collecting data via _collect_data()
+        - Notifying coordinator of completion or errors
+        - Managing processing state and queue cleanup
+
+        Implements error handling and recovery for queue processing.
+
+        Notes:
+            - Runs indefinitely as a background task
+            - Reports collection status to BatchSynchronizer
+            - Maintains processing symbols state
+        """
         while True:
             try:
                 request = await self._collection_queue.get()
@@ -253,13 +267,26 @@ class DataCollector:
                        limit: int,
                        timeframe: Timeframe) -> None:
         """
-        Collect data for specified time range with careful timestamp handling
+        Collects and stores kline/candlestick data for a given symbol and time range.
 
-        Cases to handle:
-        1. Historical collection (end_time is current time)
-        2. Gap filling (specific start/end range)
-        3. Single interval collection
+        Args:
+            symbol (SymbolInfo): Trading pair symbol information
+            start_time (Timestamp): Collection start timestamp in milliseconds
+            end_time (Timestamp): Collection end timestamp in milliseconds
+            limit (int): Maximum number of klines per request
+            timeframe (Timeframe): Candlestick interval
+
+        Raises:
+            ValidationError: If end_time is not greater than start_time
+            Exception: If data collection fails
+
+        Notes:
+            - Handles historical data collection, gap filling, and single interval collection
+            - Aligns timestamps to interval boundaries
+            - Implements retry logic for failed requests
+            - Tracks collection progress
         """
+
         try:
             # Validate time range
             if end_time <= start_time:

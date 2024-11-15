@@ -132,14 +132,29 @@ class BatchSynchronizer:
         symbol = command.params["symbol"]
         await self._schedule_sync(symbol, self._base_timeframe)
 
+
     def _calculate_next_sync(self, timeframe: Timeframe) -> datetime:
-        """Calculate the next sync time based on timeframe."""
+        """
+        Calculate the next synchronization time aligned to the given timeframe.
+
+        Args:
+            timeframe (Timeframe): The timeframe to align with
+
+        Returns:
+            datetime: Next scheduled sync time
+        """
         current_time = TimeUtils.get_current_datetime()
         minutes = timeframe.to_milliseconds() / (1000 * 60)
         return TimeUtils.align_to_interval(current_time, int(minutes), round_up=True)
 
     async def _schedule_sync(self, symbol: SymbolInfo, timeframe: Timeframe) -> None:
-        """Schedule a symbol for synchronized updates."""
+        """
+        Schedule a symbol for periodic synchronization.
+
+        Args:
+            symbol (SymbolInfo): Trading pair to synchronize
+            timeframe (Timeframe): Interval for synchronization
+        """
         next_sync = self._calculate_next_sync(timeframe)
 
         async with self._schedules_lock:
@@ -155,7 +170,12 @@ class BatchSynchronizer:
             )
 
     async def _sync_loop(self) -> None:
-        """Main sync loop with precise timing."""
+        """
+        Main synchronization loop that manages scheduled updates.
+
+        Continuously checks for due syncs and executes them concurrently
+        while handling errors and maintaining timing precision.
+        """
         while True:
             try:
                 tasks = []
@@ -194,7 +214,12 @@ class BatchSynchronizer:
                 await asyncio.sleep(1)
 
     async def _calculate_sleep_interval(self) -> None:
-        """Calculate and sleep until next sync is due"""
+        """
+        Calculate and wait for the appropriate interval until next sync.
+
+        Determines optimal sleep duration based on next scheduled sync times
+        to maintain efficient resource usage.
+        """
         next_syncs = [s.next_sync for s in self._schedules.values()]
         if next_syncs:
             sleep_time = max(0.0, (min(next_syncs) - TimeUtils.get_current_datetime()).total_seconds())
@@ -204,7 +229,15 @@ class BatchSynchronizer:
             await asyncio.sleep(1)
 
     async def _sync_symbol_with_timing(self, schedule: SyncSchedule) -> None:
-        """Sync a symbol with retry logic"""
+        """
+        Execute symbol synchronization with retry logic and timing management.
+
+        Args:
+            schedule (SyncSchedule): Synchronization schedule details
+
+        Raises:
+            Exception: If sync fails after all retries
+        """
         retry_count = 0
         while True:
             sync_start = TimeUtils.get_current_timestamp()
@@ -276,7 +309,15 @@ class BatchSynchronizer:
                     self._processing.remove(schedule.symbol)
 
     async def _update_schedule(self, schedule: SyncSchedule) -> datetime:
-        """Update schedule and calculate next sync time"""
+        """
+        Update schedule timing and calculate next sync time.
+
+        Args:
+            schedule (SyncSchedule): Schedule to update
+
+        Returns:
+            datetime: Next scheduled sync time
+        """
         next_sync = self._calculate_next_sync(schedule.timeframe)
 
         async with self._schedules_lock:
@@ -287,9 +328,16 @@ class BatchSynchronizer:
 
     async def _perform_sync(self, schedule: SyncSchedule) -> int:
         """
-        Perform actual sync with retry logic.
+        Execute the actual data synchronization for a symbol.
+
+        Args:
+            schedule (SyncSchedule): Synchronization schedule details
+
         Returns:
             int: Number of candles processed
+
+        Raises:
+            ServiceError: If sync operation fails
         """
         retry_count = 0
         processed_count = 0

@@ -185,6 +185,7 @@ class BybitConfig:
     api_key: Optional[str] = None
     api_secret: Optional[str] = None
     testnet: bool = False
+    recv_window: int = 5000
     kline_limit: int = 1000
     rate_limit: int = 600       # requests per window
     rate_limit_window: int = 5  # seconds
@@ -202,6 +203,22 @@ class BybitConfig:
 class ExchangeConfig:
     """Exchange configuration"""
     bybit: BybitConfig
+
+@dataclass
+class CoingeckoConfig:
+    """Coingecko-specific configuration"""
+    api_key: Optional[str] = None
+    pro_account: bool = False
+    rate_limit: int = 30         # requests per window
+    rate_limit_window: int = 60  # seconds
+    monthly_limit: int = 10000
+
+    def __post_init__(self) -> None:
+        """Validate Coingecko configuration"""
+        if self.rate_limit <= 0:
+            raise ConfigurationError("Rate limit must be positive")
+        if self.rate_limit_window <= 0:
+            raise ConfigurationError("Rate limit window must be positive")
 
 @dataclass
 class MarketDataConfig:
@@ -240,7 +257,7 @@ class MonitoringConfig:
     check_intervals: Dict[str, int] = field(
         default_factory=lambda: {
             'system': 30,      # System metrics need frequent updates
-            'market': 120,      # Market data metrics can be less frequent
+            'market': 120,     # Market data metrics can be less frequent
             'database': 60,    # Database metrics can be less frequent
         }
     )
@@ -317,12 +334,25 @@ class Config:
             bybit_config = BybitConfig(
                 api_key=os.getenv('BYBIT_API_KEY'),
                 api_secret=os.getenv('BYBIT_API_SECRET'),
-                testnet=bool(os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'),
+                testnet=bool(int(os.getenv('BYBIT_TESTNET', '0'))),
+                recv_window=int(os.getenv('BYBIT_RECV_WINDOW', '5000')),
                 kline_limit=int(os.getenv('BYBIT_KLINE_LIMIT', '1000')),
                 rate_limit=int(os.getenv('BYBIT_RATE_LIMIT', '600')),
                 rate_limit_window=int(os.getenv('BYBIT_RATE_LIMIT_WINDOW', '300'))
             )
             return ExchangeConfig(bybit=bybit_config)
+        except Exception as e:
+            raise ConfigurationError(f"Invalid exchange configuration: {e}")
+
+    def _init_metadata_config(self) -> CoingeckoConfig:
+        """Initialize metadata configuration"""
+        try:
+            return CoingeckoConfig(
+                api_key=os.getenv('COINGECKO_API_KEY'),
+                pro_account=bool(int(os.getenv('COINGECKO_PRO_ACCOUNT','0'))),
+                rate_limit=int(os.getenv('COINGECKO_RATE_LIMIT', '30')),
+                rate_limit_window=int(os.getenv('COINGECKO_RATE_LIMIT_WINDOW', '60'))
+            )
         except Exception as e:
             raise ConfigurationError(f"Invalid exchange configuration: {e}")
 
