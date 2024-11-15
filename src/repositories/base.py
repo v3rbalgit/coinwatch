@@ -4,7 +4,7 @@ from typing import Generic, TypeVar, List, Optional, Type
 from sqlalchemy import select
 
 from ..services.database.service import DatabaseService
-from ..models.market import Symbol, Kline
+from ..models import Symbol, Kline
 from ..core.exceptions import RepositoryError
 from ..utils.logger import LoggerSetup
 

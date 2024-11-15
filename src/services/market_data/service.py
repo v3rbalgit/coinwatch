@@ -26,17 +26,23 @@ logger = LoggerSetup.setup(__name__)
 
 class MarketDataService(ServiceBase):
     """
-    Core market data service managing historical and real-time price data collection.
+    Core service managing market data collection and synchronization across exchanges.
 
-    Responsibilities:
-    - Monitors available trading symbols
-    - Manages historical data collection
-    - Coordinates real-time data synchronization
-    - Handles resource optimization
-    - Provides system health monitoring
+    Features:
+    - Historical and real-time price data collection
+    - Multi-exchange symbol monitoring and lifecycle management
+    - Automated gap detection and recovery
+    - Error tracking and retry mechanisms
 
-    The service uses a command-based architecture for inter-component communication
-    and maintains symbol states through a centralized state manager.
+    Components:
+    - DataCollector: Historical data collection
+    - BatchSynchronizer: Real-time synchronization
+    - ExchangeAdapterRegistry: Exchange connections
+    - ErrorTracker: Error monitoring
+    - RetryStrategy: Retry logic
+
+    Uses command-based architecture for component communication and event-driven
+    symbol lifecycle management with configurable timeframes and retry policies.
     """
     def __init__(self,
                  symbol_repository: SymbolRepository,
@@ -101,8 +107,6 @@ class MarketDataService(ServiceBase):
 
             await self._register_command_handlers()
 
-            await self.exchange_registry.initialize_all()
-
             self._monitor_running.set()
             self._monitor_task = asyncio.create_task(self._monitor_symbols())
 
@@ -141,9 +145,6 @@ class MarketDataService(ServiceBase):
 
           # Wait for all cleanup tasks to complete
           await asyncio.gather(*cleanup_tasks, return_exceptions=True)
-
-          # Close exchange connections
-          await self.exchange_registry.close_all()
 
           # Clear service state
           self._active_symbols.clear()
@@ -471,7 +472,6 @@ class MarketDataService(ServiceBase):
             try:
                 # Reinitialize just this exchange
                 adapter = self.exchange_registry.get_adapter(exchange)
-                await adapter.initialize()
                 logger.info(f"Successfully reinitialized exchange {exchange}")
 
             except Exception as e:
@@ -508,7 +508,6 @@ class MarketDataService(ServiceBase):
         await asyncio.sleep(retry_interval)
 
         # Attempt restart
-        await self.exchange_registry.initialize_all()
         self._monitor_running.set()
         self._monitor_task = asyncio.create_task(self._monitor_symbols())
 
@@ -545,7 +544,27 @@ class MarketDataService(ServiceBase):
             ))
 
     async def _monitor_symbols(self) -> None:
-        """Monitor available trading symbols and manage their lifecycle"""
+        """
+        Continuously monitors trading symbols across registered exchanges.
+
+        Responsibilities:
+        - Discovers new trading symbols and initiates data collection
+        - Detects and handles delisted symbols
+        - Manages symbol lifecycle and active symbol set
+        - Implements retry logic for exchange API failures
+        - Reports critical conditions and service errors
+
+        Notes:
+            - Runs as a background task while _monitor_running is set
+            - Maintains exchange connection health via retry strategy
+            - Updates service status on critical failures
+            - Coordinates symbol management via command system
+
+        Raises:
+            asyncio.CancelledError: When monitoring is cancelled
+            Exception: On critical monitoring failures
+        """
+
         retry_count = 0
 
         try:

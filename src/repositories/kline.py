@@ -9,7 +9,7 @@ from sqlalchemy.dialects.postgresql import insert
 from..core.models import KlineData, SymbolInfo
 from ..services.database.service import DatabaseService, IsolationLevel
 from .base import Repository
-from ..models.market import Symbol, Kline
+from ..models import Symbol, Kline
 from ..utils.domain_types import Timeframe, Timestamp
 from ..core.exceptions import RepositoryError, ValidationError
 from ..utils.logger import LoggerSetup

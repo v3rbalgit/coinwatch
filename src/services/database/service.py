@@ -16,7 +16,7 @@ from sqlalchemy import text
 from ..base import ServiceBase
 from ...services.database.recovery import DatabaseRecovery
 from ...models.base import Base
-from ...models.market import Kline, Symbol
+from ...models import Kline, Symbol, TokenMetadata
 from ...core.monitoring import DatabaseMetrics
 from ...core.coordination import Command, CommandResult, MonitoringCommand, ServiceCoordinator
 from ...core.exceptions import ServiceError, ValidationError
@@ -60,17 +60,13 @@ class DatabaseService(ServiceBase):
         self.recovery = DatabaseRecovery(self)
 
         # Configure retry strategy
-        retry_config = RetryConfig(
+        self._retry_strategy = RetryStrategy(RetryConfig(
             base_delay=1.0,
             max_delay=30.0,
             max_retries=3,
             jitter_factor=0.1
-        )
-        self._retry_strategy = RetryStrategy(retry_config)
+        ))
         self._configure_retry_strategy()
-
-        # Convert config to SQLAlchemy engine options
-        self._engine_options = config.get_engine_options()
 
         # Track maintenance windows
         self._last_maintenance: Optional[int] = None
@@ -163,7 +159,6 @@ class DatabaseService(ServiceBase):
             # Start pool monitoring
             self._monitor_task = asyncio.create_task(self._monitor_database())
 
-            await super().start()
             self._status = ServiceStatus.RUNNING
             logger.info("Database service started successfully")
 
@@ -193,7 +188,6 @@ class DatabaseService(ServiceBase):
 
             self._status = ServiceStatus.STOPPED
             logger.info("Database service stopped")
-            await super().stop()
 
         except Exception as e:
             self._status = ServiceStatus.ERROR
@@ -291,7 +285,7 @@ class DatabaseService(ServiceBase):
             pool_pre_ping=True,    # Enable connection health checks
             json_serializer=None,  # Use PostgreSQL native JSON handling
             json_deserializer=None,
-            **self._engine_options
+            **self._config.get_engine_options()
         )
 
     async def _setup_timescaledb(self, engine: AsyncEngine) -> None:
@@ -604,7 +598,6 @@ class DatabaseService(ServiceBase):
                     await asyncio.sleep(1)
                     continue
 
-                # Collect metrics
                 metrics = await self._collect_metrics()
 
                 await self.recovery.check_and_recover(metrics)
@@ -634,7 +627,7 @@ class DatabaseService(ServiceBase):
                         }
                     })
 
-                await asyncio.sleep(60)  # Check every minute
+                await asyncio.sleep(60)
 
             except Exception as e:
                 logger.error(f"Database monitoring error: {e}")
@@ -656,7 +649,6 @@ class DatabaseService(ServiceBase):
                     f"found {deadlock_count} deadlocks"
                 )
 
-                # Analyze deadlocks
                 async with self.get_session() as session:
                     result = await session.execute(text("""
                         SELECT blocked_locks.pid AS blocked_pid,
@@ -733,7 +725,6 @@ class DatabaseService(ServiceBase):
                             f"retry {attempt} after {delay:.2f}s: {str(e)}"
                         )
 
-                        # For maintenance operations, we can be more patient
                         delay = min(delay * 2, 300)  # Max 5 minutes
                         await asyncio.sleep(delay)
                         continue

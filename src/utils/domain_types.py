@@ -115,3 +115,10 @@ class DatabaseErrorType(str, Enum):
     LOCK_TIMEOUT = "lock_timeout"
     MAINTENANCE_REQUIRED = "maintenance_required"
     EMERGENCY = "emergency"
+
+class DataSource(str, Enum):
+    """Types of fundamental data sources"""
+    COINGECKO = "coingecko"
+    GITHUB = "github"
+    ETHERSCAN = "etherscan"
+    BSCSCAN = "bscscan"

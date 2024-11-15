@@ -1,252 +1,172 @@
 # src/adapters/bybit.py
 
-import asyncio
-from asyncio import Lock
-import time
-from typing import List, Optional, Dict, Any, Callable, TypeVar, Protocol, cast, Union, overload
 from decimal import Decimal
-from pybit.unified_trading import HTTP
-from functools import partial
-from requests.structures import CaseInsensitiveDict
-from datetime import timedelta
+from typing import Dict, Any, List, Optional
+import aiohttp
+import asyncio
+import hmac
+import hashlib
+import time
 
-from src.config import BybitConfig
-from src.core.exceptions import ValidationError
-from src.utils.time import TimeUtils
-
+from ..adapters.registry import ExchangeAdapter
+from ..config import BybitConfig
+from ..core.exceptions import AdapterError
 from ..core.models import KlineData, SymbolInfo
-from ..core.protocols import ExchangeAdapter
-from ..utils.domain_types import Timeframe, SymbolName, Timestamp
+from ..utils.domain_types import Timeframe, Timestamp
 from ..utils.logger import LoggerSetup
+from ..utils.rate_limit import TokenBucket, RateLimitConfig
+from ..utils.time import TimeUtils
+from ..utils.retry import RetryConfig, RetryStrategy
 
 logger = LoggerSetup.setup(__name__)
 
-# Type definitions
-T = TypeVar('T')
-BybitResponse = Union[
-    tuple[Any, timedelta, CaseInsensitiveDict[str]],
-    tuple[Any, timedelta],
-    Dict[str, Any]
-]
-
-class BybitMethod(Protocol):
-    """Protocol for Bybit API methods"""
-    def __call__(self, *args: Any, **kwargs: Any) -> BybitResponse: ...
-
 class BybitAdapter(ExchangeAdapter):
     """
-    Bybit exchange adapter with async rate limiting.
+    Async Bybit API adapter using aiohttp.
 
-    Handles API communication with Bybit exchange, including:
-    - Rate limiting with token bucket algorithm
-    - Data validation and error handling
-    - Conversion of exchange data formats to internal models
-    - Thread-safe API operations
-
-    Note: Bybit API returns kline data in descending order (newest first).
+    Handles:
+    - API authentication
+    - Request signing
+    - Rate limiting
+    - Connection management
     """
 
-    def __init__(self, config: Optional[BybitConfig] = None):
-        """
-        Initialize adapter with optional configuration.
+    BASE_URL = "https://api.bybit.com"
+    TESTNET_URL = "https://api-testnet.bybit.com"
 
-        Args:
-            config: Optional configuration for API access and rate limiting
-        """
-        self._config = config or BybitConfig()
-        self._initialized = False
+    def __init__(self, config: BybitConfig):
+        super().__init__(config)
 
-        # Set rate limits from config or use defaults
-        self.RATE_LIMIT = self._config.rate_limit if config else 600
-        self.WINDOW_SIZE = self._config.rate_limit_window if config else 5
+        # Base URL based on testnet setting
+        self._base_url = self.TESTNET_URL if config.testnet else self.BASE_URL
 
-        # Store credentials for future use
-        self._api_key = self._config.api_key
-        self._api_secret = self._config.api_secret
-        self._testnet=self._config.testnet
+        # Authentication
+        self._api_key = config.api_key
+        self._api_secret = config.api_secret
 
-        # Initialize rate limiting
-        self._lock = Lock()
-        self._tokens = self.RATE_LIMIT
-        self._last_refill = time.time()
+        # Initialize rate limiter
+        self._rate_limiter = TokenBucket(RateLimitConfig(
+            calls_per_window=config.rate_limit,
+            window_size=config.rate_limit_window
+        ))
 
-    @property
-    def kline_limit(self) -> int:
-        """Get maximum number of klines that can be fetched in one request"""
-        return self._config.kline_limit
+        # Configure retry strategy
+        self._retry_strategy = RetryStrategy(RetryConfig(
+            base_delay=1.0,
+            max_delay=30.0,
+            max_retries=3,
+            jitter_factor=0.1
+        ))
 
-    def _create_session(self) -> HTTP:
-        """Create a new HTTP session for thread-safe operations"""
-        return HTTP(
-            testnet=self._testnet,
-            api_key=self._api_key,
-            api_secret=self._api_secret
+    def _generate_signature(self, params: Dict[str, Any], timestamp: int) -> str:
+        """Generate signature for authenticated requests"""
+        if not self._api_key or not self._api_secret:
+            raise AdapterError("API credentials not configured")
+
+        # Create parameter string in correct order
+        param_str = str(timestamp) + self._api_key + str(self._config.recv_window) + str(params)
+
+        # Generate HMAC SHA256 signature
+        return hmac.new(
+            self._api_secret.encode('utf-8'),
+            param_str.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+
+    async def _create_session(self) -> aiohttp.ClientSession:
+        """Create new session with Bybit configuration"""
+        return aiohttp.ClientSession(
+            base_url=self._base_url,
+            timeout=aiohttp.ClientTimeout(total=30),
+            headers={'Content-Type': 'application/json'}
         )
 
-    @overload
-    async def _execute_request(
-        self,
-        func: Callable[[HTTP], BybitResponse],
-    ) -> Dict[str, Any]: ...
-
-    @overload
-    async def _execute_request(
-        self,
-        func: Callable[[HTTP], BybitResponse],
-        **kwargs: Any
-    ) -> Dict[str, Any]: ...
-
-    @overload
-    async def _execute_request(
-        self,
-        func: Callable[[HTTP, str], BybitResponse],
-        symbol: str
-    ) -> Dict[str, Any]: ...
-
-    async def _execute_request(
-        self,
-        func: Callable[[HTTP], BybitResponse] | Callable[[HTTP, str], BybitResponse],
-        *args: Any,
-        **kwargs: Any
-    ) -> Dict[str, Any]:
+    async def _request(self,
+                      method: str,
+                      endpoint: str,
+                      auth: bool = False,
+                      **kwargs: Any) -> Any:
         """
-        Execute a request with a dedicated session.
+        Make API request with retry logic and rate limiting
 
         Args:
-            func: The API function to execute
-            *args: Positional arguments for the function
-            **kwargs: Keyword arguments for the function
-
-        Returns:
-            Dict[str, Any]: The validated API response
-
-        Raises:
-            Exception: If the request fails
+            method: HTTP method
+            endpoint: API endpoint
+            auth: Whether request needs authentication
+            **kwargs: Additional request parameters
         """
-        await self._handle_rate_limit()
+        attempt = 0
+        session = await self._get_session()
 
-        # Create a new session for this specific request
-        session = self._create_session()
-
-        try:
-            # Create a partial function with the session
-            bound_func = partial(func, session, *args, **kwargs)
-
-            # Execute in thread pool
-            response = await asyncio.to_thread(bound_func)
-            return self._validate_response(response)
-        finally:
-            # Clean up underlying requests session
-            session_obj = getattr(session, '_session', None)
-            if session_obj is not None:
-                session_obj.close()
-
-    async def _acquire_token(self) -> bool:
-        """
-        Attempt to acquire a rate limit token.
-
-        Returns:
-            bool: True if token acquired, False if no tokens available
-        """
-        async with self._lock:
-            current_time = time.time()
-            elapsed = current_time - self._last_refill
-
-            if elapsed >= self.WINDOW_SIZE:
-                self._tokens = self.RATE_LIMIT
-                self._last_refill = current_time
-                logger.debug("Rate limit token bucket refilled")
-
-            if self._tokens > 0:
-                self._tokens -= 1
-                return True
-            return False
-
-    async def _handle_rate_limit(self) -> None:
-        """Handle rate limiting by waiting when necessary."""
-        while not await self._acquire_token():
-            sleep_time = self.WINDOW_SIZE - (time.time() - self._last_refill)
-            if sleep_time > 0:
-                logger.debug(f"Rate limit reached, waiting {sleep_time:.2f}s")
-                await asyncio.sleep(sleep_time)
-
-    def _validate_response(self, response: BybitResponse) -> Dict[str, Any]:
-        """
-        Validate API response format and error codes.
-
-        Args:
-            response: Raw API response
-
-        Returns:
-            Dict[str, Any]: Validated response data
-
-        Raises:
-            ValueError: If response format is invalid or contains error
-        """
-        if isinstance(response, tuple):
-            response = response[0]
-
-        response_dict = cast(Dict[str, Any], response)
-        if not isinstance(response_dict, dict):
-            raise ValueError(f"Invalid response type: {type(response_dict)}")
-
-        ret_code = response_dict.get('retCode')
-        if ret_code is None:
-            raise ValueError("Response missing retCode")
-
-        if ret_code != 0:
-            raise ValueError(f"API Error: {ret_code} - {response_dict.get('retMsg')}")
-
-        return response_dict
-
-    @staticmethod
-    def _get_klines(session: HTTP, **kwargs: Any) -> BybitResponse:
-        """Get klines using provided session"""
-        return session.get_kline(**kwargs)
-
-    @staticmethod
-    def _get_symbols(session: HTTP) -> BybitResponse:
-        """Get symbols using provided session"""
-        return session.get_instruments_info(category='linear')
-
-    @staticmethod
-    def _get_ticker(session: HTTP, symbol: str) -> BybitResponse:
-        """Get ticker using provided session"""
-        return session.get_tickers(category="linear", symbol=symbol)
-
-    async def initialize(self) -> None:
-        """
-        Initialize the adapter by testing connection.
-
-        Raises:
-            Exception: If initialization fails
-        """
-        if not self._initialized:
+        while True:
             try:
-                await self.get_latest_price(SymbolName("BTCUSDT"))
-                self._initialized = True
-                logger.info("BybitAdapter initialized successfully")
-            except Exception as e:
-                logger.error(f"Failed to initialize BybitAdapter: {e}")
-                raise
+                # Handle rate limiting
+                await self._rate_limiter.acquire()
+
+                # Add authentication if required
+                if auth:
+                    timestamp = int(time.time() * 1000)
+                    params = kwargs.get('params', {})
+
+                    # Add authentication parameters
+                    auth_params = {
+                        'api_key': self._api_key,
+                        'timestamp': timestamp,
+                        'recv_window': self._config.recv_window,
+                        'sign': self._generate_signature(params, timestamp)
+                    }
+
+                    if method == 'GET':
+                        # For GET requests, add auth params to query string
+                        kwargs['params'] = {**params, **auth_params}
+                    else:
+                        # For POST requests, add auth params to body
+                        kwargs['json'] = {**params, **auth_params}
+
+                async with session.request(method, endpoint, **kwargs) as response:
+                    if response.status == 429:  # Rate limit exceeded
+                        retry_after = int(response.headers.get('Retry-After', 60))
+                        logger.warning(f"Rate limit exceeded, waiting {retry_after}s")
+                        await asyncio.sleep(retry_after)
+                        continue
+
+                    response.raise_for_status()
+                    data = await response.json()
+
+                    # Handle Bybit-specific error responses
+                    if data.get('ret_code') != 0:
+                        raise AdapterError(
+                            f"API error {data.get('ret_code')}: {data.get('ret_msg')}"
+                        )
+
+                    return data.get('result', {})
+
+            except aiohttp.ClientError as e:
+                should_retry, reason = self._retry_strategy.should_retry(attempt, e)
+                if should_retry:
+                    attempt += 1
+                    delay = self._retry_strategy.get_delay(attempt)
+                    logger.warning(
+                        f"API request failed ({reason}), "
+                        f"retry {attempt} after {delay:.2f}s: {str(e)}"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                raise AdapterError(f"API request failed: {str(e)}")
 
     async def get_symbols(self) -> List[SymbolInfo]:
-        """
-        Get available trading pairs from Bybit.
-
-        Returns:
-            List[SymbolInfo]: List of available trading symbols
-
-        Raises:
-            Exception: If fetching symbols fails
-        """
+        """Get available trading pairs"""
         try:
-            response = await self._execute_request(self._get_symbols)
+            data = await self._request(
+                'GET',
+                '/v5/market/instruments-info',
+                params={'category': 'linear'}
+            )
 
             symbols: List[SymbolInfo] = []
-            for item in response.get('result', {}).get('list', []):
-                if (isinstance(item, dict) and
-                    item.get('status') == 'Trading' and
+            for item in data.get('list', []):
+                if (item.get('status') == 'Trading' and
                     'USDT' in item.get('symbol', '')):
 
                     symbols.append(SymbolInfo(
@@ -267,78 +187,41 @@ class BybitAdapter(ExchangeAdapter):
             raise
 
     async def get_klines(self,
-                    symbol: SymbolInfo,
-                    timeframe: Timeframe,
-                    start_time: Optional[Timestamp] = None,
-                    end_time: Optional[Timestamp] = None,
-                    limit: Optional[int] = None) -> List[KlineData]:
-        """
-        Fetch kline data from Bybit.
-        Note: Results are returned in ascending order (oldest first).
-
-        Args:
-            symbol: Trading pair symbol
-            timeframe: Candle timeframe
-            start_time: Optional start timestamp (milliseconds)
-            end_time: Optional end timestamp (milliseconds)
-            limit: Maximum number of candles to fetch
-
-        Returns:
-            List[KlineData]: Kline data in ascending order
-
-        Raises:
-            ValidationError: If request parameters are invalid
-            Exception: If API request fails
-        """
+                        symbol: SymbolInfo,
+                        timeframe: Timeframe,
+                        start_time: Optional[Timestamp] = None,
+                        end_time: Optional[Timestamp] = None,
+                        limit: Optional[int] = None) -> List[KlineData]:
+        """Get kline (candlestick) data"""
         try:
             params = {
                 "category": "linear",
                 "symbol": symbol.name,
                 "interval": timeframe.value,
-                "limit": limit or self.kline_limit
+                "limit": limit or self._config.kline_limit
             }
 
-            current_time = TimeUtils.get_current_timestamp()
-
-            # Validate timestamps
             if start_time is not None:
-                if start_time > current_time:
-                    raise ValidationError(
-                        f"Cannot request future data: {TimeUtils.from_timestamp(start_time)}"
-                    )
-                params["start"] = start_time
-
+                params['start'] = start_time
             if end_time is not None:
-                if start_time is not None and end_time <= start_time:
-                    raise ValidationError(
-                        f"Invalid time range: end_time ({TimeUtils.from_timestamp(end_time)}) "
-                        f"must be greater than start_time ({TimeUtils.from_timestamp(start_time)})"
-                    )
-                if end_time > current_time:
-                    logger.warning(
-                        f"Adjusting end_time from future {TimeUtils.from_timestamp(end_time)} "
-                        f"to current {TimeUtils.from_timestamp(current_time)}"
-                    )
-                    end_time = current_time
-                params["end"] = end_time
+                params['end'] = end_time
 
-            response = await self._execute_request(self._get_klines, **params)
-            items = response.get('result', {}).get('list', [])
+            data = await self._request(
+                'GET',
+                '/v5/market/kline',
+                params=params
+            )
 
             klines: List[KlineData] = []
+            current_time = TimeUtils.get_current_timestamp()
 
-            # Process items in reverse order to convert from descending to ascending
-            for item in reversed(items):
+            # Process klines in ascending order
+            for item in reversed(data.get('list', [])):
                 timestamp = int(item[0])
 
-                # Skip future timestamps
                 if timestamp > current_time:
-                    logger.warning(
-                        f"Received future timestamp from API: {TimeUtils.from_timestamp(Timestamp(timestamp))}"
-                    )
                     continue
 
-                # Skip timestamps outside requested range
                 if end_time and timestamp > end_time:
                     continue
                 if start_time and timestamp < start_time:
@@ -361,30 +244,3 @@ class BybitAdapter(ExchangeAdapter):
         except Exception as e:
             logger.error(f"Failed to fetch klines for {symbol}: {e}")
             raise
-
-    async def get_latest_price(self, symbol: SymbolName) -> Decimal:
-        """
-        Get latest price for symbol.
-
-        Args:
-            symbol: Trading pair symbol
-
-        Returns:
-            Decimal: Latest price
-
-        Raises:
-            Exception: If fetching price fails
-        """
-        try:
-            response = await self._execute_request(self._get_ticker, symbol)
-            ticker = response.get('result', {}).get('list', [{}])[0]
-            return Decimal(str(ticker.get('lastPrice', '0')))
-
-        except Exception as e:
-            logger.error(f"Failed to fetch latest price for {symbol}: {e}")
-            raise
-
-    async def close(self) -> None:
-        """Cleanup adapter resources."""
-        self._initialized = False
-        logger.info("BybitAdapter closed")
