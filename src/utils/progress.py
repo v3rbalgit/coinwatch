@@ -4,12 +4,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
-from ...utils.domain_types import Timeframe
-from ...utils.time import TimeUtils
-from ...core.models import SymbolInfo
+from .domain_types import Timeframe
+from .time import TimeUtils
+from ..core.models import SymbolInfo
 
 @dataclass
-class CollectionProgress:
+class MarketDataProgress:
     """Tracks data collection progress of a symbol"""
     symbol: SymbolInfo
     start_time: datetime  # Stored as UTC datetime
@@ -67,16 +67,15 @@ class CollectionProgress:
 
     def __lt__(self, other: 'SymbolInfo') -> bool:
       """Enable sorting by symbol"""
-      if not isinstance(other, CollectionProgress):
+      if not isinstance(other, MarketDataProgress):
           return NotImplemented
       return self.symbol < other.symbol
 
     def __eq__(self, other: object) -> bool:
         """Equality comparison"""
-        if not isinstance(other, CollectionProgress):
+        if not isinstance(other, MarketDataProgress):
             return NotImplemented
         return self.symbol == other.symbol
-
 
 @dataclass
 class SyncSchedule:
@@ -110,3 +109,53 @@ class SyncSchedule:
         status.append(f"Next: {time_until:.1f}s")
 
         return " | ".join(status)
+
+@dataclass
+class FundamentalDataProgress:
+    """Generic progress tracking for data collection"""
+    symbol: SymbolInfo
+    collector_type: str
+    start_time: datetime
+    items_total: Optional[int] = None
+    items_processed: int = 0
+    status: str = "pending"
+    error: Optional[str] = None
+    last_update: Optional[datetime] = None
+
+    def update(self, processed: int, total: Optional[int] = None) -> None:
+        """Update progress"""
+        self.items_processed = processed
+        if total is not None:
+            self.items_total = total
+        self.last_update = TimeUtils.get_current_datetime()
+
+    def get_completion_summary(self, end_time: datetime) -> str:
+        """Generate detailed completion summary"""
+        elapsed = (end_time - self.start_time).total_seconds()
+
+        summary = [
+            f"Collection completed for {self.symbol.symbol_name}",
+            f"Type: {self.collector_type}",
+            f"Duration: {elapsed:.1f}s",
+            f"Status: {self.status}"
+        ]
+
+        if self.items_total:
+            percentage = (self.items_processed / self.items_total) * 100
+            summary.append(
+                f"Progress: {percentage:.1f}% "
+                f"({self.items_processed}/{self.items_total} items)"
+            )
+
+        if self.error:
+            summary.append(f"Error: {self.error}")
+
+        return " | ".join(summary)
+
+    def __str__(self) -> str:
+        """Human-readable progress representation"""
+        if self.items_total:
+            percentage = (self.items_processed / self.items_total) * 100
+            return (f"{self.collector_type} Progress: {percentage:.1f}% "
+                   f"({self.items_processed}/{self.items_total})")
+        return f"{self.collector_type} Progress: {self.status}"

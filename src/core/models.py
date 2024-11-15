@@ -2,10 +2,10 @@
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from ..utils.time import TimeUtils
-from ..utils.domain_types import SymbolName, ExchangeName, Timeframe, Timestamp
+from ..utils.domain_types import DataSource, SymbolName, ExchangeName, Timeframe, Timestamp
 
 @dataclass(frozen=True)
 class SymbolInfo:
@@ -18,6 +18,10 @@ class SymbolInfo:
     min_order_qty: Decimal
     launch_time: Timestamp
     exchange: ExchangeName = ExchangeName("bybit")
+
+    @property
+    def symbol_name(self):
+        return self.name.lower().replace('usdt', '')
 
     def check_retention_time(self, retention_days: int) -> 'SymbolInfo':
         """Create new instance with adjusted launch time based on retention period"""
@@ -193,3 +197,50 @@ class OBVResult:
             timestamp=timestamp,
             value=Decimal(str(value))
         )
+
+@dataclass
+class Metadata:
+    """Domain model for token metadata"""
+    id: str
+    symbol: SymbolInfo
+    name: str
+    description: str
+    market_cap_rank: int
+    category: str
+    updated_at: Timestamp
+    launch_time: Optional[Timestamp]
+    platform: Optional[str]
+    contract_address: Optional[str]
+    hashing_algorithm: Optional[str]
+    website: Optional[str]
+    whitepaper: Optional[str]
+    reddit: Optional[str]
+    twitter: Optional[str]
+    telegram: Optional[str]
+    github: Optional[str]
+    images: Dict[str, str]
+    data_source: DataSource
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert metadata to database-friendly dictionary"""
+        return {
+            "coingecko_id": self.id,
+            "symbol": self.symbol.name,
+            "name": self.name,
+            "description": self.description,
+            "market_cap_rank": self.market_cap_rank,
+            "category": self.category,
+            "platform": self.platform,
+            "contract_address": self.contract_address,
+            "launch_time": TimeUtils.from_timestamp(self.launch_time) if self.launch_time else None,
+            "hashing_algorithm": self.hashing_algorithm,
+            "website": self.website,
+            "whitepaper": self.whitepaper,
+            "reddit": self.reddit,
+            "twitter": self.twitter,
+            "telegram": self.telegram,
+            "github": self.github,
+            "images": self.images,
+            "updated_at": TimeUtils.from_timestamp(self.updated_at),
+            "data_source": self.data_source.value
+        }

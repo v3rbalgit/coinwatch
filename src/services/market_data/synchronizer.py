@@ -8,7 +8,7 @@ from ...core.coordination import Command, MarketDataCommand, ServiceCoordinator
 from ...core.models import SymbolInfo
 from ...core.exceptions import ServiceError, ValidationError
 from ...adapters.registry import ExchangeAdapterRegistry
-from ...services.market_data.progress import SyncSchedule
+from ...utils.progress import SyncSchedule
 from ...repositories.kline import KlineRepository
 from ...utils.retry import RetryConfig, RetryStrategy
 from ...utils.time import TimeUtils

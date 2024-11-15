@@ -5,7 +5,6 @@ from sqlalchemy import select, and_, text
 
 from ..core.models import SymbolInfo
 from ..services.database.service import DatabaseService, IsolationLevel
-from .base import Repository
 from ..models import Symbol
 from ..utils.domain_types import ExchangeName
 from ..core.exceptions import RepositoryError
@@ -14,17 +13,24 @@ from ..utils.time import TimeUtils
 
 logger = LoggerSetup.setup(__name__)
 
-class SymbolRepository(Repository[Symbol]):
-    """Repository for Symbol operations with PostgreSQL optimization"""
+class SymbolRepository:
+    """Repository for managing Symbol entities in the database."""
 
     def __init__(self, db_service: DatabaseService):
-        super().__init__(db_service, Symbol)
+        self.db_service = db_service
 
     async def get_or_create(self, symbol: SymbolInfo) -> Symbol:
         """
-        Get or create a symbol using PostgreSQL upsert
+        Get an existing symbol or create a new one if it doesn't exist.
 
-        Uses INSERT ... ON CONFLICT DO UPDATE for atomic operation
+        Args:
+            symbol (SymbolInfo): The symbol information to get or create.
+
+        Returns:
+            Symbol: The retrieved or created Symbol entity.
+
+        Raises:
+            RepositoryError: If there's an error during the operation.
         """
         try:
             async with self.db_service.get_session(isolation_level=IsolationLevel.SERIALIZABLE) as session:
@@ -70,14 +76,16 @@ class SymbolRepository(Repository[Symbol]):
 
     async def get_symbol(self, symbol: SymbolInfo) -> Optional[Symbol]:
         """
-        Get symbol by name and optionally exchange
+        Retrieve a symbol by its name and exchange.
 
         Args:
-            symbol_name: The name of the symbol
-            exchange: Optional exchange name to filter by
+            symbol (SymbolInfo): The symbol information to search for.
 
         Returns:
-            Symbol if found, None otherwise
+            Optional[Symbol]: The found Symbol entity or None if not found.
+
+        Raises:
+            RepositoryError: If there's an error during the retrieval.
         """
         try:
             async with self.db_service.get_session() as session:
@@ -97,9 +105,16 @@ class SymbolRepository(Repository[Symbol]):
 
     async def get_symbols_with_stats(self, exchange: ExchangeName) -> List[dict]:
         """
-        Get all symbols from an exchange with their data statistics
+        Get all symbols from a specific exchange with their associated statistics.
 
-        Uses TimescaleDB features to gather statistics efficiently
+        Args:
+            exchange (ExchangeName): The name of the exchange to get symbols from.
+
+        Returns:
+            List[dict]: A list of dictionaries containing symbol information and statistics.
+
+        Raises:
+            RepositoryError: If there's an error retrieving the statistics.
         """
         try:
             async with self.db_service.get_session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
@@ -140,7 +155,15 @@ class SymbolRepository(Repository[Symbol]):
             raise RepositoryError(f"Failed to get symbol statistics: {str(e)}")
 
     async def delete(self, symbol: SymbolInfo) -> None:
-        """Delete a symbol and its associated data"""
+        """
+        Delete a symbol and its associated data from the database.
+
+        Args:
+            symbol (SymbolInfo): The symbol information to delete.
+
+        Raises:
+            RepositoryError: If there's an error during the deletion process.
+        """
         try:
             async with self.db_service.get_session(isolation_level=IsolationLevel.SERIALIZABLE) as session:
                 # Find the symbol record

@@ -8,7 +8,6 @@ from sqlalchemy.dialects.postgresql import insert
 
 from..core.models import KlineData, SymbolInfo
 from ..services.database.service import DatabaseService, IsolationLevel
-from .base import Repository
 from ..models import Symbol, Kline
 from ..utils.domain_types import Timeframe, Timestamp
 from ..core.exceptions import RepositoryError, ValidationError
@@ -18,18 +17,35 @@ from ..utils.time import TimeUtils
 
 logger = LoggerSetup.setup(__name__)
 
-class KlineRepository(Repository[Kline]):
-    """Repository for Kline operations with TimescaleDB optimization"""
+class KlineRepository:
+    """
+    Repository for Kline operations with TimescaleDB optimization.
+
+    Handles database operations related to kline data, including insertion,
+    retrieval, and management of time series data.
+    """
 
     def __init__(self, db_service: DatabaseService):
-        super().__init__(db_service, Kline)
+        self.db_service = db_service
         self.validator = MarketDataValidator()
         self._batch_size = 1000
 
     async def get_latest_timestamp(self,
                              symbol: SymbolInfo,
                              timeframe: Timeframe) -> Timestamp:
-        """Get latest timestamp using TimescaleDB's last() function"""
+        """
+        Get the latest timestamp for a symbol and timeframe using TimescaleDB's last() function.
+
+        Args:
+            symbol (SymbolInfo): The symbol to query.
+            timeframe (Timeframe): The timeframe of the kline data.
+
+        Returns:
+            Timestamp: The latest timestamp for the given symbol and timeframe.
+
+        Raises:
+            RepositoryError: If there's an error retrieving the latest timestamp.
+        """
         try:
             async with self.db_service.get_session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
                 symbol_stmt = select(Symbol).where(
@@ -408,9 +424,15 @@ class KlineRepository(Repository[Kline]):
                         timeframe: Timeframe,
                         klines: List[Tuple]) -> int:
         """
-        Insert a batch of klines using PostgreSQL bulk insert
+        Insert a batch of klines using PostgreSQL bulk insert.
 
-        Uses COPY command for efficient bulk loading
+        Args:
+            symbol (SymbolInfo): The symbol information for the klines.
+            timeframe (Timeframe): The timeframe of the klines.
+            klines (List[Tuple]): A list of kline data tuples.
+
+        Returns:
+            int: The number of klines successfully inserted.
         """
         try:
             inserted_count = 0
@@ -481,7 +503,21 @@ class KlineRepository(Repository[Kline]):
                            timeframe: Timeframe,
                            start_time: Timestamp,
                            end_time: Timestamp) -> List[Tuple[Timestamp, Timestamp]]:
-        """Find gaps in time series data using TimescaleDB features"""
+        """
+        Find gaps in time series data using TimescaleDB features.
+
+        Args:
+            symbol (SymbolInfo): The symbol to check for gaps.
+            timeframe (Timeframe): The timeframe of the data.
+            start_time (Timestamp): The start time of the range to check.
+            end_time (Timestamp): The end time of the range to check.
+
+        Returns:
+            List[Tuple[Timestamp, Timestamp]]: A list of tuples representing the start and end of each gap.
+
+        Raises:
+            RepositoryError: If there's an error during the gap finding process.
+        """
         try:
             async with self.db_service.get_session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
                 # Convert timestamps to datetime for the query
@@ -525,7 +561,15 @@ class KlineRepository(Repository[Kline]):
             raise RepositoryError(f"Failed to find data gaps: {str(e)}")
 
     async def delete_symbol_data(self, symbol: SymbolInfo) -> None:
-        """Delete all kline data for a symbol"""
+        """
+        Delete all kline data for a specific symbol.
+
+        Args:
+            symbol (SymbolInfo): The symbol whose data should be deleted.
+
+        Raises:
+            RepositoryError: If there's an error during the deletion process.
+        """
         try:
             async with self.db_service.get_session() as session:
                 # Get the symbol ID first
