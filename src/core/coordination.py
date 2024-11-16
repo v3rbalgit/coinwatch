@@ -23,6 +23,7 @@ class MarketDataCommand(Enum):
     COLLECTION_START = "collection_started"
     COLLECTION_COMPLETE = "collection_complete"
     COLLECTION_ERROR = "collection_error"
+    SYMBOL_ADDED = "symbol_added"
     SYMBOL_DELISTED = "symbol_delisted"
     GAP_DETECTED = "gap_detected"
 

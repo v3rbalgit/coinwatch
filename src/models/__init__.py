@@ -3,12 +3,13 @@
 from .base import Base
 from .symbol import Symbol
 from .kline import Kline
-from .fundamental import TokenMetadata, symbol_metadata
+from .metadata import TokenMetadata
+from .market import TokenMarketMetrics
 
 __all__ = [
     'Base',
     'Symbol',
     'Kline',
     'TokenMetadata',
-    'symbol_metadata'
+    'TokenMarketMetrics'
 ]

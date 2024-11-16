@@ -1,4 +1,4 @@
-# src/models/fundamental.py
+# src/models/metadata.py
 
 from datetime import datetime
 from typing import Optional
@@ -10,8 +10,8 @@ class TokenMetadata(Base):
     """Token metadata information"""
     __tablename__ = 'token_metadata'
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    coingecko_id: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    # Coingecko identification
+    id: Mapped[str] = mapped_column(Text, nullable=False, unique=True, primary_key=True)
     symbol: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     name: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
 
@@ -44,4 +44,4 @@ class TokenMetadata(Base):
     data_source: Mapped[str] = mapped_column(Text, default='coingecko')
 
     def __repr__(self) -> str:
-        return f"TokenMetadata(id={self.id}, coingecko_id='{self.coingecko_id}', symbol='{self.symbol}')"
+        return f"TokenMetadata(id={self.id}, symbol='{self.symbol}', name='{self.name}')"

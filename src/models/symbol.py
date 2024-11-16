@@ -5,11 +5,9 @@ from sqlalchemy import Index, BigInteger, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base
-from .fundamental import symbol_metadata
 
 if TYPE_CHECKING:
     from .kline import Kline
-    from .fundamental import TokenMetadata
 
 class Symbol(Base):
     """
@@ -38,11 +36,6 @@ class Symbol(Base):
         'Kline',
         back_populates='symbol',
         cascade='all, delete-orphan'
-    )
-    metadata: Mapped[List["TokenMetadata"]] = relationship(
-        "TokenMetadata",
-        secondary=symbol_metadata,
-        back_populates="symbols"
     )
 
     def __repr__(self) -> str:

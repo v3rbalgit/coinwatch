@@ -1,13 +1,15 @@
 # src/adapters/coingecko.py
 
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 import aiohttp
 import asyncio
 
+from ..core.models import SymbolInfo
+from ..core.exceptions import AdapterError
 from ..config import CoingeckoConfig
 from ..adapters.base import APIAdapter
 from ..utils.logger import LoggerSetup
-from ..core.exceptions import AdapterError
+from ..utils.cache import async_ttl_cache
 from ..utils.retry import RetryConfig, RetryStrategy
 from ..utils.rate_limit import TokenBucket, RateLimitConfig
 
@@ -109,6 +111,7 @@ class CoinGeckoAdapter(APIAdapter):
 
                 raise AdapterError(f"API request failed: {str(e)}")
 
+    @async_ttl_cache(maxsize=1000, ttl=86400)
     async def get_coin_id(self, symbol: str) -> Optional[str]:
         """Get CoinGecko coin ID for a symbol"""
         try:
@@ -148,3 +151,60 @@ class CoinGeckoAdapter(APIAdapter):
         except Exception as e:
             logger.error(f"Error getting coin info for {coin_id}: {e}")
             raise AdapterError(f"Failed to get coin info: {str(e)}")
+
+    async def get_market_data(self, coin_ids: List[str]) -> List[Dict[str, Any]]:
+        """
+        Get market data for multiple coins handling pagination.
+
+        Args:
+            coin_ids: List of CoinGecko coin IDs
+
+        Returns:
+            List of market data dictionaries for all requested coins
+        """
+        try:
+            all_results = []
+            page = 1
+            per_page = 250  # Maximum allowed by CoinGecko
+            ids_chunks = [coin_ids[i:i + 250] for i in range(0, len(coin_ids), 250)]
+
+            # Process each chunk of IDs
+            for chunk in ids_chunks:
+                while True:
+                    params = {
+                        'ids': ','.join(chunk),
+                        'vs_currency': 'usd',
+                        'order': 'market_cap_desc',
+                        'per_page': per_page,
+                        'page': page,
+                        'sparkline': False
+                    }
+
+                    results = await self._request(
+                        'GET',
+                        '/coins/markets',
+                        params=params
+                    )
+
+                    if not results:
+                        break
+
+                    all_results.extend(results)
+
+                    # If we got less than per_page results, we've hit the last page
+                    if len(results) < per_page:
+                        break
+
+                    page += 1
+
+            # Ensure we got data for all requested coins
+            received_ids = {result['id'] for result in all_results}
+            missing_ids = set(coin_ids) - received_ids
+            if missing_ids:
+                logger.warning(f"Missing market data for coins: {missing_ids}")
+
+            return all_results
+
+        except Exception as e:
+            logger.error(f"Error getting market data for {len(coin_ids)} coins: {e}")
+            raise

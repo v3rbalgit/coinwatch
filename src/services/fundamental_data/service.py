@@ -4,15 +4,18 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Set
 
+from ...adapters.registry import ExchangeAdapterRegistry
 from ...adapters.coingecko import CoinGeckoAdapter
-from ...repositories.metadata import MetadataRepository
+from ...repositories import MarketMetricsRepository, MetadataRepository
+from ...services.base import ServiceBase
+from ...services.fundamental_data.collector import FundamentalCollector
 from ...services.fundamental_data.metadata_collector import MetadataCollector
+from ...services.fundamental_data.market_metrics_collector import MarketMetricsCollector
+from ...core.models import SymbolInfo
 from ...core.coordination import Command, MarketDataCommand, ServiceCoordinator
 from ...core.exceptions import ServiceError
 from ...utils.domain_types import ServiceStatus
-from ...services.base import ServiceBase
 from ...utils.logger import LoggerSetup
-from ...core.models import SymbolInfo
 from ...utils.error import ErrorTracker
 
 logger = LoggerSetup.setup(__name__)
@@ -22,7 +25,7 @@ class FundamentalDataConfig:
     """Configuration for fundamental data collection intervals and batch sizes."""
     collection_intervals: Dict[str, int] = field(default_factory=lambda: {
         'metadata': 86400 * 30,  # Monthly
-        'market': 86400,         # Daily
+        'market': 3600,          # Hourly
         'blockchain': 86400,     # Daily
         'sentiment': 86400       # Daily
     })
@@ -43,7 +46,9 @@ class FundamentalDataService(ServiceBase):
 
     def __init__(self,
                  coordinator: ServiceCoordinator,
+                 exchange_registry: ExchangeAdapterRegistry,
                  metadata_repository: MetadataRepository,
+                 market_metrics_repository: MarketMetricsRepository,
                  coingecko_adapter: CoinGeckoAdapter,
                  config: FundamentalDataConfig):
         """
@@ -57,12 +62,13 @@ class FundamentalDataService(ServiceBase):
         """
         super().__init__(config)
         self.coordinator = coordinator
+        self.exchange_registry = exchange_registry
         self.metadata_repository = metadata_repository
+        self.market_metrics_repository = market_metrics_repository
         self.coingecko_adapter = coingecko_adapter
 
         self._status = ServiceStatus.STOPPED
         self._active_tokens: Set[str] = set()
-        self._token_exchanges: Dict[str, Set[str]] = {}
 
         # Error tracking
         self._error_tracker = ErrorTracker()
@@ -73,15 +79,17 @@ class FundamentalDataService(ServiceBase):
         self._processing: Set[SymbolInfo] = set()
 
         # Initialize collectors (will add as we implement them)
-        self._collectors = {
+        self._collectors: Dict[str, FundamentalCollector] = {
             'metadata': MetadataCollector(
-                self.coordinator,
-                metadata_repository,
-                coingecko_adapter,
-                config.collection_intervals['metadata'],
-                config.batch_sizes['metadata']
+                self.metadata_repository,
+                self.coingecko_adapter,
+                config.collection_intervals['metadata']
                 ),
-            # 'market': MarketMetricsCollector(...),
+            'market': MarketMetricsCollector(
+                self.market_metrics_repository,
+                self.coingecko_adapter,
+                config.collection_intervals['market']
+            )
             # 'blockchain': BlockchainMetricsCollector(...),
             # 'sentiment': SentimentMetricsCollector(...)
         }
@@ -89,8 +97,8 @@ class FundamentalDataService(ServiceBase):
     async def _register_command_handlers(self) -> None:
         """Register command handlers with the service coordinator."""
         handlers = {
-            MarketDataCommand.COLLECTION_COMPLETE: self._handle_collection_complete,
-            MarketDataCommand.SYMBOL_DELISTED: self._handle_symbol_delisted
+            MarketDataCommand.SYMBOL_DELISTED: self._handle_symbol_delisted,
+            MarketDataCommand.SYMBOL_ADDED: self._handle_symbol_added
         }
         for command, handler in handlers.items():
             await self.coordinator.register_handler(command, handler)
@@ -98,54 +106,78 @@ class FundamentalDataService(ServiceBase):
     async def _unregister_command_handlers(self) -> None:
         """Unregister command handlers from the service coordinator."""
         handlers = {
-            MarketDataCommand.COLLECTION_COMPLETE: self._handle_collection_complete,
-            MarketDataCommand.SYMBOL_DELISTED: self._handle_symbol_delisted
+            MarketDataCommand.SYMBOL_DELISTED: self._handle_symbol_delisted,
+            MarketDataCommand.SYMBOL_ADDED: self._handle_symbol_added
         }
         for command, handler in handlers.items():
             await self.coordinator.unregister_handler(command, handler)
 
-    async def _handle_collection_complete(self, command: Command) -> None:
-        """
-        Handle the completion of market data collection.
-
-        Args:
-            command (Command): The collection complete command.
-        """
-        symbol = command.params["symbol"]
-        base_token = symbol.symbol_name  # Using property from SymbolInfo
-
-        self._active_tokens.add(base_token)
-        if base_token not in self._token_exchanges:
-            self._token_exchanges[base_token] = set()
-        self._token_exchanges[base_token].add(symbol.exchange)
-
-        # Schedule collectors only if this is first listing of token
-        if len(self._token_exchanges[base_token]) == 1:
-            for collector in self._collectors.values():
-                await collector.schedule_collection(symbol)
-
     async def _handle_symbol_delisted(self, command: Command) -> None:
-        """
-        Handle symbol delisting.
+        """Handle symbol delisting"""
+        symbol: SymbolInfo = command.params["symbol"]
+        base_token: str = symbol.name.lower().replace('usdt', '')
 
-        Args:
-            command (Command): The symbol delisted command.
-        """
-        symbol = command.params["symbol"]
-        base_token = symbol.symbol_name
+        # Check if token is still traded on other exchanges
+        still_active = False
+        for exchange in self.exchange_registry.get_registered():
+            adapter = self.exchange_registry.get_adapter(exchange)
+            symbols = await adapter.get_symbols()
+            if any(s.name.lower().replace('usdt', '') == base_token for s in symbols):
+                still_active = True
+                break
 
-        if base_token in self._token_exchanges:
-            self._token_exchanges[base_token].discard(symbol.exchange)
-            # Only remove from active tokens if no exchanges list it
-            if not self._token_exchanges[base_token]:
-                self._active_tokens.discard(base_token)
-                self._token_exchanges.pop(base_token)
+        if not still_active:
+            self._active_tokens.discard(base_token)
+            logger.info(f"Stopped tracking {base_token} - no longer traded")
+
+    async def _handle_symbol_added(self, command: Command) -> None:
+        """
+        Handle new symbol addition.
+        Only schedule collection if we're not already tracking this token.
+        """
+        symbol: SymbolInfo = command.params["symbol"]
+        base_token: str = symbol.name.lower().replace('usdt', '')
+
+        async with self._collection_lock:
+            if base_token not in self._active_tokens:
+                self._active_tokens.add(base_token)
+
+                # Schedule collection for new token
+                for collector in self._collectors.values():
+                    await collector.schedule_collection({base_token})
+
+                logger.info(f"Started tracking new token: {base_token}")
+
+    async def _collect_active_symbols(self) -> None:
+        """Initial collection of unique base tokens from all exchanges"""
+        unique_tokens: Set[str] = set()
+
+        for exchange in self.exchange_registry.get_registered():
+            adapter = self.exchange_registry.get_adapter(exchange)
+            symbols = await adapter.get_symbols()
+
+            # Extract unique base tokens and keep one symbol instance
+            for symbol in symbols:
+                base_token = symbol.name.lower().replace('usdt', '')
+                unique_tokens.add(base_token)
+
+        async with self._collection_lock:
+            self._active_tokens.update(unique_tokens)
+
+        logger.info(f"Collecting fundamental data for {len(unique_tokens)} unique tokens")
+
+        for collector in self._collectors.values():
+            await collector.schedule_collection(unique_tokens)
 
     async def start(self) -> None:
         """Start the service"""
         try:
             self._status = ServiceStatus.STARTING
             await self._register_command_handlers()
+
+            # Initial collection of all active symbols
+            await self._collect_active_symbols()
+
             self._status = ServiceStatus.RUNNING
             logger.info("Fundamental data service started successfully")
         except Exception as e:
@@ -160,7 +192,6 @@ class FundamentalDataService(ServiceBase):
             self._status = ServiceStatus.STOPPING
             await self._unregister_command_handlers()
 
-            # Cleanup collectors
             for collector in self._collectors.values():
                 await collector.cleanup()
 
@@ -181,13 +212,9 @@ class FundamentalDataService(ServiceBase):
             "Fundamental Data Service Status:",
             f"Status: {self._status.value}",
             f"Active Tokens: {len(self._active_tokens)}",
-            "\nToken Listings:",
-            *[f"  {token}: {len(exchanges)} exchange(s)"
-              for token, exchanges in self._token_exchanges.items()],
             "\nCollection Status:"
         ]
 
-        # Add collector statuses
         for name, collector in self._collectors.items():
             status_lines.append(f"\n{name.title()} Collector:")
             status_lines.append(collector.get_collection_status())

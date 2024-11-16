@@ -16,7 +16,7 @@ from sqlalchemy import text
 from ..base import ServiceBase
 from ...services.database.recovery import DatabaseRecovery
 from ...models.base import Base
-from ...models import Kline, Symbol, TokenMetadata
+from ...models import Kline, Symbol, TokenMetadata, TokenMarketMetrics
 from ...core.monitoring import DatabaseMetrics
 from ...core.coordination import Command, CommandResult, MonitoringCommand, ServiceCoordinator
 from ...core.exceptions import ServiceError, ValidationError

@@ -1,12 +1,13 @@
 # src/repositories/metadata.py
 
-from typing import Optional
+from typing import List, Optional
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 
 from ..services.database.service import DatabaseService
 from ..core.models import SymbolInfo, Metadata
 from ..core.exceptions import RepositoryError
-from ..models.fundamental import TokenMetadata
+from ..models.metadata import TokenMetadata
 from ..utils.time import TimeUtils
 from ..utils.logger import LoggerSetup
 from ..utils.domain_types import DataSource, IsolationLevel
@@ -19,42 +20,38 @@ class MetadataRepository:
     def __init__(self, db_service: DatabaseService):
         self.db_service = db_service
 
-    async def upsert_metadata(self, symbol: SymbolInfo, metadata: Metadata) -> None:
+    async def upsert_metadata(self, metadata_list: List[Metadata]) -> None:
         """
-        Create or update metadata for a symbol
+        Create or update metadata for a symbol using PostgreSQL upsert.
 
         Args:
             symbol: Symbol to update metadata for
-            metadata: Dictionary containing metadata fields
+            metadata: Metadata domain model
         """
         try:
             async with self.db_service.get_session(
                 isolation_level=IsolationLevel.REPEATABLE_READ
             ) as session:
-                # Check for existing metadata
-                metadata_stmt = select(TokenMetadata).where(
-                    TokenMetadata.symbol == symbol.name.lower().replace('usdt', '')
+                # Convert all metadata to database format
+                db_data = [metadata.to_dict() for metadata in metadata_list]
+
+                stmt = insert(TokenMetadata).values(db_data)
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=['id'],
+                    set_={
+                        col.name: stmt.excluded[col.name]
+                        for col in TokenMetadata.__table__.columns
+                        if col.name != 'id'
+                    }
                 )
-                metadata_result = await session.execute(metadata_stmt)
-                metadata_record = metadata_result.scalar_one_or_none()
-
-                metadata_dict = metadata.to_dict()
-
-                if metadata_record:
-                    # Update existing record
-                    for key, value in metadata_dict.items():
-                        setattr(metadata_record, key, value)
-                else:
-                    # Create new record
-                    metadata_record = TokenMetadata(**metadata_dict)
-                    session.add(metadata_record)
-
+                await session.execute(stmt)
                 await session.commit()
-                logger.debug(f"Updated metadata for {symbol}")
+
+                logger.debug(f"Updated metadata for {len(metadata_list)} tokens")
 
         except Exception as e:
-            logger.error(f"Error upserting metadata for {symbol}: {e}")
-            raise RepositoryError(f"Failed to upsert metadata: {str(e)}")
+            logger.error(f"Error in bulk metadata upsert: {e}")
+            raise RepositoryError(f"Failed to upsert metadata batch: {str(e)}")
 
     async def get_metadata(self, symbol: SymbolInfo) -> Optional[Metadata]:
         """
@@ -80,7 +77,7 @@ class MetadataRepository:
 
                 if metadata_record:
                     return Metadata(
-                        id=metadata_record.coingecko_id,
+                        id=metadata_record.id,
                         symbol=symbol,
                         name=metadata_record.name,
                         description=metadata_record.description,
@@ -102,7 +99,7 @@ class MetadataRepository:
                             'large': metadata_record.image_large
                         },
                         updated_at=TimeUtils.to_timestamp(metadata_record.updated_at),
-                        data_source=DataSource.COINGECKO
+                        data_source=DataSource(metadata_record.data_source)
                     )
                 return None
 
