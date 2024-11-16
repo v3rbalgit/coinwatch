@@ -1,4 +1,4 @@
-# src/services/market_data/progress.py
+# src/utils/progress.py
 
 from dataclasses import dataclass
 from datetime import datetime
@@ -113,7 +113,7 @@ class SyncSchedule:
 @dataclass
 class FundamentalDataProgress:
     """Generic progress tracking for data collection"""
-    symbol: SymbolInfo
+    symbol: str
     collector_type: str
     start_time: datetime
     items_total: Optional[int] = None
@@ -134,7 +134,7 @@ class FundamentalDataProgress:
         elapsed = (end_time - self.start_time).total_seconds()
 
         summary = [
-            f"Collection completed for {self.symbol.symbol_name}",
+            f"Collection completed for {self.symbol}",
             f"Type: {self.collector_type}",
             f"Duration: {elapsed:.1f}s",
             f"Status: {self.status}"

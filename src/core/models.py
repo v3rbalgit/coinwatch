@@ -198,6 +198,7 @@ class OBVResult:
             value=Decimal(str(value))
         )
 
+# Metadata Model
 @dataclass
 class Metadata:
     """Domain model for token metadata"""
@@ -228,7 +229,7 @@ class Metadata:
             "symbol": self.symbol.name,
             "name": self.name,
             "description": self.description,
-            "market_cap_rank": self.market_cap_rank,
+            "market_cap_rank": int(self.market_cap_rank) if self.market_cap_rank else None,
             "category": self.category,
             "platform": self.platform,
             "contract_address": self.contract_address,
@@ -243,4 +244,61 @@ class Metadata:
             "images": self.images,
             "updated_at": TimeUtils.from_timestamp(self.updated_at),
             "data_source": self.data_source.value
+        }
+
+# Market Metrics Model
+@dataclass
+class MarketMetrics:
+    """Market metrics for a token"""
+    id: str  # CoinGecko ID
+    symbol: SymbolInfo
+    current_price: Decimal
+    market_cap: Optional[Decimal]
+    market_cap_rank: Optional[int]
+    fully_diluted_valuation: Optional[Decimal]
+    total_volume: Decimal
+    high_24h: Optional[Decimal]
+    low_24h: Optional[Decimal]
+    price_change_24h: Optional[Decimal]
+    price_change_percentage_24h: Optional[Decimal]
+    market_cap_change_24h: Optional[Decimal]
+    market_cap_change_percentage_24h: Optional[Decimal]
+    circulating_supply: Optional[Decimal]
+    total_supply: Optional[Decimal]
+    max_supply: Optional[Decimal]
+    ath: Optional[Decimal]
+    ath_change_percentage: Optional[Decimal]
+    ath_date: Optional[str]
+    atl: Optional[Decimal]
+    atl_change_percentage: Optional[Decimal]
+    atl_date: Optional[str]
+    updated_at: Timestamp
+    data_source: DataSource
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for database storage"""
+        return {
+            'id': self.id,
+            'current_price': float(self.current_price),
+            'market_cap': float(self.market_cap) if self.market_cap else None,
+            'market_cap_rank': self.market_cap_rank,
+            'fully_diluted_valuation': float(self.fully_diluted_valuation) if self.fully_diluted_valuation else None,
+            'total_volume': float(self.total_volume),
+            'high_24h': float(self.high_24h) if self.high_24h else None,
+            'low_24h': float(self.low_24h) if self.low_24h else None,
+            'price_change_24h': float(self.price_change_24h) if self.price_change_24h else None,
+            'price_change_percentage_24h': float(self.price_change_percentage_24h) if self.price_change_percentage_24h else None,
+            'market_cap_change_24h': float(self.market_cap_change_24h) if self.market_cap_change_24h else None,
+            'market_cap_change_percentage_24h': float(self.market_cap_change_percentage_24h) if self.market_cap_change_percentage_24h else None,
+            'circulating_supply': float(self.circulating_supply) if self.circulating_supply else None,
+            'total_supply': float(self.total_supply) if self.total_supply else None,
+            'max_supply': float(self.max_supply) if self.max_supply else None,
+            'ath': float(self.ath) if self.ath else None,
+            'ath_change_percentage': float(self.ath_change_percentage) if self.ath_change_percentage else None,
+            'ath_date': self.ath_date,
+            'atl': float(self.atl) if self.atl else None,
+            'atl_change_percentage': float(self.atl_change_percentage) if self.atl_change_percentage else None,
+            'atl_date': self.atl_date,
+            'updated_at': TimeUtils.from_timestamp(self.updated_at),
+            'data_source': self.data_source.value
         }

@@ -85,3 +85,28 @@ class TimeUtils:
         current = TimeUtils.get_current_timestamp()
         interval_end = timestamp + interval_ms
         return current >= (interval_end + buffer_ms)
+
+    @staticmethod
+    def format_time_difference(time_difference_ms: int) -> str:
+        """
+        Format a time difference in milliseconds to a human-readable string.
+
+        Args:
+            time_difference_ms (int): Time difference in milliseconds.
+
+        Returns:
+            str: Formatted time difference string.
+        """
+        seconds = time_difference_ms // 1000
+        minutes, seconds = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        days, hours = divmod(hours, 24)
+
+        if days > 0:
+            return f"{days}d {hours}h"
+        elif hours > 0:
+            return f"{hours}h {minutes}m"
+        elif minutes > 0:
+            return f"{minutes}m {seconds}s"
+        else:
+            return f"{seconds}s"

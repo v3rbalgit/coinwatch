@@ -582,6 +582,16 @@ class MarketDataService(ServiceBase):
                                     if symbol not in self._active_symbols:
                                         checked_symbol = symbol.check_retention_time(self._retention_days)
                                         self._active_symbols.add(checked_symbol)
+
+                                        # Notify fundamental data service
+                                        await self.coordinator.execute(Command(
+                                            type=MarketDataCommand.SYMBOL_ADDED,
+                                            params={
+                                                "symbol": checked_symbol,
+                                                "timestamp": TimeUtils.get_current_timestamp()
+                                            }
+                                        ))
+
                                         # Start collection via command
                                         await self.coordinator.execute(Command(
                                             type=MarketDataCommand.COLLECTION_START,
