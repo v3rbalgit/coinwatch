@@ -85,6 +85,17 @@ class FundamentalCollector(ABC):
         """
         pass
 
+    @abstractmethod
+    async def delete_symbol_data(self, token: str) -> None:
+        """
+        Delete data collection for symbol.
+
+        Args:
+            token (str): Symbol to delete.
+
+        """
+        pass
+
     async def cleanup(self) -> None:
         """Clean up resources and cancel ongoing tasks."""
         if self._queue_processor:

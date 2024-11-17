@@ -22,7 +22,15 @@ class MarketMetricsRepository:
         self.db_service = db_service
 
     async def upsert_market_metrics(self, metrics_list: List[MarketMetrics]) -> None:
-        """Create or update market metrics for a symbol"""
+        """
+        Create or update market metrics for multiple symbols.
+
+        Args:
+            metrics_list (List[MarketMetrics]): List of market metrics to upsert.
+
+        Raises:
+            RepositoryError: If the upsert operation fails.
+        """
         try:
             async with self.db_service.get_session(
                 isolation_level=IsolationLevel.REPEATABLE_READ
@@ -49,7 +57,18 @@ class MarketMetricsRepository:
             raise RepositoryError(f"Failed to upsert market metrics batch: {str(e)}")
 
     async def get_market_metrics(self, symbol: SymbolInfo) -> Optional[MarketMetrics]:
-        """Get stored market metrics for a symbol"""
+        """
+        Get stored market metrics for a symbol.
+
+        Args:
+            symbol (SymbolInfo): The symbol to retrieve market metrics for.
+
+        Returns:
+            Optional[MarketMetrics]: The market metrics for the symbol, or None if not found.
+
+        Raises:
+            RepositoryError: If the retrieval operation fails.
+        """
         try:
             async with self.db_service.get_session() as session:
                 stmt = select(TokenMarketMetrics).where(
@@ -90,3 +109,33 @@ class MarketMetricsRepository:
         except Exception as e:
             logger.error(f"Error getting market metrics for {symbol}: {e}")
             raise RepositoryError(f"Failed to get market metrics: {str(e)}")
+
+    async def delete_market_metrics(self, symbol: str) -> None:
+        """
+        Delete market metrics for a token.
+
+        Args:
+            symbol (str): Symbol representing the token to delete market metrics for.
+
+        Raises:
+            RepositoryError: If the deletion operation fails.
+        """
+        try:
+            async with self.db_service.get_session() as session:
+
+                stmt = select(TokenMarketMetrics).where(
+                    TokenMarketMetrics.symbol == symbol
+                )
+                result = await session.execute(stmt)
+                market_metrics_record = result.scalar_one_or_none()
+
+                if market_metrics_record:
+                    await session.delete(market_metrics_record)
+                    await session.commit()
+                    logger.info(f"Deleted market metrics for symbol '{symbol.upper()}'")
+                else:
+                    logger.warning(f"No market metrics found for symbol '{symbol.upper()}'")
+
+        except Exception as e:
+            logger.error(f"Error deleting market metrics for {symbol}: {e}")
+            raise RepositoryError(f"Failed to delete market metrics: {str(e)}")

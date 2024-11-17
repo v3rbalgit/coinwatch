@@ -110,5 +110,19 @@ class MetadataCollector(FundamentalCollector):
             raise ServiceError(f"Metadata collection failed: {str(e)}")
 
     async def store_symbol_data(self, data: List[Metadata]) -> None:
-        """Store collected metadata"""
+        """
+        Store collected metadata for multiple symbols.
+
+        Args:
+            data (List[Metadata]): List of Metadata objects to be stored.
+        """
         await self.metadata_repository.upsert_metadata(data)
+
+    async def delete_symbol_data(self, token: str) -> None:
+        """
+        Delete metadata for a specific symbol.
+
+        Args:
+            token (str): The token symbol for which to delete metadata.
+        """
+        await self.metadata_repository.delete_metadata(token)

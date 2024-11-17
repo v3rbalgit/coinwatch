@@ -4,7 +4,6 @@ from typing import Dict, Any, List, Optional
 import aiohttp
 import asyncio
 
-from ..core.models import SymbolInfo
 from ..core.exceptions import AdapterError
 from ..config import CoingeckoConfig
 from ..adapters.base import APIAdapter
