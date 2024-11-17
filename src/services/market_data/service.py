@@ -45,10 +45,10 @@ class MarketDataService(ServiceBase):
     symbol lifecycle management with configurable timeframes and retry policies.
     """
     def __init__(self,
+                 coordinator: ServiceCoordinator,
                  symbol_repository: SymbolRepository,
                  kline_repository: KlineRepository,
                  exchange_registry: ExchangeAdapterRegistry,
-                 coordinator: ServiceCoordinator,
                  config: MarketDataConfig):
         super().__init__(config)
 

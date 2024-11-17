@@ -252,6 +252,29 @@ class MarketDataConfig:
             raise ConfigurationError("Invalid default timeframe")
 
 @dataclass
+class FundamentalDataConfig:
+    """Configuration for fundamental data collection intervals and batch sizes."""
+    collection_intervals: Dict[str, int] = field(default_factory=lambda: {
+        'metadata': 86400 * 7,   # Weekly
+        'market': 3600,          # Hourly
+        'blockchain': 86400,     # Daily
+        'sentiment': 86400       # Daily
+    })
+    batch_sizes: Dict[str, int] = field(default_factory=lambda: {
+        'metadata': 10,   # Metadata collection is API heavy
+        'market': 100,    # Market data can be batched more
+        'blockchain': 50,
+        'sentiment': 50
+    })
+
+    def __post_init__(self) -> None:
+        """Validate configuration values"""
+        if any([v < 3600 for k, v in self.collection_intervals.items()]):
+            raise ConfigurationError("Collection interval must be at least 1 hour")
+        if any([v < 10 for k, v in self.batch_sizes.items()]):
+            raise ConfigurationError("Collection batch size must be at least 1 hour")
+
+@dataclass
 class MonitoringConfig:
     """Configuration for monitoring service"""
     check_intervals: Dict[str, int] = field(
@@ -292,6 +315,8 @@ class Config:
         self.database = self._init_database_config()
         self.exchanges = self._init_exchange_config()
         self.market_data = self._init_market_data_config()
+        self.fundamental_data = self._init_fundamental_data_config()
+        self.coingecko = self._init_coingecko_config()
         self.monitoring = self._init_monitoring_config()
         self.logging = self._init_log_config()
         self.api = self._init_api_config()
@@ -344,8 +369,8 @@ class Config:
         except Exception as e:
             raise ConfigurationError(f"Invalid exchange configuration: {e}")
 
-    def _init_metadata_config(self) -> CoingeckoConfig:
-        """Initialize metadata configuration"""
+    def _init_coingecko_config(self) -> CoingeckoConfig:
+        """Initialize coingecko configuration"""
         try:
             return CoingeckoConfig(
                 api_key=os.getenv('COINGECKO_API_KEY'),
@@ -366,6 +391,13 @@ class Config:
                 default_timeframe=os.getenv('DEFAULT_TIMEFRAME', '5'),
                 batch_size=int(os.getenv('MARKET_DATA_BATCH_SIZE', '1000'))
             )
+        except Exception as e:
+            raise ConfigurationError(f"Invalid market data configuration: {e}")
+
+    def _init_fundamental_data_config(self) -> FundamentalDataConfig:
+        """Initialize fundamental data configuration"""
+        try:
+            return FundamentalDataConfig()
         except Exception as e:
             raise ConfigurationError(f"Invalid market data configuration: {e}")
 

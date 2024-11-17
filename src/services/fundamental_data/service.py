@@ -1,9 +1,9 @@
 # src/services/fundamental_data/service.py
 
 import asyncio
-from dataclasses import dataclass, field
 from typing import Dict, Optional, Set
 
+from ...config import FundamentalDataConfig
 from ...adapters.registry import ExchangeAdapterRegistry
 from ...adapters.coingecko import CoinGeckoAdapter
 from ...repositories import MarketMetricsRepository, MetadataRepository
@@ -20,21 +20,6 @@ from ...utils.error import ErrorTracker
 
 logger = LoggerSetup.setup(__name__)
 
-@dataclass
-class FundamentalDataConfig:
-    """Configuration for fundamental data collection intervals and batch sizes."""
-    collection_intervals: Dict[str, int] = field(default_factory=lambda: {
-        'metadata': 86400 * 30,  # Monthly
-        'market': 3600,          # Hourly
-        'blockchain': 86400,     # Daily
-        'sentiment': 86400       # Daily
-    })
-    batch_sizes: Dict[str, int] = field(default_factory=lambda: {
-        'metadata': 10,   # Metadata collection is API heavy
-        'market': 100,    # Market data can be batched more
-        'blockchain': 50,
-        'sentiment': 50
-    })
 
 class FundamentalDataService(ServiceBase):
     """
@@ -46,9 +31,9 @@ class FundamentalDataService(ServiceBase):
 
     def __init__(self,
                  coordinator: ServiceCoordinator,
-                 exchange_registry: ExchangeAdapterRegistry,
                  metadata_repository: MetadataRepository,
                  market_metrics_repository: MarketMetricsRepository,
+                 exchange_registry: ExchangeAdapterRegistry,
                  coingecko_adapter: CoinGeckoAdapter,
                  config: FundamentalDataConfig):
         """
@@ -57,6 +42,8 @@ class FundamentalDataService(ServiceBase):
         Args:
             coordinator (ServiceCoordinator): Service coordination manager.
             metadata_repository (MetadataRepository): Repository for metadata storage.
+            market_metrics_repository (MarketMetricsRepository): Repository for market metrics storage.
+            exchange_registry (ExchangeAdapterRegistry): Registry of API adapters for exchanges.
             coingecko_adapter (CoinGeckoAdapter): Adapter for CoinGecko API.
             config (FundamentalDataConfig): Service configuration.
         """
@@ -115,19 +102,21 @@ class FundamentalDataService(ServiceBase):
     async def _handle_symbol_delisted(self, command: Command) -> None:
         """Handle symbol delisting"""
         symbol: SymbolInfo = command.params["symbol"]
-        base_token: str = symbol.name.lower().replace('usdt', '')
+        base_token: str = symbol.token_name
 
         # Check if token is still traded on other exchanges
         still_active = False
         for exchange in self.exchange_registry.get_registered():
             adapter = self.exchange_registry.get_adapter(exchange)
             symbols = await adapter.get_symbols()
-            if any(s.name.lower().replace('usdt', '') == base_token for s in symbols):
+            if any(s.token_name == base_token for s in symbols):
                 still_active = True
                 break
 
         if not still_active:
             self._active_tokens.discard(base_token)
+            for collector in self._collectors.values():
+                await collector.delete_symbol_data(base_token)
             logger.info(f"Stopped tracking {base_token} - no longer traded")
 
     async def _handle_symbol_added(self, command: Command) -> None:
@@ -136,7 +125,7 @@ class FundamentalDataService(ServiceBase):
         Only schedule collection if we're not already tracking this token.
         """
         symbol: SymbolInfo = command.params["symbol"]
-        base_token: str = symbol.name.lower().replace('usdt', '')
+        base_token: str = symbol.token_name
 
         async with self._collection_lock:
             if base_token not in self._active_tokens:
@@ -158,7 +147,7 @@ class FundamentalDataService(ServiceBase):
 
             # Extract unique base tokens and keep one symbol instance
             for symbol in symbols:
-                base_token = symbol.name.lower().replace('usdt', '')
+                base_token = symbol.token_name
                 unique_tokens.add(base_token)
 
         async with self._collection_lock:

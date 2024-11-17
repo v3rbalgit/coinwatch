@@ -1,12 +1,14 @@
 # src/core/models.py
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..utils.time import TimeUtils
 from ..utils.domain_types import DataSource, SymbolName, ExchangeName, Timeframe, Timestamp
 
+
+# Symbol Info Model
 @dataclass(frozen=True)
 class SymbolInfo:
     """Domain model for symbol information"""
@@ -20,7 +22,7 @@ class SymbolInfo:
     exchange: ExchangeName = ExchangeName("bybit")
 
     @property
-    def symbol_name(self):
+    def token_name(self):
         return self.name.lower().replace('usdt', '')
 
     def check_retention_time(self, retention_days: int) -> 'SymbolInfo':
@@ -88,6 +90,7 @@ class SymbolInfo:
         return f"{self.base_asset}/{self.quote_asset}"
 
 
+# Kline Model
 @dataclass
 class KlineData:
     """Domain model for kline data (business logic)"""
@@ -198,6 +201,13 @@ class OBVResult:
             value=Decimal(str(value))
         )
 
+# Platform Model
+@dataclass
+class Platform:
+    """Platform information for a token"""
+    platform_id: str
+    contract_address: str
+
 # Metadata Model
 @dataclass
 class Metadata:
@@ -207,11 +217,9 @@ class Metadata:
     name: str
     description: str
     market_cap_rank: int
-    category: str
+    categories: List[str]
     updated_at: Timestamp
     launch_time: Optional[Timestamp]
-    platform: Optional[str]
-    contract_address: Optional[str]
     hashing_algorithm: Optional[str]
     website: Optional[str]
     whitepaper: Optional[str]
@@ -221,18 +229,17 @@ class Metadata:
     github: Optional[str]
     images: Dict[str, str]
     data_source: DataSource
+    platforms: List[Platform] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert metadata to database-friendly dictionary"""
         return {
-            "coingecko_id": self.id,
+            "id": self.id,
             "symbol": self.symbol.name,
             "name": self.name,
             "description": self.description,
             "market_cap_rank": int(self.market_cap_rank) if self.market_cap_rank else None,
-            "category": self.category,
-            "platform": self.platform,
-            "contract_address": self.contract_address,
+            "categories": self.categories,
             "launch_time": TimeUtils.from_timestamp(self.launch_time) if self.launch_time else None,
             "hashing_algorithm": self.hashing_algorithm,
             "website": self.website,
@@ -241,7 +248,9 @@ class Metadata:
             "twitter": self.twitter,
             "telegram": self.telegram,
             "github": self.github,
-            "images": self.images,
+            "image_thumb": self.images.get('thumb'),
+            "image_small": self.images.get('small'),
+            "image_large": self.images.get('large'),
             "updated_at": TimeUtils.from_timestamp(self.updated_at),
             "data_source": self.data_source.value
         }

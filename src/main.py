@@ -3,28 +3,29 @@
 import sys
 import asyncio
 
-from src.core.coordination import ServiceCoordinator
-from src.repositories.kline import KlineRepository
-from src.repositories.symbol import SymbolRepository
-from src.services.monitor.service import MonitoringService
+from .core.coordination import ServiceCoordinator
+from .repositories import KlineRepository, SymbolRepository, MetadataRepository, MarketMetricsRepository
+from .services.fundamental_data.service import FundamentalDataService
+from .services.monitor.service import MonitoringService
 
 from .config import Config
 from .services.database.service import DatabaseService
 from .services.market_data.service import MarketDataService
 from .adapters.registry import ExchangeAdapterRegistry
 from .adapters.bybit import BybitAdapter
+from .adapters.coingecko import CoinGeckoAdapter
 from .core.exceptions import CoinwatchError
 from .utils.logger import LoggerSetup
 from .utils.domain_types import ExchangeName
 
 logger = LoggerSetup.setup(__name__)
 
-class Application:
+class Coinwatch:
     """Main application class demonstrating component usage"""
 
     def __init__(self):
         # Setup logging
-        self.logger = LoggerSetup.setup(f"{__name__}.Application")
+        self.logger = LoggerSetup.setup(f"{__name__}.Coinwatch")
 
         # Load configuration
         self.config = Config()
@@ -38,14 +39,33 @@ class Application:
             self.config.database
         )
 
+        # Initialize exchange registry
+        self.exchange_registry = ExchangeAdapterRegistry()
+
+        # Initialize fundamental data service
+        self.fundamental_data_service = FundamentalDataService(
+            self.coordinator,
+            MetadataRepository(self.db_service),
+            MarketMetricsRepository(self.db_service),
+            self.exchange_registry,
+            CoinGeckoAdapter(self.config.coingecko),
+            self.config.fundamental_data
+        )
+
+        # Initialize market data service
+        self.market_data_service = MarketDataService(
+            self.coordinator,
+            SymbolRepository(self.db_service),
+            KlineRepository(self.db_service),
+            self.exchange_registry,
+            self.config.market_data
+        )
+
         # Initialize monitoring service
         self.monitor_service = MonitoringService(
             self.coordinator,
             self.config.monitoring
         )
-
-        # Initialize exchange registry
-        self.exchange_registry = ExchangeAdapterRegistry()
 
     async def start(self) -> None:
         """Start the application"""
@@ -53,39 +73,27 @@ class Application:
             # Start coordinator
             await self.coordinator.start()
 
-            # Initialize database
+            # Start database
             await self.db_service.start()
 
-            # Seup exchange adapters
+            # Setup exchange adapters
             await self.exchange_registry.register(
                 ExchangeName("bybit"),
                 BybitAdapter(self.config.exchanges.bybit)
                 )
 
-            # Create repositories without a transaction
-            symbol_repo = SymbolRepository(self.db_service)
-            kline_repo = KlineRepository(self.db_service)
-
-            # Setup market data service
-            market_service = MarketDataService(
-                symbol_repo,
-                kline_repo,
-                self.exchange_registry,
-                self.coordinator,
-                self.config.market_data
-            )
-
             # Start services
-            await market_service.start()
+            await self.fundamental_data_service.start()
+            await self.market_data_service.start()
             await self.monitor_service.start()
 
             # Keep application running
             while True:
+                await asyncio.sleep(3600)
+
                 # Log service status periodically
                 self.logger.info("\nService Status Report:")
                 self.logger.info(self.monitor_service.get_service_status())
-
-                await asyncio.sleep(60)
 
         except Exception as e:
             self.logger.error(f"Application error: {e}")
@@ -95,11 +103,14 @@ class Application:
     async def stop(self) -> None:
         """Stop the application"""
         await self.monitor_service.stop()
+        await self.market_data_service.stop()
+        await self.fundamental_data_service.stop()
         await self.db_service.stop()
+        await self.coordinator.stop()
 
 async def main():
     """Application entry point"""
-    app = Application()
+    app = Coinwatch()
 
     try:
         await app.start()
@@ -115,6 +126,5 @@ async def main():
         sys.exit(1)
 
 
-# Run the application
 if __name__ == "__main__":
     asyncio.run(main())

@@ -6,7 +6,7 @@ from typing import List, Set
 from .collector import FundamentalCollector
 from ...adapters.coingecko import CoinGeckoAdapter
 from ...core.exceptions import ServiceError
-from ...core.models import Metadata
+from ...core.models import Metadata, Platform
 from ...repositories.metadata import MetadataRepository
 from ...utils.logger import LoggerSetup
 from ...utils.time import TimeUtils
@@ -72,6 +72,16 @@ class MetadataCollector(FundamentalCollector):
                         except (ValueError, TypeError):
                             logger.warning(f"Invalid launch time format for {token}")
 
+                    # Process platforms data
+                    platforms = []
+                    if platform_data := coin_data.get("platforms"):
+                        for platform_id, contract_address in platform_data.items():
+                            if platform_id and contract_address:
+                                platforms.append(Platform(
+                                    platform_id=platform_id,
+                                    contract_address=contract_address
+                                ))
+
                     metadata = Metadata(
                         id=coin_data.get("id", ""),
                         symbol=coin_data.get("symbol", ""),
@@ -80,9 +90,8 @@ class MetadataCollector(FundamentalCollector):
                         market_cap_rank=coin_data.get("market_cap_rank", -1),
                         updated_at=TimeUtils.get_current_timestamp(),
                         launch_time=launch_time,
-                        category=coin_data.get("categories", [None])[0],
-                        platform=coin_data.get("asset_platform_id"),
-                        contract_address=coin_data.get("contract_address"),
+                        categories=coin_data.get("categories", []),
+                        platforms=platforms,
                         hashing_algorithm=coin_data.get("contract_address"),
                         website=coin_data.get("links", {}).get("homepage", [None])[0],
                         whitepaper=coin_data.get("links", {}).get("whitepaper"),

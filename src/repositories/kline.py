@@ -17,6 +17,7 @@ from ..utils.time import TimeUtils
 
 logger = LoggerSetup.setup(__name__)
 
+
 class KlineRepository:
     """
     Repository for Kline operations with TimescaleDB optimization.
@@ -571,7 +572,7 @@ class KlineRepository:
             RepositoryError: If there's an error during the deletion process.
         """
         try:
-            async with self.db_service.get_session() as session:
+            async with self.db_service.get_session(isolation_level=IsolationLevel.SERIALIZABLE) as session:
                 # Get the symbol ID first
                 symbol_stmt = select(Symbol.id).where(
                     and_(
