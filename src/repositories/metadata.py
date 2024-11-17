@@ -22,11 +22,13 @@ class MetadataRepository:
 
     async def upsert_metadata(self, metadata_list: List[Metadata]) -> None:
         """
-        Create or update metadata for a symbol using PostgreSQL upsert.
+        Create or update metadata for multiple symbols using PostgreSQL upsert.
 
         Args:
-            symbol: Symbol to update metadata for
-            metadata: Metadata domain model
+            metadata_list (List[Metadata]): List of metadata objects to upsert.
+
+        Raises:
+            RepositoryError: If the upsert operation fails.
         """
         try:
             async with self.db_service.get_session(
@@ -55,13 +57,16 @@ class MetadataRepository:
 
     async def get_metadata(self, symbol: SymbolInfo) -> Optional[Metadata]:
         """
-        Get stored metadata for a symbol
+        Get stored metadata for a symbol.
 
         Args:
-            symbol: Symbol to get metadata for (e.g., BTCUSDT on bybit)
+            symbol (SymbolInfo): Symbol to get metadata for (e.g., BTCUSDT on bybit).
 
         Returns:
-            Metadata domain object if found, None otherwise
+            Optional[Metadata]: Metadata domain object if found, None otherwise.
+
+        Raises:
+            RepositoryError: If the retrieval operation fails.
         """
         try:
             async with self.db_service.get_session() as session:
@@ -107,20 +112,22 @@ class MetadataRepository:
             logger.error(f"Error getting metadata for {symbol}: {e}")
             raise RepositoryError(f"Failed to get metadata: {str(e)}")
 
-    async def delete_metadata(self, symbol: SymbolInfo) -> None:
+    async def delete_metadata(self, symbol: str) -> None:
         """
-        Delete metadata for a token
+        Delete metadata for a token.
 
         Args:
-            symbol: Any symbol representing the token (e.g., BTCUSDT from any exchange)
+            symbol (str): Symbol representing the token to delete metadata for.
+
+        Raises:
+            RepositoryError: If the deletion operation fails.
         """
         try:
             async with self.db_service.get_session() as session:
-                base_token = symbol.name.lower().replace('usdt', '')
 
                 # Find and delete metadata by CoinGecko symbol
                 stmt = select(TokenMetadata).where(
-                    TokenMetadata.symbol == base_token
+                    TokenMetadata.symbol == symbol
                 )
                 result = await session.execute(stmt)
                 metadata_record = result.scalar_one_or_none()
@@ -128,9 +135,9 @@ class MetadataRepository:
                 if metadata_record:
                     await session.delete(metadata_record)
                     await session.commit()
-                    logger.info(f"Deleted metadata for symbol '{base_token.upper()}'")
+                    logger.info(f"Deleted metadata for symbol '{symbol.upper()}'")
                 else:
-                    logger.warning(f"No metadata found for symbol '{base_token.upper()}'")
+                    logger.warning(f"No metadata found for symbol '{symbol.upper()}'")
 
         except Exception as e:
             logger.error(f"Error deleting metadata for {symbol}: {e}")

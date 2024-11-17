@@ -104,5 +104,19 @@ class MarketMetricsCollector(FundamentalCollector):
             raise ServiceError(f"Market metrics collection failed: {str(e)}")
 
     async def store_symbol_data(self, data: List[MarketMetrics]) -> None:
-        """Store collected market metrics"""
+        """
+        Store collected market metrics for multiple symbols.
+
+        Args:
+            data (List[MarketMetrics]): List of MarketMetrics objects to be stored.
+        """
         await self.market_metrics_repository.upsert_market_metrics(data)
+
+    async def delete_symbol_data(self, token: str) -> None:
+        """
+        Delete market metrics for a specific symbol.
+
+        Args:
+            token (str): The token symbol for which to delete market metrics.
+        """
+        await self.market_metrics_repository.delete_market_metrics(token)
