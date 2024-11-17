@@ -48,7 +48,6 @@ class MarketMetricsRepository:
                     }
                 )
                 await session.execute(stmt)
-                await session.commit()
 
                 logger.debug(f"Updated market metrics for {len(metrics_list)} tokens")
 
@@ -121,7 +120,7 @@ class MarketMetricsRepository:
             RepositoryError: If the deletion operation fails.
         """
         try:
-            async with self.db_service.get_session() as session:
+            async with self.db_service.get_session(isolation_level=IsolationLevel.SERIALIZABLE) as session:
 
                 stmt = select(TokenMarketMetrics).where(
                     TokenMarketMetrics.symbol == symbol
@@ -131,7 +130,7 @@ class MarketMetricsRepository:
 
                 if market_metrics_record:
                     await session.delete(market_metrics_record)
-                    await session.commit()
+                    await session.flush()
                     logger.info(f"Deleted market metrics for symbol '{symbol.upper()}'")
                 else:
                     logger.warning(f"No market metrics found for symbol '{symbol.upper()}'")

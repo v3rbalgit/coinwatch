@@ -13,6 +13,7 @@ from ..utils.time import TimeUtils
 
 logger = LoggerSetup.setup(__name__)
 
+
 class SymbolRepository:
     """Repository for managing Symbol entities in the database."""
 

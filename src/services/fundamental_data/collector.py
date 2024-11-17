@@ -96,28 +96,6 @@ class FundamentalCollector(ABC):
         """
         pass
 
-    async def cleanup(self) -> None:
-        """Clean up resources and cancel ongoing tasks."""
-        if self._queue_processor:
-            self._queue_processor.cancel()
-            try:
-                await self._queue_processor
-            except asyncio.CancelledError:
-                pass
-
-        # Clear collections
-        async with self._collection_lock:
-            self._processing.clear()
-            self._progress.clear()
-            self._last_collection.clear()
-
-        while not self._collection_queue.empty():
-            try:
-                self._collection_queue.get_nowait()
-                self._collection_queue.task_done()
-            except asyncio.QueueEmpty:
-                break
-
     async def schedule_collection(self, tokens: Set[str]) -> None:
         """
         Schedule data collection for a symbol if enough time has passed.
@@ -214,6 +192,28 @@ class FundamentalCollector(ABC):
                 self._processing.difference_update(processed_tokens)
                 for token in processed_tokens:
                     self._progress.pop(token, None)
+
+    async def cleanup(self) -> None:
+        """Clean up resources and cancel ongoing tasks."""
+        if self._queue_processor:
+            self._queue_processor.cancel()
+            try:
+                await self._queue_processor
+            except asyncio.CancelledError:
+                pass
+
+        # Clear collections
+        async with self._collection_lock:
+            self._processing.clear()
+            self._progress.clear()
+            self._last_collection.clear()
+
+        while not self._collection_queue.empty():
+            try:
+                self._collection_queue.get_nowait()
+                self._collection_queue.task_done()
+            except asyncio.QueueEmpty:
+                break
 
     def get_collection_status(self) -> str:
         """
