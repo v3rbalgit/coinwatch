@@ -150,7 +150,7 @@ class MetadataRepository:
             RepositoryError: If the deletion operation fails.
         """
         try:
-            async with self.db_service.get_session(isolation_level=IsolationLevel.SERIALIZABLE) as session:
+            async with self.db_service.get_session() as session:
 
                 # Find and delete metadata by CoinGecko symbol
                 stmt = select(TokenMetadata).where(
@@ -161,7 +161,6 @@ class MetadataRepository:
 
                 if metadata_record:
                     await session.delete(metadata_record)
-                    await session.flush()
                     logger.info(f"Deleted metadata for symbol '{symbol.upper()}'")
                 else:
                     logger.warning(f"No metadata found for symbol '{symbol.upper()}'")

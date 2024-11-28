@@ -1,11 +1,9 @@
 # src/adapters/bybit.py
 
 from decimal import Decimal
-from typing import Dict, Any, List, Optional
+from typing import Any, List, Optional
 import aiohttp
 import asyncio
-import hmac
-import hashlib
 import time
 
 from ..adapters.registry import ExchangeAdapter
@@ -25,24 +23,23 @@ class BybitAdapter(ExchangeAdapter):
     Async Bybit API adapter using aiohttp.
 
     Handles:
-    - API authentication
-    - Request signing
-    - Rate limiting
+    - Rate limiting with circuit breaker
     - Connection management
+    - Retry logic
     """
 
     BASE_URL = "https://api.bybit.com"
     TESTNET_URL = "https://api-testnet.bybit.com"
+
+    # Class-level variables for circuit breaker
+    _rate_limit_reset: Optional[int] = None  # Shared timestamp when rate limit resets (in milliseconds)
+    _circuit_breaker_lock = asyncio.Lock()   # Lock for thread-safe access
 
     def __init__(self, config: BybitConfig):
         super().__init__(config)
 
         # Base URL based on testnet setting
         self._base_url = self.TESTNET_URL if config.testnet else self.BASE_URL
-
-        # Authentication
-        self._api_key = config.api_key
-        self._api_secret = config.api_secret
 
         # Initialize rate limiter
         self._rate_limiter = TokenBucket(RateLimitConfig(
@@ -58,19 +55,6 @@ class BybitAdapter(ExchangeAdapter):
             jitter_factor=0.1
         ))
 
-    def _generate_signature(self, params: Dict[str, Any], timestamp: int) -> str:
-        """Generate signature for authenticated requests"""
-        if not self._api_key or not self._api_secret:
-            raise AdapterError("API credentials not configured")
-
-        param_str = str(timestamp) + self._api_key + str(self._config.recv_window) + str(params)
-
-        return hmac.new(
-            self._api_secret.encode('utf-8'),
-            param_str.encode('utf-8'),
-            hashlib.sha256
-        ).hexdigest()
-
     async def _create_session(self) -> aiohttp.ClientSession:
         """Create new session with Bybit configuration"""
         return aiohttp.ClientSession(
@@ -82,7 +66,6 @@ class BybitAdapter(ExchangeAdapter):
     async def _request(self,
                       method: str,
                       endpoint: str,
-                      auth: bool = False,
                       **kwargs: Any) -> Any:
         """
         Make API request with retry logic and rate limiting
@@ -90,7 +73,6 @@ class BybitAdapter(ExchangeAdapter):
         Args:
             method: HTTP method
             endpoint: API endpoint
-            auth: Whether request needs authentication
             **kwargs: Additional request parameters
         """
         attempt = 0
@@ -101,41 +83,39 @@ class BybitAdapter(ExchangeAdapter):
                 # Handle rate limiting
                 await self._rate_limiter.acquire()
 
-                # Add authentication if required
-                if auth:
-                    timestamp = int(time.time() * 1000)
-                    params = kwargs.get('params', {})
-
-                    # Add authentication parameters
-                    auth_params = {
-                        'api_key': self._api_key,
-                        'timestamp': timestamp,
-                        'recv_window': self._config.recv_window,
-                        'sign': self._generate_signature(params, timestamp)
-                    }
-
-                    if method == 'GET':
-                        # For GET requests, add auth params to query string
-                        kwargs['params'] = {**params, **auth_params}
-                    else:
-                        # For POST requests, add auth params to body
-                        kwargs['json'] = {**params, **auth_params}
+                # Check circuit breaker
+                async with self.__class__._circuit_breaker_lock:
+                    current_time = int(time.time() * 1000)
+                    if self.__class__._rate_limit_reset and current_time < self.__class__._rate_limit_reset:
+                        sleep_time = (self.__class__._rate_limit_reset - current_time) / 1000
+                        logger.warning(f"Rate limit active! Sleeping for {sleep_time:.2f}s")
+                        await asyncio.sleep(sleep_time)
 
                 async with session.request(method, endpoint, **kwargs) as response:
                     if response.status == 429:  # Rate limit exceeded
-                        retry_after = int(response.headers.get('Retry-After', 60))
-                        logger.warning(f"Rate limit exceeded, waiting {retry_after}s")
-                        await asyncio.sleep(retry_after)
-                        continue
+                        reset_timestamp = int(response.headers.get('X-Bapi-Limit-Reset-Timestamp', 0))
+                        async with self.__class__._circuit_breaker_lock:
+                            self.__class__._rate_limit_reset = reset_timestamp
+                            wait_time = (reset_timestamp - current_time) / 1000
+                            logger.warning(
+                                f"Rate limit hit! Next retry in {wait_time:.2f}s. "
+                                f"Endpoint: {endpoint}"
+                            )
+                            await asyncio.sleep(wait_time)
+                            continue
 
                     response.raise_for_status()
                     data = await response.json()
 
                     # Handle Bybit-specific error responses
-                    if data.get('ret_code') != 0:
+                    if data.get('retCode') != 0:
                         raise AdapterError(
-                            f"API error {data.get('ret_code')}: {data.get('ret_msg')}"
+                            f"API error {data.get('retCode')}: {data.get('retMsg')}"
                         )
+
+                    # Clear rate limit reset after successful request
+                    async with self.__class__._circuit_breaker_lock:
+                        self.__class__._rate_limit_reset = None
 
                     return data.get('result', {})
 

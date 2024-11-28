@@ -2,8 +2,8 @@
 
 import asyncio
 import os
-import pandas as pd
-import pandas_ta as ta
+import polars as pl
+import polars_talib as plta
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
@@ -12,7 +12,7 @@ from ..core.exceptions import ServiceError, ValidationError
 from ..core.models import (
     KlineData,
     RSIResult, BollingerBandsResult, MACDResult, MAResult, OBVResult
-    )
+)
 from ..utils.domain_types import Timestamp
 from ..utils.logger import LoggerSetup
 from ..utils.retry import RetryConfig, RetryStrategy
@@ -96,7 +96,7 @@ class IndicatorCacheConfig:
 
 class IndicatorManager:
     """
-    Manages technical indicator calculations using pandas-ta.
+    Manages technical indicator calculations using polars-talib.
 
     This manager interfaces with TimeframeManager to get price data
     and calculates various technical indicators with proper caching
@@ -137,13 +137,11 @@ class IndicatorManager:
 
     def _configure_retry_strategy(self) -> None:
         """Configure retry behavior for indicator calculations"""
-        from pandas.errors import EmptyDataError
-
         # Basic retryable errors
         self._retry_strategy.add_retryable_error(
             ConnectionError,      # Network/connection issues
             TimeoutError,        # Timeout issues
-            EmptyDataError       # Pandas empty data issues
+            pl.exceptions.ComputeError      # Polars compute errors
         )
 
         self._retry_strategy.add_non_retryable_error(
@@ -154,8 +152,8 @@ class IndicatorManager:
 
         # Configure specific delays for different error types
         self._retry_strategy.configure_error_delays({
-            EmptyDataError: RetryConfig(
-                base_delay=1.0,    # Quick retry for empty data
+            pl.exceptions.ComputeError: RetryConfig(
+                base_delay=1.0,    # Quick retry for compute errors
                 max_delay=10.0,
                 max_retries=2,
                 jitter_factor=0.1
@@ -239,7 +237,6 @@ class IndicatorManager:
 
     async def cleanup(self) -> None:
         """Cleanup resources"""
-
         # Clear all caches
         for method in [
             self.calculate_rsi,
@@ -286,117 +283,152 @@ class IndicatorManager:
                 f"Insufficient kline data. Need at least 30 candles, got {len(klines)}"
             )
 
-    def _prepare_dataframe(self, klines: List[KlineData]) -> pd.DataFrame:
-        """Convert KlineData to pandas DataFrame"""
-        df = pd.DataFrame([{
-            'timestamp': k.timestamp,
-            'open': float(k.open_price),
-            'high': float(k.high_price),
-            'low': float(k.low_price),
-            'close': float(k.close_price),
-            'volume': float(k.volume)
-        } for k in klines])
+    def _prepare_dataframe(self, klines: List[KlineData]) -> pl.DataFrame:
+        """Convert KlineData to Polars DataFrame"""
+        return pl.DataFrame({
+            'timestamp': [k.timestamp for k in klines],
+            'open': [float(k.open_price) for k in klines],
+            'high': [float(k.high_price) for k in klines],
+            'low': [float(k.low_price) for k in klines],
+            'close': [float(k.close_price) for k in klines],
+            'volume': [float(k.volume) for k in klines]
+        }).with_columns(pl.col('timestamp').cast(pl.Int64))
 
-        df.set_index('timestamp', inplace=True)
-        return df
 
     @async_ttl_cache()
     async def calculate_rsi(self,
-                            klines: List[KlineData],
-                            length: int = 14,
-                            ) -> List[RSIResult]:
+                          klines: List[KlineData],
+                          length: int = 14) -> List[RSIResult]:
         """Calculate Relative Strength Index"""
         async def _calc() -> List[RSIResult]:
             self._validate_klines(klines)
             df = self._prepare_dataframe(klines)
 
-            rsi = df.ta.rsi(length=length)
+            df_with_rsi = df.with_columns(plta.rsi().alias("rsi"))
+
             return [
                 RSIResult.from_series(
-                    Timestamp(int(idx)),
-                    value,
+                    Timestamp(int(row['timestamp'])),
+                    float(row['rsi']),
                     length=length
                 )
-                for idx, value in rsi.items()
-                if not pd.isna(value)
+                for row in df_with_rsi.filter(pl.col('rsi').is_not_null()).iter_rows(named=True)
             ]
 
         return await self._calculate_with_retry('RSI', _calc)
 
     @async_ttl_cache()
     async def calculate_bollinger_bands(self,
-                                        klines: List[KlineData],
-                                        length: int = 20,
-                                        std_dev: float = 2.0,
-                                        ) -> List[BollingerBandsResult]:
+                                     klines: List[KlineData],
+                                     length: int = 20,
+                                     std_dev: float = 2.0) -> List[BollingerBandsResult]:
         """Calculate Bollinger Bands"""
         async def _calc() -> List[BollingerBandsResult]:
             self._validate_klines(klines)
             df = self._prepare_dataframe(klines)
 
-            bb = df.ta.bbands(length=length, std=std_dev)
+            bbands = df.with_columns([
+                plta.bbands(timeperiod=length, nbdevup=std_dev, nbdevdn=std_dev).struct.field("upperband").alias("upper"),
+                plta.bbands(timeperiod=length, nbdevup=std_dev, nbdevdn=std_dev).struct.field("middleband").alias("middle"),
+                plta.bbands(timeperiod=length, nbdevup=std_dev, nbdevdn=std_dev).struct.field("lowerband").alias("lower")
+            ])
+
             return [
-                BollingerBandsResult.from_series(Timestamp(int(idx)), row.to_dict())
-                for idx, row in bb.iterrows()
-                if not row.isna().any()
+                BollingerBandsResult.from_series(
+                    Timestamp(int(row['timestamp'])),
+                    {
+                        'BBL': float(row['bbands']['lower']),
+                        'BBM': float(row['bbands']['middle']),
+                        'BBU': float(row['bbands']['upper']),
+                        'BBB': float((row['bbands']['upper'] - row['bbands']['lower']) / row['bbands']['middle'])
+                    }
+                )
+                for row in bbands.filter(pl.col('bbands').is_not_null()).iter_rows(named=True)
             ]
 
         return await self._calculate_with_retry('BB', _calc)
 
     @async_ttl_cache()
     async def calculate_macd(self,
-                             klines: List[KlineData],
-                             fast: int = 12,
-                             slow: int = 26,
-                             signal: int = 9,
-                             ) -> List[MACDResult]:
+                           klines: List[KlineData],
+                           fast: int = 12,
+                           slow: int = 26,
+                           signal: int = 9) -> List[MACDResult]:
         """Calculate MACD"""
         async def _calc() -> List[MACDResult]:
             self._validate_klines(klines)
             df = self._prepare_dataframe(klines)
 
-            macd = df.ta.macd(fast=fast, slow=slow, signal=signal)
+            df_with_macd = df.with_columns([
+                plta.macd(
+                    fastperiod=fast,
+                    slowperiod=slow,
+                    signalperiod=signal
+                ).struct.field("macd").alias("macd"),
+                plta.macd(
+                    fastperiod=fast,
+                    slowperiod=slow,
+                    signalperiod=signal
+                ).struct.field("macdsignal").alias("macdsignal"),
+                plta.macd(
+                    fastperiod=fast,
+                    slowperiod=slow,
+                    signalperiod=signal
+                ).struct.field("macdhist").alias("macdhist")
+            ])
+
             return [
-                MACDResult.from_series(Timestamp(int(idx)), row.to_dict())
-                for idx, row in macd.iterrows()
-                if not row.isna().any()
+                MACDResult.from_series(
+                    Timestamp(int(row['timestamp'])),
+                    {
+                        f'MACD_{fast}_{slow}_{signal}': float(row['macd']['macd']),
+                        f'MACDs_{fast}_{slow}_{signal}': float(row['macd']['macdsignal']),
+                        f'MACDh_{fast}_{slow}_{signal}': float(row['macd']['macdhist'])
+                    }
+                )
+                for row in df_with_macd.filter(pl.col('macd').is_not_null()).iter_rows(named=True)
             ]
 
         return await self._calculate_with_retry('MACD', _calc)
 
     @async_ttl_cache()
     async def calculate_sma(self,
-                            klines: List[KlineData],
-                            period: int = 20
-                            ) -> List[MAResult]:
+                          klines: List[KlineData],
+                          period: int = 20) -> List[MAResult]:
         """Calculate Simple Moving Average"""
         async def _calc() -> List[MAResult]:
             self._validate_klines(klines)
             df = self._prepare_dataframe(klines)
 
-            sma = df.ta.sma(length=period)
+            df_with_sma = df.with_columns(plta.sma(timeperiod=period).alias("sma"))
+
             return [
-                MAResult.from_series(Timestamp(int(idx)), value)
-                for idx, value in sma.items()
-                if not pd.isna(value)
+                MAResult.from_series(
+                    Timestamp(int(row['timestamp'])),
+                    float(row['sma'])
+                )
+                for row in df_with_sma.filter(pl.col('sma').is_not_null()).iter_rows(named=True)
             ]
 
         return await self._calculate_with_retry('SMA', _calc)
 
     @async_ttl_cache()
     async def calculate_ema(self,
-                            klines: List[KlineData],
-                            period: int = 20) -> List[MAResult]:
+                          klines: List[KlineData],
+                          period: int = 20) -> List[MAResult]:
         """Calculate Exponential Moving Average"""
         async def _calc() -> List[MAResult]:
             self._validate_klines(klines)
             df = self._prepare_dataframe(klines)
 
-            ema = df.ta.ema(length=period)
+            df_with_ema = df.with_columns(plta.ema(timeperiod=period).alias("ema"))
+
             return [
-                MAResult.from_series(Timestamp(int(idx)), value)
-                for idx, value in ema.items()
-                if not pd.isna(value)
+                MAResult.from_series(
+                    Timestamp(int(row['timestamp'])),
+                    float(row['ema'])
+                )
+                for row in df_with_ema.filter(pl.col('ema').is_not_null()).iter_rows(named=True)
             ]
 
         return await self._calculate_with_retry('EMA', _calc)
@@ -408,10 +440,14 @@ class IndicatorManager:
             self._validate_klines(klines)
             df = self._prepare_dataframe(klines)
 
-            obv = df.ta.obv()
+            df_with_obv = df.with_columns(plta.obv(pl.col("close"), pl.col("volume")).alias("obv"))
+
             return [
-                OBVResult.from_series(Timestamp(int(idx)), value)
-                for idx, value in obv.items()
-                if not pd.isna(value)
+                OBVResult.from_series(
+                    Timestamp(int(row['timestamp'])),
+                    float(row['obv'])
+                )
+                for row in df_with_obv.filter(pl.col('obv').is_not_null()).iter_rows(named=True)
             ]
+
         return await self._calculate_with_retry('OBV', _calc)

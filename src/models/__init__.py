@@ -6,6 +6,7 @@ from .kline import Kline
 from .metadata import TokenMetadata
 from .market import TokenMarketMetrics
 from .platform import TokenPlatform
+from .sentiment import TokenSentiment
 
 __all__ = [
     'Base',
@@ -13,5 +14,6 @@ __all__ = [
     'Kline',
     'TokenMetadata',
     'TokenPlatform',
-    'TokenMarketMetrics'
+    'TokenMarketMetrics',
+    'TokenSentiment'
 ]

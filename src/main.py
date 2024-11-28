@@ -4,7 +4,7 @@ import sys
 import asyncio
 
 from .core.coordination import ServiceCoordinator
-from .repositories import KlineRepository, SymbolRepository, MetadataRepository, MarketMetricsRepository
+from .repositories import KlineRepository, SymbolRepository, MetadataRepository, MarketMetricsRepository, SentimentRepository
 from .services.fundamental_data.service import FundamentalDataService
 from .services.monitor.service import MonitoringService
 
@@ -47,6 +47,7 @@ class Coinwatch:
             self.coordinator,
             MetadataRepository(self.db_service),
             MarketMetricsRepository(self.db_service),
+            SentimentRepository(self.db_service),
             self.exchange_registry,
             CoinGeckoAdapter(self.config.coingecko),
             self.config.fundamental_data

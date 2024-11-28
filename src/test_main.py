@@ -5,8 +5,7 @@ import asyncio
 from typing import List
 
 from src.core.coordination import ServiceCoordinator
-from src.repositories.kline import KlineRepository
-from src.repositories.symbol import SymbolRepository
+from src.repositories import KlineRepository, SymbolRepository, SentimentRepository
 from src.services.monitor.service import MonitoringService
 
 from .config import BybitConfig, Config
@@ -78,13 +77,14 @@ class TestApplication:
             # Create repositories
             symbol_repo = SymbolRepository(self.db_service)
             kline_repo = KlineRepository(self.db_service)
+            sentiment_repo = SentimentRepository(self.db_service)
 
             # Setup market data service
             market_service = MarketDataService(
+                self.coordinator,
                 symbol_repo,
                 kline_repo,
                 self.exchange_registry,
-                self.coordinator,
                 self.config.market_data
             )
 
