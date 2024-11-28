@@ -288,6 +288,7 @@ class MarketMetrics:
         """Convert to dictionary for database storage"""
         return {
             'id': self.id,
+            'symbol': self.symbol.name,
             'current_price': float(self.current_price),
             'market_cap': float(self.market_cap) if self.market_cap else None,
             'market_cap_rank': self.market_cap_rank,
@@ -308,6 +309,65 @@ class MarketMetrics:
             'atl': float(self.atl) if self.atl else None,
             'atl_change_percentage': float(self.atl_change_percentage) if self.atl_change_percentage else None,
             'atl_date': self.atl_date,
+            'updated_at': TimeUtils.from_timestamp(self.updated_at),
+            'data_source': self.data_source.value
+        }
+
+# Sentiment Metrics Model
+@dataclass
+class SentimentMetrics:
+    """Social media sentiment metrics for a token"""
+    id: str  # CoinGecko ID
+    symbol: SymbolInfo
+
+    # Twitter metrics
+    twitter_followers: Optional[int]
+    twitter_following: Optional[int]
+    twitter_posts_24h: Optional[int]
+    twitter_engagement_rate: Optional[Decimal]
+    twitter_sentiment_score: Optional[Decimal]
+
+    # Reddit metrics
+    reddit_subscribers: Optional[int]
+    reddit_active_users: Optional[int]
+    reddit_posts_24h: Optional[int]
+    reddit_comments_24h: Optional[int]
+    reddit_sentiment_score: Optional[Decimal]
+
+    # Telegram metrics
+    telegram_members: Optional[int]
+    telegram_online_members: Optional[int]
+    telegram_messages_24h: Optional[int]
+    telegram_sentiment_score: Optional[Decimal]
+
+    # Aggregated metrics
+    overall_sentiment_score: Decimal  # Weighted average of platform sentiment scores
+    social_score: Decimal  # Weighted engagement score
+
+    updated_at: Timestamp
+    data_source: DataSource
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for database storage"""
+        return {
+            'id': self.id,
+            'symbol': self.symbol.name,
+            'twitter_followers': self.twitter_followers,
+            'twitter_following': self.twitter_following,
+            'twitter_posts_24h': self.twitter_posts_24h,
+            'twitter_engagement_rate': float(self.twitter_engagement_rate) if self.twitter_engagement_rate else None,
+            'twitter_sentiment_score': float(self.twitter_sentiment_score) if self.twitter_sentiment_score else None,
+            'reddit_subscribers': self.reddit_subscribers,
+            'reddit_active_users': self.reddit_active_users,
+            'reddit_posts_24h': self.reddit_posts_24h,
+            'reddit_comments_24h': self.reddit_comments_24h,
+            'reddit_sentiment_score': float(self.reddit_sentiment_score) if self.reddit_sentiment_score else None,
+            'telegram_members': self.telegram_members,
+            'telegram_online_members': self.telegram_online_members,
+            'telegram_messages_24h': self.telegram_messages_24h,
+            'telegram_sentiment_score': float(self.telegram_sentiment_score) if self.telegram_sentiment_score else None,
+            'overall_sentiment_score': float(self.overall_sentiment_score),
+            'social_score': float(self.social_score),
             'updated_at': TimeUtils.from_timestamp(self.updated_at),
             'data_source': self.data_source.value
         }

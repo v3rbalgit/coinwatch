@@ -252,6 +252,63 @@ class MarketDataConfig:
             raise ConfigurationError("Invalid default timeframe")
 
 @dataclass
+class SentimentConfig:
+    """Configuration for sentiment analysis APIs and rate limits"""
+    # Twitter (RapidAPI)
+    twitter_api_key: Optional[str] = None
+    twitter_api_host: Optional[str] = None
+    twitter_rate_limit: int = 950  # 100k/month ≈ 950 per day
+    twitter_rate_limit_window: int = 86400  # daily window
+
+    # Reddit API
+    reddit_client_id: Optional[str] = None
+    reddit_client_secret: Optional[str] = None
+    reddit_rate_limit: int = 95  # Keep under 100/minute
+    reddit_rate_limit_window: int = 60  # per minute window
+
+    # Telegram API
+    telegram_api_id: Optional[int] = None
+    telegram_api_hash: Optional[str] = None
+    telegram_session_name: str = "coinwatch_bot"
+
+    def get_twitter_config(self) -> Dict:
+        """Get Twitter adapter configuration"""
+        return {
+            'api_key': self.twitter_api_key,
+            'api_host': self.twitter_api_host,
+            'rate_limit': self.twitter_rate_limit,
+            'rate_limit_window': self.twitter_rate_limit_window
+        }
+
+    def get_reddit_config(self) -> Dict:
+        """Get Reddit adapter configuration"""
+        return {
+            'client_id': self.reddit_client_id,
+            'client_secret': self.reddit_client_secret,
+            'rate_limit': self.reddit_rate_limit,
+            'rate_limit_window': self.reddit_rate_limit_window
+        }
+
+    def get_telegram_config(self) -> Dict:
+        """Get Telegram adapter configuration"""
+        return {
+            'api_id': self.telegram_api_id,
+            'api_hash': self.telegram_api_hash,
+            'session_name': self.telegram_session_name
+        }
+
+    def __post_init__(self) -> None:
+        """Validate configuration values"""
+        if self.twitter_rate_limit <= 0:
+            raise ConfigurationError("Twitter rate limit must be positive")
+        if self.twitter_rate_limit_window <= 0:
+            raise ConfigurationError("Twitter rate limit window must be positive")
+        if self.reddit_rate_limit <= 0:
+            raise ConfigurationError("Reddit rate limit must be positive")
+        if self.reddit_rate_limit_window <= 0:
+            raise ConfigurationError("Reddit rate limit window must be positive")
+
+@dataclass
 class FundamentalDataConfig:
     """Configuration for fundamental data collection intervals and batch sizes."""
     collection_intervals: Dict[str, int] = field(default_factory=lambda: {
@@ -266,13 +323,15 @@ class FundamentalDataConfig:
         'blockchain': 50,
         'sentiment': 50
     })
+    sentiment: SentimentConfig = field(default_factory=SentimentConfig)
 
     def __post_init__(self) -> None:
         """Validate configuration values"""
         if any([v < 3600 for k, v in self.collection_intervals.items()]):
             raise ConfigurationError("Collection interval must be at least 1 hour")
         if any([v < 10 for k, v in self.batch_sizes.items()]):
-            raise ConfigurationError("Collection batch size must be at least 1 hour")
+            raise ConfigurationError("Collection batch size must be at least 10")
+
 
 @dataclass
 class MonitoringConfig:
@@ -397,9 +456,28 @@ class Config:
     def _init_fundamental_data_config(self) -> FundamentalDataConfig:
         """Initialize fundamental data configuration"""
         try:
-            return FundamentalDataConfig()
+            sentiment_config = SentimentConfig(
+                # Twitter (RapidAPI) settings
+                twitter_api_key=os.getenv('TWITTER_RAPIDAPI_KEY'),
+                twitter_api_host=os.getenv('TWITTER_RAPIDAPI_HOST'),
+                twitter_rate_limit=int(os.getenv('TWITTER_RATE_LIMIT', '950')),
+                twitter_rate_limit_window=int(os.getenv('TWITTER_RATE_LIMIT_WINDOW', '86400')),
+
+                # Reddit API settings
+                reddit_client_id=os.getenv('REDDIT_CLIENT_ID'),
+                reddit_client_secret=os.getenv('REDDIT_CLIENT_SECRET'),
+                reddit_rate_limit=int(os.getenv('REDDIT_RATE_LIMIT', '95')),
+                reddit_rate_limit_window=int(os.getenv('REDDIT_RATE_LIMIT_WINDOW', '60')),
+
+                # Telegram API settings
+                telegram_api_id=int(os.getenv('TELEGRAM_API_ID', '0')) or None,
+                telegram_api_hash=os.getenv('TELEGRAM_API_HASH'),
+                telegram_session_name=os.getenv('TELEGRAM_SESSION_NAME', 'coinwatch_bot')
+            )
+
+            return FundamentalDataConfig(sentiment=sentiment_config)
         except Exception as e:
-            raise ConfigurationError(f"Invalid market data configuration: {e}")
+            raise ConfigurationError(f"Invalid fundamental data configuration: {e}")
 
     def _init_monitoring_config(self) -> MonitoringConfig:
         """Initialize monitoring configuration"""

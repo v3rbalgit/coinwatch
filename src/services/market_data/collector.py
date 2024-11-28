@@ -183,7 +183,7 @@ class DataCollector:
                         self._processing_symbols.remove(processing_symbol)
                         logger.info(f"Removed delisted symbol from data collection {processing_symbol}")
 
-                await self._symbol_repository.delete(processing_symbol)
+                await self._symbol_repository.delete_symbol(processing_symbol)
                 await self._kline_repository.delete_symbol_data(processing_symbol)
 
                 logger.info(f"Cleaned up data for delisted symbol {processing_symbol}")

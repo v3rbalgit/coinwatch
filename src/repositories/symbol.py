@@ -155,7 +155,7 @@ class SymbolRepository:
             logger.error(f"Error getting symbol stats: {e}")
             raise RepositoryError(f"Failed to get symbol statistics: {str(e)}")
 
-    async def delete(self, symbol: SymbolInfo) -> None:
+    async def delete_symbol(self, symbol: SymbolInfo) -> None:
         """
         Delete a symbol and its associated data from the database.
 
@@ -166,7 +166,7 @@ class SymbolRepository:
             RepositoryError: If there's an error during the deletion process.
         """
         try:
-            async with self.db_service.get_session(isolation_level=IsolationLevel.SERIALIZABLE) as session:
+            async with self.db_service.get_session() as session:
                 # Find the symbol record
                 stmt = select(Symbol).where(
                     and_(

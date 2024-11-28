@@ -11,8 +11,8 @@ class TokenMarketMetrics(Base):
     __tablename__ = 'token_market_metrics'
 
     # Coingecko identification
-    id: Mapped[str] = mapped_column(Text, nullable=False, unique=True, primary_key=True)
-    symbol: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    id: Mapped[str] = mapped_column(Text, nullable=False, primary_key=True)
+    symbol: Mapped[str] = mapped_column(Text, nullable=False)
 
     # Price metrics
     current_price: Mapped[float] = mapped_column(Float(precision=18, decimal_return_scale=8), nullable=False)

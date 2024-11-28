@@ -1,5 +1,3 @@
-# src/utils/domain_types.py
-
 from enum import Enum
 from typing import Any, Dict, NewType, Literal, Optional, TypedDict
 
@@ -122,3 +120,4 @@ class DataSource(str, Enum):
     GITHUB = "github"
     ETHERSCAN = "etherscan"
     BSCSCAN = "bscscan"
+    INTERNAL = "internal"  # For internally computed metrics like sentiment analysis
