@@ -1,0 +1,30 @@
+# FastAPI and server
+fastapi>=0.68.0
+uvicorn[standard]>=0.15.0
+python-multipart>=0.0.5
+
+# Database
+sqlalchemy>=1.4.0
+asyncpg>=0.24.0
+alembic>=1.7.0
+
+# Message Broker
+aio-pika>=9.0.0
+
+# API Clients
+aiohttp>=3.8.0  # For CoinGecko API
+beautifulsoup4>=4.9.0  # For web scraping
+lxml>=4.9.0  # For HTML parsing
+
+# NLP and Sentiment Analysis
+nltk>=3.6.0
+textblob>=0.15.0
+vaderSentiment>=3.3.0
+
+# Utilities
+python-dotenv>=0.19.0
+pydantic>=1.8.0
+tenacity>=8.0.0
+
+# Shared package
+-e ../../shared
