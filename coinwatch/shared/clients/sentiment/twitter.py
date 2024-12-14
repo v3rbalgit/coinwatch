@@ -5,7 +5,7 @@ import aiohttp
 from decimal import Decimal
 
 from ...utils.logger import LoggerSetup
-from ...utils.rate_limit import TokenBucket, RateLimitConfig
+from ...utils.rate_limit import RateLimiter, RateLimitConfig
 
 logger = LoggerSetup.setup(__name__)
 
@@ -38,7 +38,7 @@ class TwitterAdapter:
             window_size=rate_limit_window,
             max_monthly_calls=100000  # 100k/month plan
         )
-        self.rate_limiter = TokenBucket(config=rate_limit_config)
+        self.rate_limiter = RateLimiter(config=rate_limit_config)
         self.session = aiohttp.ClientSession(headers=self.headers)
 
     async def get_user_metrics(self, username: str) -> Optional[Dict]:

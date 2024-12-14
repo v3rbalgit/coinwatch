@@ -6,16 +6,15 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from shared.core.config import FundamentalDataConfig, Config
+from .service import FundamentalDataService
+from shared.clients.coingecko import CoinGeckoAdapter
+from shared.clients.exchanges import BybitAdapter
+from shared.clients.registry import ExchangeAdapterRegistry
+from shared.core.config import Config
 from shared.database.connection import DatabaseConnection
-from shared.database.repositories.metadata import MetadataRepository
-from shared.database.repositories.market import MarketMetricsRepository
-from shared.database.repositories.sentiment import SentimentRepository
+from shared.database.repositories import MetadataRepository, MarketMetricsRepository, SentimentRepository
 from shared.messaging.broker import MessageBroker
 from shared.messaging.schemas import MessageType, ServiceStatusMessage
-from .service import FundamentalDataService
-from .adapters.registry import ExchangeAdapterRegistry
-from .adapters.coingecko import CoinGeckoAdapter
 from shared.utils.logger import LoggerSetup
 from shared.utils.time import TimeUtils
 
@@ -82,12 +81,7 @@ async def lifespan(app: FastAPI):
     try:
         config = Config()
         # Initialize database connection
-        db = DatabaseConnection(
-            url=os.getenv("DATABASE_URL", "postgresql+asyncpg://coinwatch:coinwatch@localhost/coinwatch"),
-            schema="fundamental_data",
-            pool_size=int(os.getenv("DB_POOL_SIZE", "5")),
-            max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "10"))
-        )
+        db = DatabaseConnection(config.database, schema='fundamental_data')
         await db.initialize()
 
         # Initialize repositories
@@ -97,16 +91,14 @@ async def lifespan(app: FastAPI):
 
         # Initialize message broker
         message_broker = MessageBroker("fundamental_data")
-        await message_broker.connect(os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq/"))
+        await message_broker.connect(config.message_broker.url)
 
         # Initialize exchange registry
         exchange_registry = ExchangeAdapterRegistry()
+        await exchange_registry.register("bybit", BybitAdapter(config.adapters.bybit))
 
         # Initialize CoinGecko adapter
-        coingecko_adapter = CoinGeckoAdapter(config.coingecko)
-
-        # Initialize service with config
-        config = FundamentalDataConfig()
+        coingecko_adapter = CoinGeckoAdapter(config.adapters.coingecko)
 
         service = FundamentalDataService(
             metadata_repository=metadata_repository,
@@ -115,7 +107,7 @@ async def lifespan(app: FastAPI):
             exchange_registry=exchange_registry,
             coingecko_adapter=coingecko_adapter,
             message_broker=message_broker,
-            config=config
+            config=config.fundamental_data
         )
 
         # Start service and metrics publishing

@@ -6,7 +6,6 @@ from sqlalchemy import select, and_, text
 from shared.core.models import SymbolInfo
 from shared.database.connection import DatabaseConnection, IsolationLevel
 from shared.database.models import Symbol
-from shared.utils.domain_types import ExchangeName
 from shared.core.exceptions import RepositoryError
 from shared.utils.logger import LoggerSetup
 from shared.utils.time import TimeUtils
@@ -75,12 +74,13 @@ class SymbolRepository:
             logger.error(f"Error in get_or_create: {e}")
             raise RepositoryError(f"Failed to get or create symbol: {str(e)}")
 
-    async def get_symbol(self, symbol: SymbolInfo) -> Optional[Symbol]:
+    async def get_symbol(self, name: str, exchange: str) -> Optional[Symbol]:
         """
         Retrieve a symbol by its name and exchange.
 
         Args:
-            symbol (SymbolInfo): The symbol information to search for.
+            name (str): The symbol name to search by.
+            exchange (str): The exchange name to search by.
 
         Returns:
             Optional[Symbol]: The found Symbol entity or None if not found.
@@ -93,8 +93,8 @@ class SymbolRepository:
                 # If exchange provided, get exact match
                 stmt = select(Symbol).where(
                     and_(
-                        Symbol.name == symbol.name,
-                        Symbol.exchange == symbol.exchange
+                        Symbol.name == name,
+                        Symbol.exchange == exchange
                     )
                 )
                 result = await session.execute(stmt)
@@ -104,7 +104,7 @@ class SymbolRepository:
             logger.error(f"Error getting symbol by name: {e}")
             raise RepositoryError(f"Failed to get symbol by name: {str(e)}")
 
-    async def get_symbols_with_stats(self, exchange: ExchangeName) -> List[dict]:
+    async def get_symbols_with_stats(self, exchange: str) -> List[dict]:
         """
         Get all symbols from a specific exchange with their associated statistics.
 

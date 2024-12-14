@@ -5,7 +5,7 @@ import asyncpraw
 from datetime import datetime, timezone, timedelta
 
 from ...utils.logger import LoggerSetup
-from ...utils.rate_limit import TokenBucket, RateLimitConfig
+from ...utils.rate_limit import RateLimiter, RateLimitConfig
 
 logger = LoggerSetup.setup(__name__)
 
@@ -36,7 +36,7 @@ class RedditAdapter:
             calls_per_window=rate_limit,
             window_size=rate_limit_window
         )
-        self.rate_limiter = TokenBucket(config=rate_limit_config)
+        self.rate_limiter = RateLimiter(config=rate_limit_config)
 
     def _extract_subreddit_name(self, url: str) -> str:
         """Extract subreddit name from URL"""

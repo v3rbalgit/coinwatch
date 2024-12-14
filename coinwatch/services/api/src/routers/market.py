@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from fastapi import APIRouter, Request, Depends
+from fastapi import APIRouter, Request
 from ..service_registry import ServiceRegistry
 from ..middleware.request_forwarder import RequestForwarder
 

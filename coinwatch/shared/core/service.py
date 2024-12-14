@@ -1,9 +1,9 @@
 from abc import ABC, abstractmethod
 from typing import Dict, Any, TypeVar, Generic
 
-from .config import MarketDataConfig, MonitoringConfig, DatabaseConfig
+from .config import MarketDataConfig, MonitorConfig, DatabaseConfig
 
-ConfigType = TypeVar('ConfigType', MarketDataConfig, MonitoringConfig, DatabaseConfig, Dict[str, Any])
+ConfigType = TypeVar('ConfigType', MarketDataConfig, MonitorConfig, DatabaseConfig)
 
 class ServiceBase(ABC, Generic[ConfigType]):
     """

@@ -1,18 +1,11 @@
 # src/adapters/base.py
 
 from abc import ABC, abstractmethod
-from typing import Generic, Optional, TypeVar, Any, Protocol
+from typing import Optional, Any
 import aiohttp
 import asyncio
 
-class APIConfig(Protocol):
-    """Protocol for API configs to ensure type safety"""
-    rate_limit: int
-    rate_limit_window: int
-
-TConfig = TypeVar('TConfig', bound=APIConfig)
-
-class APIAdapter(ABC, Generic[TConfig]):
+class APIAdapter(ABC):
     """
     Base class for API adapters providing common functionality
 
@@ -23,9 +16,7 @@ class APIAdapter(ABC, Generic[TConfig]):
     - Request handling
     """
 
-    def __init__(self, config: TConfig):
-        self._config = config
-        self._initialized = False
+    def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_lock = asyncio.Lock()
 
@@ -53,5 +44,6 @@ class APIAdapter(ABC, Generic[TConfig]):
     async def cleanup(self) -> None:
         """Cleanup resources"""
         if self._session:
-            await self._session.close()
-            self._session = None
+            async with self._session_lock:
+                await self._session.close()
+                self._session = None

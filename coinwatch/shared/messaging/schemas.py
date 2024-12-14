@@ -58,12 +58,13 @@ class GapMessage(BaseMessage):
     timeframe: str
     gaps: List[Tuple[int, int]]  # List of (start, end) timestamps
 
-class SyncCompleteMessage(BaseMessage):
-    """Real-time sync completion"""
+class CollectionMessage(BaseMessage):
+    """Initial or gap fill collection"""
     symbol: str
     exchange: str
     timeframe: str
-    sync_time: int  # When sync completed
+    start_time: int
+    end_time: int
     processed: int  # Number of klines processed
     context: Dict[str, Any]  # Additional sync info like next_sync, resource usage
 

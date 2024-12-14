@@ -32,8 +32,7 @@ class KlineRepository:
         self._batch_size = 1000
 
     async def get_latest_timestamp(self,
-                             symbol: SymbolInfo,
-                             timeframe: Timeframe) -> int:
+                             symbol: SymbolInfo) -> int:
         """
         Get the latest timestamp for a symbol and timeframe using TimescaleDB's last() function.
 
@@ -65,14 +64,12 @@ class KlineRepository:
                     )::BIGINT as latest_time
                     FROM kline_data
                     WHERE symbol_id = :symbol_id
-                    AND timeframe = :timeframe;
                 """)
 
                 default_time = symbol_record.first_trade_time
 
                 result = await session.execute(stmt, {
                     "symbol_id": symbol_record.id,
-                    "timeframe": timeframe.value,
                     "default_time": default_time
                 })
 
@@ -80,7 +77,7 @@ class KlineRepository:
                 if latest is None:
                     latest = default_time
                 logger.debug(
-                    f"Latest timestamp for {symbol.name}: {TimeUtils.from_timestamp(latest)}"
+                    f"Latest timestamp for {symbol.name} on {symbol.exchange}: {TimeUtils.from_timestamp(latest).strftime("%d-%m-%Y, %H:%M:%S")}"
                 )
 
                 return latest
@@ -305,19 +302,19 @@ class KlineRepository:
                         sum(volume) as volume,
                         sum(turnover) as turnover,
                         s.name as symbol_name,
-                        s.exchange as symbol_exchange,  -- Add exchange to uniquely identify symbol
+                        s.exchange as symbol_exchange,
                         :target_timeframe as timeframe,
                         count(*) as candle_count
                     FROM kline_data k
                     JOIN symbols s ON k.symbol_id = s.id
                     WHERE s.name = :symbol_name
-                    AND s.exchange = :exchange  -- Add exchange filter
+                    AND s.exchange = :exchange
                     AND k.timeframe = :base_timeframe
                     AND k.timestamp BETWEEN :start_time AND :end_time
                     GROUP BY
                         time_bucket(:bucket, k.timestamp),
                         s.name,
-                        s.exchange  -- Include exchange in GROUP BY
+                        s.exchange
                     HAVING count(*) >= :min_candles
                     ORDER BY bucket_timestamp DESC
                     LIMIT :limit

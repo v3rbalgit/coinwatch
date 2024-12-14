@@ -4,13 +4,13 @@ from typing import Dict, Any, List, Optional
 import aiohttp
 import asyncio
 
-from ..core.exceptions import AdapterError
-from ..config import CoingeckoConfig
-from ..adapters.base import APIAdapter
-from ..utils.logger import LoggerSetup
-from ..utils.cache import async_ttl_cache
-from ..utils.retry import RetryConfig, RetryStrategy
-from ..utils.rate_limit import TokenBucket, RateLimitConfig
+from shared.core.exceptions import AdapterError
+from shared.core.config import CoingeckoConfig
+from shared.core.adapter import APIAdapter
+from shared.utils.logger import LoggerSetup
+from shared.utils.cache import async_ttl_cache
+from shared.utils.retry import RetryConfig, RetryStrategy
+from shared.utils.rate_limit import RateLimiter
 
 logger = LoggerSetup.setup(__name__)
 
@@ -30,14 +30,16 @@ class CoinGeckoAdapter(APIAdapter):
     PRO_URL = "https://pro-api.coingecko.com/api/v3"
 
     def __init__(self, config: CoingeckoConfig):
-        super().__init__(config)
+        super().__init__()
+
+        self._config = config or CoingeckoConfig()
 
         # Initialize rate limiter
-        self._rate_limiter = TokenBucket(RateLimitConfig(
+        self._rate_limiter = RateLimiter(
             calls_per_window=config.rate_limit,
             window_size=config.rate_limit_window,
             max_monthly_calls=config.monthly_limit
-        ))
+        )
 
         self._api_key = config.api_key
 

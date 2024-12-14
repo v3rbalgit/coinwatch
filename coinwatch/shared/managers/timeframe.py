@@ -1,14 +1,14 @@
 # src/managers/timeframe.py
 
-import asyncio
 from datetime import timedelta
 from typing import List, Optional, Set
 
-from shared.core.coordination import Command, MarketDataCommand, ServiceCoordinator
 from shared.core.exceptions import ValidationError
 from shared.core.models import KlineData, SymbolInfo
 from shared.database.repositories.kline import KlineRepository
-from shared.utils.domain_types import Timeframe, Timestamp
+from shared.messaging.broker import MessageBroker
+from shared.messaging.schemas import MessageType, GapMessage
+from shared.utils.domain_types import Timeframe
 from shared.utils.logger import LoggerSetup
 from shared.utils.time import TimeUtils
 
@@ -22,7 +22,6 @@ class TimeframeManager:
     - Provides access to kline data across different timeframes
     - Manages continuous aggregates for common timeframes
     - Handles timeframe calculations and validations
-    - Responds to market data updates via coordinator
 
     The manager uses TimescaleDB continuous aggregates for common timeframes
     (1h, 4h, 1d) and provides on-demand calculation for other timeframes.
@@ -30,10 +29,10 @@ class TimeframeManager:
     """
 
     def __init__(self,
+                 message_broker: MessageBroker,
                  kline_repository: KlineRepository,
-                 coordinator: ServiceCoordinator,
                  base_timeframe: Timeframe = Timeframe.MINUTE_5):
-        self.coordinator = coordinator
+        self.message_broker = message_broker
         self.kline_repository = kline_repository
         self.base_timeframe = base_timeframe
 
@@ -44,9 +43,6 @@ class TimeframeManager:
 
         # Cache of valid higher timeframes
         self._valid_timeframes: Optional[Set[Timeframe]] = None
-
-        # Register command handlers
-        asyncio.create_task(self._register_command_handlers())
 
     @property
     def valid_timeframes(self) -> Set[Timeframe]:
@@ -119,12 +115,10 @@ class TimeframeManager:
 
             if start_time is None and limit:
                 # Calculate start time based on limit
-                start_time = Timestamp(
-                    end_time - (limit * timeframe.to_milliseconds())
-                )
+                start_time = end_time - (limit * timeframe.to_milliseconds())
             elif start_time is None:
                 # If no start_time and no limit, use a default period (e.g., last day)
-                start_time = Timestamp(end_time - (24 * 60 * 60 * 1000))  # Last 24 hours
+                start_time = end_time - (24 * 60 * 60 * 1000)  # Last 24 hours
 
             # Now we can be sure both timestamps are not None
             aligned_start = self._align_to_timeframe(start_time, timeframe)
@@ -137,7 +131,7 @@ class TimeframeManager:
             gaps = await self._check_data_gaps(symbol, aligned_start, aligned_end)
 
             if gaps:
-                await self._handle_data_gaps(symbol, gaps)
+                await self._fill_data_gaps(symbol, gaps)
 
             # Choose appropriate repository method based on timeframe
             if timeframe == self.base_timeframe:
@@ -174,54 +168,6 @@ class TimeframeManager:
                 f"Error getting {timeframe.value} klines for {symbol}: {e}"
             )
             raise
-
-    async def _register_command_handlers(self) -> None:
-        """Register handlers for market data commands"""
-        handlers = {
-            MarketDataCommand.COLLECTION_COMPLETE: self._handle_collection_complete,
-            MarketDataCommand.SYNC_COMPLETE: self._handle_sync_complete
-        }
-
-        for command, handler in handlers.items():
-            await self.coordinator.register_handler(command, handler)
-            logger.debug(f"Registered handler for {command.value}")
-
-    async def _handle_collection_complete(self, command: Command) -> None:
-        """Handle completion of historical data collection"""
-        try:
-            start_time = command.params['start_time']
-            end_time = command.params['end_time']
-
-            # Trigger recalculation of stored timeframes
-            for timeframe in self._stored_timeframes:
-                if timeframe in self.valid_timeframes:
-                    await self._refresh_continuous_aggregate(
-                        timeframe,
-                        start_time,
-                        end_time
-                    )
-        except Exception as e:
-            logger.error(f"Error handling collection complete: {e}")
-
-    async def _handle_sync_complete(self, command: Command) -> None:
-        """Handle completion of real-time data sync"""
-        try:
-            sync_time = command.params['sync_time']
-
-            # For real-time updates, we only need to process the latest period
-            interval_ms = self.base_timeframe.to_milliseconds()
-            start_time = Timestamp(sync_time - interval_ms)
-
-            # Refresh stored timeframes
-            for timeframe in self._stored_timeframes:
-                if timeframe in self.valid_timeframes:
-                    await self._refresh_continuous_aggregate(
-                        timeframe,
-                        start_time,
-                        sync_time
-                    )
-        except Exception as e:
-            logger.error(f"Error handling sync complete: {e}")
 
     def _align_to_timeframe(self,
                            timestamp: Optional[int],
@@ -286,43 +232,18 @@ class TimeframeManager:
             end_time
         )
 
-    async def _handle_data_gaps(self, symbol: SymbolInfo, gaps: List[tuple[int, int]]) -> None:
-        """Report detected data gaps"""
+    async def _fill_data_gaps(self, symbol: SymbolInfo, gaps: List[tuple[int, int]]) -> None:
+        """Fill detected data gaps"""
         if not gaps:
             return
 
-        await self.coordinator.execute(Command(
-            type=MarketDataCommand.GAP_DETECTED,
-            params={
-                "symbol": symbol,
-                "gaps": gaps,
-                "timeframe": self.base_timeframe.value,
-                "timestamp": TimeUtils.get_current_timestamp()
-            }
-        ))
-
-    async def _refresh_continuous_aggregate(self,
-                                          timeframe: Timeframe,
-                                          start_time: Timestamp,
-                                          end_time: Timestamp) -> None:
-        """Refresh TimescaleDB continuous aggregate for given period"""
-        if not timeframe.is_stored_timeframe():
-            logger.debug(f"Skipping refresh for non-stored timeframe: {timeframe.value}")
-            return
-
-        # Align to timeframe boundaries
-        aligned_start = self._align_to_timeframe(start_time, timeframe, round_up=False)
-        aligned_end = self._align_to_timeframe(end_time, timeframe, round_up=True)
-
-        # Only proceed if we have valid timestamps
-        if aligned_start is not None and aligned_end is not None:
-            start_dt = TimeUtils.from_timestamp(aligned_start)
-            end_dt = TimeUtils.from_timestamp(aligned_end)
-
-            await self.kline_repository.refresh_continuous_aggregate(
-                timeframe,
-                start_dt,
-                end_dt
-            )
-        else:
-            logger.warning("Skipping continuous aggregate refresh due to invalid timestamps")
+        await self.message_broker.publish(MessageType.GAP_DETECTED,
+                                          GapMessage(
+                                              service="market_data",
+                                              type=MessageType.GAP_DETECTED,
+                                              timestamp=TimeUtils.get_current_timestamp(),
+                                              symbol=symbol.name,
+                                              exchange=symbol.exchange,
+                                              gaps=gaps,
+                                              timeframe=self.base_timeframe.value
+                                          ).model_dump())

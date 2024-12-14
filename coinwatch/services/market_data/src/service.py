@@ -1,48 +1,33 @@
-import os
 import asyncio
-from typing import Optional, Set
+from typing import Optional, Set, Dict, Any, List
 
+from shared.clients.registry import ExchangeAdapterRegistry
 from shared.core.config import MarketDataConfig
 from shared.core.models import SymbolInfo
-from shared.core.exceptions import ServiceError, ValidationError
+from shared.core.exceptions import ServiceError
 from shared.core.service import ServiceBase
-from shared.database.repositories.kline import KlineRepository
-from shared.database.repositories.symbol import SymbolRepository
+from shared.database.repositories import KlineRepository, SymbolRepository
 from shared.messaging.broker import MessageBroker
-from shared.messaging.schemas import (
-    MessageType,
-    SymbolMessage,
-    ServiceStatusMessage,
-    ErrorMessage
-)
+from shared.messaging.schemas import MessageType, SymbolMessage, ErrorMessage
 from shared.utils.logger import LoggerSetup
 from shared.utils.domain_types import ServiceStatus, Timeframe
 from shared.utils.time import TimeUtils
 from shared.utils.error import ErrorTracker
-from shared.utils.retry import RetryConfig, RetryStrategy
 
 from .collector import DataCollector
-from .synchronizer import BatchSynchronizer
-from .adapters.registry import ExchangeAdapterRegistry
 
 logger = LoggerSetup.setup(__name__)
 
 class MarketDataService(ServiceBase):
     """
-    Core service managing market data collection and synchronization across exchanges.
+    Core service managing market data collection and real-time streaming.
 
     Features:
     - Historical and real-time price data collection
     - Multi-exchange symbol monitoring and lifecycle management
     - Automated gap detection and recovery
     - Error tracking and retry mechanisms
-
-    Components:
-    - DataCollector: Historical data collection
-    - BatchSynchronizer: Real-time synchronization
-    - ExchangeAdapterRegistry: Exchange connections
-    - ErrorTracker: Error monitoring
-    - RetryStrategy: Retry logic
+    - Real-time data streaming via websocket
     """
     def __init__(self,
                  symbol_repository: SymbolRepository,
@@ -58,18 +43,12 @@ class MarketDataService(ServiceBase):
         self.exchange_registry = exchange_registry
         self.message_broker = message_broker
         self.base_timeframe = Timeframe(config.default_timeframe)
-        self._retention_days = int(os.getenv('TIMESCALE_RETENTION_DAYS', '0'))
+        self._retention_days = 30
 
         # Core components
         self.data_collector = DataCollector(
             adapter_registry=exchange_registry,
             symbol_repository=symbol_repository,
-            kline_repository=kline_repository,
-            message_broker=message_broker,
-            base_timeframe=self.base_timeframe
-        )
-        self.batch_synchronizer = BatchSynchronizer(
-            adapter_registry=exchange_registry,
             kline_repository=kline_repository,
             message_broker=message_broker,
             base_timeframe=self.base_timeframe
@@ -83,53 +62,16 @@ class MarketDataService(ServiceBase):
         self._symbol_check_interval = 3600  # 1 hour
         self._symbol_lock = asyncio.Lock()
 
+        # Concurrency control
+        self._max_concurrent_collections = 10  # Limit concurrent collections
+        self._collection_semaphore = asyncio.Semaphore(self._max_concurrent_collections)
+
         # Task management
         self._monitor_task: Optional[asyncio.Task] = None
         self._monitor_running = asyncio.Event()
 
         # Error tracking and retry strategy
         self._error_tracker = ErrorTracker()
-        self._retry_strategy = RetryStrategy(RetryConfig(
-            base_delay=5.0,
-            max_delay=300.0,
-            max_retries=3,
-            jitter_factor=0.25
-        ))
-        self._configure_retry_strategy()
-
-    def _configure_retry_strategy(self) -> None:
-        """Configure retry behavior for market data service"""
-        # Basic retryable errors
-        self._retry_strategy.add_retryable_error(
-            ConnectionError,
-            TimeoutError,
-            ServiceError
-        )
-        self._retry_strategy.add_non_retryable_error(
-            ValidationError
-        )
-
-        # Configure specific delays for different error types
-        self._retry_strategy.configure_error_delays({
-            ConnectionError: RetryConfig(
-                base_delay=5.0,      # Moderate base delay for connection issues
-                max_delay=180.0,
-                max_retries=4,
-                jitter_factor=0.25
-            ),
-            TimeoutError: RetryConfig(
-                base_delay=3.0,      # Balanced delay for timeouts
-                max_delay=90.0,
-                max_retries=3,
-                jitter_factor=0.2
-            ),
-            ServiceError: RetryConfig(
-                base_delay=2.0,      # Quick retry for service errors
-                max_delay=45.0,
-                max_retries=4,
-                jitter_factor=0.15
-            )
-        })
 
     async def start(self) -> None:
         """Start market data service"""
@@ -138,8 +80,9 @@ class MarketDataService(ServiceBase):
             self._start_time = TimeUtils.get_current_timestamp()
             logger.info("Starting market data service")
 
-            # Connect to message broker
+            # Connect to message broker and register handlers
             await self.message_broker.connect()
+            await self.message_broker.subscribe(MessageType.GAP_DETECTED, self._handle_gap_message)
 
             # Start monitoring
             self._monitor_running.set()
@@ -147,21 +90,6 @@ class MarketDataService(ServiceBase):
 
             self._status = ServiceStatus.RUNNING
             logger.info("Market data service started successfully")
-
-            # Publish service status
-            await self.message_broker.publish(
-                MessageType.SERVICE_STATUS,
-                ServiceStatusMessage(
-                    service="market_data",
-                    timestamp=TimeUtils.get_current_timestamp(),
-                    type=MessageType.SERVICE_STATUS,
-                    status=self._status,
-                    uptime=0.0,
-                    error_count=0,
-                    warning_count=0,
-                    metrics={}
-                ).dict()
-            )
 
         except Exception as e:
             self._status = ServiceStatus.ERROR
@@ -186,13 +114,8 @@ class MarketDataService(ServiceBase):
                 self._monitor_task = None
 
             # Cleanup components
-            cleanup_tasks = [
-                self.data_collector.cleanup(),
-                self.batch_synchronizer.cleanup(),
-                self.message_broker.close()
-            ]
-
-            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+            await self.data_collector.cleanup()
+            await self.message_broker.close()
 
             # Clear service state
             self._active_symbols.clear()
@@ -207,17 +130,40 @@ class MarketDataService(ServiceBase):
             logger.error(f"Error during service shutdown: {e}")
             raise ServiceError(f"Service stop failed: {str(e)}")
 
-    async def _monitor_symbols(self) -> None:
-        """
-        Continuously monitors trading symbols across registered exchanges.
+    async def _process_symbol_batch(self, symbols: List[SymbolInfo]) -> None:
+        """Process a batch of symbols with limited concurrency"""
+        tasks = []
+        for symbol in symbols:
+            checked_symbol = symbol.check_retention_time(self._retention_days)
+            self._active_symbols.add(checked_symbol)
 
-        Core business logic:
-        - Discovers new trading symbols and initiates data collection
-        - Detects and handles delisted symbols
-        - Manages symbol lifecycle and active symbol set
-        - Implements retry logic for exchange API failures
-        - Reports errors and service status
-        """
+            # Publish symbol added event
+            await self._publish_symbol_added(checked_symbol)
+
+            # Create collection task with semaphore
+            tasks.append(self._collect_with_semaphore(
+                checked_symbol,
+                checked_symbol.launch_time,
+                TimeUtils.get_current_timestamp(),
+                {"type": "initial"}
+            ))
+
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    async def _collect_with_semaphore(self, symbol: SymbolInfo, start_time: int,
+                                    end_time: int, context: Dict[str, Any]) -> None:
+        """Collect data with concurrency control"""
+        async with self._collection_semaphore:
+            await self.data_collector.collect(
+                symbol=symbol,
+                start_time=start_time,
+                end_time=end_time,
+                context=context
+            )
+
+    async def _monitor_symbols(self) -> None:
+        """Monitor trading symbols across exchanges"""
         retry_count = 0
 
         try:
@@ -230,90 +176,30 @@ class MarketDataService(ServiceBase):
                                 symbols = await adapter.get_symbols()
                                 retry_count = 0  # Reset on success
 
-                                # Process new symbols
-                                for symbol in symbols:
-                                    if symbol not in self._active_symbols:
-                                        checked_symbol = symbol.check_retention_time(self._retention_days)
-                                        self._active_symbols.add(checked_symbol)
-
-                                        # Publish symbol added event
-                                        await self.message_broker.publish(
-                                            MessageType.SYMBOL_ADDED,
-                                            SymbolMessage(
-                                                service="market_data",
-                                                type=MessageType.SYMBOL_ADDED,
-                                                timestamp=TimeUtils.get_current_timestamp(),
-                                                symbol=checked_symbol.name,
-                                                exchange=checked_symbol.exchange,
-                                                base_asset=checked_symbol.base_asset,
-                                                quote_asset=checked_symbol.quote_asset,
-                                                first_trade_time=checked_symbol.launch_time
-                                            ).dict()
-                                        )
-
-                                        # Start collection
-                                        await self.data_collector.start_collection(
-                                            symbol=checked_symbol,
-                                            start_time=checked_symbol.launch_time,
-                                            end_time=TimeUtils.get_current_timestamp(),
-                                            context={"type": "initial"}
+                                # Process new symbols in batches with limited concurrency
+                                new_symbols = [s for s in symbols if s not in self._active_symbols]
+                                if new_symbols:
+                                    # Process symbols in smaller batches
+                                    batch_size = self._max_concurrent_collections
+                                    for i in range(0, len(new_symbols), batch_size):
+                                        batch = new_symbols[i:i + batch_size]
+                                        await self._process_symbol_batch(batch)
+                                        logger.info(
+                                            f"Processed batch {i//batch_size + 1} of "
+                                            f"{(len(new_symbols) + batch_size - 1)//batch_size} "
+                                            f"({len(batch)} symbols)"
                                         )
 
                                 # Handle delisted symbols
                                 delisted = self._active_symbols - set(symbols)
                                 for symbol in delisted:
                                     self._active_symbols.remove(symbol)
-
-                                    # Publish symbol delisted event
-                                    await self.message_broker.publish(
-                                        MessageType.SYMBOL_DELISTED,
-                                        SymbolMessage(
-                                            service="market_data",
-                                            type=MessageType.SYMBOL_DELISTED,
-                                            timestamp=TimeUtils.get_current_timestamp(),
-                                            symbol=symbol.name,
-                                            exchange=symbol.exchange,
-                                            base_asset=symbol.base_asset,
-                                            quote_asset=symbol.quote_asset
-                                        ).dict()
-                                    )
-
-                                    # Handle delisting in collector
-                                    await self.data_collector.handle_delisted(symbol)
+                                    await self._publish_symbol_delisted(symbol)
+                                    await self.data_collector.delist(symbol)
 
                             except Exception as e:
-                                # Track error
-                                await self._error_tracker.record_error(e, exchange)
-
-                                # Check if should retry
-                                should_retry, reason = self._retry_strategy.should_retry(retry_count, e)
-
-                                if should_retry:
-                                    retry_count += 1
-                                    delay = self._retry_strategy.get_delay(retry_count)
-                                    logger.warning(
-                                        f"Exchange {exchange} error ({reason}), "
-                                        f"retry {retry_count} after {delay:.2f}s: {e}"
-                                    )
-                                    await asyncio.sleep(delay)
-                                else:
-                                    # Publish error event
-                                    await self.message_broker.publish(
-                                        MessageType.ERROR_REPORTED,
-                                        ErrorMessage(
-                                            service="market_data",
-                                            type=MessageType.ERROR_REPORTED,
-                                            timestamp=TimeUtils.get_current_timestamp(),
-                                            error_type="ExchangeError",
-                                            severity="error",
-                                            message=str(e),
-                                            context={
-                                                "exchange": exchange,
-                                                "retry_count": retry_count,
-                                                "reason": reason
-                                            }
-                                        ).dict()
-                                    )
+                                await self._handle_exchange_error(e, exchange, retry_count)
+                                retry_count += 1
 
                     await asyncio.sleep(self._symbol_check_interval)
 
@@ -326,27 +212,107 @@ class MarketDataService(ServiceBase):
             raise
 
         except Exception as e:
-            logger.error(f"Critical error in symbol monitoring: {e}")
-            self._status = ServiceStatus.ERROR
-            self._last_error = e
+            await self._handle_critical_error(e, retry_count)
 
-            # Publish critical error
-            await self.message_broker.publish(
-                MessageType.ERROR_REPORTED,
-                ErrorMessage(
-                    service="market_data",
-                    type=MessageType.ERROR_REPORTED,
-                    timestamp=TimeUtils.get_current_timestamp(),
-                    error_type="CriticalError",
-                    severity="critical",
-                    message=str(e),
-                    context={
-                        "component": "monitor",
-                        "retry_count": retry_count,
-                        "active_symbols": len(self._active_symbols)
-                    }
-                ).dict()
-            )
+    async def _handle_gap_message(self, message: Dict[str, Any]) -> None:
+        """Handle gap detection message"""
+        try:
+            # Get symbol info from exchange
+            adapter = self.exchange_registry.get_adapter(message["exchange"])
+            symbols = await adapter.get_symbols(message["symbol"])
+            if not symbols:
+                logger.warning(f"Symbol {message['symbol']} not found on {message['exchange']}")
+                return
+            symbol = symbols[0]  # get_symbols returns a list, but with symbol param it should have only one item
+
+            # Only process if symbol is active and not in historical collection
+            if (symbol in self._active_symbols and
+                symbol not in self.data_collector._processing_symbols):
+
+                gaps = message["gaps"]
+                for start, end in gaps:
+                    # Use semaphore for gap filling too
+                    await self._collect_with_semaphore(symbol=symbol,
+                            start_time=start,
+                            end_time=end,
+                            context={
+                                "type": "gap_fill",
+                                "gap_size": (end - start) // self.base_timeframe.to_milliseconds()
+                            })
+
+        except Exception as e:
+            logger.error(f"Error handling gap for {message['symbol']}: {e}")
+
+    async def _publish_symbol_added(self, symbol: SymbolInfo) -> None:
+        """Publish symbol added event"""
+        await self.message_broker.publish(
+            MessageType.SYMBOL_ADDED,
+            SymbolMessage(
+                service="market_data",
+                type=MessageType.SYMBOL_ADDED,
+                timestamp=TimeUtils.get_current_timestamp(),
+                symbol=symbol.name,
+                exchange=symbol.exchange,
+                base_asset=symbol.base_asset,
+                quote_asset=symbol.quote_asset,
+                first_trade_time=symbol.launch_time
+            ).model_dump()
+        )
+
+    async def _publish_symbol_delisted(self, symbol: SymbolInfo) -> None:
+        """Publish symbol delisted event"""
+        await self.message_broker.publish(
+            MessageType.SYMBOL_DELISTED,
+            SymbolMessage(
+                service="market_data",
+                type=MessageType.SYMBOL_DELISTED,
+                timestamp=TimeUtils.get_current_timestamp(),
+                symbol=symbol.name,
+                exchange=symbol.exchange,
+                base_asset=symbol.base_asset,
+                quote_asset=symbol.quote_asset
+            ).model_dump()
+        )
+
+    async def _handle_exchange_error(self, error: Exception, exchange: str, retry_count: int) -> None:
+        """Handle exchange-specific errors"""
+        await self._error_tracker.record_error(error, exchange)
+        await self.message_broker.publish(
+            MessageType.ERROR_REPORTED,
+            ErrorMessage(
+                service="market_data",
+                type=MessageType.ERROR_REPORTED,
+                timestamp=TimeUtils.get_current_timestamp(),
+                error_type="ExchangeError",
+                severity="error",
+                message=str(error),
+                context={
+                    "exchange": exchange,
+                    "retry_count": retry_count
+                }
+            ).model_dump()
+        )
+
+    async def _handle_critical_error(self, error: Exception, retry_count: int) -> None:
+        """Handle critical service errors"""
+        self._status = ServiceStatus.ERROR
+        self._last_error = error
+        await self.message_broker.publish(
+            MessageType.ERROR_REPORTED,
+            ErrorMessage(
+                service="market_data",
+                type=MessageType.ERROR_REPORTED,
+                timestamp=TimeUtils.get_current_timestamp(),
+                error_type="CriticalError",
+                severity="critical",
+                message=str(error),
+                context={
+                    "component": "monitor",
+                    "retry_count": retry_count,
+                    "active_symbols": len(self._active_symbols)
+                }
+            ).model_dump()
+        )
 
     def get_service_status(self) -> str:
         """Get comprehensive service status"""
@@ -356,10 +322,7 @@ class MarketDataService(ServiceBase):
             f"Active Symbols: {len(self._active_symbols)}",
             "",
             "Collection Status:",
-            self.data_collector.get_collection_status(),
-            "",
-            "Synchronization Status:",
-            self.batch_synchronizer.get_sync_status()
+            self.data_collector.get_collection_status()
         ]
 
         error_summary = self._error_tracker.get_error_summary(window_minutes=60)

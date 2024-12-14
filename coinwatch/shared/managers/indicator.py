@@ -7,7 +7,6 @@ import polars_talib as plta
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
-from shared.core.coordination import ServiceCoordinator
 from shared.core.exceptions import ServiceError, ValidationError
 from shared.core.models import (
     KlineData,
@@ -103,9 +102,7 @@ class IndicatorManager:
     """
 
     def __init__(self,
-                 coordinator: ServiceCoordinator,
                  config: Optional[IndicatorCacheConfig] = None):
-        self.coordinator = coordinator
 
         # Initialize cache configuration
         if config is None:

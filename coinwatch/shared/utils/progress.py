@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
-from .domain_types import Timeframe
 from .time import TimeUtils
 from ..core.models import SymbolInfo
 
@@ -76,39 +75,6 @@ class MarketDataProgress:
         if not isinstance(other, MarketDataProgress):
             return NotImplemented
         return self.symbol == other.symbol
-
-@dataclass
-class SyncSchedule:
-    """Tracks synchronization schedule of a symbol"""
-    symbol: SymbolInfo
-    timeframe: Timeframe
-    next_sync: datetime  # Stored as UTC datetime
-    last_sync: Optional[datetime] = None  # Stored as UTC datetime
-
-    def update(self, sync_time: datetime) -> None:
-        """Update last sync time"""
-        self.last_sync = sync_time
-
-    def is_due(self) -> bool:
-        """Check if sync is due based on current time"""
-        return TimeUtils.get_current_datetime() >= self.next_sync
-
-    def get_time_until_next(self) -> float:
-        """Get seconds until next scheduled sync"""
-        return max(0.0, (self.next_sync - TimeUtils.get_current_datetime()).total_seconds())
-
-    def __str__(self) -> str:
-        """Human-readable schedule representation"""
-        status = [f"Sync Schedule for {self.symbol.name}"]
-
-        if self.last_sync:
-            time_since = (TimeUtils.get_current_datetime() - self.last_sync).total_seconds()
-            status.append(f"Last: {time_since:.1f}s ago")
-
-        time_until = self.get_time_until_next()
-        status.append(f"Next: {time_until:.1f}s")
-
-        return " | ".join(status)
 
 @dataclass
 class FundamentalDataProgress:

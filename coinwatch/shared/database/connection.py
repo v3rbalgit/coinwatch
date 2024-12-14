@@ -10,6 +10,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import text
 from contextlib import asynccontextmanager
 
+from shared.core.config import DatabaseConfig
+
 class IsolationLevel(str, Enum):
     """Transaction isolation levels"""
     READ_COMMITTED = "READ COMMITTED"
@@ -21,27 +23,18 @@ class DatabaseConnection:
     Database connection manager for microservices.
     Provides schema isolation and transaction management.
     """
-    def __init__(
-        self,
-        url: str,
-        schema: str,
-        pool_size: int = 5,
-        max_overflow: int = 10,
-        pool_timeout: int = 30,
-        pool_recycle: int = 1800,
-        echo: bool = False
-    ):
-        self.url = url
+    def __init__(self, config: DatabaseConfig, schema: str):
+        self.url = config.url
         self.schema = schema
         self.engine: Optional[AsyncEngine] = None
         self.session_factory = None
 
         # Connection pool settings
-        self._pool_size = pool_size
-        self._max_overflow = max_overflow
-        self._pool_timeout = pool_timeout
-        self._pool_recycle = pool_recycle
-        self._echo = echo
+        self._pool_size = config.pool_size
+        self._max_overflow = config.max_overflow
+        self._pool_timeout = config.pool_timeout
+        self._pool_recycle = config.pool_recycle
+        self._echo = config.echo
 
     async def initialize(self) -> None:
         """Initialize database connection with optimized settings"""

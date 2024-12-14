@@ -1,5 +1,5 @@
 # Build stage
-FROM python:3.9-slim as builder
+FROM python:3.12.8-slim as builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -18,7 +18,7 @@ COPY ./shared /shared
 RUN pip install --no-cache-dir -r /requirements.txt
 
 # Runtime stage
-FROM python:3.9-slim
+FROM python:3.12.8-slim
 
 # Copy virtual environment from builder
 COPY --from=builder /opt/venv /opt/venv
