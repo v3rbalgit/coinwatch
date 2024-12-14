@@ -57,6 +57,45 @@ class DatabaseConfig:
             'pool_recycle': self.pool_recycle,
             'echo': self.echo
         }
+@dataclass
+class BybitConfig:
+    """Bybit-specific configuration"""
+    testnet: bool = False
+    recv_window: int = 5000
+    kline_limit: int = 1000
+    rate_limit: int = 600       # requests per window
+    rate_limit_window: int = 5  # seconds
+
+    def __post_init__(self) -> None:
+        """Validate Bybit configuration"""
+        if self.kline_limit <= 0 or self.kline_limit > 1000:
+            raise ConfigurationError("Kline limit must be between 1 and 1000")
+        if self.rate_limit <= 0:
+            raise ConfigurationError("Rate limit must be positive")
+        if self.rate_limit_window <= 0:
+            raise ConfigurationError("Rate limit window must be positive")
+
+@dataclass
+class CoingeckoConfig:
+    """Coingecko-specific configuration"""
+    api_key: Optional[str] = None
+    pro_account: bool = False
+    rate_limit: int = 30         # requests per window
+    rate_limit_window: int = 60  # seconds
+    monthly_limit: int = 10000
+
+    def __post_init__(self) -> None:
+        """Validate Coingecko configuration"""
+        if self.rate_limit <= 0:
+            raise ConfigurationError("Rate limit must be positive")
+        if self.rate_limit_window <= 0:
+            raise ConfigurationError("Rate limit window must be positive")
+
+@dataclass
+class AdapterConfig:
+    """API adapters configuration"""
+    bybit: BybitConfig = field(default_factory=BybitConfig)
+    coingecko: CoingeckoConfig = field(default_factory=CoingeckoConfig)
 
 @dataclass
 class MarketDataConfig:
@@ -149,6 +188,7 @@ class Config:
         self.database = self._init_database_config()
         self.message_broker = self._init_message_broker_config()
         self.market_data = self._init_market_data_config()
+        self.adapters = self._init_adapter_config()
         self.fundamental_data = self._init_fundamental_data_config()
         self.monitoring = self._init_monitor_config()
         self.api = self._init_api_config()
@@ -195,6 +235,26 @@ class Config:
             )
         except Exception as e:
             raise ConfigurationError(f"Invalid market data configuration: {e}")
+
+    def _init_adapter_config(self) -> AdapterConfig:
+        """Initialize API adapters configuration"""
+        try:
+            bybit_config = BybitConfig(
+                testnet=bool(int(os.getenv('BYBIT_TESTNET', '0'))),
+                recv_window=int(os.getenv('BYBIT_RECV_WINDOW', '5000')),
+                kline_limit=int(os.getenv('BYBIT_KLINE_LIMIT', '1000')),
+                rate_limit=int(os.getenv('BYBIT_RATE_LIMIT', '600')),
+                rate_limit_window=int(os.getenv('BYBIT_RATE_LIMIT_WINDOW', '300'))
+            )
+            coingecko_config = CoingeckoConfig(
+                api_key=os.getenv('COINGECKO_API_KEY'),
+                pro_account=bool(int(os.getenv('COINGECKO_PRO_ACCOUNT','0'))),
+                rate_limit=int(os.getenv('COINGECKO_RATE_LIMIT', '30')),
+                rate_limit_window=int(os.getenv('COINGECKO_RATE_LIMIT_WINDOW', '60'))
+            )
+            return AdapterConfig(bybit=bybit_config, coingecko=coingecko_config)
+        except Exception as e:
+            raise ConfigurationError(f"Invalid exchange configuration: {e}")
 
     def _init_fundamental_data_config(self) -> FundamentalDataConfig:
         """Initialize fundamental data configuration"""

@@ -1,6 +1,6 @@
 # src/adapters/registry.py
 
-from typing import Dict, List, Optional
+from typing import Any, Callable, Coroutine, Dict, List, Optional
 from abc import abstractmethod
 
 from shared.core.models import KlineData, SymbolInfo
@@ -18,7 +18,7 @@ class ExchangeAdapter(APIAdapter):
     """
 
     @abstractmethod
-    async def get_symbols(self) -> List[SymbolInfo]:
+    async def get_symbols(self, symbol: Optional[str] = None) -> List[SymbolInfo]:
         """Get available trading pairs"""
         pass
 
@@ -30,6 +30,25 @@ class ExchangeAdapter(APIAdapter):
                         end_time: Optional[int] = None,
                         limit: Optional[int] = None) -> List[KlineData]:
         """Get kline data"""
+        pass
+
+    @abstractmethod
+    async def subscribe_klines(self,
+                             symbol: SymbolInfo,
+                             timeframe: Timeframe,
+                             handler: Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]) -> None:
+        """
+        Subscribe to real-time kline updates for a symbol.
+        """
+        pass
+
+    @abstractmethod
+    async def unsubscribe_klines(self,
+                                symbol: SymbolInfo,
+                                timeframe: Timeframe) -> None:
+        """
+        Unsubscribe from kline updates for a symbol.
+        """
         pass
 
 class ExchangeAdapterRegistry:

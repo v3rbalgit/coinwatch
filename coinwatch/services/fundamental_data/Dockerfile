@@ -1,39 +1,46 @@
-# Use Python 3.12.8 as the base image
-FROM python:3.12.8-slim
+# Build stage
+FROM python:3.12.8-slim as builder
 
-# Set environment variables
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
-
-# Set working directory
-WORKDIR /app
-
-# Install system dependencies
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy shared package
-COPY ./shared /app/shared
+# Create and activate virtual environment
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
-# Install shared package
-RUN pip install -e /app/shared
+# Copy requirements and install dependencies
+COPY ./services/fundamental_data/requirements.txt /requirements.txt
+COPY ./shared /shared
 
-# Install service dependencies
-COPY ./services/fundamental_data/requirements.txt /app/requirements.txt
-RUN pip install -r requirements.txt
+# Install shared package and requirements
+RUN pip install --no-cache-dir -r /requirements.txt
 
-# Copy service code
-COPY ./services/fundamental_data/src /app/src
+# Runtime stage
+FROM python:3.12.8-slim
 
-# Expose port for health checks
-EXPOSE 8002
+# Copy virtual environment from builder
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Create non-root user
+RUN useradd -m -u 1000 coinwatch
+
+# Set working directory and copy application code
+WORKDIR /app
+COPY ./services/fundamental_data/src ./src
+
+# Set environment variables
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+
+# Switch to non-root user
+USER coinwatch
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8002/health || exit 1
 
-# Command to run the service
-CMD ["python", "-m", "src.main"]
+# Run the application
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8002"]
