@@ -7,8 +7,8 @@ from hashlib import md5
 import logging
 from dataclasses import dataclass
 
-from .domain_types import Timeframe
-from ..core.models import SymbolInfo
+from shared.core.enums import Timeframe
+from shared.core.models import SymbolInfo
 
 logger = logging.getLogger(__name__)
 

@@ -1,22 +1,18 @@
 import asyncio
-from typing import Any, Dict, Set
+from typing import Any, AsyncGenerator, Dict, Optional, Set, Tuple
 from decimal import Decimal
 
+from shared.clients.registry import ExchangeAdapterRegistry
+from shared.core.enums import Timeframe
+from shared.core.exceptions import ServiceError
 from shared.core.models import KlineData, SymbolInfo
 from shared.database.repositories.kline import KlineRepository
 from shared.database.repositories.symbol import SymbolRepository
 from shared.messaging.broker import MessageBroker
-from shared.messaging.schemas import (
-    MessageType,
-    KlineMessage,
-    ErrorMessage,
-    CollectionMessage
-)
-from shared.utils.domain_types import Timeframe
+from shared.messaging.schemas import MessageType, KlineMessage, ErrorMessage, CollectionMessage
 from shared.utils.logger import LoggerSetup
 from shared.utils.progress import MarketDataProgress
 from shared.utils.time import TimeUtils
-from shared.clients.registry import ExchangeAdapterRegistry
 
 logger = LoggerSetup.setup(__name__)
 
@@ -36,147 +32,231 @@ class DataCollector:
                  symbol_repository: SymbolRepository,
                  kline_repository: KlineRepository,
                  message_broker: MessageBroker,
-                 base_timeframe: Timeframe = Timeframe.MINUTE_5,
-                 batch_size: int = 1000):
+                 base_timeframe: Timeframe = Timeframe.MINUTE_5):
         # Core dependencies
         self._adapter_registry = adapter_registry
         self._symbol_repository = symbol_repository
         self._kline_repository = kline_repository
         self._message_broker = message_broker
         self._base_timeframe = base_timeframe
-        self._batch_size = batch_size
 
-        # State management
-        self._processing_symbols: Set[SymbolInfo] = set()
-        self._streaming_symbols: Set[SymbolInfo] = set()
+        # State management - separate locks for collection and streaming
         self._collection_lock = asyncio.Lock()
+        self._processing_symbols: Set[SymbolInfo] = set()
+        self._streaming_lock = asyncio.Lock()
+        self._streaming_symbols: Set[SymbolInfo] = set()
         self._symbol_progress: Dict[SymbolInfo, MarketDataProgress] = {}
 
+        # Separate adapters for collection and streaming
+        self._collection_adapter = None
+        self._streaming_adapter = None
+
     async def collect(self, symbol: SymbolInfo, start_time: int, end_time: int, context: Dict[str, Any]) -> None:
-        """Start data collection for a symbol"""
-        async with self._collection_lock:
-            if symbol not in self._processing_symbols:
-                self._processing_symbols.add(symbol)
-                try:
-                    # Initialize progress tracking
-                    self._symbol_progress[symbol] = MarketDataProgress(
-                        symbol=symbol,
-                        start_time=TimeUtils.get_current_datetime()
-                    )
+        """
+        Start price data collection for a symbol
 
-                    await self._stop_streaming(symbol)
+        Args:
+            symbol (SymbolInfo): Symbol to start the price data collection for.
+            start_time (int): Start timestamp for collection.
+            end_time (int): End timestamp for collection.
+            context (Dict[str, Any]): Additional context for collection (initial, gap_fill).
+        """
+        try:
+            # Add symbol to processing set if not already processing
+            async with self._collection_lock:
+                if symbol not in self._processing_symbols:
+                    self._processing_symbols.add(symbol)
+                    logger.info(f"Collection started for {symbol.name} on {symbol.exchange}")
+                else:
+                    logger.info(f"Collection already in progress for {symbol.name} on {symbol.exchange}, skipping")
+                    return
 
-                    # Ensure symbol exists and continue from latest timestamp
-                    await self._symbol_repository.get_or_create(symbol)
+            # Process collection
+            start_time, end_time = self._align_time_range((start_time, end_time), self._base_timeframe)
+            if start_time == end_time:
+                logger.info(f"No data to collect for {symbol.name} on {symbol.exchange}, skipping collection")
+                return
 
-                    latest_timestamp = await self._kline_repository.get_latest_timestamp(symbol)
-                    if latest_timestamp > symbol.launch_time:
-                        start_time = latest_timestamp
+            # Collect all required data including any gaps
+            await self._collect_with_gaps(symbol, start_time, end_time, context)
 
-                    # Process collection
-                    await self._process_collection(symbol, start_time, end_time)
+            # Start streaming if not already streaming
+            if symbol not in self._streaming_symbols:
+                await self._start_streaming(symbol)
 
-                    await self._start_streaming(symbol)
+        except Exception as e:
+            await self._publish_error("CollectionError", str(e), symbol, start_time, end_time, context)
+            raise
+        finally:
+            # Clean up collection state
+            async with self._collection_lock:
+                self._processing_symbols.remove(symbol)
+                self._symbol_progress.pop(symbol, None)
 
-                    # Log completion
-                    if progress := self._symbol_progress.get(symbol):
-                        logger.info(progress.get_completion_summary(TimeUtils.get_current_datetime()))
-
-                    # Publish completion
-                    await self._message_broker.publish(
-                        MessageType.COLLECTION_COMPLETE,
-                        CollectionMessage(service="market_data",
-                                          type=MessageType.COLLECTION_COMPLETE,
-                                          timestamp=TimeUtils.get_current_timestamp(),
-                                          timeframe=self._base_timeframe.value,
-                                          symbol=symbol.name,
-                                          exchange=symbol.exchange,
-                                          start_time=start_time,
-                                          end_time=end_time,
-                                          processed=self._symbol_progress[symbol].processed_candles,
-                                          context=context
-                                          ).model_dump())
-                except Exception as e:
-                    await self._publish_error("CollectionError", str(e), symbol, start_time, end_time, context)
-                    raise
-                finally:
-                    self._processing_symbols.remove(symbol)
-                    self._symbol_progress.pop(symbol, None)
-
-    async def _process_collection(self, symbol: SymbolInfo, start_time: int, end_time: int) -> None:
-        """Core collection logic for both historical and gap filling"""
-        interval_ms = self._base_timeframe.to_milliseconds()
-        current_time = TimeUtils.get_current_timestamp()
-
-        # Align timestamps
-        aligned_start = start_time - (start_time % interval_ms)
-        aligned_end = min(
-            end_time - (end_time % interval_ms),
-            current_time - (current_time % interval_ms) - interval_ms  # Last completed interval
-        )
-
-        # Calculate total candles for progress tracking
-        total_candles = ((aligned_end - aligned_start) // interval_ms) + 1
-        processed_candles = 0
-
-        # Update progress with total
-        if progress := self._symbol_progress.get(symbol):
-            progress.update(processed_candles, total_candles)
-
-        # Process in batches
-        current_start = aligned_start
-        while current_start < aligned_end:
-            batch_end = min(aligned_end, current_start + (self._batch_size * interval_ms))
-
-            # Get and store batch
-            adapter = self._adapter_registry.get_adapter(symbol.exchange)
-            klines = await adapter.get_klines(
+    async def _collect_with_gaps(self, symbol: SymbolInfo, start_time: int, end_time: int, context: Dict[str, Any]) -> None:
+        """
+        Collect data for a time range and handle any gaps that are found.
+        This method will continue collecting until all gaps are filled.
+        """
+        while True:
+            # Initialize progress tracking with total candles calculation
+            progress = MarketDataProgress(
                 symbol=symbol,
-                timeframe=self._base_timeframe,
-                start_time=current_start,
-                end_time=batch_end,
-                limit=self._batch_size
+                time_range=(start_time, end_time),
+                timeframe=self._base_timeframe
             )
+            self._symbol_progress[symbol] = progress
 
+            # Process current range
+            processed_count = 0
+            async for processed in self._process_collection(symbol, start_time, end_time):
+                # Update progress
+                processed_count += processed
+                if progress := self._symbol_progress.get(symbol):
+                    progress.update(processed_count)
+                    logger.info(progress)
+
+            # Log completion of current range
+            if progress := self._symbol_progress.get(symbol):
+                logger.info(progress.get_completion_summary(TimeUtils.get_current_datetime()))
+
+            # Publish completion message
+            await self._publish_collection_complete(symbol, start_time, end_time, context)
+
+            # Check for any gaps
+            time_range = await self._verify_collection(symbol)
+            if not time_range:
+                break
+            else:
+                # Process the gap in the next iteration
+                start_time, end_time = time_range
+                context = {
+                    "type": "gap_fill",
+                    "gap_size": (end_time - start_time) // self._base_timeframe.to_milliseconds()
+                }
+
+    async def _process_collection(self, symbol: SymbolInfo, start_time: int, end_time: int) -> AsyncGenerator[int, None]:
+        """
+        Core collection logic for both historical and gap filling
+
+        Args:
+            symbol (SymbolInfo): Symbol to process collection for.
+            start_time (int): Aligned start timestamp.
+            end_time (int): Aligned end timestamp.
+
+        Yields:
+            int: Number of processed candles.
+        """
+        # Get collection adapter
+        if not self._collection_adapter:
+            self._collection_adapter = self._adapter_registry.get_adapter(symbol.exchange)
+
+        # Process using generator pattern
+        async for klines in self._collection_adapter.get_klines(
+            symbol=symbol,
+            timeframe=self._base_timeframe,
+            start_time=start_time,
+            end_time=end_time
+        ):
             if not klines:
                 break
 
-            # Filter for completed intervals
-            klines = [k for k in klines if TimeUtils.is_complete_interval(k.timestamp, interval_ms)]
-            if klines:
-                # Store batch
-                processed = await self._kline_repository.insert_batch(
-                    symbol,
-                    self._base_timeframe,
-                    [k.to_tuple() for k in klines]
-                )
+            # Store batch
+            processed = await self._kline_repository.insert_batch(
+                symbol,
+                self._base_timeframe,
+                [k.to_tuple() for k in klines]
+            )
 
-                # Update progress
-                processed_candles += processed
-                if progress := self._symbol_progress.get(symbol):
-                    progress.update(processed_candles)
-                    logger.info(progress)
+            yield processed
 
-                # Refresh aggregates
-                await self._refresh_continuous_aggregate(
-                    self._base_timeframe,
-                    klines[0].timestamp,
-                    klines[-1].timestamp + interval_ms
-                )
+    async def _verify_collection(self, symbol: SymbolInfo) -> Optional[Tuple[int,int]]:
+        """
+        Check if historical data for symbol are up-to-date
 
-                current_start = klines[-1].timestamp + interval_ms
-            else:
-                current_start = batch_end
+        Args:
+            symbol (SymbolInfo): Symbol to check.
+
+        Returns:
+            Optional[Tuple[int,int]]: Range of timestamps if there is a gap, otherwise None.
+
+        """
+        # Get latest timestamp to verify we have the most recent data
+        latest = await self._kline_repository.get_latest_timestamp(symbol)
+
+        if not latest:
+            raise ServiceError(f'No historical data found for {symbol}')
+
+        # Calculate the last completed interval
+        current_time = TimeUtils.get_current_timestamp()
+        interval_ms = self._base_timeframe.to_milliseconds()
+        last_complete = current_time - (current_time % interval_ms) - interval_ms
+
+        # Check for gaps and fill if needed
+        if latest < last_complete:
+            logger.warning(
+                f"Missing historical data for {symbol.name} on {symbol.exchange} "
+                f"from {TimeUtils.from_timestamp(latest)} "
+                f"to {TimeUtils.from_timestamp(last_complete)}"
+            )
+            return latest, last_complete
+
+    def _align_time_range(self,time_range: Tuple[int,int], timeframe: Timeframe) -> Tuple[int, int]:
+        """
+        Align start and end timestamps to interval
+
+        Args:
+            time_range (Tuple[int,int]): Tuple of start and end timestamps to align.
+            timeframe (Timeframe): Timeframe to base the calculation on.
+
+        Returns:
+            Tuple[int,int]: Aligned range of timestamps.
+        """
+        start_time, end_time = time_range
+        interval_ms = timeframe.to_milliseconds()
+        aligned_start = start_time - (start_time % interval_ms)
+        current_time = TimeUtils.get_current_timestamp()
+        aligned_end = min(
+            end_time - (end_time % interval_ms),
+            current_time - (current_time % interval_ms) - interval_ms
+        )
+        return aligned_start, aligned_end
+
+    async def _start_streaming(self, symbol: SymbolInfo) -> None:
+        """Start real-time data streaming for a symbol"""
+        try:
+            async with self._streaming_lock:
+                # Start streaming if not already streaming
+                if symbol not in self._streaming_symbols:
+                    if not self._streaming_adapter:
+                        self._streaming_adapter = self._adapter_registry.get_adapter(symbol.exchange)
+                    await self._streaming_adapter.subscribe_klines(
+                        symbol,
+                        self._base_timeframe,
+                        lambda data: self._handle_kline_update(symbol, data)
+                    )
+                    self._streaming_symbols.add(symbol)
+                    logger.info(f"Streaming started for {symbol.name} on {symbol.exchange}")
+
+        except Exception as e:
+            logger.error(f"Failed to start streaming for {symbol}: {e}")
+            await self._publish_error("StreamingError", str(e), symbol, 0, 0, {"type": "streaming"})
+
+    async def _stop_streaming(self, symbol: SymbolInfo) -> None:
+        """Stop streaming for a symbol"""
+        async with self._streaming_lock:
+            if symbol in self._streaming_symbols:
+                if not self._streaming_adapter:
+                    self._streaming_adapter = self._adapter_registry.get_adapter(symbol.exchange)
+                await self._streaming_adapter.unsubscribe_klines(symbol, self._base_timeframe)
+                self._streaming_symbols.remove(symbol)
+                logger.info(f"Streaming stopped for {symbol.name} on {symbol.exchange}")
 
     async def delist(self, symbol: SymbolInfo) -> None:
         """Handle symbol delisting"""
         try:
-            # Stop streaming if active
-            if symbol in self._streaming_symbols:
-                adapter = self._adapter_registry.get_adapter(symbol.exchange)
-                await adapter.unsubscribe_klines(symbol, self._base_timeframe)
-                self._streaming_symbols.remove(symbol)
-                logger.info(f"Stopped streaming for delisted symbol {symbol}")
+            await self._stop_streaming(symbol)
+            logger.info(f"Stopped streaming for delisted symbol {symbol}")
 
             # Remove from collection if in progress
             async with self._collection_lock:
@@ -191,6 +271,24 @@ class DataCollector:
 
         except Exception as e:
             logger.error(f"Error handling symbol delisting for {symbol}: {e}")
+
+    async def _publish_collection_complete(self, symbol: SymbolInfo, start_time: int, end_time: int, context: Dict[str, Any]) -> None:
+        """Publish collection complete message"""
+        await self._message_broker.publish(
+            MessageType.COLLECTION_COMPLETE,
+            CollectionMessage(
+                service="market_data",
+                type=MessageType.COLLECTION_COMPLETE,
+                timestamp=TimeUtils.get_current_timestamp(),
+                timeframe=self._base_timeframe.value,
+                symbol=symbol.name,
+                exchange=symbol.exchange,
+                start_time=start_time,
+                end_time=end_time,
+                processed=self._symbol_progress[symbol].processed_candles,
+                context=context
+            ).model_dump()
+        )
 
     async def _publish_kline_update(self, symbol: SymbolInfo, kline: KlineData) -> None:
         """Publish kline update message"""
@@ -231,7 +329,6 @@ class DataCollector:
                     "start_time": start_time,
                     "end_time": end_time,
                     "collection_type": context.get("type"),
-                    "batch_size": self._batch_size,
                     "timeframe": self._base_timeframe.value
                 }
             ).model_dump()
@@ -262,94 +359,11 @@ class DataCollector:
                 [kline.to_tuple()]
             )
 
-            await self._refresh_continuous_aggregate(
-                self._base_timeframe,
-                kline.timestamp,
-                kline.timestamp + self._base_timeframe.to_milliseconds()
-            )
-
             await self._publish_kline_update(symbol, kline)
 
         except Exception as e:
             logger.error(f"Error handling kline update for {symbol}: {e}")
-
-    async def _start_streaming(self, symbol: SymbolInfo) -> None:
-        """Start real-time data streaming for a symbol"""
-        try:
-            # Get latest timestamp to verify we have the most recent data
-            latest = await self._kline_repository.get_latest_timestamp(symbol)
-
-            if not latest:
-                logger.warning(f"No historical data found for {symbol}, skipping streaming")
-                return
-
-            # Calculate the last completed interval
-            current_time = TimeUtils.get_current_timestamp()
-            interval_ms = self._base_timeframe.to_milliseconds()
-            last_complete = current_time - (current_time % interval_ms) - interval_ms
-
-            # Only start streaming if we have data up to the last complete interval
-            if latest < last_complete:
-                logger.warning(
-                    f"Historical data not up to date for {symbol} "
-                    f"(latest: {TimeUtils.from_timestamp(latest)}, "
-                    f"expected: {TimeUtils.from_timestamp(last_complete)})"
-                )
-                return
-
-            # Start streaming if not already streaming
-            if symbol not in self._streaming_symbols:
-                adapter = self._adapter_registry.get_adapter(symbol.exchange)
-                await adapter.subscribe_klines(
-                    symbol,
-                    self._base_timeframe,
-                    lambda data: self._handle_kline_update(symbol, data)
-                )
-                self._streaming_symbols.add(symbol)
-                logger.info(f"Started streaming for {symbol}")
-
-        except Exception as e:
-            logger.error(f"Failed to start streaming for {symbol}: {e}")
-
-    async def _stop_streaming(self, symbol: SymbolInfo) -> None:
-        """Pause streaming for a symbol during collection"""
-        if symbol in self._streaming_symbols:
-            adapter = self._adapter_registry.get_adapter(symbol.exchange)
-            await adapter.unsubscribe_klines(symbol, self._base_timeframe)
-            self._streaming_symbols.remove(symbol)
-            logger.info(f"Stopped streaming for {symbol} during collection")
-
-    async def _refresh_continuous_aggregate(self, timeframe: Timeframe, start_time: int, end_time: int) -> None:
-        """
-        Refresh TimescaleDB continuous aggregate for given period.
-
-        Args:
-            kline_repository: Repository for kline operations
-            timeframe: Target timeframe to refresh
-            start_time: Start timestamp in milliseconds
-            end_time: End timestamp in milliseconds
-        """
-        if not timeframe.is_stored_timeframe():
-            logger.debug(f"Skipping refresh for non-stored timeframe: {timeframe.value}")
-            return
-
-        # Align to timeframe boundaries
-        interval_ms = timeframe.to_milliseconds()
-        aligned_start = start_time - (start_time % interval_ms)
-        aligned_end = end_time - (end_time % interval_ms) + interval_ms
-
-        # Only proceed if we have valid timestamps
-        if aligned_start is not None and aligned_end is not None:
-            start_dt = TimeUtils.from_timestamp(aligned_start)
-            end_dt = TimeUtils.from_timestamp(aligned_end)
-
-            await self._kline_repository.refresh_continuous_aggregate(
-                timeframe,
-                start_dt,
-                end_dt
-            )
-        else:
-            logger.warning("Skipping continuous aggregate refresh due to invalid timestamps")
+            await self._publish_error("StreamingError", str(e), symbol, 0, 0, {"type": "streaming"})
 
     async def cleanup(self) -> None:
         """Cleanup resources"""
@@ -365,8 +379,21 @@ class DataCollector:
 
     def get_collection_status(self) -> str:
         """Get collection status"""
-        return "\n".join([
+        status_lines = [
             "Collection Status:",
             f"Active Collections: {len(self._processing_symbols)}",
             f"Streaming Symbols: {len(self._streaming_symbols)}"
-        ])
+        ]
+
+        # Add details about active collections
+        if self._processing_symbols:
+            status_lines.append("\nActive Collections:")
+            for symbol in self._processing_symbols:
+                if progress := self._symbol_progress.get(symbol):
+                    percentage = progress.get_percentage()
+                    status_lines.append(
+                        f"  {symbol}: {percentage:.1f}% complete "
+                        f"({progress.processed_candles}/{progress.total_candles} candles)"
+                    )
+
+        return "\n".join(status_lines)

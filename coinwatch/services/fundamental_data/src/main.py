@@ -91,11 +91,10 @@ async def lifespan(app: FastAPI):
 
         # Initialize message broker
         message_broker = MessageBroker("fundamental_data")
-        await message_broker.connect(config.message_broker.url)
 
         # Initialize exchange registry
         exchange_registry = ExchangeAdapterRegistry()
-        await exchange_registry.register("bybit", BybitAdapter(config.adapters.bybit))
+        exchange_registry.register("bybit", BybitAdapter(config.adapters.bybit))
 
         # Initialize CoinGecko adapter
         coingecko_adapter = CoinGeckoAdapter(config.adapters.coingecko)

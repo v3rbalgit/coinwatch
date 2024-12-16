@@ -51,6 +51,7 @@ def upgrade() -> None:
         sa.Column('turnover', sa.Float(precision=18), nullable=False),
         sa.ForeignKeyConstraint(['symbol_id'], ['market_data.symbols.id'], ondelete='CASCADE'),
         sa.PrimaryKeyConstraint('id', 'timestamp'),
+        sa.UniqueConstraint('symbol_id', 'timeframe', 'timestamp', name='uix_kline_symbol_time'),
         sa.Index('idx_kline_query', 'symbol_id', 'timeframe', 'timestamp', postgresql_using='btree'),
         schema='market_data'
     )
@@ -83,6 +84,15 @@ def upgrade() -> None:
         );
     """)
 
+    # Setup retention
+    op.execute("""
+        SELECT add_retention_policy(
+            'market_data.kline_data',
+            INTERVAL '90 days',
+            if_not_exists => TRUE
+        );
+    """)
+
     # Create continuous aggregates for different timeframes
     # 1h view
     op.execute("""
@@ -102,7 +112,9 @@ def upgrade() -> None:
         WHERE timeframe = '5'
         GROUP BY bucket, symbol_id
         WITH NO DATA;
+    """)
 
+    op.execute("""
         SELECT add_continuous_aggregate_policy('market_data.kline_1h',
             start_offset => INTERVAL '3 hours',
             end_offset => INTERVAL '1 hour',
@@ -129,7 +141,9 @@ def upgrade() -> None:
         WHERE timeframe = '5'
         GROUP BY bucket, symbol_id
         WITH NO DATA;
+    """)
 
+    op.execute("""
         SELECT add_continuous_aggregate_policy('market_data.kline_4h',
             start_offset => INTERVAL '12 hours',
             end_offset => INTERVAL '4 hours',
@@ -156,7 +170,9 @@ def upgrade() -> None:
         WHERE timeframe = '5'
         GROUP BY bucket, symbol_id
         WITH NO DATA;
+    """)
 
+    op.execute("""
         SELECT add_continuous_aggregate_policy('market_data.kline_1d',
             start_offset => INTERVAL '3 days',
             end_offset => INTERVAL '1 day',

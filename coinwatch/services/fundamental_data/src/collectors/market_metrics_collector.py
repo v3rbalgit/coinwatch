@@ -4,11 +4,11 @@ from decimal import Decimal
 from typing import List, Set
 
 from .collector import FundamentalCollector
-from .adapters.coingecko import CoinGeckoAdapter
+from shared.clients.coingecko import CoinGeckoAdapter
+from shared.core.enums import DataSource
 from shared.core.models import MarketMetrics
 from shared.core.exceptions import ServiceError
 from shared.database.repositories.market import MarketMetricsRepository
-from shared.utils.domain_types import DataSource
 from shared.utils.logger import LoggerSetup
 from shared.utils.time import TimeUtils
 

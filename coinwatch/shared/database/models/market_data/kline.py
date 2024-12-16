@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Index, BigInteger, Float, PrimaryKeyConstraint, Text, ForeignKey
+from sqlalchemy import Index, BigInteger, Float, PrimaryKeyConstraint, Text, ForeignKey, UniqueConstraint
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -48,6 +48,7 @@ class Kline(MarketDataBase):
 
     __table_args__ = (
         PrimaryKeyConstraint('id', 'timestamp'),
+        UniqueConstraint('symbol_id', 'timeframe', 'timestamp', name='uix_kline_symbol_time'),
         Index(
             'idx_kline_query',
             'symbol_id', 'timeframe', 'timestamp',

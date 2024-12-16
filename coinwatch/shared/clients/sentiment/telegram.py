@@ -6,7 +6,7 @@ from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.types import Channel, InputChannel
 from datetime import datetime, timezone, timedelta
 
-from ...utils.logger import LoggerSetup
+from shared.utils.logger import LoggerSetup
 
 logger = LoggerSetup.setup(__name__)
 

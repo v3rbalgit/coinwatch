@@ -5,9 +5,7 @@ from dotenv import load_dotenv
 from sqlalchemy import AsyncAdaptedQueuePool
 
 from .exceptions import ConfigurationError
-from ..utils.logger import LoggerSetup
-
-logger = LoggerSetup.setup(__name__)
+from shared.core.enums import Timeframe
 
 @dataclass
 class MessageBrokerConfig:
@@ -70,8 +68,8 @@ class BybitConfig:
         """Validate Bybit configuration"""
         if self.kline_limit <= 0 or self.kline_limit > 1000:
             raise ConfigurationError("Kline limit must be between 1 and 1000")
-        if self.rate_limit <= 0:
-            raise ConfigurationError("Rate limit must be positive")
+        if self.rate_limit <= 0 or self.rate_limit > 600:
+            raise ConfigurationError("Rate limit must be positive and up to 600")
         if self.rate_limit_window <= 0:
             raise ConfigurationError("Rate limit window must be positive")
 
@@ -90,6 +88,8 @@ class CoingeckoConfig:
             raise ConfigurationError("Rate limit must be positive")
         if self.rate_limit_window <= 0:
             raise ConfigurationError("Rate limit window must be positive")
+        if self.monthly_limit <= 0:
+            raise ConfigurationError("Monthly limit must be positive")
 
 @dataclass
 class AdapterConfig:
@@ -100,38 +100,57 @@ class AdapterConfig:
 @dataclass
 class MarketDataConfig:
     """Market data service configuration"""
-    sync_interval: int = 300  # 5 minutes
-    retry_interval: int = 60  # 1 minute
-    max_retries: int = 3
     default_timeframe: str = '5'
     batch_size: int = 1000
 
     def __post_init__(self) -> None:
         """Validate market data configuration"""
-        if self.sync_interval < 60:
-            raise ConfigurationError("Sync interval must be at least 60 seconds")
-        if self.retry_interval <= 0:
-            raise ConfigurationError("Retry interval must be positive")
-        if self.max_retries <= 0:
-            raise ConfigurationError("Max retries must be positive")
         if self.batch_size <= 0:
             raise ConfigurationError("Batch size must be positive")
+        if self.default_timeframe not in [tf.value for tf in Timeframe]:
+            raise ConfigurationError(f"Invalid timeframe '{self.default_timeframe}'")
 
 @dataclass
 class SentimentConfig:
     """Configuration for sentiment analysis APIs"""
     twitter_api_key: Optional[str] = None
     twitter_api_host: Optional[str] = None
-    twitter_rate_limit: int = 950
-    twitter_rate_limit_window: int = 86400
+    twitter_rate_limit: int = 60
+    twitter_rate_limit_window: int = 60
+    twitter_monthly_limit: int = 100_000
 
     reddit_client_id: Optional[str] = None
     reddit_client_secret: Optional[str] = None
-    reddit_rate_limit: int = 95
+    reddit_rate_limit: int = 100
     reddit_rate_limit_window: int = 60
-    telegram_api_id: Optional[int] = None
+
+    telegram_api_id: Optional[str] = None
     telegram_api_hash: Optional[str] = None
     telegram_session_name: str = "coinwatch_bot"
+
+    def get_twitter_config(self):
+        return {
+            "api_key": self.twitter_api_key,
+            "api_host": self.twitter_api_host,
+            "rate_limit": self.twitter_rate_limit,
+            "rate_limit_window": self.twitter_rate_limit_window,
+            "max_monthly": self.twitter_monthly_limit
+        }
+
+    def get_reddit_config(self):
+        return {
+            "client_id": self.reddit_client_id,
+            "client_secret": self.reddit_client_secret,
+            "rate_limit": self.reddit_rate_limit,
+            "rate_limit_window": self.reddit_rate_limit_window
+        }
+
+    def get_telegram_config(self):
+        return {
+            "api_id": self.telegram_api_id,
+            "client_secret": self.telegram_api_hash,
+            "rate_limit": self.telegram_session_name,
+        }
 
 @dataclass
 class FundamentalDataConfig:
@@ -227,9 +246,6 @@ class Config:
         """Initialize market data configuration"""
         try:
             return MarketDataConfig(
-                sync_interval=int(os.getenv('SYNC_INTERVAL', '300')),
-                retry_interval=int(os.getenv('RETRY_INTERVAL', '60')),
-                max_retries=int(os.getenv('MAX_RETRIES', '3')),
                 default_timeframe=os.getenv('DEFAULT_TIMEFRAME', '5'),
                 batch_size=int(os.getenv('MARKET_DATA_BATCH_SIZE', '1000'))
             )
@@ -244,13 +260,14 @@ class Config:
                 recv_window=int(os.getenv('BYBIT_RECV_WINDOW', '5000')),
                 kline_limit=int(os.getenv('BYBIT_KLINE_LIMIT', '1000')),
                 rate_limit=int(os.getenv('BYBIT_RATE_LIMIT', '600')),
-                rate_limit_window=int(os.getenv('BYBIT_RATE_LIMIT_WINDOW', '300'))
+                rate_limit_window=int(os.getenv('BYBIT_RATE_LIMIT_WINDOW', '5'))
             )
             coingecko_config = CoingeckoConfig(
                 api_key=os.getenv('COINGECKO_API_KEY'),
                 pro_account=bool(int(os.getenv('COINGECKO_PRO_ACCOUNT','0'))),
                 rate_limit=int(os.getenv('COINGECKO_RATE_LIMIT', '30')),
-                rate_limit_window=int(os.getenv('COINGECKO_RATE_LIMIT_WINDOW', '60'))
+                rate_limit_window=int(os.getenv('COINGECKO_RATE_LIMIT_WINDOW', '60')),
+                monthly_limit=int(os.getenv('COINGECKO_MONTHLY_LIMIT', '10000'))
             )
             return AdapterConfig(bybit=bybit_config, coingecko=coingecko_config)
         except Exception as e:
@@ -262,13 +279,14 @@ class Config:
             sentiment_config = SentimentConfig(
                 twitter_api_key=os.getenv('TWITTER_RAPIDAPI_KEY'),
                 twitter_api_host=os.getenv('TWITTER_RAPIDAPI_HOST'),
-                twitter_rate_limit=int(os.getenv('TWITTER_RATE_LIMIT', '950')),
-                twitter_rate_limit_window=int(os.getenv('TWITTER_RATE_LIMIT_WINDOW', '86400')),
+                twitter_rate_limit=int(os.getenv('TWITTER_RATE_LIMIT', '60')),
+                twitter_rate_limit_window=int(os.getenv('TWITTER_RATE_LIMIT_WINDOW', '60')),
+                twitter_monthly_limit=int(os.getenv('TWITTER_MONTHLY_LIMIT', '100000')),
                 reddit_client_id=os.getenv('REDDIT_CLIENT_ID'),
                 reddit_client_secret=os.getenv('REDDIT_CLIENT_SECRET'),
-                reddit_rate_limit=int(os.getenv('REDDIT_RATE_LIMIT', '95')),
+                reddit_rate_limit=int(os.getenv('REDDIT_RATE_LIMIT', '100')),
                 reddit_rate_limit_window=int(os.getenv('REDDIT_RATE_LIMIT_WINDOW', '60')),
-                telegram_api_id=int(os.getenv('TELEGRAM_API_ID', '0')) or None,
+                telegram_api_id=os.getenv('TELEGRAM_API_ID'),
                 telegram_api_hash=os.getenv('TELEGRAM_API_HASH'),
                 telegram_session_name=os.getenv('TELEGRAM_SESSION_NAME', 'coinwatch_bot')
             )

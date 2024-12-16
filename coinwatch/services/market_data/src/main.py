@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 
 from .service import MarketDataService
 from shared.core.config import Config
+from shared.core.enums import ServiceStatus
 from shared.database.connection import DatabaseConnection
 from shared.database.repositories import SymbolRepository, KlineRepository
 from shared.messaging.broker import MessageBroker
@@ -16,7 +17,6 @@ from shared.clients.exchanges import BybitAdapter
 from shared.clients.registry import ExchangeAdapterRegistry
 from shared.utils.logger import LoggerSetup
 from shared.utils.time import TimeUtils
-from shared.utils.domain_types import ServiceStatus
 
 logger = LoggerSetup.setup(__name__)
 
@@ -46,7 +46,7 @@ async def publish_metrics():
                         service="market_data",
                         type=MessageType.SERVICE_STATUS,
                         timestamp=TimeUtils.get_current_timestamp(),
-                        status=service._status,
+                        status=service._status.value,
                         uptime=uptime,
                         error_count=len(recent_errors),
                         warning_count=len([e for e in recent_errors if "warning" in str(e).lower()]),
@@ -56,7 +56,6 @@ async def publish_metrics():
                             "streaming_symbols": len(service.data_collector._streaming_symbols),
                             "streaming_errors": streaming_errors,
                             "collection_errors": collection_errors,
-                            "batch_size": service.data_collector._batch_size,
                             "data_gaps": gap_errors,
                             "last_error": str(service._last_error) if service._last_error else None
                         }
@@ -87,11 +86,10 @@ async def lifespan(app: FastAPI):
 
         # Initialize exchange registry with adapters
         exchange_registry = ExchangeAdapterRegistry()
-        await exchange_registry.register("bybit", BybitAdapter(config.adapters.bybit))
+        exchange_registry.register("bybit", BybitAdapter(config.adapters.bybit))
 
         # Initialize message broker
         message_broker = MessageBroker("market_data")
-        await message_broker.connect(config.message_broker.url)
 
         service = MarketDataService(
             symbol_repository=symbol_repository,
@@ -119,8 +117,8 @@ async def lifespan(app: FastAPI):
                 await metrics_task
             except asyncio.CancelledError:
                 pass
-
         if service:
+            await db.close()
             await service.stop()
 
 # Initialize FastAPI app
@@ -148,7 +146,7 @@ async def health_check():
 
     return {
         "status": "healthy",
-        "service_status": service._status,
+        "service_status": service._status.value,
         "active_symbols": len(service._active_symbols)
     }
 
@@ -169,7 +167,7 @@ async def get_metrics():
         gap_errors = len([e for e in recent_errors if "gap" in str(e).lower()])
 
         return {
-            "status": service._status,
+            "status": service._status.value,
             "uptime_seconds": uptime,
             "last_error": str(service._last_error) if service._last_error else None,
             "error_count": len(recent_errors),
@@ -179,7 +177,6 @@ async def get_metrics():
             "streaming_symbols": len(service.data_collector._streaming_symbols),
             "streaming_errors": streaming_errors,
             "collection_errors": collection_errors,
-            "batch_size": service.data_collector._batch_size,
             "data_gaps": gap_errors
         }
     except Exception as e:
@@ -192,8 +189,7 @@ async def get_status():
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     return {
-        "status": service.get_service_status(),
-        "collector_status": service.data_collector.get_collection_status()
+        "status": service.get_service_status()
     }
 
 @app.exception_handler(Exception)

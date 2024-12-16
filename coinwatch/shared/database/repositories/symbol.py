@@ -19,40 +19,62 @@ class SymbolRepository:
     def __init__(self, db_service: DatabaseConnection):
         self.db_service = db_service
 
-    async def get_or_create(self, symbol: SymbolInfo) -> Symbol:
+    async def get_symbol(self, symbol: SymbolInfo) -> Optional[Symbol]:
         """
-        Get an existing symbol or create a new one if it doesn't exist.
+        Retrieve a symbol by its information.
 
         Args:
-            symbol (SymbolInfo): The symbol information to get or create.
+            symbol (SymbolInfo): The symbol information to search by.
 
         Returns:
-            Symbol: The retrieved or created Symbol entity.
+            Optional[Symbol]: The found Symbol entity or None if not found.
 
         Raises:
-            RepositoryError: If there's an error during the operation.
+            RepositoryError: If there's an error during the retrieval.
         """
         try:
-            async with self.db_service.session(isolation_level=IsolationLevel.SERIALIZABLE) as session:
-                # First try to get existing symbol
-                existing_stmt = select(Symbol).where(
+            async with self.db_service.session() as session:
+                stmt = select(Symbol).where(
                     and_(
                         Symbol.name == symbol.name,
                         Symbol.exchange == symbol.exchange
                     )
                 )
-                result = await session.execute(existing_stmt)
+                result = await session.execute(stmt)
                 existing_symbol = result.scalar_one_or_none()
 
-                if existing_symbol:
-                    if existing_symbol.first_trade_time is None:
-                        existing_symbol.first_trade_time = symbol.launch_time
-                        await session.flush()
-                    logger.debug(
-                        f"Retrieved symbol {symbol.name} for {symbol.exchange} "
-                        f"with launch time {TimeUtils.from_timestamp(symbol.launch_time)}"
+                return existing_symbol
+
+        except Exception as e:
+            logger.error(f"Error getting symbol: {e}")
+            raise RepositoryError(f"Failed to get symbol: {str(e)}")
+
+    async def create_symbol(self, symbol: SymbolInfo) -> bool:
+        """
+        Create a new symbol in the database.
+
+        Args:
+            symbol (SymbolInfo): The symbol information to create.
+
+        Returns:
+            bool: True if creation was successful, False otherwise.
+
+        Raises:
+            RepositoryError: If there's an error during the creation.
+        """
+        try:
+            async with self.db_service.session(isolation_level=IsolationLevel.SERIALIZABLE) as session:
+                # Check if symbol already exists
+                stmt = select(Symbol).where(
+                    and_(
+                        Symbol.name == symbol.name,
+                        Symbol.exchange == symbol.exchange
                     )
-                    return existing_symbol
+                )
+                result = await session.execute(stmt)
+                if result.scalar_one_or_none() is not None:
+                    logger.debug(f"Symbol {symbol.name} already exists for {symbol.exchange}")
+                    return False
 
                 # Create new symbol
                 new_symbol = Symbol(
@@ -68,41 +90,45 @@ class SymbolRepository:
                     f"Created new symbol {symbol.name} for {symbol.exchange} "
                     f"with launch time {TimeUtils.from_timestamp(symbol.launch_time)}"
                 )
-                return new_symbol
+                return True
+
+        except Exception as e:
+            logger.error(f"Error creating symbol: {e}")
+            raise RepositoryError(f"Failed to create symbol: {str(e)}")
+
+    async def get_or_create(self, symbol: SymbolInfo) -> Symbol:
+        """
+        Get an existing symbol or create a new one if it doesn't exist.
+
+        Args:
+            symbol (SymbolInfo): The symbol information to get or create.
+
+        Returns:
+            Symbol: The retrieved or created Symbol entity.
+
+        Raises:
+            RepositoryError: If there's an error during the operation.
+        """
+        try:
+            # First try to get existing symbol
+            existing_symbol = await self.get_symbol(symbol)
+            if existing_symbol:
+                return existing_symbol
+
+            # Create new symbol if it doesn't exist
+            success = await self.create_symbol(symbol)
+            if success:
+                return await self.get_symbol(symbol)
+            else:
+                # Handle race condition where symbol was created between get and create
+                existing_symbol = await self.get_symbol(symbol)
+                if existing_symbol:
+                    return existing_symbol
+                raise RepositoryError("Failed to get or create symbol: Unexpected state")
 
         except Exception as e:
             logger.error(f"Error in get_or_create: {e}")
             raise RepositoryError(f"Failed to get or create symbol: {str(e)}")
-
-    async def get_symbol(self, name: str, exchange: str) -> Optional[Symbol]:
-        """
-        Retrieve a symbol by its name and exchange.
-
-        Args:
-            name (str): The symbol name to search by.
-            exchange (str): The exchange name to search by.
-
-        Returns:
-            Optional[Symbol]: The found Symbol entity or None if not found.
-
-        Raises:
-            RepositoryError: If there's an error during the retrieval.
-        """
-        try:
-            async with self.db_service.session() as session:
-                # If exchange provided, get exact match
-                stmt = select(Symbol).where(
-                    and_(
-                        Symbol.name == name,
-                        Symbol.exchange == exchange
-                    )
-                )
-                result = await session.execute(stmt)
-                return result.scalar_one_or_none()
-
-        except Exception as e:
-            logger.error(f"Error getting symbol by name: {e}")
-            raise RepositoryError(f"Failed to get symbol by name: {str(e)}")
 
     async def get_symbols_with_stats(self, exchange: str) -> List[dict]:
         """

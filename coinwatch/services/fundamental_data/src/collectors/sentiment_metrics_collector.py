@@ -5,14 +5,14 @@ from typing import Dict, List, Optional
 from textblob import TextBlob
 
 from .collector import FundamentalCollector
-from shared.core.models import SentimentMetrics, Metadata, SymbolInfo
+from shared.clients.sentiment import RedditAdapter, TelegramAdapter, TwitterAdapter
+from shared.core.config import SentimentConfig
+from shared.core.enums import DataSource
 from shared.core.exceptions import ServiceError
+from shared.core.models import SentimentMetrics, Metadata, SymbolInfo
 from shared.database.repositories import MetadataRepository, SentimentRepository
-from .adapters.sentiment import RedditAdapter, TelegramAdapter, TwitterAdapter
-from shared.utils.domain_types import DataSource
 from shared.utils.logger import LoggerSetup
 from shared.utils.time import TimeUtils
-from shared.core.config import SentimentConfig
 
 logger = LoggerSetup.setup(__name__)
 

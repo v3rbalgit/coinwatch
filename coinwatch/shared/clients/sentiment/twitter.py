@@ -5,7 +5,7 @@ import aiohttp
 from decimal import Decimal
 
 from ...utils.logger import LoggerSetup
-from ...utils.rate_limit import RateLimiter, RateLimitConfig
+from shared.utils.rate_limit import RateLimiter
 
 logger = LoggerSetup.setup(__name__)
 
@@ -15,7 +15,7 @@ class TwitterAdapter:
     Handles rate limiting and data transformation.
     """
 
-    def __init__(self, api_key: str, api_host: str, rate_limit: int, rate_limit_window: int):
+    def __init__(self, api_key: str, api_host: str, rate_limit: int, rate_limit_window: int, max_monthly: int):
         """
         Initialize the Twitter adapter.
 
@@ -32,13 +32,9 @@ class TwitterAdapter:
             'X-RapidAPI-Host': api_host
         }
 
-        # Configure rate limiting
-        rate_limit_config = RateLimitConfig(
-            calls_per_window=rate_limit,
-            window_size=rate_limit_window,
-            max_monthly_calls=100000  # 100k/month plan
-        )
-        self.rate_limiter = RateLimiter(config=rate_limit_config)
+        self.rate_limiter = RateLimiter(calls_per_window=rate_limit,
+                                        window_size=rate_limit_window,
+                                        max_monthly_calls=max_monthly)
         self.session = aiohttp.ClientSession(headers=self.headers)
 
     async def get_user_metrics(self, username: str) -> Optional[Dict]:

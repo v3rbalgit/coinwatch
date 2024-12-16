@@ -14,8 +14,9 @@ class RateLimiter:
     """
 
     def __init__(self, calls_per_window: int, window_size: int, max_monthly_calls: Optional[int] = None):
+        self._calls_per_window = calls_per_window
+        self._window_size = window_size
         self._tokens = calls_per_window
-        self._bucket_size = window_size
         self._last_refill = time.time()
         self._max_monthly_calls = max_monthly_calls
         self._monthly_calls = 0
@@ -45,9 +46,18 @@ class RateLimiter:
 
             # Handle window-based limit
             elapsed = current_time - self._last_refill
-            if elapsed >= self._tokens:
-                self._tokens = self._tokens
+
+            # Calculate token refill based on elapsed time
+            if elapsed >= self._window_size:
+                # Full window has passed, reset tokens
+                self._tokens = self._calls_per_window
                 self._last_refill = current_time
+            elif elapsed > 0:
+                # Partial window refill
+                new_tokens = int((elapsed / self._window_size) * self._calls_per_window)
+                if new_tokens > 0:
+                    self._tokens = min(self._calls_per_window, self._tokens + new_tokens)
+                    self._last_refill = current_time
 
             if self._tokens > 0:
                 self._tokens -= 1
@@ -61,12 +71,9 @@ class RateLimiter:
         """
         Acquire a token, waiting if necessary.
 
-        Raises:
-            asyncio.TimeoutError: If wait time would exceed window size
+        This method will wait until a token becomes available.
         """
         while not await self._acquire_token():
-            # Calculate wait time
-            wait_time = self._bucket_size - (time.time() - self._last_refill)
-
-            if wait_time > 0:
-                await asyncio.sleep(wait_time)
+            # Calculate minimum wait time
+            min_wait = self._window_size / self._calls_per_window
+            await asyncio.sleep(min_wait)

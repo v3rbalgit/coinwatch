@@ -1,11 +1,10 @@
 # src/adapters/base.py
 
-from abc import ABC, abstractmethod
-from typing import Optional, Any
+from typing import Optional, Any, Protocol
 import aiohttp
 import asyncio
 
-class APIAdapter(ABC):
+class APIAdapter(Protocol):
     """
     Base class for API adapters providing common functionality
 
@@ -16,9 +15,8 @@ class APIAdapter(ABC):
     - Request handling
     """
 
-    def __init__(self):
-        self._session: Optional[aiohttp.ClientSession] = None
-        self._session_lock = asyncio.Lock()
+    _session: Optional[aiohttp.ClientSession] = None
+    _session_lock = asyncio.Lock()
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session"""
@@ -28,18 +26,16 @@ class APIAdapter(ABC):
                     self._session = await self._create_session()
         return self._session
 
-    @abstractmethod
     async def _create_session(self) -> aiohttp.ClientSession:
         """Create new session with adapter-specific configuration"""
-        pass
+        ...
 
-    @abstractmethod
     async def _request(self,
                       method: str,
                       endpoint: str,
                       **kwargs: Any) -> Any:
         """Make API request with retry logic and rate limiting"""
-        pass
+        ...
 
     async def cleanup(self) -> None:
         """Cleanup resources"""
