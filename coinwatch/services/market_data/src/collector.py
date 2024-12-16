@@ -1,5 +1,5 @@
 import asyncio
-from typing import Any, AsyncGenerator, Dict, Optional, Set, Tuple
+from typing import Any, AsyncGenerator, Callable, Coroutine, Dict, Optional, Set, Tuple
 from decimal import Decimal
 
 from shared.clients.registry import ExchangeAdapterRegistry
@@ -230,10 +230,11 @@ class DataCollector:
                 if symbol not in self._streaming_symbols:
                     if not self._streaming_adapter:
                         self._streaming_adapter = self._adapter_registry.get_adapter(symbol.exchange)
+                    handler = await self._create_kline_handler(symbol)
                     await self._streaming_adapter.subscribe_klines(
                         symbol,
                         self._base_timeframe,
-                        lambda data: self._handle_kline_update(symbol, data)
+                        handler
                     )
                     self._streaming_symbols.add(symbol)
                     logger.info(f"Streaming started for {symbol.name} on {symbol.exchange}")
@@ -251,6 +252,42 @@ class DataCollector:
                 await self._streaming_adapter.unsubscribe_klines(symbol, self._base_timeframe)
                 self._streaming_symbols.remove(symbol)
                 logger.info(f"Streaming stopped for {symbol.name} on {symbol.exchange}")
+
+    async def _create_kline_handler(self, symbol: SymbolInfo) -> Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]:
+        async def handle_update(data: Dict[str, Any]) -> None:
+            await self._handle_kline_update(symbol, data)
+        return handle_update
+
+    async def _handle_kline_update(self, symbol: SymbolInfo, data: Dict[str, Any]) -> None:
+        """Handle real-time kline updates from websocket"""
+        try:
+            kline_data = data.get('data', [{}])[0]
+            if not kline_data.get('confirm', False):
+                return  # Skip unconfirmed candles
+
+            kline = KlineData(
+                timestamp=int(kline_data['start']),
+                open_price=Decimal(str(kline_data['open'])),
+                high_price=Decimal(str(kline_data['high'])),
+                low_price=Decimal(str(kline_data['low'])),
+                close_price=Decimal(str(kline_data['close'])),
+                volume=Decimal(str(kline_data['volume'])),
+                turnover=Decimal(str(kline_data['turnover'])),
+                symbol=symbol,
+                timeframe=self._base_timeframe
+            )
+
+            await self._kline_repository.insert_batch(
+                symbol,
+                self._base_timeframe,
+                [kline.to_tuple()]
+            )
+
+            await self._publish_kline_update(symbol, kline)
+
+        except Exception as e:
+            logger.error(f"Error handling kline update for {symbol}: {e}")
+            await self._publish_error("StreamingError", str(e), symbol, 0, 0, {"type": "streaming"})
 
     async def delist(self, symbol: SymbolInfo) -> None:
         """Handle symbol delisting"""
@@ -289,6 +326,7 @@ class DataCollector:
                 context=context
             ).model_dump()
         )
+
 
     async def _publish_kline_update(self, symbol: SymbolInfo, kline: KlineData) -> None:
         """Publish kline update message"""
@@ -333,37 +371,6 @@ class DataCollector:
                 }
             ).model_dump()
         )
-
-    async def _handle_kline_update(self, symbol: SymbolInfo, data: Dict[str, Any]) -> None:
-        """Handle real-time kline updates from websocket"""
-        try:
-            kline_data = data.get('data', [{}])[0]
-            if not kline_data.get('confirm', False):
-                return  # Skip unconfirmed candles
-
-            kline = KlineData(
-                timestamp=int(kline_data['start']),
-                open_price=Decimal(str(kline_data['open'])),
-                high_price=Decimal(str(kline_data['high'])),
-                low_price=Decimal(str(kline_data['low'])),
-                close_price=Decimal(str(kline_data['close'])),
-                volume=Decimal(str(kline_data['volume'])),
-                turnover=Decimal(str(kline_data['turnover'])),
-                symbol=symbol,
-                timeframe=self._base_timeframe
-            )
-
-            await self._kline_repository.insert_batch(
-                symbol,
-                self._base_timeframe,
-                [kline.to_tuple()]
-            )
-
-            await self._publish_kline_update(symbol, kline)
-
-        except Exception as e:
-            logger.error(f"Error handling kline update for {symbol}: {e}")
-            await self._publish_error("StreamingError", str(e), symbol, 0, 0, {"type": "streaming"})
 
     async def cleanup(self) -> None:
         """Cleanup resources"""
