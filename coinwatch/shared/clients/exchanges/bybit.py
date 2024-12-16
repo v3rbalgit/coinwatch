@@ -1,10 +1,9 @@
 # src/adapters/bybit.py
 
 from decimal import Decimal
-from typing import Any, AsyncGenerator, Dict, List, Optional, Set, Callable, Coroutine
+from typing import Any, AsyncGenerator, Callable, Coroutine, Dict, List, Optional
 import aiohttp
 import asyncio
-import json
 import time
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
@@ -15,6 +14,7 @@ from shared.core.exceptions import AdapterError
 from shared.core.models import KlineData, SymbolInfo
 from shared.utils.logger import LoggerSetup
 from shared.utils.rate_limit import RateLimiter
+from .bybit_ws import BybitWebsocket
 
 logger = LoggerSetup.setup(__name__)
 
@@ -27,26 +27,19 @@ class BybitAdapter(ExchangeAdapter):
     - Rate limiting with circuit breaker
     - Connection management
     - Retry logic
-    - Websocket streaming for real-time data
+    - Websocket streaming via BybitWebsocket client
     """
 
     BASE_URL = "https://api.bybit.com"
     TESTNET_URL = "https://api-testnet.bybit.com"
-    WS_URL = "wss://stream.bybit.com/v5/public/linear"
-    TESTNET_WS_URL = "wss://stream-testnet.bybit.com/v5/public/linear"
 
     # Class-level variables for circuit breaker
     _rate_limit_reset: Optional[int] = None  # Shared timestamp when rate limit resets (in milliseconds)
     _circuit_breaker_lock = asyncio.Lock()   # Lock for thread-safe access
 
     def __init__(self, config: BybitConfig):
-        super().__init__()
-
         self._config = config
-
-        # Base URL based on testnet setting
         self._base_url = self.TESTNET_URL if self._config.testnet else self.BASE_URL
-        self._ws_url = self.TESTNET_WS_URL if self._config.testnet else self.WS_URL
 
         # Initialize rate limiter
         self._rate_limiter = RateLimiter(
@@ -54,16 +47,8 @@ class BybitAdapter(ExchangeAdapter):
             window_size=self._config.rate_limit_window
         )
 
-        # Websocket management
-        self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
-        self._ws_task: Optional[asyncio.Task] = None
-        self._subscribed_topics: Set[str] = set()
-        self._kline_handlers: Dict[str, Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]] = {}
-        self._ws_lock = asyncio.Lock()
-        self._ws_connected = asyncio.Event()
-        self._ws_reconnect_delay = 1.0
-        self._ws_heartbeat_interval = 20.0
-        self._last_heartbeat = 0.0
+        # Websocket client for streaming
+        self._ws_client = BybitWebsocket(config)
 
     async def _create_session(self) -> aiohttp.ClientSession:
         """Create new session with Bybit configuration"""
@@ -131,7 +116,15 @@ class BybitAdapter(ExchangeAdapter):
             return data.get('result', {})
 
     async def get_symbols(self, symbol: Optional[str] = None) -> List[SymbolInfo]:
-        """Get available trading pairs"""
+        """
+        Get available trading pairs
+
+        Args:
+            symbol (Optional[str]): Name of a symbol to fetch from Bybit.
+
+        Returns:
+            List[SymbolInfo]: List of SymbolInfo objects.
+        """
         try:
             params = {'category': 'linear'}
 
@@ -172,7 +165,19 @@ class BybitAdapter(ExchangeAdapter):
                         start_time: int,
                         end_time: int,
                         limit: Optional[int] = None) -> AsyncGenerator[List[KlineData], None]:
-        """Get kline (candlestick) data"""
+        """
+        Get kline (candlestick) data
+
+        Args:
+            symbol (SymbolInfo): Symbol to get the klines for.
+            timeframe (Timeframe): Timeframe to use.
+            start_time (int): Start timestamp of the klines.
+            end_time (int): End timestamp of the klines.
+            limit (Optional[int]): Number of klines to fetch (will default to config value).
+
+        Yields:
+            List[KlineData]: List of KlineData objects.
+        """
         try:
             params = {
                 "category": "linear",
@@ -209,7 +214,7 @@ class BybitAdapter(ExchangeAdapter):
                     timeframe=timeframe
                 ) for item in reversed(data.get('list', []))]
 
-                logger.debug(f"Fetched {len(klines)} for {symbol.name} on {symbol.exchange}")
+                logger.debug(f"Fetched {len(klines)} klines for {symbol.name} on {symbol.exchange}")
                 yield klines
 
                 current_start = current_end
@@ -222,140 +227,18 @@ class BybitAdapter(ExchangeAdapter):
                              symbol: SymbolInfo,
                              timeframe: Timeframe,
                              handler: Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]) -> None:
-        """
-        Subscribe to real-time kline updates for a symbol.
-
-        Args:
-            symbol: Trading pair to subscribe to
-            timeframe: Kline interval
-            handler: Async callback for handling kline updates
-        """
-        topic = f"kline.{timeframe.value}.{symbol.name}"
-
-        if self._ws:
-            async with self._ws_lock:
-                if not self._ws_connected.is_set():
-                    await self._connect_websocket()
-
-                if topic not in self._subscribed_topics:
-                    await self._ws.send_str(json.dumps({
-                        "op": "subscribe",
-                        "args": [topic]
-                    }))
-                    self._subscribed_topics.add(topic)
-                    self._kline_handlers[topic] = handler
-                    logger.info(f"Subscribed to {topic}")
+        """Subscribe to real-time kline updates via websocket client"""
+        await self._ws_client.subscribe_klines(symbol, timeframe, handler)
 
     async def unsubscribe_klines(self,
                                 symbol: SymbolInfo,
                                 timeframe: Timeframe) -> None:
-        """
-        Unsubscribe from kline updates for a symbol.
-
-        Args:
-            symbol: Trading pair to unsubscribe from
-            timeframe: Kline interval
-        """
-        topic = f"kline.{timeframe.value}.{symbol.name}"
-
-        if self._ws:
-            async with self._ws_lock:
-                if topic in self._subscribed_topics:
-                    await self._ws.send_str(json.dumps({
-                        "op": "unsubscribe",
-                        "args": [topic]
-                    }))
-                    self._subscribed_topics.remove(topic)
-                    self._kline_handlers.pop(topic, None)
-                    logger.info(f"Unsubscribed from {topic}")
-
-    async def _connect_websocket(self) -> None:
-        """Establish websocket connection"""
-        try:
-            session = await self._get_session()
-            self._ws = await session.ws_connect(self._ws_url)
-            self._ws_connected.set()
-            self._ws_task = asyncio.create_task(self._handle_websocket())
-            self._last_heartbeat = time.time()
-            logger.info("Websocket connected")
-
-        except Exception as e:
-            logger.error(f"Failed to connect websocket: {e}")
-            self._ws_connected.clear()
-            raise
-
-    async def _handle_websocket(self) -> None:
-        """Handle websocket messages and maintain connection"""
-        if self._ws:
-            try:
-                while True:
-                    msg = await self._ws.receive()
-
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        data = json.loads(msg.data)
-
-                        if 'topic' in data:  # Kline update
-                            topic = data['topic']
-                            if handler := self._kline_handlers.get(topic):
-                                await handler(data)
-
-                        elif data.get('op') == 'ping':  # Heartbeat
-                            await self._ws.send_str(json.dumps({"op": "pong"}))
-                            self._last_heartbeat = time.time()
-
-                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                        break
-
-                    # Check heartbeat
-                    if time.time() - self._last_heartbeat > self._ws_heartbeat_interval * 2:
-                        logger.warning("Websocket heartbeat timeout")
-                        break
-
-            except Exception as e:
-                logger.error(f"Websocket error: {e}")
-
-            finally:
-                self._ws_connected.clear()
-                await self._handle_disconnect()
-
-    async def _handle_disconnect(self) -> None:
-        """Handle websocket disconnection and reconnection"""
-        try:
-            if self._ws:
-                await self._ws.close()
-
-            # Exponential backoff for reconnect
-            await asyncio.sleep(self._ws_reconnect_delay)
-            self._ws_reconnect_delay = min(self._ws_reconnect_delay * 2, 60)
-
-            # Reconnect and resubscribe
-            await self._connect_websocket()
-            if self._ws:
-                for topic in list(self._subscribed_topics):
-                    await self._ws.send_str(json.dumps({
-                        "op": "subscribe",
-                        "args": [topic]
-                    }))
-
-            # Reset reconnect delay on successful reconnection
-            self._ws_reconnect_delay = 1.0
-
-        except Exception as e:
-            logger.error(f"Reconnection failed: {e}")
-            asyncio.create_task(self._handle_disconnect())
+        """Unsubscribe from kline updates via websocket client"""
+        await self._ws_client.unsubscribe_klines(symbol, timeframe)
 
     async def cleanup(self) -> None:
-        """Cleanup websocket resources"""
-        if self._ws_task:
-            self._ws_task.cancel()
-            try:
-                await self._ws_task
-            except asyncio.CancelledError:
-                pass
-
-        if self._ws:
-            await self._ws.close()
-
-        self._subscribed_topics.clear()
-        self._kline_handlers.clear()
-        self._ws_connected.clear()
+        """Cleanup resources"""
+        # Use APIAdapter's session cleanup
+        await super().cleanup()
+        # Cleanup websocket client
+        await self._ws_client.cleanup()
