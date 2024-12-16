@@ -5,10 +5,10 @@ from typing import List, Optional
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 
+from shared.core.enums import DataSource, IsolationLevel
 from shared.core.models import SymbolInfo, MarketMetrics
-from shared.database.connection import DatabaseConnection, IsolationLevel
+from shared.database.connection import DatabaseConnection
 from shared.database.models.fundamental_data import TokenMarketMetrics
-from shared.utils.domain_types import DataSource
 from shared.core.exceptions import RepositoryError
 from shared.utils.logger import LoggerSetup
 from shared.utils.time import TimeUtils

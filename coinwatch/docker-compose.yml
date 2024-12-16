@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # Infrastructure
   postgres:
@@ -68,6 +66,8 @@ services:
         condition: service_healthy
     ports:
       - "8001:8001"
+    volumes:
+      - ./logs/market_data:/app/logs
 
   fundamental_data:
     build:
@@ -84,6 +84,8 @@ services:
         condition: service_healthy
     ports:
       - "8002:8002"
+    volumes:
+      - ./logs/fundamental_data:/app/logs
 
   monitor:
     build:
@@ -100,6 +102,8 @@ services:
         condition: service_healthy
     ports:
       - "8003:8003"
+    volumes:
+      - ./logs/monitor:/app/logs
 
   api:
     build:

@@ -1,11 +1,8 @@
 from enum import Enum
-from typing import Any, Dict, NewType, Literal, Optional, TypedDict
+from typing import Optional
 
-# Universal domain types
-SymbolName = NewType('SymbolName', str)
-ExchangeName = NewType('ExchangeName', str)
-Timestamp = NewType('Timestamp', int)
-Price = NewType('Price', float)
+from sqlalchemy import Tuple
+
 
 # Timeframe type
 class Timeframe(Enum):
@@ -64,29 +61,6 @@ class Timeframe(Enum):
         }
         return mapping[self.value]
 
-# System monitoring types
-CriticalConditionType = Literal[
-    "service_error",
-    "collection_failure",
-    "sync_failure",
-    "connection_overflow",
-    "connection_timeout",
-    "deadlock",
-    "maintenance_required",
-    "query_timeout",
-    "replication_lag",
-    "lock_timeout"
-]
-
-# Critical condition
-class CriticalCondition(TypedDict):
-    type: CriticalConditionType
-    severity: Literal["warning", "error", "critical"]
-    message: str
-    timestamp: int
-    error_type: str
-    context: Dict[str, Any]
-
 # Service status types
 class ServiceStatus(Enum):
     STARTING = "starting"
@@ -95,24 +69,11 @@ class ServiceStatus(Enum):
     STOPPED = "stopped"
     ERROR = "error"
 
-# Isolation level types
 class IsolationLevel(str, Enum):
-    READ_UNCOMMITTED = "READ COMMITTED"
+    """Transaction isolation levels"""
     READ_COMMITTED = "READ COMMITTED"
     REPEATABLE_READ = "REPEATABLE READ"
     SERIALIZABLE = "SERIALIZABLE"
-
-# Database error types
-class DatabaseErrorType(str, Enum):
-    """Specific database error categories"""
-    CONNECTION_OVERFLOW = "connection_overflow"
-    CONNECTION_TIMEOUT = "connection_timeout"
-    DEADLOCK = "deadlock"
-    QUERY_TIMEOUT = "query_timeout"
-    REPLICATION_LAG = "replication_lag"
-    LOCK_TIMEOUT = "lock_timeout"
-    MAINTENANCE_REQUIRED = "maintenance_required"
-    EMERGENCY = "emergency"
 
 class DataSource(str, Enum):
     """Types of fundamental data sources"""

@@ -10,12 +10,10 @@ RUN apt-get update && apt-get install -y \
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Copy requirements and install dependencies
+# Install service requirements (excluding shared package for now)
 COPY ./services/monitor/requirements.txt /requirements.txt
-COPY ./shared /shared
-
-# Install shared package and requirements
-RUN pip install --no-cache-dir -r /requirements.txt
+RUN grep -v "../../shared" requirements.txt > requirements_clean.txt && \
+    pip install --no-cache-dir -r requirements_clean.txt
 
 # Runtime stage
 FROM python:3.12.8-slim
@@ -32,13 +30,22 @@ ENV PATH="/opt/venv/bin:$PATH"
 # Create non-root user
 RUN useradd -m -u 1000 coinwatch
 
-# Set working directory and copy application code
+# Set working directory
 WORKDIR /app
+
+# Copy shared package and install it
+COPY ./shared /app/shared
+RUN pip install -e /app/shared
+
+# Copy application code
 COPY ./services/monitor/src ./src
 
 # Set environment variables
-ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
+
+# Create logs directory and set permissions
+RUN mkdir -p /app/logs && \
+    chown -R coinwatch:coinwatch /app/logs
 
 # Switch to non-root user
 USER coinwatch

@@ -4,8 +4,8 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..utils.time import TimeUtils
-from ..utils.domain_types import DataSource, Timeframe
+from shared.utils.time import TimeUtils
+from .enums import DataSource, Timeframe
 
 
 # Symbol Info Model

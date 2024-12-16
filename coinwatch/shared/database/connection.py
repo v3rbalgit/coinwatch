@@ -11,12 +11,7 @@ from sqlalchemy import text
 from contextlib import asynccontextmanager
 
 from shared.core.config import DatabaseConfig
-
-class IsolationLevel(str, Enum):
-    """Transaction isolation levels"""
-    READ_COMMITTED = "READ COMMITTED"
-    REPEATABLE_READ = "REPEATABLE READ"
-    SERIALIZABLE = "SERIALIZABLE"
+from shared.core.enums import IsolationLevel
 
 class DatabaseConnection:
     """
@@ -70,17 +65,12 @@ class DatabaseConnection:
             self.session_factory = None
 
     @asynccontextmanager
-    async def session(
-        self,
-        isolation_level: Optional[IsolationLevel] = None,
-        use_transaction: bool = True
-    ) -> AsyncGenerator[AsyncSession, None]:
+    async def session(self, isolation_level: IsolationLevel = IsolationLevel.READ_COMMITTED) -> AsyncGenerator[AsyncSession, None]:
         """
         Get a database session with schema and isolation level set.
 
         Args:
             isolation_level: Optional transaction isolation level
-            use_transaction: Whether to wrap session in a transaction
 
         Raises:
             SQLAlchemyError: If database is not initialized
@@ -90,22 +80,15 @@ class DatabaseConnection:
 
         session = self.session_factory()
         try:
-            # Set schema search path
+            # Set schema and isolation level
             await session.execute(text(f"SET search_path TO {self.schema}"))
+            await session.execute(text(f"SET TRANSACTION ISOLATION LEVEL {isolation_level.value}"))
 
-            if use_transaction:
-                async with session.begin():
-                    if isolation_level:
-                        await session.execute(
-                            text(f"SET TRANSACTION ISOLATION LEVEL {isolation_level.value}")
-                        )
-                    yield session
-            else:
-                if isolation_level:
-                    await session.execute(
-                        text(f"SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL {isolation_level.value}")
-                    )
-                yield session
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
         finally:
             await session.close()
 

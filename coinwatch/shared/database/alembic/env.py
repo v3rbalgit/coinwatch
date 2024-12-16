@@ -116,14 +116,14 @@ async def run_async_migrations() -> None:
 
     configuration: Dict[str, Any] = dict(config_section)
 
-    # Update configuration with environment variables
-    configuration["sqlalchemy.url"] = configuration["sqlalchemy.url"] % {
-        "DB_USER": os.getenv("DB_USER", "coinwatch"),
-        "DB_PASSWORD": os.getenv("DB_PASSWORD", "coinwatch"),
-        "DB_HOST": os.getenv("DB_HOST", "localhost"),
-        "DB_PORT": os.getenv("DB_PORT", "5432"),
-        "DB_NAME": os.getenv("DB_NAME", "coinwatch"),
-    }
+    # Replace the placeholder URL with the actual URL using environment variables
+    configuration["sqlalchemy.url"] = (
+        f"postgresql+asyncpg://{os.getenv('DB_USER', 'coinwatch')}:"
+        f"{os.getenv('DB_PASSWORD', 'coinwatch')}@"
+        f"{os.getenv('DB_HOST', 'localhost')}:"
+        f"{os.getenv('DB_PORT', '5432')}/"
+        f"{os.getenv('DB_NAME', 'coinwatch')}"
+    )
 
     connectable = async_engine_from_config(
         configuration,

@@ -1,23 +1,23 @@
 import asyncio
 from typing import Dict, Optional, Set
 
-from shared.utils.domain_types import ServiceStatus
+from .collectors import FundamentalCollector, MetadataCollector, MarketMetricsCollector, SentimentMetricsCollector
+from shared.clients.coingecko import CoinGeckoAdapter
+from shared.clients.registry import ExchangeAdapterRegistry
 from shared.core.config import FundamentalDataConfig
-from shared.database.repositories import MarketMetricsRepository, MetadataRepository, SentimentRepository
-from shared.core.service import ServiceBase
-from shared.messaging.broker import MessageBroker
-from shared.messaging.schemas import MessageType, SymbolMessage
-from shared.core.models import SymbolInfo
+from shared.core.enums import ServiceStatus
 from shared.core.exceptions import ServiceError
+from shared.core.models import SymbolInfo
+from shared.core.service import ServiceBase
+from shared.database.repositories import MarketMetricsRepository, MetadataRepository, SentimentRepository
+from shared.messaging.schemas import MessageType, SymbolMessage
+from shared.messaging.broker import MessageBroker
 from shared.utils.logger import LoggerSetup
 from shared.utils.error import ErrorTracker
 from shared.utils.time import TimeUtils
 
-from .collectors import FundamentalCollector, MetadataCollector, MarketMetricsCollector, SentimentMetricsCollector
-from .adapters.coingecko import CoinGeckoAdapter
-from .adapters.exchange import ExchangeAdapterRegistry
-
 logger = LoggerSetup.setup(__name__)
+
 
 class FundamentalDataService(ServiceBase):
     """
@@ -164,6 +164,9 @@ class FundamentalDataService(ServiceBase):
         try:
             self._status = ServiceStatus.STARTING
             self._start_time = TimeUtils.get_current_timestamp()
+
+            # Connect to the message broker
+            await self.message_broker.connect()
 
             # Setup message handlers
             await self._setup_message_handlers()

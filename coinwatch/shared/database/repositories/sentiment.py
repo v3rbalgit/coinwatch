@@ -4,13 +4,14 @@ from typing import List, Optional
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 
+from shared.core.enums import DataSource, IsolationLevel
 from shared.database.models import TokenSentiment
 from shared.core.models import SentimentMetrics, SymbolInfo
 from shared.core.exceptions import RepositoryError
 from shared.database.connection import DatabaseConnection
 from shared.utils.logger import LoggerSetup
 from shared.utils.time import TimeUtils
-from shared.utils.domain_types import DataSource, IsolationLevel
+
 
 logger = LoggerSetup.setup(__name__)
 

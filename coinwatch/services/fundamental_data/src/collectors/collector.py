@@ -6,7 +6,6 @@ import asyncio
 
 from shared.core.models import MarketMetrics, Metadata
 from shared.utils.retry import RetryConfig, RetryStrategy
-from shared.utils.domain_types import Timestamp
 from shared.utils.time import TimeUtils
 from shared.utils.logger import LoggerSetup
 from shared.utils.progress import FundamentalDataProgress

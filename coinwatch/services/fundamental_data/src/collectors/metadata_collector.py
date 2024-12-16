@@ -4,13 +4,13 @@ from datetime import datetime
 from typing import List, Set
 
 from .collector import FundamentalCollector
-from .adapters.coingecko import CoinGeckoAdapter
+from shared.clients.coingecko import CoinGeckoAdapter
+from shared.core.enums import DataSource
 from shared.core.exceptions import ServiceError
 from shared.core.models import Metadata, Platform
 from shared.database.repositories.metadata import MetadataRepository
 from shared.utils.logger import LoggerSetup
 from shared.utils.time import TimeUtils
-from shared.utils.domain_types import DataSource
 
 logger = LoggerSetup.setup(__name__)
 

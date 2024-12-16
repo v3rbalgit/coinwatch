@@ -3,16 +3,17 @@
 from datetime import timedelta
 from typing import List, Optional, Set
 
+from shared.core.enums import Timeframe
 from shared.core.exceptions import ValidationError
 from shared.core.models import KlineData, SymbolInfo
 from shared.database.repositories.kline import KlineRepository
 from shared.messaging.broker import MessageBroker
 from shared.messaging.schemas import MessageType, GapMessage
-from shared.utils.domain_types import Timeframe
 from shared.utils.logger import LoggerSetup
 from shared.utils.time import TimeUtils
 
 logger = LoggerSetup.setup(__name__)
+
 
 class TimeframeManager:
     """

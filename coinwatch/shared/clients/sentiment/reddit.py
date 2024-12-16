@@ -4,8 +4,8 @@ from typing import Dict, Optional
 import asyncpraw
 from datetime import datetime, timezone, timedelta
 
-from ...utils.logger import LoggerSetup
-from ...utils.rate_limit import RateLimiter, RateLimitConfig
+from shared.utils.logger import LoggerSetup
+from shared.utils.rate_limit import RateLimiter
 
 logger = LoggerSetup.setup(__name__)
 
@@ -31,12 +31,8 @@ class RedditAdapter:
             user_agent="Coinwatch/1.0"
         )
 
-        # Configure rate limiting
-        rate_limit_config = RateLimitConfig(
-            calls_per_window=rate_limit,
-            window_size=rate_limit_window
-        )
-        self.rate_limiter = RateLimiter(config=rate_limit_config)
+        self.rate_limiter = RateLimiter(calls_per_window=rate_limit,
+                                        window_size=rate_limit_window)
 
     def _extract_subreddit_name(self, url: str) -> str:
         """Extract subreddit name from URL"""

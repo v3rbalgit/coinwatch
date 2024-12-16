@@ -3,6 +3,7 @@ from typing import Optional, Set, Dict, Any, List
 
 from shared.clients.registry import ExchangeAdapterRegistry
 from shared.core.config import MarketDataConfig
+from shared.core.enums import ServiceStatus, Timeframe
 from shared.core.models import SymbolInfo
 from shared.core.exceptions import ServiceError
 from shared.core.service import ServiceBase
@@ -10,13 +11,13 @@ from shared.database.repositories import KlineRepository, SymbolRepository
 from shared.messaging.broker import MessageBroker
 from shared.messaging.schemas import MessageType, SymbolMessage, ErrorMessage
 from shared.utils.logger import LoggerSetup
-from shared.utils.domain_types import ServiceStatus, Timeframe
 from shared.utils.time import TimeUtils
 from shared.utils.error import ErrorTracker
 
 from .collector import DataCollector
 
 logger = LoggerSetup.setup(__name__)
+
 
 class MarketDataService(ServiceBase):
     """
@@ -43,7 +44,7 @@ class MarketDataService(ServiceBase):
         self.exchange_registry = exchange_registry
         self.message_broker = message_broker
         self.base_timeframe = Timeframe(config.default_timeframe)
-        self._retention_days = 30
+        self._retention_days = 90
 
         # Core components
         self.data_collector = DataCollector(
@@ -130,42 +131,28 @@ class MarketDataService(ServiceBase):
             logger.error(f"Error during service shutdown: {e}")
             raise ServiceError(f"Service stop failed: {str(e)}")
 
-    async def _process_symbol_batch(self, symbols: List[SymbolInfo]) -> None:
+    async def _process_symbols(self, symbols: List[SymbolInfo]) -> None:
         """Process a batch of symbols with limited concurrency"""
-        tasks = []
         for symbol in symbols:
             checked_symbol = symbol.check_retention_time(self._retention_days)
             self._active_symbols.add(checked_symbol)
 
-            # Publish symbol added event
-            await self._publish_symbol_added(checked_symbol)
+            # Ensure the symbol exists
+            if not await self.symbol_repository.get_symbol(checked_symbol):
+                await self.symbol_repository.create_symbol(checked_symbol)
+                await self._publish_symbol_added(checked_symbol)
 
-            # Create collection task with semaphore
-            tasks.append(self._collect_with_semaphore(
-                checked_symbol,
-                checked_symbol.launch_time,
-                TimeUtils.get_current_timestamp(),
-                {"type": "initial"}
-            ))
+            latest_timestamp = await self.kline_repository.get_latest_timestamp(checked_symbol)
 
-        if tasks:
-            await asyncio.gather(*tasks)
-
-    async def _collect_with_semaphore(self, symbol: SymbolInfo, start_time: int,
-                                    end_time: int, context: Dict[str, Any]) -> None:
-        """Collect data with concurrency control"""
-        async with self._collection_semaphore:
             await self.data_collector.collect(
-                symbol=symbol,
-                start_time=start_time,
-                end_time=end_time,
-                context=context
+                symbol=checked_symbol,
+                start_time=latest_timestamp if latest_timestamp else checked_symbol.launch_time,
+                end_time=TimeUtils.get_current_timestamp(),
+                context={"type": "initial"}
             )
 
     async def _monitor_symbols(self) -> None:
         """Monitor trading symbols across exchanges"""
-        retry_count = 0
-
         try:
             while self._monitor_running.is_set():
                 try:
@@ -174,32 +161,21 @@ class MarketDataService(ServiceBase):
                             adapter = self.exchange_registry.get_adapter(exchange)
                             try:
                                 symbols = await adapter.get_symbols()
-                                retry_count = 0  # Reset on success
 
                                 # Process new symbols in batches with limited concurrency
                                 new_symbols = [s for s in symbols if s not in self._active_symbols]
                                 if new_symbols:
-                                    # Process symbols in smaller batches
-                                    batch_size = self._max_concurrent_collections
-                                    for i in range(0, len(new_symbols), batch_size):
-                                        batch = new_symbols[i:i + batch_size]
-                                        await self._process_symbol_batch(batch)
-                                        logger.info(
-                                            f"Processed batch {i//batch_size + 1} of "
-                                            f"{(len(new_symbols) + batch_size - 1)//batch_size} "
-                                            f"({len(batch)} symbols)"
-                                        )
+                                    await self._process_symbols(new_symbols)
 
                                 # Handle delisted symbols
                                 delisted = self._active_symbols - set(symbols)
                                 for symbol in delisted:
                                     self._active_symbols.remove(symbol)
-                                    await self._publish_symbol_delisted(symbol)
                                     await self.data_collector.delist(symbol)
+                                    await self._publish_symbol_delisted(symbol)
 
                             except Exception as e:
-                                await self._handle_exchange_error(e, exchange, retry_count)
-                                retry_count += 1
+                                await self._handle_exchange_error(e, exchange)
 
                     await asyncio.sleep(self._symbol_check_interval)
 
@@ -212,7 +188,7 @@ class MarketDataService(ServiceBase):
             raise
 
         except Exception as e:
-            await self._handle_critical_error(e, retry_count)
+            await self._handle_critical_error(e)
 
     async def _handle_gap_message(self, message: Dict[str, Any]) -> None:
         """Handle gap detection message"""
@@ -231,14 +207,14 @@ class MarketDataService(ServiceBase):
 
                 gaps = message["gaps"]
                 for start, end in gaps:
-                    # Use semaphore for gap filling too
-                    await self._collect_with_semaphore(symbol=symbol,
-                            start_time=start,
-                            end_time=end,
-                            context={
-                                "type": "gap_fill",
-                                "gap_size": (end - start) // self.base_timeframe.to_milliseconds()
-                            })
+                    await self.data_collector.collect(
+                        symbol=symbol,
+                        start_time=start,
+                        end_time=end,
+                        context={
+                            "type": "gap_fill",
+                            "gap_size": (end - start) // self.base_timeframe.to_milliseconds()
+                        })
 
         except Exception as e:
             logger.error(f"Error handling gap for {message['symbol']}: {e}")
@@ -274,7 +250,7 @@ class MarketDataService(ServiceBase):
             ).model_dump()
         )
 
-    async def _handle_exchange_error(self, error: Exception, exchange: str, retry_count: int) -> None:
+    async def _handle_exchange_error(self, error: Exception, exchange: str) -> None:
         """Handle exchange-specific errors"""
         await self._error_tracker.record_error(error, exchange)
         await self.message_broker.publish(
@@ -287,13 +263,12 @@ class MarketDataService(ServiceBase):
                 severity="error",
                 message=str(error),
                 context={
-                    "exchange": exchange,
-                    "retry_count": retry_count
+                    "exchange": exchange
                 }
             ).model_dump()
         )
 
-    async def _handle_critical_error(self, error: Exception, retry_count: int) -> None:
+    async def _handle_critical_error(self, error: Exception) -> None:
         """Handle critical service errors"""
         self._status = ServiceStatus.ERROR
         self._last_error = error
@@ -308,7 +283,6 @@ class MarketDataService(ServiceBase):
                 message=str(error),
                 context={
                     "component": "monitor",
-                    "retry_count": retry_count,
                     "active_symbols": len(self._active_symbols)
                 }
             ).model_dump()

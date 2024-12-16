@@ -4,7 +4,7 @@ setup(
     name="coinwatch-shared",
     version="1.0.0",
     description="Shared package for Coinwatch services",
-    author="Your Name",
+    author="Boris Vereš",
     packages=find_packages(),
     install_requires=[
         "sqlalchemy>=1.4.0",

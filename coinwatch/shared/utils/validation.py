@@ -4,12 +4,9 @@ from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import Union, Tuple
 
-from .domain_types import Timestamp
-from ..core.exceptions import ValidationError
-from ..utils.time import TimeUtils
-from ..utils.logger import LoggerSetup
+from shared.core.exceptions import ValidationError
+from shared.utils.time import TimeUtils
 
-logger = LoggerSetup.setup(__name__)
 
 class MarketDataValidator:
     """
@@ -30,7 +27,7 @@ class MarketDataValidator:
     MAX_FUTURE_TOLERANCE = 60  # seconds
 
     @classmethod
-    def _validate_timestamp(cls, timestamp: Timestamp) -> None:
+    def _validate_timestamp(cls, timestamp: int) -> None:
         """
         Validate timestamp is within acceptable range.
 
@@ -60,9 +57,6 @@ class MarketDataValidator:
         max_allowed = TimeUtils.from_timestamp(current_time) + timedelta(seconds=cls.MAX_FUTURE_TOLERANCE)
 
         if dt > max_allowed:
-            logger.warning(
-                f"Timestamp too far in future: {(dt - TimeUtils.from_timestamp(current_time)).total_seconds()} seconds ahead"
-            )
             raise ValidationError(
                 f"Future timestamp not allowed: {dt} > {max_allowed}"
             )
@@ -130,7 +124,7 @@ class MarketDataValidator:
 
     @classmethod
     def validate_kline(cls,
-                      timestamp: Timestamp,
+                      timestamp: int,
                       open_price: float,
                       high_price: float,
                       low_price: float,
@@ -193,5 +187,4 @@ class MarketDataValidator:
         except ValidationError:
             raise
         except Exception as e:
-            logger.error("Unexpected validation error", exc_info=e)
             raise ValidationError(f"Validation failed: {str(e)}")

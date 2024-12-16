@@ -2,7 +2,8 @@ from enum import Enum
 from typing import Any, Dict, Optional, List, Tuple
 from pydantic import BaseModel
 
-from shared.utils.domain_types import ServiceStatus
+from shared.core.enums import ServiceStatus
+
 
 class MessageType(str, Enum):
     """Message types organized by domain"""
@@ -96,7 +97,7 @@ class MarketMetricsMessage(BaseMessage):
 
 class ServiceStatusMessage(BaseMessage):
     """Service health status"""
-    status: ServiceStatus
+    status: str
     uptime: float
     error_count: int
     warning_count: int

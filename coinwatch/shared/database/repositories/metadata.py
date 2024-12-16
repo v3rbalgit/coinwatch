@@ -5,13 +5,14 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.dialects.postgresql import insert
 
-from shared.database.connection import DatabaseConnection, IsolationLevel
+from shared.core.enums import IsolationLevel, DataSource
+from shared.database.connection import DatabaseConnection
 from shared.core.models import Platform, SymbolInfo, Metadata
 from shared.core.exceptions import RepositoryError
 from shared.database.models import TokenMetadata, TokenPlatform
 from shared.utils.time import TimeUtils
 from shared.utils.logger import LoggerSetup
-from shared.utils.domain_types import DataSource, IsolationLevel
+
 
 logger = LoggerSetup.setup(__name__)
 
