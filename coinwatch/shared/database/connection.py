@@ -1,4 +1,3 @@
-from enum import Enum
 from typing import Optional, AsyncGenerator, Any
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -129,14 +128,3 @@ class DatabaseConnection:
                 "error": str(e),
                 "schema": self.schema
             }
-
-# Usage example:
-# db = DatabaseConnection(
-#     url="postgresql+asyncpg://user:pass@localhost/db",
-#     schema="market_data",
-#     pool_size=5
-# )
-# await db.initialize()
-#
-# async with db.session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
-#     await session.execute(text("SELECT * FROM symbols"))

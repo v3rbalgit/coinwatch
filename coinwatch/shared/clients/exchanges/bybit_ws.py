@@ -23,19 +23,15 @@ class BybitWebsocket:
         self._ws: Optional[ClientConnection] = None
         self._ws_url = self.TESTNET_WS_URL if self._config.testnet else self.WS_URL
         self._ws_lock = asyncio.Lock()
-        self._running = False
         self._runner: Optional[asyncio.Task] = None
         self._handlers: Dict[str, Callable] = {}
 
     async def start(self) -> None:
         """Start websocket client"""
-        if not self._running:
-            self._running = True
-            self._runner = asyncio.create_task(self._run())
+        self._runner = asyncio.create_task(self._run())
 
     async def stop(self) -> None:
         """Stop websocket client"""
-        self._running = False
         if self._runner:
             self._runner.cancel()
             try:
@@ -63,10 +59,7 @@ class BybitWebsocket:
 
                     # Subscribe to all pending topics
                     if self._handlers:
-                        subscribe_msg = {
-                            "op": "subscribe",
-                            "args": list(self._handlers.keys())
-                        }
+                        subscribe_msg = { "op": "subscribe", "args": list(self._handlers.keys()) }
                         await websocket.send(json.dumps(subscribe_msg))
                         logger.debug(f"Resubscribed to topics: {list(self._handlers.keys())}")
 
@@ -116,7 +109,7 @@ class BybitWebsocket:
         """Subscribe to kline updates"""
         topic = f"kline.{timeframe.value}.{symbol.name}"
 
-        if not self._running:
+        if not self._runner:
             await self.start()
 
         self._handlers[topic] = handler
@@ -124,10 +117,7 @@ class BybitWebsocket:
         # Send subscription through existing connection
         async with self._ws_lock:
             if self._ws:
-                subscribe_msg = {
-                    "op": "subscribe",
-                    "args": [topic]
-                }
+                subscribe_msg = { "op": "subscribe", "args": [topic] }
                 await self._ws.send(json.dumps(subscribe_msg))
 
     async def unsubscribe_klines(self,
@@ -141,9 +131,5 @@ class BybitWebsocket:
 
             async with self._ws_lock:
                 if self._ws:
-                    unsubscribe_msg = {
-                        "op": "unsubscribe",
-                        "args": [topic]
-                    }
+                    unsubscribe_msg = { "op": "unsubscribe", "args": [topic] }
                     await self._ws.send(json.dumps(unsubscribe_msg))
-                    logger.info(f"Sent unsubscription for {topic}")

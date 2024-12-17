@@ -355,7 +355,7 @@ class DataCollector:
                 timestamp=TimeUtils.get_current_timestamp(),
                 symbol=symbol.name,
                 exchange=symbol.exchange,
-                timeframe=str(self._base_timeframe),
+                timeframe=self._base_timeframe.value,
                 kline_timestamp=kline.timestamp,
                 open_price=float(kline.open_price),
                 high_price=float(kline.high_price),
