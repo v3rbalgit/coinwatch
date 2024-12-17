@@ -63,7 +63,7 @@ class SymbolRepository:
             RepositoryError: If there's an error during the creation.
         """
         try:
-            async with self.db_service.session(isolation_level=IsolationLevel.SERIALIZABLE) as session:
+            async with self.db_service.session() as session:
                 # Check if symbol already exists
                 stmt = select(Symbol).where(
                     and_(
@@ -95,40 +95,6 @@ class SymbolRepository:
         except Exception as e:
             logger.error(f"Error creating symbol: {e}")
             raise RepositoryError(f"Failed to create symbol: {str(e)}")
-
-    async def get_or_create(self, symbol: SymbolInfo) -> Symbol:
-        """
-        Get an existing symbol or create a new one if it doesn't exist.
-
-        Args:
-            symbol (SymbolInfo): The symbol information to get or create.
-
-        Returns:
-            Symbol: The retrieved or created Symbol entity.
-
-        Raises:
-            RepositoryError: If there's an error during the operation.
-        """
-        try:
-            # First try to get existing symbol
-            existing_symbol = await self.get_symbol(symbol)
-            if existing_symbol:
-                return existing_symbol
-
-            # Create new symbol if it doesn't exist
-            success = await self.create_symbol(symbol)
-            if success:
-                return await self.get_symbol(symbol)
-            else:
-                # Handle race condition where symbol was created between get and create
-                existing_symbol = await self.get_symbol(symbol)
-                if existing_symbol:
-                    return existing_symbol
-                raise RepositoryError("Failed to get or create symbol: Unexpected state")
-
-        except Exception as e:
-            logger.error(f"Error in get_or_create: {e}")
-            raise RepositoryError(f"Failed to get or create symbol: {str(e)}")
 
     async def get_symbols_with_stats(self, exchange: str) -> List[dict]:
         """

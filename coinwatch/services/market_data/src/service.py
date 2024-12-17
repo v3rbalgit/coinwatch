@@ -1,5 +1,7 @@
 import asyncio
 from typing import Optional, Set, Dict, Any, List
+from sqlalchemy.exc import DBAPIError
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from shared.clients.registry import ExchangeAdapterRegistry
 from shared.core.config import MarketDataConfig
@@ -64,7 +66,8 @@ class MarketDataService(ServiceBase):
         self._symbol_lock = asyncio.Lock()
 
         # Concurrency control
-        self._max_concurrent_collections = 10  # Limit concurrent collections
+        self._max_concurrent_collections = 5  # Limit concurrent collections
+        self._batch_size = self._max_concurrent_collections * 2
         self._collection_semaphore = asyncio.Semaphore(self._max_concurrent_collections)
 
         # Task management
@@ -131,16 +134,24 @@ class MarketDataService(ServiceBase):
             logger.error(f"Error during service shutdown: {e}")
             raise ServiceError(f"Service stop failed: {str(e)}")
 
-    async def _process_symbols(self, symbols: List[SymbolInfo]) -> None:
-        """Process a batch of symbols with limited concurrency"""
-        for symbol in symbols:
+    async def _process_symbol(self, symbol: SymbolInfo) -> None:
+        """Process a single symbol with semaphore control"""
+        async with self._collection_semaphore:
             checked_symbol = symbol.check_retention_time(self._retention_days)
             self._active_symbols.add(checked_symbol)
 
-            # Ensure the symbol exists
-            if not await self.symbol_repository.get_symbol(checked_symbol):
-                await self.symbol_repository.create_symbol(checked_symbol)
-                await self._publish_symbol_added(checked_symbol)
+            @retry(
+                stop=stop_after_attempt(3),
+                wait=wait_exponential(multiplier=1, min=1, max=10),
+                retry=retry_if_exception_type(DBAPIError),
+                reraise=True
+            )
+            async def ensure_symbol_exists():
+                if not await self.symbol_repository.get_symbol(checked_symbol):
+                    await self.symbol_repository.create_symbol(checked_symbol)
+                    await self._publish_symbol_added(checked_symbol)
+
+            await ensure_symbol_exists()
 
             latest_timestamp = await self.kline_repository.get_latest_timestamp(checked_symbol)
 
@@ -150,6 +161,18 @@ class MarketDataService(ServiceBase):
                 end_time=TimeUtils.get_current_timestamp(),
                 context={"type": "initial"}
             )
+
+    async def _process_symbols(self, symbols: List[SymbolInfo]) -> None:
+        """Process symbols in batches for better memory management"""
+        for i in range(0, len(symbols), self._batch_size):
+            batch = symbols[i:i + self._batch_size]
+            tasks = [self._process_symbol(symbol) for symbol in batch]
+
+            # Process batch concurrently
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Optional: Add small delay between batches to prevent overwhelming
+            await asyncio.sleep(self._batch_size / 20)
 
     async def _monitor_symbols(self) -> None:
         """Monitor trading symbols across exchanges"""

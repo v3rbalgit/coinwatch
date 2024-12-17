@@ -1,7 +1,6 @@
 # src/adapters/registry.py
 
-from typing import Any, AsyncGenerator, Callable, Coroutine, Dict, List, Optional, Protocol
-from abc import abstractmethod
+from typing import Any, AsyncGenerator, Callable, Coroutine, Dict, List, Optional
 
 from shared.core.adapter import APIAdapter
 from shared.core.enums import Timeframe

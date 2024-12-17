@@ -12,6 +12,8 @@ setup(
         "pydantic>=1.8.0",
         "python-dotenv>=0.19.0",
         "aio-pika>=8.0.0",  # For RabbitMQ
+        "aiohttp>=3.8.0",   # For HTTP client
+        "websockets>=14.1",  # For WebSocket client
     ],
     extras_require={
         "dev": [
