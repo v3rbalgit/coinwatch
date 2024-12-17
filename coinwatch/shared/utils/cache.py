@@ -1,171 +1,185 @@
-# src/utils/cache.py
-
-from typing import Any, Callable, TypeVar, ParamSpec, Coroutine, cast, Optional
-from functools import wraps
-from cachetools import TTLCache
-from hashlib import md5
-import logging
-from dataclasses import dataclass
+from decimal import Decimal
+import json
+import functools
+from typing import Any, Dict, Optional, Callable, Awaitable, Type, cast, get_origin, get_args
+from pydantic import BaseModel
+from redis.asyncio import Redis
 
 from shared.core.enums import Timeframe
-from shared.core.models import SymbolInfo
+from shared.core.models import (
+    KlineData,
+    RSIResult, BollingerBandsResult, MACDResult, MAResult, OBVResult
+)
+from shared.utils.logger import LoggerSetup
 
-logger = logging.getLogger(__name__)
+logger = LoggerSetup.setup(__name__)
 
-T = TypeVar('T')
-P = ParamSpec('P')
 
-@dataclass
-class CacheStats:
-    """Statistics for cache monitoring"""
-    hits: int = 0
-    misses: int = 0
-    size: int = 0
-    maxsize: int = 0
-    ttl: int = 0
-
-    def __str__(self) -> str:
-        hit_ratio = (self.hits / (self.hits + self.misses)) * 100 if (self.hits + self.misses) > 0 else 0
-        return (
-            f"Cache Stats: hits={self.hits}, misses={self.misses}, "
-            f"hit_ratio={hit_ratio:.1f}%, size={self.size}/{self.maxsize}, "
-            f"ttl={self.ttl}s"
-        )
-
-    @property
-    def hit_ratio(self) -> float:
-        """Calculate cache hit ratio"""
-        total = self.hits + self.misses
-        return (self.hits / total * 100) if total > 0 else 0.0
-
-class AsyncTTLCache:
-    """Thread-safe TTL cache for async functions"""
-
-    def __init__(self, maxsize: int = 1000, ttl: int = 300):
-        """
-        Initialize cache with size and TTL limits
-
-        Args:
-            maxsize: Maximum number of items in cache
-            ttl: Time to live in seconds
-        """
-        self.cache = TTLCache(maxsize=maxsize, ttl=ttl)
-        self.stats = CacheStats(maxsize=maxsize, ttl=ttl)
-        self._wrapped_function: Optional[str] = None
-
-    def _make_key(self, *args: Any, **kwargs: Any) -> str:
-        """
-        Generate a cache key from function arguments
-
-        Handles special cases for domain types like SymbolInfo and Timeframe
-        """
-        processed_args = []
-
-        for arg in args:
-            if isinstance(arg, SymbolInfo):
-                processed_args.append(f"{arg.name}_{arg.exchange}")
-            elif isinstance(arg, Timeframe):
-                processed_args.append(arg.value)
-            elif isinstance(arg, (int, float, str)):
-                processed_args.append(str(arg))
-            elif arg is None:
-                processed_args.append('None')
-            else:
-                processed_args.append(str(arg))
-
-        # Process kwargs in sorted order for consistent keys
-        processed_kwargs = [
-            f"{k}_{v}" for k, v in sorted(kwargs.items())
-        ]
-
-        # Combine all parts and hash
-        key_parts = processed_args + processed_kwargs
-        return md5('_'.join(key_parts).encode()).hexdigest()
-
-    def clear(self) -> None:
-        """Clear the cache and reset statistics"""
-        self.cache.clear()
-        self.stats = CacheStats(maxsize=int(self.cache.maxsize), ttl=int(self.cache.ttl))
-
-    def get_stats(self) -> CacheStats:
-        """Get current cache statistics"""
-        self.stats.size = len(self.cache)
-        self.stats.maxsize = int(self.cache.maxsize)
-        self.stats.ttl = int(self.cache.ttl)
-        return self.stats
-
-    def reconfigure(self, maxsize: Optional[int] = None, ttl: Optional[int] = None) -> None:
-        """
-        Reconfigure cache parameters
-
-        Args:
-            maxsize: New maximum size (optional)
-            ttl: New TTL in seconds (optional)
-        """
-        new_maxsize = maxsize if maxsize is not None else self.cache.maxsize
-        new_ttl = ttl if ttl is not None else self.cache.ttl
-
-        # Create new cache with updated parameters
-        new_cache = TTLCache(maxsize=new_maxsize, ttl=new_ttl)
-
-        # Transfer still-valid entries
-        for key, value in self.cache.items():
-            new_cache[key] = value
-
-        # Update cache and stats
-        self.cache = new_cache
-        self.stats.maxsize = int(new_maxsize)
-        self.stats.ttl = int(new_ttl)
-
-    def __call__(
-        self,
-        func: Callable[P, Coroutine[Any, Any, T]]
-    ) -> Callable[P, Coroutine[Any, Any, T]]:
-        """Make class instance callable as a decorator"""
-        self._wrapped_function = func.__name__
-
-        @wraps(func)
-        async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
-            key = self._make_key(*args, **kwargs)
-
-            try:
-                # Try to get from cache
-                result = self.cache[key]
-                self.stats.hits += 1
-                logger.debug(f"Cache hit for {self._wrapped_function}")
-                return cast(T, result)
-            except KeyError:
-                # Calculate and cache result
-                result = await func(*args, **kwargs)
-                self.cache[key] = result
-                self.stats.misses += 1
-                self.stats.size = len(self.cache)
-                logger.debug(f"Cache miss for {self._wrapped_function}, stored new result")
-                return result
-
-        # Add cache management methods directly to wrapper
-        wrapper.cache_clear = self.clear  # type: ignore
-        wrapper.cache_info = self.get_stats  # type: ignore
-        wrapper.reconfigure = self.reconfigure  # type: ignore
-        return wrapper
-
-def async_ttl_cache(
-    maxsize: int = 1000,
-    ttl: int = 300
-) -> Callable[[Callable[P, Coroutine[Any, Any, T]]], Callable[P, Coroutine[Any, Any, T]]]:
+class RedisCache:
     """
-    Create an async TTL cache decorator
+    Redis-based caching implementation.
 
-    Args:
-        maxsize: Maximum cache size (default: 1000)
-        ttl: Time to live in seconds (default: 300)
+    Features:
+    - Async Redis operations
+    - Automatic serialization/deserialization
+    - Configurable TTL
+    - Namespace support for different services
+    """
 
-    Returns:
-        Callable: Cache decorator for async functions
+    def __init__(self, redis_url: str, namespace: str = "market_data"):
+        self.redis = Redis.from_url(redis_url, decode_responses=True)
+        self.namespace = namespace
+
+    def _make_key(self, key: str) -> str:
+        """Create namespaced key"""
+        return f"{self.namespace}:{key}"
+
+    async def get(self, key: str) -> Optional[Any]:
+        """Get value from cache"""
+        try:
+            value = await self.redis.get(self._make_key(key))
+            return json.loads(value) if value else None
+        except Exception as e:
+            logger.error(f"Redis get error: {e}")
+            return None
+
+    async def set(self, key: str, value: Any, ttl: int = 300) -> bool:
+        """Set value in cache with TTL in seconds"""
+        try:
+            if isinstance(value, list) and value and isinstance(value[0], BaseModel):
+                serialized = json.dumps([
+                    json.loads(v.model_dump_json()) for v in value
+                ])
+            elif isinstance(value, BaseModel):
+                serialized = value.model_dump_json()
+            else:
+                serialized = json.dumps(value)
+
+            return await self.redis.set(
+                self._make_key(key),
+                serialized,
+                ex=ttl
+            )
+        except Exception as e:
+            logger.error(f"Redis set error: {e}")
+            return False
+
+    async def delete(self, key: str) -> bool:
+        """Delete value from cache"""
+        try:
+            return bool(await self.redis.delete(self._make_key(key)))
+        except Exception as e:
+            logger.error(f"Redis delete error: {e}")
+            return False
+
+    async def clear_namespace(self) -> bool:
+        """Clear all keys in namespace"""
+        try:
+            keys = await self.redis.keys(f"{self.namespace}:*")
+            if keys:
+                return bool(await self.redis.delete(*keys))
+            return True
+        except Exception as e:
+            logger.error(f"Redis clear error: {e}")
+            return False
+
+    async def close(self) -> None:
+        """Close Redis connection"""
+        try:
+            await self.redis.close()
+        except Exception as e:
+            logger.error(f"Redis close error: {e}")
+
+class redis_cached[T]:
+    """
+    Decorator class for caching async function results in Redis.
 
     Example:
-        @async_ttl_cache(maxsize=100, ttl=60)
-        async def fetch_data() -> List[DataType]:
+        @redis_cached[list[KlineData]]()
+        async def get_klines(...) -> list[KlineData]:
             ...
     """
-    return AsyncTTLCache(maxsize=maxsize, ttl=ttl)
+    def __init__(self, ttl: int = 300):
+        self.ttl = ttl
+
+    def _convert_to_decimal(self, value: Any) -> Any:
+        """Convert string values back to Decimal where needed"""
+        if isinstance(value, str) and value.replace('.', '').replace('-', '').isdigit():
+            return Decimal(value)
+        return value
+
+    def _convert_to_enum(self, value: Any, field_type: Any) -> Any:
+        """Convert string values back to Enum where needed"""
+        if isinstance(value, str) and field_type == Timeframe:
+            return Timeframe(value)
+        return value
+
+    def _deserialize_model(self, data: Dict[str, Any], model_class: Type[BaseModel]) -> BaseModel:
+        """Deserialize a single model instance with proper type handling"""
+        # Get field types from model
+        field_types = {
+            field_name: field.annotation
+            for field_name, field in model_class.model_fields.items()
+        }
+
+        # Convert values based on field types
+        converted_data = {}
+        for k, v in data.items():
+            field_type = field_types.get(k)
+            if field_type == Decimal:
+                converted_data[k] = self._convert_to_decimal(v)
+            elif field_type == Timeframe:
+                converted_data[k] = self._convert_to_enum(v, Timeframe)
+            else:
+                converted_data[k] = v
+
+        return model_class.model_validate(converted_data)
+
+    def _deserialize_cached_value(self, cached_value: Any, return_type: Type[T]) -> T:
+        """Deserialize cached value back to appropriate type"""
+        origin = get_origin(return_type)
+        args = get_args(return_type)
+
+        if origin is list and args and issubclass(args[0], BaseModel):
+            model_class = args[0]
+
+            # Handle different model types
+            if model_class in (KlineData, RSIResult, MACDResult,
+                             BollingerBandsResult, MAResult, OBVResult):
+                return cast(T, [
+                    self._deserialize_model(item, model_class)
+                    for item in cached_value
+                ])
+
+            return cast(T, [model_class.model_validate(item) for item in cached_value])
+
+        elif isinstance(return_type, type) and issubclass(return_type, BaseModel):
+            return cast(T, self._deserialize_model(cached_value, return_type))
+
+        return cast(T, cached_value)
+
+    def __call__(self, func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
+        @functools.wraps(func)
+        async def wrapper(self_obj: Any, *args: Any, **kwargs: Any) -> T:
+            if not hasattr(self_obj, 'cache') or not isinstance(self_obj.cache, RedisCache):
+                return await func(self_obj, *args, **kwargs)
+
+            key_parts = [
+                func.__name__,
+                *[str(arg) for arg in args],
+                *[f"{k}:{v}" for k, v in sorted(kwargs.items())]
+            ]
+            cache_key = ":".join(key_parts)
+
+            if cached_value := await self_obj.cache.get(cache_key):
+                return_type = func.__annotations__.get('return', Any)
+                return self._deserialize_cached_value(cached_value, return_type)
+
+            result = await func(self_obj, *args, **kwargs)
+
+            if result is not None:
+                await self_obj.cache.set(cache_key, result, self.ttl)
+
+            return result
+
+        return wrapper

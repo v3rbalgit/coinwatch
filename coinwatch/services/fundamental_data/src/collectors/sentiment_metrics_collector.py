@@ -12,7 +12,7 @@ from shared.core.exceptions import ServiceError
 from shared.core.models import SentimentMetrics, Metadata, SymbolInfo
 from shared.database.repositories import MetadataRepository, SentimentRepository
 from shared.utils.logger import LoggerSetup
-from shared.utils.time import TimeUtils
+import shared.utils.time as TimeUtils
 
 logger = LoggerSetup.setup(__name__)
 

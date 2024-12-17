@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Tuple
 
-from .time import TimeUtils
+import shared.utils.time as TimeUtils
 from shared.core.models import SymbolInfo
 from shared.core.enums import Timeframe
 

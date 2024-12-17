@@ -1,6 +1,3 @@
-# src/managers/timeframe.py
-
-from datetime import timedelta
 from typing import List, Optional, Set
 
 from shared.core.enums import Timeframe
@@ -10,10 +7,10 @@ from shared.database.repositories.kline import KlineRepository
 from shared.messaging.broker import MessageBroker
 from shared.messaging.schemas import MessageType, GapMessage
 from shared.utils.logger import LoggerSetup
-from shared.utils.time import TimeUtils
+import shared.utils.time as TimeUtils
+from shared.utils.cache import RedisCache, redis_cached
 
 logger = LoggerSetup.setup(__name__)
-
 
 class TimeframeManager:
     """
@@ -23,19 +20,18 @@ class TimeframeManager:
     - Provides access to kline data across different timeframes
     - Manages continuous aggregates for common timeframes
     - Handles timeframe calculations and validations
-
-    The manager uses TimescaleDB continuous aggregates for common timeframes
-    (1h, 4h, 1d) and provides on-demand calculation for other timeframes.
-    All calculations maintain proper UTC time boundaries.
+    - Caches frequently accessed kline data in Redis
     """
 
     def __init__(self,
                  message_broker: MessageBroker,
                  kline_repository: KlineRepository,
+                 redis_url: str,
                  base_timeframe: Timeframe = Timeframe.MINUTE_5):
         self.message_broker = message_broker
         self.kline_repository = kline_repository
         self.base_timeframe = base_timeframe
+        self.cache = RedisCache(redis_url, namespace="timeframe")
 
         # Common timeframes stored as continuous aggregates
         self._stored_timeframes = {
@@ -76,18 +72,22 @@ class TimeframeManager:
         Raises:
             ValidationError: If timeframe is invalid
         """
+        if not isinstance(timeframe, Timeframe):
+            raise ValidationError(f"Invalid timeframe type: {type(timeframe)}")
+
         if timeframe not in self.valid_timeframes:
             raise ValidationError(
                 f"Cannot calculate {timeframe.value} timeframe from "
                 f"{self.base_timeframe.value} base timeframe"
             )
 
+    @redis_cached[List[KlineData]](ttl=60)  # Cache for 1 minute since klines update frequently
     async def get_klines(self,
                         symbol: SymbolInfo,
                         timeframe: Timeframe,
                         start_time: Optional[int] = None,
                         end_time: Optional[int] = None,
-                        limit: Optional[int] = None) -> List[KlineData]:
+                        limit: Optional[int] = 200) -> List[KlineData]:
         """
         Get kline data for specified timeframe.
         Uses continuous aggregates for common timeframes, calculates others on demand.
@@ -97,7 +97,7 @@ class TimeframeManager:
             timeframe: Target timeframe
             start_time: Optional start time (None for latest)
             end_time: Optional end time (None for latest)
-            limit: Optional limit on number of klines
+            limit: Optional limit on number of klines (default 200)
 
         Returns:
             List[KlineData]: Kline data in ascending order
@@ -122,8 +122,8 @@ class TimeframeManager:
                 start_time = end_time - (24 * 60 * 60 * 1000)  # Last 24 hours
 
             # Now we can be sure both timestamps are not None
-            aligned_start = self._align_to_timeframe(start_time, timeframe)
-            aligned_end = self._align_to_timeframe(end_time, timeframe, round_up=True)
+            aligned_start = TimeUtils.align_timestamp_to_interval(start_time, timeframe)
+            aligned_end = TimeUtils.align_timestamp_to_interval(end_time, timeframe, round_up=True)
 
             # At this point, aligned_start and aligned_end cannot be None
             assert aligned_start is not None and aligned_end is not None
@@ -137,7 +137,7 @@ class TimeframeManager:
             # Choose appropriate repository method based on timeframe
             if timeframe == self.base_timeframe:
                 # Get base timeframe data directly
-                return await self.kline_repository.get_base_klines(
+                klines = await self.kline_repository.get_base_klines(
                     symbol,
                     timeframe,
                     aligned_start,
@@ -146,7 +146,7 @@ class TimeframeManager:
                 )
             elif timeframe in self._stored_timeframes:
                 # Get data from continuous aggregates
-                return await self.kline_repository.get_stored_klines(
+                klines = await self.kline_repository.get_stored_klines(
                     symbol,
                     timeframe,
                     aligned_start,
@@ -155,7 +155,7 @@ class TimeframeManager:
                 )
             else:
                 # Calculate timeframe on demand
-                return await self.kline_repository.get_calculated_klines(
+                klines = await self.kline_repository.get_calculated_klines(
                     symbol,
                     timeframe,
                     self.base_timeframe,
@@ -164,62 +164,11 @@ class TimeframeManager:
                     limit
                 )
 
+            return klines or []
+
         except Exception as e:
-            logger.error(
-                f"Error getting {timeframe.value} klines for {symbol}: {e}"
-            )
+            logger.error(f"Error getting {timeframe.value} klines for {symbol}: {str(e)}")
             raise
-
-    def _align_to_timeframe(self,
-                           timestamp: Optional[int],
-                           timeframe: Timeframe,
-                           round_up: bool = False) -> Optional[int]:
-        """
-        Align timestamp to timeframe boundary ensuring proper interval alignment.
-
-        Examples:
-        - 15min: :00, :15, :30, :45
-        - 30min: :00, :30
-        - 1h: :00
-        - 4h: :00, 04:00, 08:00, etc.
-        - 1d: 00:00 UTC
-        """
-        if timestamp is None:
-            return None
-
-        # Convert to datetime for easier manipulation
-        dt = TimeUtils.from_timestamp(timestamp)
-
-        if timeframe == Timeframe.DAY_1:
-            # Align to UTC midnight
-            aligned = dt.replace(hour=0, minute=0, second=0, microsecond=0)
-        elif timeframe == Timeframe.WEEK_1:
-            # Align to UTC midnight Monday
-            aligned = dt.replace(hour=0, minute=0, second=0, microsecond=0)
-            days_since_monday = dt.weekday()
-            aligned -= timedelta(days=days_since_monday)
-        else:
-            # For minute-based timeframes
-            minutes = int(timeframe.value) if timeframe.value.isdigit() else 0
-            total_minutes = dt.hour * 60 + dt.minute
-            aligned_minutes = (total_minutes // minutes) * minutes
-
-            aligned = dt.replace(
-                hour=aligned_minutes // 60,
-                minute=aligned_minutes % 60,
-                second=0,
-                microsecond=0
-            )
-
-        if round_up and aligned < dt:
-            if timeframe == Timeframe.WEEK_1:
-                aligned += timedelta(days=7)
-            elif timeframe == Timeframe.DAY_1:
-                aligned += timedelta(days=1)
-            else:
-                aligned += timedelta(minutes=minutes)
-
-        return TimeUtils.to_timestamp(aligned)
 
     async def _check_data_gaps(self,
                               symbol: SymbolInfo,
@@ -238,13 +187,18 @@ class TimeframeManager:
         if not gaps:
             return
 
-        await self.message_broker.publish(MessageType.GAP_DETECTED,
-                                          GapMessage(
-                                              service="market_data",
-                                              type=MessageType.GAP_DETECTED,
-                                              timestamp=TimeUtils.get_current_timestamp(),
-                                              symbol=symbol.name,
-                                              exchange=symbol.exchange,
-                                              gaps=gaps,
-                                              timeframe=self.base_timeframe.value
-                                          ).model_dump())
+        await self.message_broker.publish(
+            MessageType.GAP_DETECTED,
+            GapMessage(
+                service="market_data",
+                type=MessageType.GAP_DETECTED,
+                timestamp=TimeUtils.get_current_timestamp(),
+                symbol=symbol.name,
+                exchange=symbol.exchange,
+                gaps=gaps,
+                timeframe=self.base_timeframe.value
+            ).model_dump())
+
+    async def cleanup(self) -> None:
+        """Cleanup resources"""
+        await self.cache.close()

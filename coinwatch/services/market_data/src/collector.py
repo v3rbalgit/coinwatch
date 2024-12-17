@@ -12,7 +12,7 @@ from shared.messaging.broker import MessageBroker
 from shared.messaging.schemas import MessageType, KlineMessage, ErrorMessage, CollectionMessage
 from shared.utils.logger import LoggerSetup
 from shared.utils.progress import MarketDataProgress
-from shared.utils.time import TimeUtils
+import shared.utils.time as TimeUtils
 
 logger = LoggerSetup.setup(__name__)
 
@@ -73,7 +73,7 @@ class DataCollector:
                     return
 
             # Align the start and end timestamps to interval boundaries
-            start_time, end_time = self._align_time_range((start_time, end_time), self._base_timeframe)
+            start_time, end_time = TimeUtils.align_time_range_to_interval(start_time, end_time, self._base_timeframe)
             if start_time == end_time:
                 logger.info(f"No data to collect for {symbol.name} on {symbol.exchange}, skipping collection")
             else:
@@ -168,11 +168,7 @@ class DataCollector:
                 break
 
             # Store batch
-            processed = await self._kline_repository.insert_batch(
-                symbol,
-                self._base_timeframe,
-                [k.to_tuple() for k in klines]
-            )
+            processed = await self._kline_repository.insert_batch(symbol, klines)
 
             yield processed
 
@@ -206,27 +202,6 @@ class DataCollector:
                 f"to {TimeUtils.from_timestamp(last_complete)}"
             )
             return latest, last_complete
-
-    def _align_time_range(self,time_range: Tuple[int,int], timeframe: Timeframe) -> Tuple[int, int]:
-        """
-        Align start and end timestamps to interval
-
-        Args:
-            time_range (Tuple[int,int]): Tuple of start and end timestamps to align.
-            timeframe (Timeframe): Timeframe to base the calculation on.
-
-        Returns:
-            Tuple[int,int]: Aligned range of timestamps.
-        """
-        start_time, end_time = time_range
-        interval_ms = timeframe.to_milliseconds()
-        aligned_start = start_time - (start_time % interval_ms)
-        current_time = TimeUtils.get_current_timestamp()
-        aligned_end = min(
-            end_time - (end_time % interval_ms),
-            current_time - (current_time % interval_ms) - interval_ms
-        )
-        return aligned_start, aligned_end
 
     async def _start_streaming(self, symbol: SymbolInfo) -> None:
         """Start real-time data streaming for a symbol"""
@@ -282,7 +257,6 @@ class DataCollector:
 
                 # Create KlineData object
                 kline = KlineData(
-                    symbol=symbol,
                     timeframe=self._base_timeframe,
                     timestamp=int(kline_data['start']),
                     open_price=Decimal(str(kline_data['open'])),
@@ -294,7 +268,7 @@ class DataCollector:
                 )
 
                 # Store the kline
-                await self._kline_repository.insert_batch(symbol, self._base_timeframe, [kline.to_tuple()])
+                await self._kline_repository.insert_batch(symbol, [kline])
 
                 # Publish update
                 await self._publish_kline_update(symbol, kline)

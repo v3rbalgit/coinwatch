@@ -1,12 +1,9 @@
-# src/services/fundamental_data/collector.py
-
 from abc import ABC, abstractmethod
 from typing import Dict, List, Set
 import asyncio
 
 from shared.core.models import MarketMetrics, Metadata
-from shared.utils.retry import RetryConfig, RetryStrategy
-from shared.utils.time import TimeUtils
+import shared.utils.time as TimeUtils
 from shared.utils.logger import LoggerSetup
 from shared.utils.progress import FundamentalDataProgress
 
@@ -37,14 +34,6 @@ class FundamentalCollector(ABC):
         self._processing: Set[str] = set()
         self._progress: Dict[str, FundamentalDataProgress] = {}
         self._last_collection: Dict[str, int] = {}
-
-        # Initialize retry strategy
-        self._retry_strategy = RetryStrategy(RetryConfig(
-            base_delay=1.0,
-            max_delay=30.0,
-            max_retries=3,
-            jitter_factor=0.1
-        ))
 
         # Start collection worker
         self._queue_processor = asyncio.create_task(self._collection_worker())

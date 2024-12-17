@@ -3,7 +3,7 @@ import psutil
 from typing import Dict, Any
 
 from shared.messaging.broker import MessageBroker
-from shared.utils.time import TimeUtils
+import shared.utils.time as TimeUtils
 from shared.utils.logger import LoggerSetup
 
 logger = LoggerSetup.setup(__name__)

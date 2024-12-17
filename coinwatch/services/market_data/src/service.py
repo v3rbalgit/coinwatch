@@ -11,7 +11,7 @@ from shared.database.repositories import KlineRepository, SymbolRepository
 from shared.messaging.broker import MessageBroker
 from shared.messaging.schemas import MessageType, SymbolMessage, ErrorMessage
 from shared.utils.logger import LoggerSetup
-from shared.utils.time import TimeUtils
+import shared.utils.time as TimeUtils
 from shared.utils.error import ErrorTracker
 
 from .collector import DataCollector
@@ -161,7 +161,7 @@ class MarketDataService(ServiceBase):
             await asyncio.gather(*tasks, return_exceptions=True)
 
             # Optional: Add small delay between batches to prevent overwhelming
-            await asyncio.sleep(self._batch_size / 100)
+            await asyncio.sleep(0)
 
     async def _monitor_symbols(self) -> None:
         """Monitor trading symbols across exchanges"""

@@ -1,5 +1,3 @@
-# src/repositories/kline.py
-
 from decimal import Decimal
 from typing import List, Optional, Tuple
 from sqlalchemy import select, and_, text
@@ -11,8 +9,7 @@ from shared.database.connection import DatabaseConnection
 from shared.database.models.market_data import Symbol, Kline
 from shared.core.exceptions import RepositoryError, ValidationError
 from shared.utils.logger import LoggerSetup
-from shared.utils.validation import MarketDataValidator
-from shared.utils.time import TimeUtils
+import shared.utils.time as TimeUtils
 
 logger = LoggerSetup.setup(__name__)
 
@@ -27,7 +24,6 @@ class KlineRepository:
 
     def __init__(self, db: DatabaseConnection):
         self.db = db
-        self.validator = MarketDataValidator()
         self._batch_size = 1000
 
     async def get_latest_timestamp(self, symbol: SymbolInfo) -> Optional[int]:
@@ -126,20 +122,19 @@ class KlineRepository:
                     }
                 )
 
-                return [
-                    KlineData(
-                        timestamp=TimeUtils.to_timestamp(row.timestamp),
-                        open_price=Decimal(str(row.open_price)),
-                        high_price=Decimal(str(row.high_price)),
-                        low_price=Decimal(str(row.low_price)),
-                        close_price=Decimal(str(row.close_price)),
-                        volume=Decimal(str(row.volume)),
-                        turnover=Decimal(str(row.turnover)),
-                        symbol=symbol,
-                        timeframe=Timeframe(row.timeframe)
-                    )
-                    for row in result
-                ]
+            return [
+                KlineData(
+                    timestamp=TimeUtils.to_timestamp(row.timestamp),
+                    open_price=Decimal(str(row.open_price)),
+                    high_price=Decimal(str(row.high_price)),
+                    low_price=Decimal(str(row.low_price)),
+                    close_price=Decimal(str(row.close_price)),
+                    volume=Decimal(str(row.volume)),
+                    turnover=Decimal(str(row.turnover)),
+                    timeframe=Timeframe(row.timeframe)
+                )
+                for row in result
+            ]
 
         except Exception as e:
             logger.error(f"Error getting base klines for {symbol}: {e}")
@@ -166,81 +161,48 @@ class KlineRepository:
         """
         try:
             async with self.db.session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
-                start_dt = TimeUtils.from_timestamp(start_time)
-                end_dt = TimeUtils.from_timestamp(end_time)
-
                 stmt = text(f"""
-                WITH aligned_klines AS (
                     SELECT
-                        time_bucket(:bucket, timestamp) as bucket_timestamp,
-                        first(open_price, timestamp) as open_price,
-                        max(high_price) as high_price,
-                        min(low_price) as low_price,
-                        last(close_price, timestamp) as close_price,
-                        sum(volume) as volume,
-                        sum(turnover) as turnover,
-                        s.name as symbol_name,
-                        s.exchange as symbol_exchange,
+                        EXTRACT(EPOCH FROM k.bucket) * 1000 AS timestamp,
+                        k.open_price,
+                        k.high_price,
+                        k.low_price,
+                        k.close_price,
+                        k.volume,
+                        k.turnover,
+                        s.name AS symbol_name,
+                        s.exchange AS symbol_exchange,
                         k.timeframe
                     FROM {timeframe.continuous_aggregate_view} k
-                    JOIN symbols s ON k.symbol_id = s.id
+                    JOIN market_data.symbols s ON k.symbol_id = s.id
                     WHERE s.name = :symbol_name
                     AND s.exchange = :exchange
-                    AND k.timestamp BETWEEN :start_time AND :end_time
-                    GROUP BY
-                        time_bucket(:bucket, timestamp),
-                        s.name,
-                        s.exchange,
-                        k.timeframe
-                    ORDER BY bucket_timestamp DESC
+                    AND k.bucket BETWEEN :start_time AND :end_time
+                    ORDER BY k.bucket DESC
                     LIMIT :limit
-                )
-                SELECT
-                    EXTRACT(EPOCH FROM bucket_timestamp) * 1000 as timestamp,
-                    open_price,
-                    high_price,
-                    low_price,
-                    close_price,
-                    volume,
-                    turnover,
-                    symbol_name,
-                    symbol_exchange,
-                    timeframe
-                FROM aligned_klines
-                ORDER BY bucket_timestamp DESC;
-            """)
+                """)
 
-            result = await session.execute(
-                stmt,
-                {
-                    "symbol_name": symbol.name,
-                    "exchange": symbol.exchange,
-                    "start_time": start_dt,
-                    "end_time": end_dt,
-                    "bucket": timeframe.get_bucket_interval(),
-                    "limit": limit or 2147483647
-                }
-            )
+                result = await session.execute(
+                    stmt,
+                    {
+                        "symbol_name": symbol.name,
+                        "exchange": symbol.exchange,
+                        "start_time": TimeUtils.from_timestamp(start_time),
+                        "end_time": TimeUtils.from_timestamp(end_time),
+                        "bucket": timeframe.get_bucket_interval(),
+                        "limit": limit or 2147483647
+                    }
+                )
 
             return [
                 KlineData(
-                    timestamp=row.timestamp,
+                    timestamp=int(row.timestamp),
                     open_price=Decimal(str(row.open_price)),
                     high_price=Decimal(str(row.high_price)),
                     low_price=Decimal(str(row.low_price)),
                     close_price=Decimal(str(row.close_price)),
                     volume=Decimal(str(row.volume)),
                     turnover=Decimal(str(row.turnover)),
-                    symbol=SymbolInfo(
-                        name=row.symbol_name,
-                        exchange=row.symbol_exchange,
-                        base_asset=symbol.base_asset,
-                        quote_asset=symbol.quote_asset,
-                        price_precision=symbol.price_precision,
-                        qty_precision=symbol.qty_precision,
-                        min_order_qty=symbol.min_order_qty,
-                        launch_time=symbol.launch_time
-                    ),
                     timeframe=Timeframe(row.timeframe)
                 )
                 for row in result
@@ -273,39 +235,36 @@ class KlineRepository:
         """
         try:
             async with self.db.session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
-                start_dt = TimeUtils.from_timestamp(start_time)
-                end_dt = TimeUtils.from_timestamp(end_time)
-
                 stmt = text("""
                     WITH base_aligned AS (
                         SELECT
-                            time_bucket(:bucket, k.timestamp) as bucket_timestamp,
-                            first(open_price, timestamp) as open_price,
-                            max(high_price) as high_price,
-                            min(low_price) as low_price,
-                            last(close_price, timestamp) as close_price,
-                            sum(volume) as volume,
-                            sum(turnover) as turnover,
-                            s.name as symbol_name,
-                            s.exchange as symbol_exchange,
-                            :target_timeframe as timeframe,
-                            count(*) as candle_count
-                        FROM kline_data k
-                        JOIN symbols s ON k.symbol_id = s.id
+                            public.time_bucket(:bucket, k.timestamp) AS bucket_timestamp,
+                            public.first(k.open_price, k.timestamp) AS open_price,
+                            public.last(k.close_price, k.timestamp) AS close_price,
+                            MAX(k.high_price) AS high_price,
+                            MIN(k.low_price) AS low_price,
+                            SUM(k.volume) AS volume,
+                            SUM(k.turnover) AS turnover,
+                            s.name AS symbol_name,
+                            s.exchange AS symbol_exchange,
+                            :target_timeframe AS timeframe,
+                            COUNT(*) AS candle_count
+                        FROM market_data.kline_data k
+                        JOIN market_data.symbols s ON k.symbol_id = s.id
                         WHERE s.name = :symbol_name
                         AND s.exchange = :exchange
                         AND k.timeframe = :base_timeframe
                         AND k.timestamp BETWEEN :start_time AND :end_time
                         GROUP BY
-                            time_bucket(:bucket, k.timestamp),
+                            public.time_bucket(:bucket, k.timestamp),
                             s.name,
                             s.exchange
-                        HAVING count(*) >= :min_candles
+                        HAVING COUNT(*) >= :min_candles
                         ORDER BY bucket_timestamp DESC
                         LIMIT :limit
                     )
                     SELECT
-                        EXTRACT(EPOCH FROM bucket_timestamp) * 1000 as timestamp,
+                        EXTRACT(EPOCH FROM bucket_timestamp) * 1000 AS timestamp,
                         open_price,
                         high_price,
                         low_price,
@@ -329,53 +288,39 @@ class KlineRepository:
                         "exchange": symbol.exchange,
                         "base_timeframe": base_timeframe.value,
                         "target_timeframe": timeframe.value,
-                        "start_time": start_dt,
-                        "end_time": end_dt,
+                        "start_time": TimeUtils.from_timestamp(start_time),
+                        "end_time": TimeUtils.from_timestamp(end_time),
                         "bucket": timeframe.get_bucket_interval(),
                         "min_candles": min_candles,
                         "limit": limit or 2147483647
                     }
                 )
 
-                return [
-                    KlineData(
-                        timestamp=row.timestamp,
-                        open_price=Decimal(str(row.open_price)),
-                        high_price=Decimal(str(row.high_price)),
-                        low_price=Decimal(str(row.low_price)),
-                        close_price=Decimal(str(row.close_price)),
-                        volume=Decimal(str(row.volume)),
-                        turnover=Decimal(str(row.turnover)),
-                        symbol=SymbolInfo(
-                            name=row.symbol_name,
-                            exchange=row.symbol_exchange,
-                            base_asset=symbol.base_asset,
-                            quote_asset=symbol.quote_asset,
-                            price_precision=symbol.price_precision,
-                            qty_precision=symbol.qty_precision,
-                            min_order_qty=symbol.min_order_qty,
-                            launch_time=symbol.launch_time
-                        ),
-                        timeframe=Timeframe(row.timeframe)
-                    )
-                    for row in result
-                ]
+            return [
+                KlineData(
+                    timestamp=int(row.timestamp),
+                    open_price=Decimal(str(row.open_price)),
+                    high_price=Decimal(str(row.high_price)),
+                    low_price=Decimal(str(row.low_price)),
+                    close_price=Decimal(str(row.close_price)),
+                    volume=Decimal(str(row.volume)),
+                    turnover=Decimal(str(row.turnover)),
+                    timeframe=Timeframe(row.timeframe)
+                )
+                for row in result
+            ]
 
         except Exception as e:
             logger.error(f"Error calculating klines for {symbol}: {e}")
             raise RepositoryError(f"Failed to calculate klines: {str(e)}")
 
-    async def insert_batch(self,
-                        symbol: SymbolInfo,
-                        timeframe: Timeframe,
-                        klines: List[Tuple]) -> int:
+    async def insert_batch(self, symbol: SymbolInfo, klines: List[KlineData]) -> int:
         """
         Insert a batch of klines using PostgreSQL bulk insert.
 
         Args:
             symbol (SymbolInfo): The symbol information for the klines.
-            timeframe (Timeframe): The timeframe of the klines.
-            klines (List[Tuple]): A list of kline data tuples.
+            klines (List[KlineData]): A list of kline data.
 
         Returns:
             int: The number of klines successfully inserted.
@@ -395,26 +340,17 @@ class KlineRepository:
                 # Process klines in batches
                 for i in range(0, len(klines), self._batch_size):
                     batch = klines[i:i + self._batch_size]
-                    valid_klines = []
-
-                    # Validate klines
-                    for k in batch:
-                        try:
-                            if self.validator.validate_kline(*k):
-                                valid_klines.append({
+                    valid_klines = [{
                                     "symbol_id": symbol_id,
-                                    "timeframe": timeframe.value,
-                                    "timestamp": TimeUtils.from_timestamp(k[0]),
-                                    "open_price": k[1],
-                                    "high_price": k[2],
-                                    "low_price": k[3],
-                                    "close_price": k[4],
-                                    "volume": k[5],
-                                    "turnover": k[6]
-                                })
-                        except ValidationError as e:
-                            logger.warning(f"Invalid kline data for {symbol}: {e}")
-                            continue
+                                    "timeframe": k.timeframe.value,
+                                    "timestamp": TimeUtils.from_timestamp(k.timestamp),
+                                    "open_price": k.open_price,
+                                    "high_price": k.high_price,
+                                    "low_price": k.low_price,
+                                    "close_price": k.close_price,
+                                    "volume": k.volume,
+                                    "turnover": k.turnover
+                                } for k in batch]
 
                     if valid_klines:
                         stmt = insert(Kline).values(valid_klines)
@@ -432,13 +368,13 @@ class KlineRepository:
                         await session.execute(stmt)
                         inserted_count += len(valid_klines)
 
-                if klines:
-                    logger.debug(
-                        f"Processed {inserted_count} klines for {symbol.name} on {symbol.exchange}, "
-                        f"last timestamp: {TimeUtils.from_timestamp(klines[-1][0])}"
-                    )
+            if klines:
+                logger.debug(
+                    f"Inserted {inserted_count} klines for {symbol.name} on {symbol.exchange}, "
+                    f"last timestamp: {TimeUtils.from_timestamp(klines[-1].timestamp)}"
+                )
 
-                return inserted_count
+            return inserted_count
 
         except Exception as e:
             logger.error(f"Error inserting klines for {symbol}: {e}")
@@ -466,16 +402,14 @@ class KlineRepository:
         """
         try:
             async with self.db.session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
-                # Convert timestamps to datetime for the query
-                start_dt = TimeUtils.from_timestamp(start_time)
-                end_dt = TimeUtils.from_timestamp(end_time)
+                # Calculate expected interval in milliseconds
+                expected_interval = timeframe.to_milliseconds()
 
                 stmt = text("""
                     WITH time_series AS (
                         SELECT
                             EXTRACT(EPOCH FROM timestamp) * 1000 as ts_start,
-                            EXTRACT(EPOCH FROM lead(timestamp) OVER (ORDER BY timestamp)) * 1000 as ts_next,
-                            :interval as expected_interval
+                            EXTRACT(EPOCH FROM lead(timestamp) OVER (ORDER BY timestamp)) * 1000 as ts_next
                         FROM kline_data k
                         JOIN symbols s ON k.symbol_id = s.id
                         WHERE s.name = :symbol
@@ -485,7 +419,7 @@ class KlineRepository:
                     )
                     SELECT ts_start, ts_next
                     FROM time_series
-                    WHERE (ts_next - ts_start) > (expected_interval * 2)
+                    WHERE (ts_next - ts_start) > (:interval * 2)
                     ORDER BY ts_start;
                 """)
 
@@ -493,14 +427,14 @@ class KlineRepository:
                     "symbol": symbol.name,
                     "exchange": symbol.exchange,
                     "timeframe": timeframe.value,
-                    "start_time": start_dt,
-                    "end_time": end_dt,
-                    "interval": timeframe.to_milliseconds()
+                    "start_time": TimeUtils.from_timestamp(start_time),
+                    "end_time": TimeUtils.from_timestamp(end_time),
+                    "interval": expected_interval
                 })
 
-                return [(int(row.ts_start + timeframe.to_milliseconds()),
-                         int(row.ts_next))
-                        for row in result]
+            return [(int(row.ts_start + expected_interval),
+                        int(row.ts_next))
+                    for row in result]
 
         except Exception as e:
             logger.error(f"Error finding data gaps: {e}")

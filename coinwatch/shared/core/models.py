@@ -1,47 +1,169 @@
-# src/core/models.py
-
 from dataclasses import dataclass, field
-from decimal import Decimal
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, Optional
+from typing import Any, ClassVar
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationInfo,
+    model_validator,
+    field_validator,
+    computed_field,
+    ValidationError,
+    ConfigDict
+)
 
-from shared.utils.time import TimeUtils
+import shared.utils.time as TimeUtils
 from .enums import DataSource, Timeframe
 
+class SymbolInfo(BaseModel):
+    """
+    Domain model for cryptocurrency trading symbol information.
 
-# Symbol Info Model
-@dataclass(frozen=True)
-class SymbolInfo:
-    """Domain model for symbol information"""
-    name: str
-    base_asset: str
-    quote_asset: str
-    price_precision: int
-    qty_precision: int
-    min_order_qty: Decimal
-    launch_time: int
-    exchange: str = "bybit"
+    Represents a trading symbol on a cryptocurrency exchange with its
+    associated metadata and trading parameters.
+    """
 
+    model_config = ConfigDict(
+        frozen=True,
+        strict=True,
+        validate_assignment=True,
+        json_schema_extra={
+            "example": {
+                "name": "BTCUSDT",
+                "exchange": "bybit",
+                "launch_time": 1573776000000,  # 2019-11-15
+                "base_asset": "BTC",
+                "quote_asset": "USDT",
+                "price_precision": 2,
+                "qty_precision": 6,
+                "min_order_qty": "0.000001"
+            }
+        }
+    )
+
+    # Constants
+    MIN_LAUNCH_TIME: ClassVar[int] = TimeUtils.to_timestamp(
+        datetime(2009, 1, 3)  # Bitcoin genesis block date
+    )
+
+    # Required fields with validation and metadata
+    name: str = Field(
+        ...,
+        description="Trading symbol name (e.g., 'BTCUSDT')",
+        min_length=5,
+        max_length=50,
+        pattern="^[A-Z0-9]+$",  # Only uppercase letters and numbers
+        examples=["BTCUSDT", "ETHUSDT"]
+    )
+
+    exchange: str = Field(
+        ...,
+        description="Exchange name",
+        min_length=1,
+        max_length=20,
+        pattern="^[a-z0-9_]+$",  # lowercase letters, numbers, underscore
+        examples=["bybit", "binance"]
+    )
+
+    launch_time: int = Field(
+        description="Symbol launch timestamp in milliseconds",
+        examples=[1573776000000]
+    )
+
+    base_asset: str = Field(
+        ...,
+        description="Base asset symbol (e.g., 'BTC')",
+        min_length=1,
+        max_length=20,
+        pattern="^[A-Z0-9]+$",
+        examples=["BTC", "ETH"]
+    )
+
+    quote_asset: str = Field(
+        ...,
+        description="Quote asset symbol (e.g., 'USDT')",
+        min_length=1,
+        max_length=10,
+        pattern="^[A-Z0-9]+$",
+        examples=["USDT", "USD"]
+    )
+
+    price_precision: int = Field(
+        ...,
+        description="Number of decimal places for price",
+        ge=0,
+        le=18,
+        examples=[2]
+    )
+
+    qty_precision: int = Field(
+        ...,
+        description="Number of decimal places for quantity",
+        ge=0,
+        le=18,
+        examples=[6]
+    )
+
+    min_order_qty: Decimal = Field(
+        ...,
+        description="Minimum order quantity",
+        gt=0,
+        examples=["0.000001"]
+    )
+
+    @field_validator('name')
+    def validate_name(value: Any, info: ValidationInfo) -> str:
+        """Validate symbol name matches base/quote convention if possible"""
+        data = info.data
+        if 'base_asset' in data and 'quote_asset' in data:
+            expected = f"{data['base_asset']}{data['quote_asset']}"
+            if value != expected:
+                raise ValidationError(f'Expected {expected}, got {value}')
+        return value
+
+    @field_validator('launch_time')
+    def validate_launch_time(value: Any) -> int:
+        """Validate launch time is within acceptable range"""
+        if value < SymbolInfo.MIN_LAUNCH_TIME:
+            raise ValidationError(f"Launch time cannot be before {SymbolInfo.MIN_LAUNCH_TIME}")
+
+        max_time = TimeUtils.get_current_timestamp() + (24 * 60 * 60 * 1000)
+        if value > max_time:
+            raise ValidationError(f"Launch time cannot be more than 1 day in future")
+
+        return value
+
+    @computed_field
     @property
-    def token_name(self):
-        return self.name.lower().replace('usdt', '')
+    def token_name(self) -> str:
+        """Lowercase base asset name"""
+        return self.base_asset.lower()
+
+    @computed_field
+    @property
+    def trading_pair(self) -> str:
+        """Trading pair in format BASE/QUOTE"""
+        return f"{self.base_asset}/{self.quote_asset}"
 
     def check_retention_time(self, retention_days: int) -> 'SymbolInfo':
-        """Create new instance with adjusted launch time based on retention period"""
-        if retention_days > 0:
-            retention_start = TimeUtils.get_current_timestamp() - (retention_days * 24 * 60 * 60 * 1000)
-            new_launch_time = max(self.launch_time, retention_start)
+        """
+        Create new instance with adjusted launch time based on retention period.
 
-            return SymbolInfo(
-                name=self.name,
-                base_asset=self.base_asset,
-                quote_asset=self.quote_asset,
-                price_precision=self.price_precision,
-                qty_precision=self.qty_precision,
-                min_order_qty=self.min_order_qty,
-                launch_time=new_launch_time,
-                exchange=self.exchange
-            )
-        return self
+        Args:
+            retention_days: Number of days to retain data
+
+        Returns:
+            New SymbolInfo instance with adjusted launch time
+        """
+        if retention_days <= 0:
+            return self
+
+        retention_start = TimeUtils.get_current_timestamp() - (retention_days * 24 * 60 * 60 * 1000)
+        new_launch_time = max(self.launch_time, retention_start)
+
+        return self.model_copy(update={'launch_time': new_launch_time})
 
     def __hash__(self) -> int:
         """Hash based on name and exchange which uniquely identify a symbol"""
@@ -64,16 +186,15 @@ class SymbolInfo:
         """Human-readable string representation"""
         return f"{self.name} ({self.exchange})"
 
-    def __repr__(self) -> str:
-        """Detailed string representation for debugging"""
-        return (f"SymbolInfo(name='{self.name}', exchange='{self.exchange}', "
-                f"launch_time={self.launch_time}, "
-                f"base='{self.base_asset}', quote='{self.quote_asset}', "
-                f"price_prec={self.price_precision}, qty_prec={self.qty_precision}, "
-                f"min_qty={self.min_order_qty})")
-
     def __format__(self, format_spec: str) -> str:
-        """Support string formatting"""
+        """
+        Support string formatting
+
+        Format specs:
+            'short': Symbol name and exchange
+            'pair': Trading pair format (BASE/QUOTE)
+            default: Detailed representation
+        """
         if format_spec == 'short':
             return self.__str__()
         if format_spec == 'pair':
@@ -84,55 +205,174 @@ class SymbolInfo:
         """Consider symbol valid if it has a name and exchange"""
         return bool(self.name and self.exchange)
 
-    @property
-    def trading_pair(self) -> str:
-        """Get base/quote pair"""
-        return f"{self.base_asset}/{self.quote_asset}"
-
 
 # Kline Model
-@dataclass
-class KlineData:
-    """Domain model for kline data (business logic)"""
-    timestamp: int
-    open_price: Decimal
-    high_price: Decimal
-    low_price: Decimal
-    close_price: Decimal
-    volume: Decimal
-    turnover: Decimal
-    symbol: SymbolInfo
-    timeframe: Timeframe
+class KlineData(BaseModel):
+    """
+    Domain model for kline data with built-in validation
 
-    def to_tuple(self) -> Tuple[int, float, float, float, float, float, float]:
-        """Convert to tuple format for database storage"""
-        return (
-            self.timestamp,
-            float(self.open_price),
-            float(self.high_price),
-            float(self.low_price),
-            float(self.close_price),
-            float(self.volume),
-            float(self.turnover)
+    Attributes:
+        timestamp: Unix timestamp in milliseconds
+        open_price: Opening price of the period
+        high_price: Highest price during the period
+        low_price: Lowest price during the period
+        close_price: Closing price of the period
+        volume: Trading volume during the period
+        turnover: Trading turnover during the period
+        timeframe: Trading timeframe/interval
+    """
+
+    # Model configuration
+    model_config = ConfigDict(
+        frozen=True,
+        validate_assignment=True,
+        strict=True,  # Ensures strict type checking
+        json_schema_extra={
+            "example": {
+                "timestamp": 1635724800000,
+                "open_price": "60000.0",
+                "high_price": "61000.0",
+                "low_price": "59000.0",
+                "close_price": "60500.0",
+                "volume": "16.7",
+                "turnover": "1000000.0",
+                "timeframe": "60"
+            }
+        }
+    )
+
+    # Class variables (constants)
+    BYBIT_LAUNCH_DATE: ClassVar[int] = TimeUtils.to_timestamp(
+        datetime(2019, 11, 1, tzinfo=timezone.utc)
+    )
+    MAX_FUTURE_TOLERANCE: ClassVar[int] = 60  # seconds
+
+    # Fields with validation and metadata
+    timestamp: int = Field(
+        ...,  # ... means required
+        description="Unix timestamp in milliseconds",
+        examples=[1635724800000]
+    )
+    open_price: Decimal = Field(
+        ...,
+        description="Opening price of the period",
+        examples=["60000.0"]
+    )
+    high_price: Decimal = Field(
+        ...,
+        description="Highest price during the period",
+        examples=["61000.0"]
+    )
+    low_price: Decimal = Field(
+        ...,
+        description="Lowest price during the period",
+        examples=["59000.0"]
+    )
+    close_price: Decimal = Field(
+        ...,
+        description="Closing price of the period",
+        examples=["60500.0"]
+    )
+    volume: Decimal = Field(
+        ...,
+        description="Trading volume during the period",
+        ge=0,  # Built-in validation for greater than 0
+        examples=["16.7"]
+    )
+    turnover: Decimal = Field(
+        ...,
+        description="Trading turnover during the period",
+        ge=0,  # Built-in validation for greater than 0
+        examples=["1000000.0"]
+    )
+    timeframe: Timeframe = Field(
+        ...,
+        description="Trading timeframe/interval"
+    )
+
+    @field_validator('timestamp')
+    def validate_timestamp(value: Any) -> int:
+        """Validate timestamp is within acceptable range"""
+        if len(str(abs(value))) != 13:
+            raise ValidationError(
+                'Invalid timestamp length',
+                {'timestamp': f'Must be 13 digits, got {len(str(abs(value)))}'}
+            )
+
+        if value < KlineData.BYBIT_LAUNCH_DATE:
+            launch_date = TimeUtils.from_timestamp(KlineData.BYBIT_LAUNCH_DATE)
+            raise ValidationError(
+                'Invalid timestamp range',
+                {'timestamp': f'Cannot be before exchange launch ({launch_date})'}
+            )
+
+        current_time = TimeUtils.get_current_timestamp()
+        dt = TimeUtils.from_timestamp(value)
+        max_allowed = TimeUtils.from_timestamp(current_time) + timedelta(
+            seconds=KlineData.MAX_FUTURE_TOLERANCE
         )
 
+        if dt > max_allowed:
+            raise ValidationError(
+                'Future timestamp',
+                {'timestamp': f'Cannot be in future: {dt} > {max_allowed}'}
+            )
+
+        return value
+
+    @field_validator('open_price', 'high_price', 'low_price', 'close_price', 'volume', 'turnover')
+    def validate_numeric(value: Any, info: Any) -> Decimal:
+        """Validate and convert numeric values to Decimal"""
+        try:
+            decimal_value = Decimal(str(value))
+            if decimal_value < 0:
+                raise ValidationError(
+                    'Negative value',
+                    {info.field_name: f'Must be non-negative, got {value}'}
+                )
+            return decimal_value
+        except (ValueError, TypeError, InvalidOperation):
+            raise ValidationError(
+                'Invalid decimal',
+                {info.field_name: f'Cannot convert {value} to Decimal'}
+            )
+
+    @model_validator(mode='after')
+    def validate_price_relationships(self) -> 'KlineData':
+        """Validate OHLC price relationships follow market logic"""
+        if not (self.low_price <= min(self.open_price, self.close_price) <=
+                max(self.open_price, self.close_price) <= self.high_price):
+            raise ValidationError(
+                'Invalid OHLC relationships',
+                {
+                    'prices': {
+                        'open': self.open_price,
+                        'high': self.high_price,
+                        'low': self.low_price,
+                        'close': self.close_price,
+                        'message': 'Price relationships must follow: low ≤ open/close ≤ high'
+                    }
+                }
+            )
+        return self
+
 # Technical Indicator Models
-@dataclass
-class RSIResult:
+class RSIResult(BaseModel):
     """Relative Strength Index result"""
     timestamp: int
     value: Decimal
+    length: int = 14
 
     @classmethod
     def from_series(cls, timestamp: int, value: float, length: int = 14) -> 'RSIResult':
         # RSI column name format: 'RSI_14'
         return cls(
             timestamp=timestamp,
-            value=Decimal(str(value))
+            value=Decimal(str(value)),
+            length=length
         )
 
-@dataclass
-class MACDResult:
+class MACDResult(BaseModel):
     """MACD result"""
     timestamp: int
     macd: Decimal
@@ -151,8 +391,7 @@ class MACDResult:
             histogram=Decimal(str(macd_dict[f'MACDh{suffix}']))
         )
 
-@dataclass
-class BollingerBandsResult:
+class BollingerBandsResult(BaseModel):
     """Bollinger Bands result"""
     timestamp: int
     upper: Decimal
@@ -173,22 +412,22 @@ class BollingerBandsResult:
             bandwidth=Decimal(str(bb_dict[f'BBB{suffix}']))
         )
 
-@dataclass
-class MAResult:
+class MAResult(BaseModel):
     """Moving Average result"""
     timestamp: int
     value: Decimal
+    length: int = 20
 
     @classmethod
     def from_series(cls, timestamp: int, value: float, length: int = 20) -> 'MAResult':
         # MA column names format: 'SMA_20' or 'EMA_20'
         return cls(
             timestamp=timestamp,
-            value=Decimal(str(value))
+            value=Decimal(str(value)),
+            length=length
         )
 
-@dataclass
-class OBVResult:
+class OBVResult(BaseModel):
     """On Balance Volume result"""
     timestamp: int
     value: Decimal

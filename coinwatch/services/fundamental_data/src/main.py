@@ -16,7 +16,7 @@ from shared.database.repositories import MetadataRepository, MarketMetricsReposi
 from shared.messaging.broker import MessageBroker
 from shared.messaging.schemas import MessageType, ServiceStatusMessage
 from shared.utils.logger import LoggerSetup
-from shared.utils.time import TimeUtils
+import shared.utils.time as TimeUtils
 
 logger = LoggerSetup.setup(__name__)
 
