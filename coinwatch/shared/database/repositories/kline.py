@@ -1,6 +1,5 @@
 # src/repositories/kline.py
 
-from datetime import datetime
 from decimal import Decimal
 from typing import List, Optional, Tuple
 from sqlalchemy import select, and_, text
@@ -66,7 +65,7 @@ class KlineRepository:
                     )
                     return latest
                 else:
-                    logger.debug(f"No data found for {symbol.name} on {symbol.exchange}")
+                    logger.debug(f"No latest timestamp found for {symbol.name} on {symbol.exchange}")
                     return None
 
         except Exception as e:
@@ -186,7 +185,7 @@ class KlineRepository:
                     FROM {timeframe.continuous_aggregate_view} k
                     JOIN symbols s ON k.symbol_id = s.id
                     WHERE s.name = :symbol_name
-                    AND s.exchange = :exchange  -- Add exchange filter
+                    AND s.exchange = :exchange
                     AND k.timestamp BETWEEN :start_time AND :end_time
                     GROUP BY
                         time_bucket(:bucket, timestamp),
@@ -365,43 +364,6 @@ class KlineRepository:
         except Exception as e:
             logger.error(f"Error calculating klines for {symbol}: {e}")
             raise RepositoryError(f"Failed to calculate klines: {str(e)}")
-
-    async def refresh_continuous_aggregate(self,
-                                        timeframe: Timeframe,
-                                        start_time: datetime,
-                                        end_time: datetime) -> None:
-        """
-        Refresh a continuous aggregate for the given period.
-
-        Args:
-            timeframe: Timeframe of the continuous aggregate to refresh
-            start_time: Start time for refresh (datetime)
-            end_time: End time for refresh (datetime)
-        """
-        try:
-            async with self.db.session(isolation_level=IsolationLevel.SERIALIZABLE) as session:
-                await session.execute(
-                    text(f"""
-                    CALL refresh_continuous_aggregate(
-                        :view_name,
-                        :start_dt,
-                        :end_dt
-                    );
-                    """),
-                    {
-                        "view_name": timeframe.continuous_aggregate_view,
-                        "start_dt": start_time,
-                        "end_dt": end_time
-                    }
-                )
-                logger.debug(
-                    f"Refreshed continuous aggregate for timeframe {timeframe.value} "
-                    f"from {start_time} to {end_time}"
-                )
-
-        except Exception as e:
-            logger.error(f"Error refreshing continuous aggregate: {e}")
-            raise RepositoryError(f"Failed to refresh continuous aggregate: {str(e)}")
 
     async def insert_batch(self,
                         symbol: SymbolInfo,

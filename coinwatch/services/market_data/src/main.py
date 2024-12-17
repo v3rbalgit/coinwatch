@@ -33,7 +33,6 @@ async def publish_metrics():
                 recent_errors = service._error_tracker.get_recent_errors(60)
                 collection_errors = len([e for e in recent_errors if "collection" in str(e).lower()])
                 streaming_errors = len([e for e in recent_errors if "streaming" in str(e).lower()])
-                gap_errors = len([e for e in recent_errors if "gap" in str(e).lower()])
 
                 uptime = 0.0
                 if service._start_time is not None:
@@ -56,7 +55,7 @@ async def publish_metrics():
                             "streaming_symbols": len(service.data_collector._streaming_symbols),
                             "streaming_errors": streaming_errors,
                             "collection_errors": collection_errors,
-                            "data_gaps": gap_errors,
+                            "batch_size": service._batch_size,
                             "last_error": str(service._last_error) if service._last_error else None
                         }
                     ).model_dump()
@@ -164,7 +163,6 @@ async def get_metrics():
         recent_errors = service._error_tracker.get_recent_errors(60)
         collection_errors = len([e for e in recent_errors if "collection" in str(e).lower()])
         streaming_errors = len([e for e in recent_errors if "streaming" in str(e).lower()])
-        gap_errors = len([e for e in recent_errors if "gap" in str(e).lower()])
 
         return {
             "status": service._status.value,
@@ -177,7 +175,7 @@ async def get_metrics():
             "streaming_symbols": len(service.data_collector._streaming_symbols),
             "streaming_errors": streaming_errors,
             "collection_errors": collection_errors,
-            "data_gaps": gap_errors
+            "batch_size": service._batch_size
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to collect metrics: {str(e)}")
