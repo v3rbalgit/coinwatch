@@ -10,7 +10,7 @@ from shared.database.connection import DatabaseConnection
 from shared.core.models import Platform, SymbolInfo, Metadata
 from shared.core.exceptions import RepositoryError
 from shared.database.models import TokenMetadata, TokenPlatform
-from shared.utils.time import TimeUtils
+import shared.utils.time as TimeUtils
 from shared.utils.logger import LoggerSetup
 
 

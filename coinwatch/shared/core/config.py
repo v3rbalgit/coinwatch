@@ -211,6 +211,7 @@ class Config:
         self.fundamental_data = self._init_fundamental_data_config()
         self.monitoring = self._init_monitor_config()
         self.api = self._init_api_config()
+        self.redis_url = os.getenv('REDIS_URL', 'redis://redis:6379')
 
     def _init_database_config(self) -> DatabaseConfig:
         """Initialize database configuration"""

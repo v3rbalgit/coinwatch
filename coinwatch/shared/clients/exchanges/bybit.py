@@ -144,6 +144,7 @@ class BybitAdapter(ExchangeAdapter):
 
                     symbols.append(SymbolInfo(
                         name=item['symbol'],
+                        exchange='bybit',
                         base_asset=item['baseCoin'],
                         quote_asset=item['quoteCoin'],
                         price_precision=str(item['priceFilter']['tickSize']).count('0'),
@@ -210,7 +211,6 @@ class BybitAdapter(ExchangeAdapter):
                     close_price=Decimal(item[4]),
                     volume=Decimal(item[5]),
                     turnover=Decimal(item[6]),
-                    symbol=symbol,
                     timeframe=timeframe
                 ) for item in reversed(data.get('list', []))]
 

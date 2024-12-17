@@ -10,7 +10,7 @@ from shared.core.exceptions import ServiceError
 from shared.core.models import Metadata, Platform
 from shared.database.repositories.metadata import MetadataRepository
 from shared.utils.logger import LoggerSetup
-from shared.utils.time import TimeUtils
+import shared.utils.time as TimeUtils
 
 logger = LoggerSetup.setup(__name__)
 

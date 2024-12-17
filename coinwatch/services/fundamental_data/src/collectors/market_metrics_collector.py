@@ -10,7 +10,7 @@ from shared.core.models import MarketMetrics
 from shared.core.exceptions import ServiceError
 from shared.database.repositories.market import MarketMetricsRepository
 from shared.utils.logger import LoggerSetup
-from shared.utils.time import TimeUtils
+import shared.utils.time as TimeUtils
 
 logger = LoggerSetup.setup(__name__)
 

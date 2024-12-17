@@ -6,7 +6,7 @@ from shared.core.config import MonitoringConfig
 from shared.core.service import ServiceBase
 from shared.messaging.broker import MessageBroker
 from shared.messaging.schemas import MessageType, ServiceStatusMessage
-from shared.utils.time import TimeUtils
+import shared.utils.time as TimeUtils
 from shared.utils.logger import LoggerSetup
 from .metrics_collector import MetricsCollector
 from .monitor_metrics import MonitoringMetrics

@@ -2,13 +2,13 @@ import os
 import asyncio
 from typing import Optional
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .service import MarketDataService
 from shared.core.config import Config
-from shared.core.enums import ServiceStatus
+from shared.core.enums import ServiceStatus, Timeframe
 from shared.database.connection import DatabaseConnection
 from shared.database.repositories import SymbolRepository, KlineRepository
 from shared.messaging.broker import MessageBroker
@@ -16,13 +16,17 @@ from shared.messaging.schemas import MessageType, ServiceStatusMessage
 from shared.clients.exchanges import BybitAdapter
 from shared.clients.registry import ExchangeAdapterRegistry
 from shared.utils.logger import LoggerSetup
-from shared.utils.time import TimeUtils
+import shared.utils.time as TimeUtils
+from shared.managers.timeframe import TimeframeManager
+from shared.managers.indicator import IndicatorManager
 
 logger = LoggerSetup.setup(__name__)
 
 # Service instance
 service: Optional[MarketDataService] = None
 metrics_task: Optional[asyncio.Task] = None
+timeframe_manager: Optional[TimeframeManager] = None
+indicator_manager: Optional[IndicatorManager] = None
 
 async def publish_metrics():
     """Periodically publish service metrics"""
@@ -70,7 +74,7 @@ async def publish_metrics():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Service lifecycle manager"""
-    global service, metrics_task
+    global service, metrics_task, timeframe_manager, indicator_manager
 
     try:
         config = Config()
@@ -89,6 +93,10 @@ async def lifespan(app: FastAPI):
 
         # Initialize message broker
         message_broker = MessageBroker("market_data")
+
+        # Initialize managers
+        timeframe_manager = TimeframeManager(message_broker, kline_repository, config.redis_url)
+        indicator_manager = IndicatorManager(config.redis_url)
 
         service = MarketDataService(
             symbol_repository=symbol_repository,
@@ -116,6 +124,10 @@ async def lifespan(app: FastAPI):
                 await metrics_task
             except asyncio.CancelledError:
                 pass
+        if timeframe_manager:
+            await timeframe_manager.cleanup()
+        if indicator_manager:
+            await indicator_manager.cleanup()
         if service:
             await db.close()
             await service.stop()
@@ -137,6 +149,211 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Business endpoints
+@app.get("/symbols")
+async def get_symbols():
+    """Get all trading symbols"""
+    if not service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    try:
+        symbols = sorted(list(service._active_symbols), key=lambda x: x.name)
+        return {
+            "symbols": [symbol.model_dump() for symbol in symbols]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch symbols: {str(e)}")
+
+@app.get("/symbols/{symbol}")
+async def get_symbol(symbol: str):
+    """Get details for a specific symbol"""
+    if not service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    try:
+        # Find symbol in active symbols
+        symbol_info = next(
+            (s for s in service._active_symbols if s.name == symbol),
+            None
+        )
+        if not symbol_info:
+            raise HTTPException(status_code=404, detail=f"Symbol {symbol} not found")
+
+        return symbol_info.model_dump()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch symbol details: {str(e)}")
+
+@app.get("/klines/{symbol}")
+async def get_klines(
+    symbol: str,
+    interval: str = Query(..., description="Candlestick timeframe (e.g., 5, 15, 60, D)"),
+    start_time: Optional[int] = None,
+    end_time: Optional[int] = None,
+    limit: Optional[int] = 200
+):
+    """
+    Get candlestick data for a symbol
+
+    Args:
+        symbol: Trading pair symbol (e.g., BTCUSDT)
+        interval: Candlestick timeframe (e.g., 5, 15, 60, D)
+        start_time: Optional start time in milliseconds
+        end_time: Optional end time in milliseconds
+        limit: Optional limit on number of candles (default 200)
+    """
+    if not service or not timeframe_manager:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    try:
+        # Find symbol in active symbols
+        symbol_info = next(
+            (s for s in service._active_symbols if s.name == symbol),
+            None
+        )
+        if not symbol_info:
+            raise HTTPException(status_code=404, detail=f"Symbol {symbol} not found")
+
+        # Convert interval string to Timeframe enum
+        try:
+            timeframe = Timeframe(interval)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid interval: {interval}. Valid values are: {[tf.value for tf in Timeframe]}"
+            )
+
+        # Get klines using timeframe manager
+        klines = await timeframe_manager.get_klines(
+            symbol=symbol_info,
+            timeframe=timeframe,
+            start_time=start_time,
+            end_time=end_time,
+            limit=limit
+        )
+
+        return {
+            "symbol": symbol,
+            "interval": timeframe.value,
+            "klines": [
+                {
+                    "timestamp": kline.timestamp,
+                    "open": str(kline.open_price),
+                    "high": str(kline.high_price),
+                    "low": str(kline.low_price),
+                    "close": str(kline.close_price),
+                    "volume": str(kline.volume),
+                    "turnover": str(kline.turnover)
+                } for kline in klines
+            ]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch klines: {str(e)}")
+
+@app.get("/indicators/{symbol}/{indicator}")
+async def get_indicator(
+    symbol: str,
+    indicator: str,
+    interval: str = Query(..., description="Candlestick timeframe (e.g., 5, 15, 60, D)"),
+    start_time: Optional[int] = None,
+    end_time: Optional[int] = None,
+    length: Optional[int] = None,
+    fast_length: Optional[int] = None,
+    slow_length: Optional[int] = None,
+    signal_length: Optional[int] = None,
+    std_dev: Optional[float] = None
+):
+    """
+    Get technical indicator values for a symbol
+
+    Args:
+        symbol: Trading pair symbol (e.g., BTCUSDT)
+        indicator: Indicator type (rsi, macd, bb, sma, ema, obv)
+        interval: Candlestick timeframe (e.g., 5, 15, 60, D)
+        start_time: Optional start time in milliseconds
+        end_time: Optional end time in milliseconds
+        length: Period length for RSI, BB, SMA, EMA
+        fast_length: Fast period for MACD
+        slow_length: Slow period for MACD
+        signal_length: Signal period for MACD
+        std_dev: Standard deviation for Bollinger Bands
+    """
+    if not service or not timeframe_manager or not indicator_manager:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    try:
+        # Find symbol in active symbols
+        symbol_info = next(
+            (s for s in service._active_symbols if s.name == symbol),
+            None
+        )
+        if not symbol_info:
+            raise HTTPException(status_code=404, detail=f"Symbol {symbol} not found")
+
+        # Convert interval string to Timeframe enum
+        try:
+            timeframe = Timeframe(interval)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid interval: {interval}. Valid values are: {[tf.value for tf in Timeframe]}"
+            )
+
+        # Get klines first
+        klines = await timeframe_manager.get_klines(
+            symbol=symbol_info,
+            timeframe=timeframe,
+            start_time=start_time,
+            end_time=end_time
+        )
+
+        # Calculate indicator based on type
+        indicator = indicator.lower()
+        result = None
+
+        if indicator == "rsi":
+            result = await indicator_manager.calculate_rsi(klines, length or 14)
+        elif indicator == "macd":
+            result = await indicator_manager.calculate_macd(
+                klines,
+                fast=fast_length or 12,
+                slow=slow_length or 26,
+                signal=signal_length or 9
+            )
+        elif indicator == "bb":
+            result = await indicator_manager.calculate_bollinger_bands(
+                klines,
+                length=length or 20,
+                std_dev=std_dev or 2.0
+            )
+        elif indicator == "sma":
+            result = await indicator_manager.calculate_sma(klines, period=length or 20)
+        elif indicator == "ema":
+            result = await indicator_manager.calculate_ema(klines, period=length or 20)
+        elif indicator == "obv":
+            result = await indicator_manager.calculate_obv(klines)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported indicator: {indicator}"
+            )
+
+        return {
+            "symbol": symbol,
+            "indicator": indicator,
+            "interval": timeframe.value,
+            "values": [value.model_dump() for value in result]
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to calculate indicator: {str(e)}")
+
+# Service endpoints
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""

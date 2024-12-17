@@ -11,7 +11,7 @@ from shared.database.connection import DatabaseConnection
 from shared.database.models.fundamental_data import TokenMarketMetrics
 from shared.core.exceptions import RepositoryError
 from shared.utils.logger import LoggerSetup
-from shared.utils.time import TimeUtils
+import shared.utils.time as TimeUtils
 
 logger = LoggerSetup.setup(__name__)
 

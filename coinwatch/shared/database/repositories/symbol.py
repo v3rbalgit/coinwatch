@@ -8,7 +8,7 @@ from shared.database.connection import DatabaseConnection, IsolationLevel
 from shared.database.models import Symbol
 from shared.core.exceptions import RepositoryError
 from shared.utils.logger import LoggerSetup
-from shared.utils.time import TimeUtils
+import shared.utils.time as TimeUtils
 
 logger = LoggerSetup.setup(__name__)
 
