@@ -238,7 +238,5 @@ class BybitAdapter(ExchangeAdapter):
 
     async def cleanup(self) -> None:
         """Cleanup resources"""
-        # Use APIAdapter's session cleanup
         await super().cleanup()
-        # Cleanup websocket client
-        await self._ws_client.cleanup()
+        await self._ws_client.stop()

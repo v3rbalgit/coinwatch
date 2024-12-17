@@ -40,16 +40,17 @@ class DataCollector:
         self._message_broker = message_broker
         self._base_timeframe = base_timeframe
 
-        # State management - separate locks for collection and streaming
-        self._collection_lock = asyncio.Lock()
-        self._processing_symbols: Set[SymbolInfo] = set()
-        self._streaming_lock = asyncio.Lock()
-        self._streaming_symbols: Set[SymbolInfo] = set()
-        self._symbol_progress: Dict[SymbolInfo, MarketDataProgress] = {}
-
-        # Separate adapters for collection and streaming
+        # Adapters
         self._collection_adapter = None
         self._streaming_adapter = None
+
+        # State management - separate locks for collection and streaming
+        self._collection_lock = asyncio.Lock()
+        self._streaming_lock = asyncio.Lock()
+        self._collection_progress: Dict[SymbolInfo, MarketDataProgress] = {}
+        self._processing_symbols: Set[SymbolInfo] = set()
+        self._streaming_symbols: Set[SymbolInfo] = set()
+
 
     async def collect(self, symbol: SymbolInfo, start_time: int, end_time: int, context: Dict[str, Any]) -> None:
         """
@@ -71,14 +72,13 @@ class DataCollector:
                     logger.info(f"Collection already in progress for {symbol.name} on {symbol.exchange}, skipping")
                     return
 
-            # Process collection
+            # Align the start and end timestamps to interval boundaries
             start_time, end_time = self._align_time_range((start_time, end_time), self._base_timeframe)
             if start_time == end_time:
                 logger.info(f"No data to collect for {symbol.name} on {symbol.exchange}, skipping collection")
-                return
-
-            # Collect all required data including any gaps
-            await self._collect_with_gaps(symbol, start_time, end_time, context)
+            else:
+                # Collect all required data including any gaps
+                await self._collect_with_gaps(symbol, start_time, end_time, context)
 
             # Start streaming if not already streaming
             if symbol not in self._streaming_symbols:
@@ -91,12 +91,18 @@ class DataCollector:
             # Clean up collection state
             async with self._collection_lock:
                 self._processing_symbols.remove(symbol)
-                self._symbol_progress.pop(symbol, None)
+                self._collection_progress.pop(symbol, None)
 
     async def _collect_with_gaps(self, symbol: SymbolInfo, start_time: int, end_time: int, context: Dict[str, Any]) -> None:
         """
         Collect data for a time range and handle any gaps that are found.
         This method will continue collecting until all gaps are filled.
+
+        Args:
+            symbol (SymbolInfo): Symbol to start the price data collection for.
+            start_time (int): Start timestamp for collection.
+            end_time (int): End timestamp for collection.
+            context (Dict[str, Any]): Additional context for collection (initial, gap_fill).
         """
         while True:
             # Initialize progress tracking with total candles calculation
@@ -105,19 +111,19 @@ class DataCollector:
                 time_range=(start_time, end_time),
                 timeframe=self._base_timeframe
             )
-            self._symbol_progress[symbol] = progress
+            self._collection_progress[symbol] = progress
 
             # Process current range
             processed_count = 0
             async for processed in self._process_collection(symbol, start_time, end_time):
                 # Update progress
                 processed_count += processed
-                if progress := self._symbol_progress.get(symbol):
+                if progress := self._collection_progress.get(symbol):
                     progress.update(processed_count)
                     logger.info(progress)
 
             # Log completion of current range
-            if progress := self._symbol_progress.get(symbol):
+            if progress := self._collection_progress.get(symbol):
                 logger.info(progress.get_completion_summary(TimeUtils.get_current_datetime()))
 
             # Publish completion message
@@ -226,68 +232,80 @@ class DataCollector:
         """Start real-time data streaming for a symbol"""
         try:
             async with self._streaming_lock:
+                if not self._streaming_adapter:
+                    self._streaming_adapter = self._adapter_registry.get_adapter(symbol.exchange)
+
                 # Start streaming if not already streaming
                 if symbol not in self._streaming_symbols:
-                    if not self._streaming_adapter:
-                        self._streaming_adapter = self._adapter_registry.get_adapter(symbol.exchange)
+                    # Create handler for this symbol
                     handler = await self._create_kline_handler(symbol)
-                    await self._streaming_adapter.subscribe_klines(
-                        symbol,
-                        self._base_timeframe,
-                        handler
-                    )
+
+                    # Subscribe to klines
+                    await self._streaming_adapter.subscribe_klines(symbol, self._base_timeframe, handler)
+
                     self._streaming_symbols.add(symbol)
                     logger.info(f"Streaming started for {symbol.name} on {symbol.exchange}")
 
         except Exception as e:
             logger.error(f"Failed to start streaming for {symbol}: {e}")
             await self._publish_error("StreamingError", str(e), symbol, 0, 0, {"type": "streaming"})
+            raise
 
     async def _stop_streaming(self, symbol: SymbolInfo) -> None:
         """Stop streaming for a symbol"""
         async with self._streaming_lock:
             if symbol in self._streaming_symbols:
-                if not self._streaming_adapter:
-                    self._streaming_adapter = self._adapter_registry.get_adapter(symbol.exchange)
-                await self._streaming_adapter.unsubscribe_klines(symbol, self._base_timeframe)
-                self._streaming_symbols.remove(symbol)
-                logger.info(f"Streaming stopped for {symbol.name} on {symbol.exchange}")
+                try:
+                    if not self._streaming_adapter:
+                        self._streaming_adapter = self._adapter_registry.get_adapter(symbol.exchange)
+
+                    # Unsubscribe from websocket
+                    await self._streaming_adapter.unsubscribe_klines(symbol, self._base_timeframe)
+
+                    self._streaming_symbols.remove(symbol)
+                    logger.info(f"Streaming stopped for {symbol.name} on {symbol.exchange}")
+
+                except Exception as e:
+                    logger.error(f"Error stopping streaming for {symbol}: {e}")
+                    raise
 
     async def _create_kline_handler(self, symbol: SymbolInfo) -> Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]:
+        """Create a handler for kline updates"""
         async def handle_update(data: Dict[str, Any]) -> None:
-            await self._handle_kline_update(symbol, data)
+            try:
+                # Extract kline data from the message
+                kline_data = data.get('data', [{}])[0]
+
+                # Skip unconfirmed candles
+                if not kline_data.get('confirm', False):
+                    return
+
+                # Create KlineData object
+                kline = KlineData(
+                    symbol=symbol,
+                    timeframe=self._base_timeframe,
+                    timestamp=int(kline_data['start']),
+                    open_price=Decimal(str(kline_data['open'])),
+                    high_price=Decimal(str(kline_data['high'])),
+                    low_price=Decimal(str(kline_data['low'])),
+                    close_price=Decimal(str(kline_data['close'])),
+                    volume=Decimal(str(kline_data['volume'])),
+                    turnover=Decimal(str(kline_data['turnover']))
+                )
+
+                # Store the kline
+                await self._kline_repository.insert_batch(symbol, self._base_timeframe, [kline.to_tuple()])
+
+                # Publish update
+                await self._publish_kline_update(symbol, kline)
+
+                logger.info(f"New kline for {symbol.name} on {symbol.exchange}")
+
+            except Exception as e:
+                logger.error(f"Error handling kline update for {symbol}: {e}")
+                await self._publish_error("StreamingError", str(e), symbol, 0, 0, {"type": "streaming_update"})
+
         return handle_update
-
-    async def _handle_kline_update(self, symbol: SymbolInfo, data: Dict[str, Any]) -> None:
-        """Handle real-time kline updates from websocket"""
-        try:
-            kline_data = data.get('data', [{}])[0]
-            if not kline_data.get('confirm', False):
-                return  # Skip unconfirmed candles
-
-            kline = KlineData(
-                timestamp=int(kline_data['start']),
-                open_price=Decimal(str(kline_data['open'])),
-                high_price=Decimal(str(kline_data['high'])),
-                low_price=Decimal(str(kline_data['low'])),
-                close_price=Decimal(str(kline_data['close'])),
-                volume=Decimal(str(kline_data['volume'])),
-                turnover=Decimal(str(kline_data['turnover'])),
-                symbol=symbol,
-                timeframe=self._base_timeframe
-            )
-
-            await self._kline_repository.insert_batch(
-                symbol,
-                self._base_timeframe,
-                [kline.to_tuple()]
-            )
-
-            await self._publish_kline_update(symbol, kline)
-
-        except Exception as e:
-            logger.error(f"Error handling kline update for {symbol}: {e}")
-            await self._publish_error("StreamingError", str(e), symbol, 0, 0, {"type": "streaming"})
 
     async def delist(self, symbol: SymbolInfo) -> None:
         """Handle symbol delisting"""
@@ -322,11 +340,10 @@ class DataCollector:
                 exchange=symbol.exchange,
                 start_time=start_time,
                 end_time=end_time,
-                processed=self._symbol_progress[symbol].processed_candles,
+                processed=self._collection_progress[symbol].processed_candles,
                 context=context
             ).model_dump()
         )
-
 
     async def _publish_kline_update(self, symbol: SymbolInfo, kline: KlineData) -> None:
         """Publish kline update message"""
@@ -350,7 +367,7 @@ class DataCollector:
         )
 
     async def _publish_error(self, error_type: str, message: str, symbol: SymbolInfo,
-                           start_time: int, end_time: int, context: Dict[str, Any]) -> None:
+                             start_time: int, end_time: int, context: Dict[str, Any]) -> None:
         """Publish error message"""
         await self._message_broker.publish(
             MessageType.ERROR_REPORTED,
@@ -376,13 +393,23 @@ class DataCollector:
         """Cleanup resources"""
         logger.info("Cleaning up DataCollector")
 
-        # Stop all streaming
-        for symbol in list(self._streaming_symbols):
-            await self._stop_streaming(symbol)
+        try:
+            # Stop all streaming
+            streaming_symbols = list(self._streaming_symbols)
+            for symbol in streaming_symbols:
+                await self._stop_streaming(symbol)
 
-        self._streaming_symbols.clear()
-        self._processing_symbols.clear()
-        logger.info("DataCollector cleanup completed")
+            # Cleanup streaming adapter if it exists
+            if self._streaming_adapter:
+                await self._streaming_adapter.cleanup()
+
+            self._streaming_symbols.clear()
+            self._processing_symbols.clear()
+            logger.info("DataCollector cleanup completed")
+
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+            raise
 
     def get_collection_status(self) -> str:
         """Get collection status"""
@@ -396,7 +423,7 @@ class DataCollector:
         if self._processing_symbols:
             status_lines.append("\nActive Collections:")
             for symbol in self._processing_symbols:
-                if progress := self._symbol_progress.get(symbol):
+                if progress := self._collection_progress.get(symbol):
                     percentage = progress.get_percentage()
                     status_lines.append(
                         f"  {symbol}: {percentage:.1f}% complete "

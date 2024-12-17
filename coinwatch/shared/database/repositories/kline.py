@@ -472,7 +472,7 @@ class KlineRepository:
 
                 if klines:
                     logger.debug(
-                        f"Processed {inserted_count} klines for {symbol}, "
+                        f"Processed {inserted_count} klines for {symbol.name} on {symbol.exchange}, "
                         f"last timestamp: {TimeUtils.from_timestamp(klines[-1][0])}"
                     )
 
