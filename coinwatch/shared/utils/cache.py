@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, Callable, Awaitable, Type, cast, get_ori
 from pydantic import BaseModel
 from redis.asyncio import Redis
 
-from shared.core.enums import Timeframe
+from shared.core.enums import Interval
 from shared.core.models import (
     KlineData,
     RSIResult, BollingerBandsResult, MACDResult, MAResult, OBVResult
@@ -110,8 +110,8 @@ class redis_cached[T]:
 
     def _convert_to_enum(self, value: Any, field_type: Any) -> Any:
         """Convert string values back to Enum where needed"""
-        if isinstance(value, str) and field_type == Timeframe:
-            return Timeframe(value)
+        if isinstance(value, str) and field_type == Interval:
+            return Interval(value)
         return value
 
     def _deserialize_model(self, data: Dict[str, Any], model_class: Type[BaseModel]) -> BaseModel:
@@ -128,8 +128,8 @@ class redis_cached[T]:
             field_type = field_types.get(k)
             if field_type == Decimal:
                 converted_data[k] = self._convert_to_decimal(v)
-            elif field_type == Timeframe:
-                converted_data[k] = self._convert_to_enum(v, Timeframe)
+            elif field_type == Interval:
+                converted_data[k] = self._convert_to_enum(v, Interval)
             else:
                 converted_data[k] = v
 

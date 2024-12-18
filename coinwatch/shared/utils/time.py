@@ -2,23 +2,20 @@ from datetime import datetime, timedelta, timezone
 import time
 from typing import Tuple
 
-from shared.core.enums import Timeframe
+from shared.core.enums import Interval
 
 
 def get_current_timestamp() -> int:
     """Get current time as millisecond timestamp"""
     return int(time.time() * 1000)
 
-
 def get_current_datetime() -> datetime:
     """Get current time as UTC datetime"""
     return datetime.now(timezone.utc)
 
-
 def from_timestamp(timestamp: int) -> datetime:
     """Convert millisecond timestamp to UTC datetime"""
     return datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
-
 
 def to_timestamp(dt: datetime) -> int:
     """Convert datetime to millisecond timestamp"""
@@ -28,9 +25,9 @@ def to_timestamp(dt: datetime) -> int:
         dt = dt.astimezone(timezone.utc)
     return int(dt.timestamp() * 1000)
 
-def align_time_range_to_interval(start_time: int, end_time: int, base_timeframe: Timeframe) -> Tuple[int, int]:
+def align_time_range_to_interval(start_time: int, end_time: int, base_interval: Interval) -> Tuple[int, int]:
     """
-    Align start and end timestamps to base timeframe taking into account the last closed timestamp.
+    Align start and end timestamps to base interval taking into account the last closed timestamp.
 
     Args:
         start_time (int): Start timestamp of the time range.
@@ -40,7 +37,7 @@ def align_time_range_to_interval(start_time: int, end_time: int, base_timeframe:
     Returns:
         Tuple[int,int]: Aligned range of timestamps.
     """
-    interval_ms = base_timeframe.to_milliseconds()
+    interval_ms = base_interval.to_milliseconds()
     aligned_start = start_time - (start_time % interval_ms)
     current_time = get_current_timestamp()
     aligned_end = min(
@@ -49,59 +46,70 @@ def align_time_range_to_interval(start_time: int, end_time: int, base_timeframe:
     )
     return aligned_start, aligned_end
 
-def align_timestamp_to_interval(timestamp: int, timeframe: Timeframe, round_up: bool = False) -> int:
-        """
-        Align timestamp to timeframe boundary ensuring proper interval alignment.
+def align_timestamp_to_interval(timestamp: int, interval: Interval, round_up: bool = False) -> int:
+    """
+    Align timestamp to interval boundary ensuring proper interval alignment.
+    If round_up is True and the timestamp is not already aligned, rounds up to the next interval boundary.
+    If round_up is False, always rounds down to the current interval boundary.
 
-        Examples:
-        - 15min: :00, :15, :30, :45
-        - 30min: :00, :30
-        - 1h: :00
-        - 4h: :00, 04:00, 08:00, etc.
-        - 1d: 00:00 UTC
+    Examples:
+        With round_up=False:
+        - 14:05 aligned to 15min → 14:00
+        - 14:17 aligned to 15min → 14:15
+        - 14:02 aligned to 1h → 14:00
+        - 2024-01-09 15:30 aligned to 1d → 2024-01-09 00:00
+        - 2024-01-09 aligned to 1w → 2024-01-08 (Monday)
 
-        Args:
-            timestamp (int): Timestamp to align to interval.
-            timeframe (Timeframe): Interval (timeframe) to align to.
-            round_up (bool): Whether to align up or down (for end timestamps).
+        With round_up=True:
+        - 14:05 aligned to 15min → 14:15
+        - 14:17 aligned to 15min → 14:30
+        - 14:02 aligned to 1h → 15:00
+        - 2024-01-09 15:30 aligned to 1d → 2024-01-10 00:00
+        - 2024-01-09 aligned to 1w → 2024-01-15 (next Monday)
 
-        Returns:
-            int: Timestamp aligned to nearest interval boundary.
-        """
+    Args:
+        timestamp (int): Timestamp to align to interval.
+        interval (Interval): Interval to align to.
+        round_up (bool): Whether to align to the next interval boundary if not already aligned.
 
-        # Convert to datetime for easier manipulation
-        dt = from_timestamp(timestamp)
+    Returns:
+        int: Timestamp aligned to interval boundary.
+    """
+    # Convert to datetime for easier manipulation
+    dt = from_timestamp(timestamp)
 
-        if timeframe == Timeframe.DAY_1:
-            # Align to UTC midnight
-            aligned = dt.replace(hour=0, minute=0, second=0, microsecond=0)
-        elif timeframe == Timeframe.WEEK_1:
-            # Align to UTC midnight Monday
-            aligned = dt.replace(hour=0, minute=0, second=0, microsecond=0)
-            days_since_monday = dt.weekday()
-            aligned -= timedelta(days=days_since_monday)
+    if interval == Interval.DAY_1:
+        # Align to UTC midnight
+        aligned = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif interval == Interval.WEEK_1:
+        # Align to UTC midnight Monday
+        aligned = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        days_since_monday = dt.weekday()
+        aligned -= timedelta(days=days_since_monday)
+    else:
+        # For minute-based intervals
+        minutes = int(interval.value) if interval.value.isdigit() else 0
+        total_minutes = dt.hour * 60 + dt.minute
+        aligned_minutes = (total_minutes // minutes) * minutes
+
+        aligned = dt.replace(
+            hour=aligned_minutes // 60,
+            minute=aligned_minutes % 60,
+            second=0,
+            microsecond=0
+        )
+
+    # If timestamp is not already aligned and round_up is True,
+    # move to the next interval boundary
+    if round_up and aligned < dt:
+        if interval == Interval.WEEK_1:
+            aligned += timedelta(days=7)
+        elif interval == Interval.DAY_1:
+            aligned += timedelta(days=1)
         else:
-            # For minute-based timeframes
-            minutes = int(timeframe.value) if timeframe.value.isdigit() else 0
-            total_minutes = dt.hour * 60 + dt.minute
-            aligned_minutes = (total_minutes // minutes) * minutes
+            aligned += timedelta(minutes=minutes)
 
-            aligned = dt.replace(
-                hour=aligned_minutes // 60,
-                minute=aligned_minutes % 60,
-                second=0,
-                microsecond=0
-            )
-
-        if round_up and aligned < dt:
-            if timeframe == Timeframe.WEEK_1:
-                aligned += timedelta(days=7)
-            elif timeframe == Timeframe.DAY_1:
-                aligned += timedelta(days=1)
-            else:
-                aligned += timedelta(minutes=minutes)
-
-        return to_timestamp(aligned)
+    return to_timestamp(aligned)
 
 def format_time_difference(time_difference_ms: int) -> str:
     """

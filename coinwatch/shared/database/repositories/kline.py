@@ -3,11 +3,11 @@ from typing import List, Optional, Tuple
 from sqlalchemy import select, and_, text
 from sqlalchemy.dialects.postgresql import insert
 
-from shared.core.enums import IsolationLevel, Timeframe
+from shared.core.enums import IsolationLevel, Interval
 from shared.core.models import KlineData, SymbolInfo
 from shared.database.connection import DatabaseConnection
 from shared.database.models.market_data import Symbol, Kline
-from shared.core.exceptions import RepositoryError, ValidationError
+from shared.core.exceptions import RepositoryError
 from shared.utils.logger import LoggerSetup
 import shared.utils.time as TimeUtils
 
@@ -70,16 +70,16 @@ class KlineRepository:
 
     async def get_base_klines(self,
                             symbol: SymbolInfo,
-                            timeframe: Timeframe,
+                            interval: Interval,
                             start_time: int,
                             end_time: int,
                             limit: Optional[int] = None) -> List[KlineData]:
         """
-        Get kline data directly at base timeframe without any aggregation.
+        Get kline data directly at base interval without any aggregation.
 
         Args:
             symbol: Symbol to get data for
-            timeframe: Base timeframe
+            interval: Base interval
             start_time: Start timestamp
             end_time: End timestamp
             limit: Optional limit on number of klines
@@ -99,12 +99,12 @@ class KlineRepository:
                         k.volume,
                         k.turnover,
                         s.name as symbol,
-                        k.timeframe
+                        k.interval
                     FROM kline_data k
                     JOIN symbols s ON k.symbol_id = s.id
                     WHERE s.name = :symbol
                     AND s.exchange = :exchange
-                    AND k.timeframe = :timeframe
+                    AND k.interval = :interval
                     AND k.timestamp BETWEEN :start_time AND :end_time
                     ORDER BY k.timestamp DESC
                     LIMIT :limit
@@ -115,7 +115,7 @@ class KlineRepository:
                     {
                         "symbol": symbol.name,
                         "exchange": symbol.exchange,
-                        "timeframe": timeframe.value,
+                        "interval": interval.value,
                         "start_time": TimeUtils.from_timestamp(start_time),
                         "end_time": TimeUtils.from_timestamp(end_time),
                         "limit": limit or 2147483647
@@ -131,7 +131,7 @@ class KlineRepository:
                     close_price=Decimal(str(row.close_price)),
                     volume=Decimal(str(row.volume)),
                     turnover=Decimal(str(row.turnover)),
-                    timeframe=Timeframe(row.timeframe)
+                    interval=Interval(row.interval)
                 )
                 for row in result
             ]
@@ -142,7 +142,7 @@ class KlineRepository:
 
     async def get_stored_klines(self,
                               symbol: SymbolInfo,
-                              timeframe: Timeframe,
+                              interval: Interval,
                               start_time: int,
                               end_time: int,
                               limit: Optional[int] = None) -> List[KlineData]:
@@ -151,7 +151,7 @@ class KlineRepository:
 
         Args:
             symbol: Symbol to get data for
-            timeframe: Target timeframe (must be a continuous aggregate timeframe)
+            interval: Target interval (must be a continuous aggregate interval)
             start_time: Start timestamp
             end_time: End timestamp
             limit: Optional limit on number of klines
@@ -172,8 +172,8 @@ class KlineRepository:
                         k.turnover,
                         s.name AS symbol_name,
                         s.exchange AS symbol_exchange,
-                        k.timeframe
-                    FROM {timeframe.continuous_aggregate_view} k
+                        k.interval
+                    FROM {interval.continuous_aggregate_view} k
                     JOIN market_data.symbols s ON k.symbol_id = s.id
                     WHERE s.name = :symbol_name
                     AND s.exchange = :exchange
@@ -189,7 +189,7 @@ class KlineRepository:
                         "exchange": symbol.exchange,
                         "start_time": TimeUtils.from_timestamp(start_time),
                         "end_time": TimeUtils.from_timestamp(end_time),
-                        "bucket": timeframe.get_bucket_interval(),
+                        "bucket": interval.get_bucket_interval(),
                         "limit": limit or 2147483647
                     }
                 )
@@ -203,7 +203,7 @@ class KlineRepository:
                     close_price=Decimal(str(row.close_price)),
                     volume=Decimal(str(row.volume)),
                     turnover=Decimal(str(row.turnover)),
-                    timeframe=Timeframe(row.timeframe)
+                    interval=Interval(row.interval)
                 )
                 for row in result
             ]
@@ -214,18 +214,18 @@ class KlineRepository:
 
     async def get_calculated_klines(self,
                                   symbol: SymbolInfo,
-                                  timeframe: Timeframe,
-                                  base_timeframe: Timeframe,
+                                  interval: Interval,
+                                  base_interval: Interval,
                                   start_time: int,
                                   end_time: int,
                                   limit: Optional[int] = None) -> List[KlineData]:
         """
-        Calculate klines on demand for non-stored timeframes.
+        Calculate klines on demand for non-stored intervals.
 
         Args:
             symbol: Symbol to get data for
-            timeframe: Target timeframe to calculate
-            base_timeframe: Base timeframe to calculate from
+            interval: Target interval to calculate
+            base_interval: Base interval to calculate from
             start_time: Start timestamp
             end_time: End timestamp
             limit: Optional limit on number of klines
@@ -247,13 +247,13 @@ class KlineRepository:
                             SUM(k.turnover) AS turnover,
                             s.name AS symbol_name,
                             s.exchange AS symbol_exchange,
-                            :target_timeframe AS timeframe,
+                            :target_interval AS interval,
                             COUNT(*) AS candle_count
                         FROM market_data.kline_data k
                         JOIN market_data.symbols s ON k.symbol_id = s.id
                         WHERE s.name = :symbol_name
                         AND s.exchange = :exchange
-                        AND k.timeframe = :base_timeframe
+                        AND k.interval = :base_interval
                         AND k.timestamp BETWEEN :start_time AND :end_time
                         GROUP BY
                             public.time_bucket(:bucket, k.timestamp),
@@ -273,24 +273,24 @@ class KlineRepository:
                         turnover,
                         symbol_name,
                         symbol_exchange,
-                        timeframe,
+                        interval,
                         candle_count
                     FROM base_aligned
                     ORDER BY bucket_timestamp DESC;
                 """)
 
-                min_candles = timeframe.to_milliseconds() // base_timeframe.to_milliseconds()
+                min_candles = interval.to_milliseconds() // base_interval.to_milliseconds()
 
                 result = await session.execute(
                     stmt,
                     {
                         "symbol_name": symbol.name,
                         "exchange": symbol.exchange,
-                        "base_timeframe": base_timeframe.value,
-                        "target_timeframe": timeframe.value,
+                        "base_interval": base_interval.value,
+                        "target_interval": interval.value,
                         "start_time": TimeUtils.from_timestamp(start_time),
                         "end_time": TimeUtils.from_timestamp(end_time),
-                        "bucket": timeframe.get_bucket_interval(),
+                        "bucket": interval.get_bucket_interval(),
                         "min_candles": min_candles,
                         "limit": limit or 2147483647
                     }
@@ -305,7 +305,7 @@ class KlineRepository:
                     close_price=Decimal(str(row.close_price)),
                     volume=Decimal(str(row.volume)),
                     turnover=Decimal(str(row.turnover)),
-                    timeframe=Timeframe(row.timeframe)
+                    interval=Interval(row.interval)
                 )
                 for row in result
             ]
@@ -342,7 +342,7 @@ class KlineRepository:
                     batch = klines[i:i + self._batch_size]
                     valid_klines = [{
                                     "symbol_id": symbol_id,
-                                    "timeframe": k.timeframe.value,
+                                    "interval": k.interval.value,
                                     "timestamp": TimeUtils.from_timestamp(k.timestamp),
                                     "open_price": k.open_price,
                                     "high_price": k.high_price,
@@ -355,7 +355,7 @@ class KlineRepository:
                     if valid_klines:
                         stmt = insert(Kline).values(valid_klines)
                         stmt = stmt.on_conflict_do_update(
-                            index_elements=['symbol_id', 'timeframe', 'timestamp'],
+                            index_elements=['symbol_id', 'interval', 'timestamp'],
                             set_=dict(
                                 open_price=stmt.excluded.open_price,
                                 high_price=stmt.excluded.high_price,
@@ -382,7 +382,7 @@ class KlineRepository:
 
     async def get_data_gaps(self,
                            symbol: SymbolInfo,
-                           timeframe: Timeframe,
+                           interval: Interval,
                            start_time: int,
                            end_time: int) -> List[Tuple[int, int]]:
         """
@@ -390,7 +390,7 @@ class KlineRepository:
 
         Args:
             symbol (SymbolInfo): The symbol to check for gaps.
-            timeframe (Timeframe): The timeframe of the data.
+            interval (Interval): The interval of the data.
             start_time (Timestamp): The start time of the range to check.
             end_time (Timestamp): The end time of the range to check.
 
@@ -403,7 +403,7 @@ class KlineRepository:
         try:
             async with self.db.session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
                 # Calculate expected interval in milliseconds
-                expected_interval = timeframe.to_milliseconds()
+                expected_interval = interval.to_milliseconds()
 
                 stmt = text("""
                     WITH time_series AS (
@@ -414,22 +414,22 @@ class KlineRepository:
                         JOIN symbols s ON k.symbol_id = s.id
                         WHERE s.name = :symbol
                         AND s.exchange = :exchange
-                        AND k.timeframe = :timeframe
+                        AND k.interval = :interval_value
                         AND k.timestamp BETWEEN :start_time AND :end_time
                     )
                     SELECT ts_start, ts_next
                     FROM time_series
-                    WHERE (ts_next - ts_start) > (:interval * 2)
+                    WHERE (ts_next - ts_start) > (:expected_interval * 2)
                     ORDER BY ts_start;
                 """)
 
                 result = await session.execute(stmt, {
                     "symbol": symbol.name,
                     "exchange": symbol.exchange,
-                    "timeframe": timeframe.value,
+                    "interval_value": interval.value,
                     "start_time": TimeUtils.from_timestamp(start_time),
                     "end_time": TimeUtils.from_timestamp(end_time),
-                    "interval": expected_interval
+                    "expected_interval": expected_interval
                 })
 
             return [(int(row.ts_start + expected_interval),

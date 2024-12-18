@@ -8,7 +8,7 @@ from shared.core.config import FundamentalDataConfig
 from shared.core.enums import ServiceStatus
 from shared.core.exceptions import ServiceError
 from shared.core.models import SymbolInfo
-from shared.core.service import ServiceBase
+from shared.core.protocols import Service
 from shared.database.repositories import MarketMetricsRepository, MetadataRepository, SentimentRepository
 from shared.messaging.schemas import MessageType, SymbolMessage
 from shared.messaging.broker import MessageBroker
@@ -19,7 +19,7 @@ import shared.utils.time as TimeUtils
 logger = LoggerSetup.setup(__name__)
 
 
-class FundamentalDataService(ServiceBase):
+class FundamentalDataService(Service):
     """
     Service for collecting and managing fundamental cryptocurrency data.
 
@@ -47,7 +47,6 @@ class FundamentalDataService(ServiceBase):
             message_broker (MessageBroker): Message broker for service communication.
             config (FundamentalDataConfig): Service configuration.
         """
-        super().__init__(config)
         self.exchange_registry = exchange_registry
         self.metadata_repository = metadata_repository
         self.market_metrics_repository = market_metrics_repository

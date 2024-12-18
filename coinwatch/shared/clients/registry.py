@@ -1,9 +1,7 @@
-# src/adapters/registry.py
-
 from typing import Any, AsyncGenerator, Callable, Coroutine, Dict, List, Optional
 
-from shared.core.adapter import APIAdapter
-from shared.core.enums import Timeframe
+from shared.core.protocols import APIAdapter
+from shared.core.enums import Interval
 from shared.core.exceptions import AdapterError
 from shared.core.models import KlineData, SymbolInfo
 from shared.utils.logger import LoggerSetup
@@ -23,7 +21,7 @@ class ExchangeAdapter(APIAdapter):
 
     async def get_klines(self,
                         symbol: SymbolInfo,
-                        timeframe: Timeframe,
+                        interval: Interval,
                         start_time: int,
                         end_time: int,
                         limit: Optional[int] = None) -> AsyncGenerator[List[KlineData], None]:
@@ -32,19 +30,15 @@ class ExchangeAdapter(APIAdapter):
 
     async def subscribe_klines(self,
                              symbol: SymbolInfo,
-                             timeframe: Timeframe,
+                             interval: Interval,
                              handler: Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]) -> None:
-        """
-        Subscribe to real-time kline updates for a symbol.
-        """
+        """Subscribe to real-time kline updates for a symbol"""
         ...
 
     async def unsubscribe_klines(self,
                                 symbol: SymbolInfo,
-                                timeframe: Timeframe) -> None:
-        """
-        Unsubscribe from kline updates for a symbol.
-        """
+                                interval: Interval) -> None:
+        """Unsubscribe from kline updates for a symbol"""
         ...
 
 

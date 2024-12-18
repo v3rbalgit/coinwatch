@@ -30,10 +30,10 @@ class Kline(MarketDataBase):
         comment='Candlestick timestamp in UTC'
     )
 
-    timeframe: Mapped[str] = mapped_column(
+    interval: Mapped[str] = mapped_column(
         Text,
         nullable=False,
-        comment='Timeframe of the kline (e.g., "1m", "5m", "1h")'
+        comment='Time interval of the kline (e.g., "1m", "5m", "1h")'
     )
 
     open_price: Mapped[float] = mapped_column(Float(precision=18, decimal_return_scale=8), nullable=False)
@@ -48,10 +48,10 @@ class Kline(MarketDataBase):
 
     __table_args__ = (
         PrimaryKeyConstraint('id', 'timestamp'),
-        UniqueConstraint('symbol_id', 'timeframe', 'timestamp', name='uix_kline_symbol_time'),
+        UniqueConstraint('symbol_id', 'interval', 'timestamp', name='uix_kline_symbol_interval_time'),
         Index(
             'idx_kline_query',
-            'symbol_id', 'timeframe', 'timestamp',
+            'symbol_id', 'interval', 'timestamp',
             postgresql_using='btree'
         ),
         {'comment': 'Time-series price data for trading pairs'}
@@ -60,5 +60,5 @@ class Kline(MarketDataBase):
     def __repr__(self) -> str:
         return (
             f"Kline(id={self.id}, symbol_id={self.symbol_id}, "
-            f"timestamp={self.timestamp}, timeframe='{self.timeframe}')"
+            f"timestamp={self.timestamp}, interval='{self.interval}')"
         )

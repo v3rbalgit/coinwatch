@@ -2,8 +2,8 @@ import asyncio
 from typing import Dict, Any, Optional
 from prometheus_client import generate_latest
 
-from shared.core.config import MonitoringConfig
-from shared.core.service import ServiceBase
+from shared.core.config import MonitorConfig
+from shared.core.service import Service
 from shared.messaging.broker import MessageBroker
 from shared.messaging.schemas import MessageType, ServiceStatusMessage
 import shared.utils.time as TimeUtils
@@ -13,7 +13,7 @@ from .monitor_metrics import MonitoringMetrics
 
 logger = LoggerSetup.setup(__name__)
 
-class MonitoringService(ServiceBase):
+class MonitoringService(Service):
     """
     Centralized monitoring service that collects and aggregates metrics from all system components.
 
@@ -26,12 +26,12 @@ class MonitoringService(ServiceBase):
 
     def __init__(self,
                  message_broker: MessageBroker,
-                 config: MonitoringConfig):
-        super().__init__(config)
+                 config: MonitorConfig):
 
         self.message_broker = message_broker
         self.metrics_collector = MetricsCollector()
         self.prometheus_metrics = MonitoringMetrics()
+        self._check_intervals = config.check_intervals
 
         # Service state
         self._status = "stopped"
@@ -188,7 +188,7 @@ class MonitoringService(ServiceBase):
                 self.prometheus_metrics.system_process_count.set(system["process_count"])
 
                 # Sleep until next collection
-                await asyncio.sleep(self._config.check_intervals.get("system", 60))
+                await asyncio.sleep(self._check_intervals.get("system", 60))
 
             except Exception as e:
                 logger.error(f"Error in metrics collection: {e}")

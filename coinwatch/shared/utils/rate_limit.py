@@ -1,5 +1,3 @@
-# src/utils/rate_limit.py
-
 import time
 import asyncio
 from typing import Optional

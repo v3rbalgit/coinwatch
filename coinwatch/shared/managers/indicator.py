@@ -1,13 +1,6 @@
 import polars as pl
 import polars_talib as plta
 from typing import List
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
-    before_sleep_log
-)
 
 from shared.core.exceptions import ValidationError
 from shared.core.models import (
@@ -58,12 +51,6 @@ class IndicatorManager:
         }).with_columns(pl.col('timestamp').cast(pl.Int64))
 
     @redis_cached[List[RSIResult]](ttl=60)  # Fast indicator, shorter TTL
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type((ConnectionError, TimeoutError, pl.exceptions.ComputeError)),
-        before_sleep=before_sleep_log(logger, log_level=20)  # INFO level
-    )
     async def calculate_rsi(self,
                           klines: List[KlineData],
                           length: int = 14) -> List[RSIResult]:
@@ -71,24 +58,23 @@ class IndicatorManager:
         self._validate_klines(klines)
         df = self._prepare_dataframe(klines)
 
-        df_with_rsi = df.with_columns(plta.rsi().alias("rsi"))
+        # Calculate RSI and filter out NaN values
+        df_with_rsi = df.with_columns(
+            plta.rsi(pl.col("close"), timeperiod=length).alias(f"RSI_{length}")
+        ).filter(
+            pl.col(f'RSI_{length}').is_not_null() & pl.col(f'RSI_{length}').is_finite()
+        )
 
         return [
             RSIResult.from_series(
                 int(row['timestamp']),
-                float(row['rsi']),
+                float(row[f'RSI_{length}']),
                 length=length
             )
-            for row in df_with_rsi.filter(pl.col('rsi').is_not_null()).iter_rows(named=True)
+            for row in df_with_rsi.iter_rows(named=True)
         ]
 
     @redis_cached[List[BollingerBandsResult]](ttl=300)
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type((ConnectionError, TimeoutError, pl.exceptions.ComputeError)),
-        before_sleep=before_sleep_log(logger, log_level=20)
-    )
     async def calculate_bollinger_bands(self,
                                      klines: List[KlineData],
                                      length: int = 20,
@@ -97,32 +83,42 @@ class IndicatorManager:
         self._validate_klines(klines)
         df = self._prepare_dataframe(klines)
 
-        bbands = df.with_columns([
-            plta.bbands(timeperiod=length, nbdevup=std_dev, nbdevdn=std_dev).struct.field("upperband").alias("upper"),
-            plta.bbands(timeperiod=length, nbdevup=std_dev, nbdevdn=std_dev).struct.field("middleband").alias("middle"),
-            plta.bbands(timeperiod=length, nbdevup=std_dev, nbdevdn=std_dev).struct.field("lowerband").alias("lower")
+        suffix = f"_{length}_{std_dev}.0"
+        bbands = plta.bbands(pl.col("close"), timeperiod=length, nbdevup=std_dev, nbdevdn=std_dev)
+        df_with_bb = df.with_columns([
+            bbands.struct.field("upperband").alias(f"BBU{suffix}"),
+            bbands.struct.field("middleband").alias(f"BBM{suffix}"),
+            bbands.struct.field("lowerband").alias(f"BBL{suffix}")
         ])
+
+        # Calculate bandwidth and filter out NaN values
+        df_with_bb = df_with_bb.with_columns([
+            ((pl.col(f"BBU{suffix}") - pl.col(f"BBL{suffix}")) / pl.col(f"BBM{suffix}")).alias(f"BBB{suffix}")
+        ]).filter(
+            pl.col(f'BBU{suffix}').is_not_null() &
+            pl.col(f'BBM{suffix}').is_not_null() &
+            pl.col(f'BBL{suffix}').is_not_null() &
+            pl.col(f'BBU{suffix}').is_finite() &
+            pl.col(f'BBM{suffix}').is_finite() &
+            pl.col(f'BBL{suffix}').is_finite()
+        )
 
         return [
             BollingerBandsResult.from_series(
                 int(row['timestamp']),
                 {
-                    'BBL': float(row['bbands']['lower']),
-                    'BBM': float(row['bbands']['middle']),
-                    'BBU': float(row['bbands']['upper']),
-                    'BBB': float((row['bbands']['upper'] - row['bbands']['lower']) / row['bbands']['middle'])
-                }
+                    f'BBU{suffix}': float(row[f'BBU{suffix}']),
+                    f'BBM{suffix}': float(row[f'BBM{suffix}']),
+                    f'BBL{suffix}': float(row[f'BBL{suffix}']),
+                    f'BBB{suffix}': float(row[f'BBB{suffix}'])
+                },
+                length=length,
+                std=std_dev
             )
-            for row in bbands.filter(pl.col('bbands').is_not_null()).iter_rows(named=True)
+            for row in df_with_bb.iter_rows(named=True)
         ]
 
     @redis_cached[List[MACDResult]](ttl=300)
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type((ConnectionError, TimeoutError, pl.exceptions.ComputeError)),
-        before_sleep=before_sleep_log(logger, log_level=20)
-    )
     async def calculate_macd(self,
                            klines: List[KlineData],
                            fast: int = 12,
@@ -132,43 +128,42 @@ class IndicatorManager:
         self._validate_klines(klines)
         df = self._prepare_dataframe(klines)
 
+        suffix = f"_{fast}_{slow}_{signal}"
+        macd = plta.macd(
+            pl.col("close"),
+            fastperiod=fast,
+            slowperiod=slow,
+            signalperiod=signal
+        )
         df_with_macd = df.with_columns([
-            plta.macd(
-                fastperiod=fast,
-                slowperiod=slow,
-                signalperiod=signal
-            ).struct.field("macd").alias("macd"),
-            plta.macd(
-                fastperiod=fast,
-                slowperiod=slow,
-                signalperiod=signal
-            ).struct.field("macdsignal").alias("macdsignal"),
-            plta.macd(
-                fastperiod=fast,
-                slowperiod=slow,
-                signalperiod=signal
-            ).struct.field("macdhist").alias("macdhist")
-        ])
+            macd.struct.field("macd").alias(f"MACD{suffix}"),
+            macd.struct.field("macdsignal").alias(f"MACDs{suffix}"),
+            macd.struct.field("macdhist").alias(f"MACDh{suffix}")
+        ]).filter(
+            pl.col(f'MACD{suffix}').is_not_null() &
+            pl.col(f'MACDs{suffix}').is_not_null() &
+            pl.col(f'MACDh{suffix}').is_not_null() &
+            pl.col(f'MACD{suffix}').is_finite() &
+            pl.col(f'MACDs{suffix}').is_finite() &
+            pl.col(f'MACDh{suffix}').is_finite()
+        )
 
         return [
             MACDResult.from_series(
                 int(row['timestamp']),
                 {
-                    f'MACD_{fast}_{slow}_{signal}': float(row['macd']['macd']),
-                    f'MACDs_{fast}_{slow}_{signal}': float(row['macd']['macdsignal']),
-                    f'MACDh_{fast}_{slow}_{signal}': float(row['macd']['macdhist'])
-                }
+                    f'MACD{suffix}': float(row[f'MACD{suffix}']),
+                    f'MACDs{suffix}': float(row[f'MACDs{suffix}']),
+                    f'MACDh{suffix}': float(row[f'MACDh{suffix}'])
+                },
+                fast=fast,
+                slow=slow,
+                signal=signal
             )
-            for row in df_with_macd.filter(pl.col('macd').is_not_null()).iter_rows(named=True)
+            for row in df_with_macd.iter_rows(named=True)
         ]
 
     @redis_cached[List[MAResult]](ttl=300)
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type((ConnectionError, TimeoutError, pl.exceptions.ComputeError)),
-        before_sleep=before_sleep_log(logger, log_level=20)
-    )
     async def calculate_sma(self,
                           klines: List[KlineData],
                           period: int = 20) -> List[MAResult]:
@@ -176,23 +171,22 @@ class IndicatorManager:
         self._validate_klines(klines)
         df = self._prepare_dataframe(klines)
 
-        df_with_sma = df.with_columns(plta.sma(timeperiod=period).alias("sma"))
+        df_with_sma = df.with_columns(
+            plta.sma(pl.col("close"), timeperiod=period).alias(f"SMA_{period}")
+        ).filter(
+            pl.col(f'SMA_{period}').is_not_null() & pl.col(f'SMA_{period}').is_finite()
+        )
 
         return [
             MAResult.from_series(
                 int(row['timestamp']),
-                float(row['sma'])
+                float(row[f'SMA_{period}']),
+                length=period
             )
-            for row in df_with_sma.filter(pl.col('sma').is_not_null()).iter_rows(named=True)
+            for row in df_with_sma.iter_rows(named=True)
         ]
 
     @redis_cached[List[MAResult]](ttl=300)
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type((ConnectionError, TimeoutError, pl.exceptions.ComputeError)),
-        before_sleep=before_sleep_log(logger, log_level=20)
-    )
     async def calculate_ema(self,
                           klines: List[KlineData],
                           period: int = 20) -> List[MAResult]:
@@ -200,36 +194,39 @@ class IndicatorManager:
         self._validate_klines(klines)
         df = self._prepare_dataframe(klines)
 
-        df_with_ema = df.with_columns(plta.ema(timeperiod=period).alias("ema"))
+        df_with_ema = df.with_columns(
+            plta.ema(pl.col("close"), timeperiod=period).alias(f"EMA_{period}")
+        ).filter(
+            pl.col(f'EMA_{period}').is_not_null() & pl.col(f'EMA_{period}').is_finite()
+        )
 
         return [
             MAResult.from_series(
                 int(row['timestamp']),
-                float(row['ema'])
+                float(row[f'EMA_{period}']),
+                length=period
             )
-            for row in df_with_ema.filter(pl.col('ema').is_not_null()).iter_rows(named=True)
+            for row in df_with_ema.iter_rows(named=True)
         ]
 
     @redis_cached[List[OBVResult]](ttl=60)  # Fast indicator, shorter TTL
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type((ConnectionError, TimeoutError, pl.exceptions.ComputeError)),
-        before_sleep=before_sleep_log(logger, log_level=20)
-    )
     async def calculate_obv(self, klines: List[KlineData]) -> List[OBVResult]:
         """Calculate On Balance Volume"""
         self._validate_klines(klines)
         df = self._prepare_dataframe(klines)
 
-        df_with_obv = df.with_columns(plta.obv(pl.col("close"), pl.col("volume")).alias("obv"))
+        df_with_obv = df.with_columns(
+            plta.obv(pl.col("close"), pl.col("volume")).alias("OBV")
+        ).filter(
+            pl.col('OBV').is_not_null() & pl.col('OBV').is_finite()
+        )
 
         return [
             OBVResult.from_series(
                 int(row['timestamp']),
-                float(row['obv'])
+                float(row['OBV'])
             )
-            for row in df_with_obv.filter(pl.col('obv').is_not_null()).iter_rows(named=True)
+            for row in df_with_obv.iter_rows(named=True)
         ]
 
     async def cleanup(self) -> None:

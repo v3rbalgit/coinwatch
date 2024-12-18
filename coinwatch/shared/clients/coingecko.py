@@ -1,16 +1,14 @@
-# src/adapters/coingecko.py
-
 from typing import Dict, Any, List, Optional
 import aiohttp
 import asyncio
 
 from shared.core.exceptions import AdapterError
 from shared.core.config import CoingeckoConfig
-from shared.core.adapter import APIAdapter
+from shared.core.protocols import APIAdapter
 from shared.utils.logger import LoggerSetup
-from shared.utils.cache import async_ttl_cache
-from shared.utils.retry import RetryConfig, RetryStrategy
+from shared.utils.cache import redis_cached, RedisCache
 from shared.utils.rate_limit import RateLimiter
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 logger = LoggerSetup.setup(__name__)
 
@@ -46,13 +44,11 @@ class CoinGeckoAdapter(APIAdapter):
         # Base URL based on testnet setting
         self._base_url = self.PRO_URL if config.pro_account else self.BASE_URL
 
-        # Configure retry strategy
-        self._retry_strategy = RetryStrategy(RetryConfig(
-            base_delay=2.0,
-            max_delay=60.0,
-            max_retries=3,
-            jitter_factor=0.1
-        ))
+        # Initialize Redis cache with namespace
+        self.cache = RedisCache(
+            redis_url=config.redis_url,
+            namespace="coingecko"
+        )
 
     async def _create_session(self) -> aiohttp.ClientSession:
         """Create new session with CoinGecko configuration"""
@@ -71,6 +67,12 @@ class CoinGeckoAdapter(APIAdapter):
             headers=headers
         )
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=30),
+        retry=retry_if_exception_type(aiohttp.ClientError),
+        reraise=True
+    )
     async def _request(self, method: str, endpoint: str, **kwargs: Any) -> Any:
         """
         Make API request with retry logic and rate limiting
@@ -80,39 +82,22 @@ class CoinGeckoAdapter(APIAdapter):
             endpoint: API endpoint
             **kwargs: Additional request parameters
         """
-        attempt = 0
         session = await self._get_session()
 
-        while True:
-            try:
-                # Handle rate limiting
-                await self._rate_limiter.acquire()
+        # Handle rate limiting
+        await self._rate_limiter.acquire()
 
-                async with session.request(method, endpoint, **kwargs) as response:
-                    if response.status == 429:  # Rate limit exceeded
-                        retry_after = int(response.headers.get('Retry-After', 60))
-                        logger.warning(f"Rate limit exceeded, waiting {retry_after}s")
-                        await asyncio.sleep(retry_after)
-                        continue
+        async with session.request(method, endpoint, **kwargs) as response:
+            if response.status == 429:  # Rate limit exceeded
+                retry_after = int(response.headers.get('Retry-After', 60))
+                logger.warning(f"Rate limit exceeded, waiting {retry_after}s")
+                await asyncio.sleep(retry_after)
+                raise aiohttp.ClientError("Coingecko API Rate limit exceeded")
 
-                    response.raise_for_status()
-                    return await response.json()
+            response.raise_for_status()
+            return await response.json()
 
-            except aiohttp.ClientError as e:
-                should_retry, reason = self._retry_strategy.should_retry(attempt, e)
-                if should_retry:
-                    attempt += 1
-                    delay = self._retry_strategy.get_delay(attempt)
-                    logger.warning(
-                        f"API request failed ({reason}), "
-                        f"retry {attempt} after {delay:.2f}s: {str(e)}"
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-
-                raise AdapterError(f"API request failed: {str(e)}")
-
-    @async_ttl_cache(maxsize=1000, ttl=86400)
+    @redis_cached[Optional[str]](ttl=86400)  # Cache for 24 hours
     async def get_coin_id(self, symbol: str) -> Optional[str]:
         """Get CoinGecko coin ID for a symbol"""
         try:

@@ -3,10 +3,10 @@ from typing import Optional, Set, Dict, Any, List
 
 from shared.clients.registry import ExchangeAdapterRegistry
 from shared.core.config import MarketDataConfig
-from shared.core.enums import ServiceStatus, Timeframe
+from shared.core.enums import ServiceStatus, Interval
 from shared.core.models import SymbolInfo
 from shared.core.exceptions import ServiceError
-from shared.core.service import ServiceBase
+from shared.core.protocols import Service
 from shared.database.repositories import KlineRepository, SymbolRepository
 from shared.messaging.broker import MessageBroker
 from shared.messaging.schemas import MessageType, SymbolMessage, ErrorMessage
@@ -19,7 +19,7 @@ from .collector import DataCollector
 logger = LoggerSetup.setup(__name__)
 
 
-class MarketDataService(ServiceBase):
+class MarketDataService(Service):
     """
     Core service managing market data collection and real-time streaming.
 
@@ -36,14 +36,13 @@ class MarketDataService(ServiceBase):
                  exchange_registry: ExchangeAdapterRegistry,
                  message_broker: MessageBroker,
                  config: MarketDataConfig):
-        super().__init__(config)
 
         # Core dependencies
         self.symbol_repository = symbol_repository
         self.kline_repository = kline_repository
         self.exchange_registry = exchange_registry
         self.message_broker = message_broker
-        self.base_timeframe = Timeframe(config.default_timeframe)
+        self.base_interval = Interval(config.default_interval)
         self._retention_days = 90
 
         # Core components
@@ -52,7 +51,7 @@ class MarketDataService(ServiceBase):
             symbol_repository=symbol_repository,
             kline_repository=kline_repository,
             message_broker=message_broker,
-            base_timeframe=self.base_timeframe
+            base_interval=self.base_interval
         )
 
         # Service state
@@ -224,7 +223,7 @@ class MarketDataService(ServiceBase):
                         end_time=end,
                         context={
                             "type": "gap_fill",
-                            "gap_size": (end - start) // self.base_timeframe.to_milliseconds()
+                            "gap_size": (end - start) // self.base_interval.to_milliseconds()
                         })
 
         except Exception as e:
