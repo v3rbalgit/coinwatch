@@ -1,6 +1,5 @@
 # src/adapters/twitter.py
 
-from typing import Dict, Optional
 import aiohttp
 from decimal import Decimal
 
@@ -37,7 +36,7 @@ class TwitterAdapter:
                                         max_monthly_calls=max_monthly)
         self.session = aiohttp.ClientSession(headers=self.headers)
 
-    async def get_user_metrics(self, username: str) -> Optional[Dict]:
+    async def get_user_metrics(self, username: str) -> dict | None:
         """
         Get user metrics for a Twitter account.
 
@@ -72,7 +71,7 @@ class TwitterAdapter:
             logger.error(f"Error fetching Twitter user metrics: {e}")
             return None
 
-    async def get_recent_tweets(self, username: str, hours: int = 24) -> Optional[Dict]:
+    async def get_recent_tweets(self, username: str, hours: int = 24) -> dict | None:
         """
         Get recent tweets and their metrics.
 

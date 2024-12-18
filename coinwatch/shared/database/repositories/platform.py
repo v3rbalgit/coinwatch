@@ -1,6 +1,5 @@
 # src/repositories/platform.py
 
-from typing import List
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,7 +31,7 @@ class PlatformRepository:
             logger.error(f"Failed to delete platform records for {token_id}: {e}")
             raise
 
-    async def get_token_platforms(self, token_id: str) -> List[TokenPlatform]:
+    async def get_token_platforms(self, token_id: str) -> list[TokenPlatform]:
         """
         Get all platform records for a token
 

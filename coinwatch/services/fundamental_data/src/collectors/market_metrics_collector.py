@@ -1,7 +1,6 @@
 # src/services/fundamental_data/market_metrics_collector.py
 
 from decimal import Decimal
-from typing import List, Set
 
 from .collector import FundamentalCollector
 from shared.clients.coingecko import CoinGeckoAdapter
@@ -53,7 +52,7 @@ class MarketMetricsCollector(FundamentalCollector):
         """
         return "market_metrics"
 
-    async def collect_symbol_data(self, tokens: Set[str]) -> List[MarketMetrics]:
+    async def collect_symbol_data(self, tokens: set[str]) -> list[MarketMetrics]:
         """Collect market metrics for multiple tokens"""
         try:
             # Get CoinGecko IDs for all tokens (using cached values)
@@ -103,7 +102,7 @@ class MarketMetricsCollector(FundamentalCollector):
             logger.error(f"Error collecting market metrics: {e}")
             raise ServiceError(f"Market metrics collection failed: {str(e)}")
 
-    async def store_symbol_data(self, data: List[MarketMetrics]) -> None:
+    async def store_symbol_data(self, data: list[MarketMetrics]) -> None:
         """
         Store collected market metrics for multiple symbols.
 

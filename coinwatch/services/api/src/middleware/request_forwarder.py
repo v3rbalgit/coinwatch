@@ -1,5 +1,5 @@
 import aiohttp
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from fastapi import Request, HTTPException
 from shared.utils.logger import LoggerSetup
 from ..service_registry import ServiceRegistry
@@ -19,7 +19,7 @@ class RequestForwarder:
 
     def __init__(self, registry: ServiceRegistry):
         self.registry = registry
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session"""

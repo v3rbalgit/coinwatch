@@ -1,7 +1,6 @@
 # src/services/fundamental_data/sentiment_metrics_collector.py
 
 from decimal import Decimal
-from typing import Dict, List, Optional
 from textblob import TextBlob
 
 from .collector import FundamentalCollector
@@ -60,7 +59,7 @@ class SentimentMetricsCollector(FundamentalCollector):
         """
         return "sentiment_metrics"
 
-    def _analyze_sentiment(self, texts: List[str]) -> Optional[Decimal]:
+    def _analyze_sentiment(self, texts: list[str]) -> Decimal | None:
         """
         Calculate average sentiment polarity score for a list of texts.
 
@@ -83,7 +82,7 @@ class SentimentMetricsCollector(FundamentalCollector):
 
         return Decimal(str(sum(sentiment_scores) / len(sentiment_scores)))
 
-    async def collect_symbol_data(self, tokens: List[SymbolInfo]) -> List[SentimentMetrics]:
+    async def collect_symbol_data(self, tokens: list[SymbolInfo]) -> list[SentimentMetrics]:
         """
         Collect sentiment metrics for multiple tokens across social media platforms.
 
@@ -104,7 +103,7 @@ class SentimentMetricsCollector(FundamentalCollector):
         """
         try:
             # Get metadata for all tokens to access social media links
-            metadata_list: List[Metadata] = []
+            metadata_list: list[Metadata] = []
             for token in tokens:
                 if metadata := await self.metadata_repository.get_metadata(token):
                     metadata_list.append(metadata)
@@ -186,7 +185,7 @@ class SentimentMetricsCollector(FundamentalCollector):
             logger.error(f"Error collecting sentiment metrics: {e}")
             raise ServiceError(f"Sentiment metrics collection failed: {str(e)}")
 
-    async def _collect_twitter_metrics(self, metadata: Metadata) -> Optional[Dict]:
+    async def _collect_twitter_metrics(self, metadata: Metadata) -> dict | None:
         """
         Collect metrics from Twitter for a given token.
 
@@ -228,7 +227,7 @@ class SentimentMetricsCollector(FundamentalCollector):
             logger.error(f"Error collecting Twitter metrics: {e}")
             return None
 
-    async def _collect_reddit_metrics(self, metadata: Metadata) -> Optional[Dict]:
+    async def _collect_reddit_metrics(self, metadata: Metadata) -> dict | None:
         """
         Collect metrics from Reddit for a given token.
 
@@ -269,7 +268,7 @@ class SentimentMetricsCollector(FundamentalCollector):
             logger.error(f"Error collecting Reddit metrics: {e}")
             return None
 
-    async def _collect_telegram_metrics(self, metadata: Metadata) -> Optional[Dict]:
+    async def _collect_telegram_metrics(self, metadata: Metadata) -> dict | None:
         """
         Collect metrics from Telegram for a given token.
 
@@ -309,7 +308,7 @@ class SentimentMetricsCollector(FundamentalCollector):
             logger.error(f"Error collecting Telegram metrics: {e}")
             return None
 
-    async def store_symbol_data(self, data: List[SentimentMetrics]) -> None:
+    async def store_symbol_data(self, data: list[SentimentMetrics]) -> None:
         """
         Store collected sentiment metrics for multiple tokens.
 

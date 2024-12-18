@@ -1,5 +1,5 @@
 import asyncio
-from typing import Dict, Optional, Set
+from typing import Dict, Set
 
 from .collectors import FundamentalCollector, MetadataCollector, MarketMetricsCollector, SentimentMetricsCollector
 from shared.clients.coingecko import CoinGeckoAdapter
@@ -61,7 +61,7 @@ class FundamentalDataService(Service):
 
         # Error tracking
         self._error_tracker = ErrorTracker()
-        self._last_error: Optional[Exception] = None
+        self._last_error: Exception | None = None
 
         # Collection management
         self._collection_lock = asyncio.Lock()

@@ -1,4 +1,4 @@
-from typing import Any, AsyncGenerator, Callable, Coroutine, Dict, List, Optional
+from typing import AsyncGenerator, Callable, Coroutine, Any
 
 from shared.core.protocols import APIAdapter
 from shared.core.enums import Interval
@@ -15,7 +15,7 @@ class ExchangeAdapter(APIAdapter):
     Defines required methods for exchange data collection.
     """
 
-    async def get_symbols(self, symbol: Optional[str] = None) -> List[SymbolInfo]:
+    async def get_symbols(self, symbol: str | None = None) -> list[SymbolInfo]:
         """Get available trading pairs"""
         ...
 
@@ -24,14 +24,14 @@ class ExchangeAdapter(APIAdapter):
                         interval: Interval,
                         start_time: int,
                         end_time: int,
-                        limit: Optional[int] = None) -> AsyncGenerator[List[KlineData], None]:
+                        limit: int | None = None) -> AsyncGenerator[list[KlineData], None]:
         """Get kline data"""
         ...
 
     async def subscribe_klines(self,
                              symbol: SymbolInfo,
                              interval: Interval,
-                             handler: Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]) -> None:
+                             handler: Callable[[dict[str, Any]], Coroutine[Any, Any, None]]) -> None:
         """Subscribe to real-time kline updates for a symbol"""
         ...
 
@@ -46,7 +46,7 @@ class ExchangeAdapterRegistry:
     """Registry for managing exchange adapters"""
 
     def __init__(self):
-        self._adapters: Dict[str, ExchangeAdapter] = {}
+        self._adapters: dict[str, ExchangeAdapter] = {}
 
     def register(self, name: str, adapter: ExchangeAdapter) -> None:
         """Register a new exchange adapter"""
@@ -82,6 +82,6 @@ class ExchangeAdapterRegistry:
 
         return adapter
 
-    def get_registered(self) -> List[str]:
+    def get_registered(self) -> list[str]:
         """Get list of registered exchanges"""
         return list(self._adapters.keys())

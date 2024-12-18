@@ -1,4 +1,4 @@
-from typing import Optional, Any, Protocol
+from typing import Any, Protocol
 import aiohttp
 import asyncio
 
@@ -59,7 +59,7 @@ class APIAdapter(Protocol):
     - Request handling
     """
 
-    _session: Optional[aiohttp.ClientSession] = None
+    _session: aiohttp.ClientSession | None = None
     _session_lock = asyncio.Lock()
 
     async def _get_session(self) -> aiohttp.ClientSession:

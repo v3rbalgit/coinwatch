@@ -1,5 +1,5 @@
-from typing import TYPE_CHECKING, List
-from sqlalchemy import Index, BigInteger, Text, UniqueConstraint
+from typing import TYPE_CHECKING
+from sqlalchemy import Index, BigInteger, Text, Integer, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from ..base import MarketDataBase
@@ -18,7 +18,18 @@ class Symbol(MarketDataBase):
     name: Mapped[str] = mapped_column(Text, nullable=False, index=True)
     exchange: Mapped[str] = mapped_column(Text, nullable=False, index=True)
 
-    first_trade_time: Mapped[int] = mapped_column(
+    # Trading parameters
+    base_asset: Mapped[str] = mapped_column(Text, nullable=True)
+    quote_asset: Mapped[str] = mapped_column(Text, nullable=True)
+    price_scale: Mapped[int] = mapped_column(Integer, nullable=True)
+    tick_size: Mapped[str] = mapped_column(Text, nullable=True)
+    qty_step: Mapped[str] = mapped_column(Text, nullable=True)
+    max_qty: Mapped[str] = mapped_column(Text, nullable=True)
+    min_notional: Mapped[str] = mapped_column(Text, nullable=True)
+    max_leverage: Mapped[str] = mapped_column(Text, nullable=True)
+    funding_interval: Mapped[int] = mapped_column(Integer, nullable=True)
+
+    launch_time: Mapped[int] = mapped_column(
         BigInteger,
         nullable=True,
         comment='First trading time for the symbol in ms'
@@ -30,7 +41,7 @@ class Symbol(MarketDataBase):
     )
 
     # Relationships
-    klines: Mapped[List['Kline']] = relationship(
+    klines: Mapped[list['Kline']] = relationship(
         'Kline',
         back_populates='symbol',
         cascade='all, delete-orphan'

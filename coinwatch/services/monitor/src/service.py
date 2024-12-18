@@ -1,9 +1,9 @@
 import asyncio
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from prometheus_client import generate_latest
 
 from shared.core.config import MonitorConfig
-from shared.core.service import Service
+from shared.core.protocols import Service
 from shared.messaging.broker import MessageBroker
 from shared.messaging.schemas import MessageType, ServiceStatusMessage
 import shared.utils.time as TimeUtils
@@ -36,7 +36,7 @@ class MonitoringService(Service):
         # Service state
         self._status = "stopped"
         self._start_time = TimeUtils.get_current_timestamp()
-        self._collection_task: Optional[asyncio.Task] = None
+        self._collection_task: asyncio.Task | None = None
         self._running = False
 
     async def start(self) -> None:

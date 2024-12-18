@@ -1,5 +1,4 @@
 from abc import ABC, abstractmethod
-from typing import Dict, List, Set
 import asyncio
 
 from shared.core.models import MarketMetrics, Metadata
@@ -29,11 +28,11 @@ class FundamentalCollector(ABC):
         self._collection_interval = collection_interval
 
         # Collection management
-        self._collection_queue: asyncio.Queue[Set[str]] = asyncio.Queue()
+        self._collection_queue: asyncio.Queue[set[str]] = asyncio.Queue()
         self._collection_lock = asyncio.Lock()
-        self._processing: Set[str] = set()
-        self._progress: Dict[str, FundamentalDataProgress] = {}
-        self._last_collection: Dict[str, int] = {}
+        self._processing: set[str] = set()
+        self._progress: dict[str, FundamentalDataProgress] = {}
+        self._last_collection: dict[str, int] = {}
 
         # Start collection worker
         self._queue_processor = asyncio.create_task(self._collection_worker())
@@ -50,7 +49,7 @@ class FundamentalCollector(ABC):
         pass
 
     @abstractmethod
-    async def collect_symbol_data(self, tokens: List[str]) -> List[MarketMetrics | Metadata]:
+    async def collect_symbol_data(self, tokens: list[str]) -> list[MarketMetrics | Metadata]:
         """
         Collect fundamental data for specific symbols.
 
@@ -63,7 +62,7 @@ class FundamentalCollector(ABC):
         pass
 
     @abstractmethod
-    async def store_symbol_data(self, data: List[MarketMetrics | Metadata]) -> None:
+    async def store_symbol_data(self, data: list[MarketMetrics | Metadata]) -> None:
         """
         Store collected data for symbols.
 
@@ -84,7 +83,7 @@ class FundamentalCollector(ABC):
         """
         pass
 
-    async def schedule_collection(self, tokens: Set[str]) -> None:
+    async def schedule_collection(self, tokens: set[str]) -> None:
         """
         Schedule data collection for a symbol if enough time has passed.
 
@@ -127,7 +126,7 @@ class FundamentalCollector(ABC):
                 logger.error(f"Worker error: {e}")
                 await asyncio.sleep(1)
 
-    async def _process_symbols(self, tokens: Set[str]) -> None:
+    async def _process_symbols(self, tokens: set[str]) -> None:
         """
         Process a set of symbols by collecting and storing their data.
 

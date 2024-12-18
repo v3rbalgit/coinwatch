@@ -1,6 +1,5 @@
 # src/repositories/metadata.py
 
-from typing import List, Optional
 from sqlalchemy import delete, select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.dialects.postgresql import insert
@@ -22,7 +21,7 @@ class MetadataRepository:
     def __init__(self, db_service: DatabaseConnection):
         self.db_service = db_service
 
-    async def upsert_metadata(self, metadata_list: List[Metadata]) -> None:
+    async def upsert_metadata(self, metadata_list: list[Metadata]) -> None:
         """
         Create or update metadata for multiple symbols using PostgreSQL upsert.
 
@@ -72,7 +71,7 @@ class MetadataRepository:
             logger.error(f"Error in bulk metadata upsert: {e}")
             raise RepositoryError(f"Failed to upsert metadata batch: {str(e)}")
 
-    async def get_metadata(self, symbol: SymbolInfo) -> Optional[Metadata]:
+    async def get_metadata(self, symbol: SymbolInfo) -> Metadata | None:
         """
         Get stored metadata for a symbol.
 

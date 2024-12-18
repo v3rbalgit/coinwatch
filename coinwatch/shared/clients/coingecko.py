@@ -1,4 +1,3 @@
-from typing import Dict, Any, List, Optional
 import aiohttp
 import asyncio
 
@@ -73,7 +72,7 @@ class CoinGeckoAdapter(APIAdapter):
         retry=retry_if_exception_type(aiohttp.ClientError),
         reraise=True
     )
-    async def _request(self, method: str, endpoint: str, **kwargs: Any) -> Any:
+    async def _request(self, method: str, endpoint: str, **kwargs):
         """
         Make API request with retry logic and rate limiting
 
@@ -97,8 +96,8 @@ class CoinGeckoAdapter(APIAdapter):
             response.raise_for_status()
             return await response.json()
 
-    @redis_cached[Optional[str]](ttl=86400)  # Cache for 24 hours
-    async def get_coin_id(self, symbol: str) -> Optional[str]:
+    @redis_cached[str | None](ttl=86400)  # Cache for 24 hours
+    async def get_coin_id(self, symbol: str) -> str | None:
         """Get CoinGecko coin ID for a symbol"""
         try:
             # Use coins/list endpoint for efficient lookup
@@ -119,7 +118,7 @@ class CoinGeckoAdapter(APIAdapter):
             logger.error(f"Error getting coin ID for {symbol}: {e}")
             return None
 
-    async def get_coin_info(self, coin_id: str) -> Dict[str, Any]:
+    async def get_coin_info(self, coin_id: str) -> dict:
         """Get detailed coin information"""
         try:
             return await self._request(
@@ -138,7 +137,7 @@ class CoinGeckoAdapter(APIAdapter):
             logger.error(f"Error getting coin info for {coin_id}: {e}")
             raise AdapterError(f"Failed to get coin info: {str(e)}")
 
-    async def get_market_data(self, coin_ids: List[str]) -> List[Dict[str, Any]]:
+    async def get_market_data(self, coin_ids: list[str]) -> list[dict]:
         """
         Get market data for multiple coins handling pagination.
 

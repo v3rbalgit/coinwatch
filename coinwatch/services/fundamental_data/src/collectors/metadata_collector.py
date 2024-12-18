@@ -1,7 +1,6 @@
 # src/services/fundamental_data/metadata_collector.py
 
 from datetime import datetime
-from typing import List, Set
 
 from .collector import FundamentalCollector
 from shared.clients.coingecko import CoinGeckoAdapter
@@ -50,7 +49,7 @@ class MetadataCollector(FundamentalCollector):
         """
         return "metadata"
 
-    async def collect_symbol_data(self, tokens: Set[str]) -> List[Metadata]:
+    async def collect_symbol_data(self, tokens: set[str]) -> list[Metadata]:
         """Collect metadata for multiple tokens"""
         collected_metadata = []
         try:
@@ -118,7 +117,7 @@ class MetadataCollector(FundamentalCollector):
             logger.error(f"Error in bulk metadata collection: {e}")
             raise ServiceError(f"Metadata collection failed: {str(e)}")
 
-    async def store_symbol_data(self, data: List[Metadata]) -> None:
+    async def store_symbol_data(self, data: list[Metadata]) -> None:
         """
         Store collected metadata for multiple symbols.
 

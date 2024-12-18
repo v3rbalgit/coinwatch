@@ -1,4 +1,3 @@
-from typing import List, Optional
 from sqlalchemy import select, and_, text
 
 from shared.core.models import SymbolInfo
@@ -17,7 +16,7 @@ class SymbolRepository:
     def __init__(self, db_service: DatabaseConnection):
         self.db_service = db_service
 
-    async def get_symbol(self, symbol: SymbolInfo) -> Optional[Symbol]:
+    async def get_symbol(self, symbol: SymbolInfo) -> Symbol | None:
         """
         Retrieve a symbol by its information.
 
@@ -74,11 +73,20 @@ class SymbolRepository:
                     logger.debug(f"Symbol {symbol.name} already exists for {symbol.exchange}")
                     return False
 
-                # Create new symbol
+                # Create new symbol with all fields
                 new_symbol = Symbol(
                     name=symbol.name,
                     exchange=symbol.exchange,
-                    first_trade_time=symbol.launch_time
+                    launch_time=symbol.launch_time,
+                    base_asset=symbol.base_asset,
+                    quote_asset=symbol.quote_asset,
+                    price_scale=symbol.price_scale,
+                    tick_size=symbol.tick_size,
+                    qty_step=symbol.qty_step,
+                    max_qty=symbol.max_qty,
+                    min_notional=symbol.min_notional,
+                    max_leverage=symbol.max_leverage,
+                    funding_interval=symbol.funding_interval
                 )
                 session.add(new_symbol)
                 await session.flush()
@@ -94,7 +102,7 @@ class SymbolRepository:
             logger.error(f"Error creating symbol: {e}")
             raise RepositoryError(f"Failed to create symbol: {str(e)}")
 
-    async def get_symbols_with_stats(self, exchange: str) -> List[dict]:
+    async def get_symbols_with_stats(self, exchange: str) -> list[dict]:
         """
         Get all symbols from a specific exchange with their associated statistics.
 
@@ -115,8 +123,8 @@ class SymbolRepository:
                             symbol_id,
                             interval,
                             count(*) as kline_count,
-                            min(start_time) as first_kline,
-                            max(start_time) as last_kline
+                            min(timestamp) as first_kline,
+                            max(timestamp) as last_kline
                         FROM kline_data
                         GROUP BY symbol_id, interval
                     )
@@ -124,7 +132,16 @@ class SymbolRepository:
                         s.id,
                         s.name,
                         s.exchange,
-                        s.first_trade_time,
+                        s.launch_time,
+                        s.base_asset,
+                        s.quote_asset,
+                        s.price_scale,
+                        s.tick_size,
+                        s.qty_step,
+                        s.max_qty,
+                        s.min_notional,
+                        s.max_leverage,
+                        s.funding_interval,
                         json_agg(json_build_object(
                             'interval', st.interval,
                             'kline_count', st.kline_count,
@@ -134,7 +151,11 @@ class SymbolRepository:
                     FROM symbols s
                     LEFT JOIN stats st ON s.id = st.symbol_id
                     WHERE s.exchange = :exchange
-                    GROUP BY s.id, s.name, s.exchange, s.first_trade_time
+                    GROUP BY
+                        s.id, s.name, s.exchange, s.launch_time,
+                        s.base_asset, s.quote_asset, s.price_scale,
+                        s.tick_size, s.qty_step, s.max_qty,
+                        s.min_notional, s.max_leverage, s.funding_interval
                     ORDER BY s.name;
                 """)
 

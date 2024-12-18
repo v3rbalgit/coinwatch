@@ -1,5 +1,3 @@
-from typing import List, Optional, Set
-
 from shared.core.enums import Interval
 from shared.core.exceptions import ValidationError
 from shared.core.models import KlineData, SymbolInfo
@@ -40,16 +38,16 @@ class KlineManager:
         }
 
         # Cache of valid higher intervals
-        self._valid_intervals: Optional[Set[Interval]] = None
+        self._valid_intervals: set[Interval] | None = None
 
     @property
-    def valid_intervals(self) -> Set[Interval]:
+    def valid_intervals(self) -> set[Interval]:
         """Get all valid intervals that can be calculated from base interval"""
         if self._valid_intervals is None:
             self._valid_intervals = self._calculate_valid_intervals()
         return self._valid_intervals
 
-    def _calculate_valid_intervals(self) -> Set[Interval]:
+    def _calculate_valid_intervals(self) -> set[Interval]:
         """
         Calculate which intervals can be derived from base interval.
         An interval is valid if it's a multiple of the base interval.
@@ -82,13 +80,13 @@ class KlineManager:
                 f"{self.base_interval.value} base interval"
             )
 
-    @redis_cached[List[KlineData]](ttl=60)
+    @redis_cached[list[KlineData]](ttl=60)
     async def get_klines(self,
                         symbol: SymbolInfo,
                         interval: Interval,
-                        start_time: Optional[int] = None,
-                        end_time: Optional[int] = None,
-                        limit: Optional[int] = None) -> List[KlineData]:
+                        start_time: int | None = None,
+                        end_time: int | None = None,
+                        limit: int | None = None) -> list[KlineData]:
         """
         Get kline data for specified interval.
         Uses continuous aggregates for common intervals, calculates others on demand.
@@ -182,7 +180,7 @@ class KlineManager:
     async def _check_data_gaps(self,
                               symbol: SymbolInfo,
                               start_time: int,
-                              end_time: int) -> List[tuple[int, int]]:
+                              end_time: int) -> list[tuple[int, int]]:
         """Check for gaps in base interval data"""
         return await self.kline_repository.get_data_gaps(
             symbol,
@@ -191,7 +189,7 @@ class KlineManager:
             end_time
         )
 
-    async def _fill_data_gaps(self, symbol: SymbolInfo, gaps: List[tuple[int, int]]) -> None:
+    async def _fill_data_gaps(self, symbol: SymbolInfo, gaps: list[tuple[int, int]]) -> None:
         """Fill detected data gaps"""
         if not gaps:
             return

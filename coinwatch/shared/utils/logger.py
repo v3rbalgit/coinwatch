@@ -3,7 +3,6 @@ import os
 import logging
 import sys
 from logging.handlers import RotatingFileHandler
-from typing import Optional
 
 class LoggerSetup:
     """
@@ -90,8 +89,8 @@ class LoggerSetup:
 
     @classmethod
     def update_log_level(cls, module_name: str,
-                        console_level: Optional[int] = None,
-                        file_level: Optional[int] = None) -> None:
+                        console_level: int | None = None,
+                        file_level: int | None = None) -> None:
         """
         Update log levels for an existing logger.
         Args:

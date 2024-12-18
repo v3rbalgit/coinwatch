@@ -1,4 +1,3 @@
-from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 import os
 from dotenv import load_dotenv
@@ -45,7 +44,7 @@ class DatabaseConfig:
         """Get database URL"""
         return f"{self.dialect}+{self.driver}://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
 
-    def get_engine_options(self) -> Dict[str, Any]:
+    def get_engine_options(self) -> dict[str, type[AsyncAdaptedQueuePool] | int | bool]:
         """Get SQLAlchemy engine options"""
         return {
             'poolclass': AsyncAdaptedQueuePool,
@@ -77,7 +76,7 @@ class BybitConfig:
 class CoingeckoConfig:
     """Coingecko-specific configuration"""
     redis_url: str = ''
-    api_key: Optional[str] = None
+    api_key: str | None = None
     pro_account: bool = False
     rate_limit: int = 30         # requests per window
     rate_limit_window: int = 60  # seconds
@@ -114,19 +113,19 @@ class MarketDataConfig:
 @dataclass
 class SentimentConfig:
     """Configuration for sentiment analysis APIs"""
-    twitter_api_key: Optional[str] = None
-    twitter_api_host: Optional[str] = None
+    twitter_api_key: str | None = None
+    twitter_api_host: str | None = None
     twitter_rate_limit: int = 60
     twitter_rate_limit_window: int = 60
     twitter_monthly_limit: int = 100_000
 
-    reddit_client_id: Optional[str] = None
-    reddit_client_secret: Optional[str] = None
+    reddit_client_id: str | None = None
+    reddit_client_secret: str | None = None
     reddit_rate_limit: int = 100
     reddit_rate_limit_window: int = 60
 
-    telegram_api_id: Optional[str] = None
-    telegram_api_hash: Optional[str] = None
+    telegram_api_id: str | None = None
+    telegram_api_hash: str | None = None
     telegram_session_name: str = "coinwatch_bot"
 
     def get_twitter_config(self):
@@ -156,12 +155,12 @@ class SentimentConfig:
 @dataclass
 class FundamentalDataConfig:
     """Configuration for fundamental data collection"""
-    collection_intervals: Dict[str, int] = field(default_factory=lambda: {
+    collection_intervals: dict[str, int] = field(default_factory=lambda: {
         'metadata': 86400 * 7,   # Weekly
         'market': 3600,          # Hourly
         'sentiment': 86400       # Daily
     })
-    batch_sizes: Dict[str, int] = field(default_factory=lambda: {
+    batch_sizes: dict[str, int] = field(default_factory=lambda: {
         'metadata': 10,
         'market': 100,
         'sentiment': 50
@@ -171,7 +170,7 @@ class FundamentalDataConfig:
 @dataclass
 class MonitorConfig:
     """Configuration for monitoring service"""
-    check_intervals: Dict[str, int] = field(
+    check_intervals: dict[str, int] = field(
         default_factory=lambda: {
             'system': 30,      # System metrics
             'market': 120,     # Market data metrics
@@ -183,7 +182,7 @@ class MonitorConfig:
 class APIConfig:
     """API Gateway configuration"""
     port: int = 8000
-    cors_origins: List[str] = field(default_factory=lambda: ["*"])
+    cors_origins: list[str] = field(default_factory=lambda: ["*"])
     rate_limit_enabled: bool = True
     rate_limit_requests: int = 100
     rate_limit_window: int = 60
@@ -193,7 +192,7 @@ class APIConfig:
 class LogConfig:
     """Logging configuration"""
     level: str = "INFO"
-    file_path: Optional[str] = None
+    file_path: str | None = None
     max_size: int = 10 * 1024 * 1024  # 10MB
     backup_count: int = 5
 

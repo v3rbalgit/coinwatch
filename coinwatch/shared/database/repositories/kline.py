@@ -1,5 +1,3 @@
-from decimal import Decimal
-from typing import List, Optional, Tuple
 from sqlalchemy import select, and_, text
 from sqlalchemy.dialects.postgresql import insert
 
@@ -26,7 +24,7 @@ class KlineRepository:
         self.db = db
         self._batch_size = 1000
 
-    async def get_latest_timestamp(self, symbol: SymbolInfo) -> Optional[int]:
+    async def get_latest_timestamp(self, symbol: SymbolInfo) -> int | None:
         """
         Get the latest timestamp for a symbol.
 
@@ -73,7 +71,7 @@ class KlineRepository:
                             interval: Interval,
                             start_time: int,
                             end_time: int,
-                            limit: Optional[int] = None) -> List[KlineData]:
+                            limit: int | None = None) -> list[KlineData]:
         """
         Get kline data directly at base interval without any aggregation.
 
@@ -123,15 +121,16 @@ class KlineRepository:
                 )
 
             return [
-                KlineData(
+                KlineData.from_raw_data(
                     timestamp=TimeUtils.to_timestamp(row.timestamp),
-                    open_price=Decimal(str(row.open_price)),
-                    high_price=Decimal(str(row.high_price)),
-                    low_price=Decimal(str(row.low_price)),
-                    close_price=Decimal(str(row.close_price)),
-                    volume=Decimal(str(row.volume)),
-                    turnover=Decimal(str(row.turnover)),
-                    interval=Interval(row.interval)
+                    open_price=row.open_price,
+                    high_price=row.high_price,
+                    low_price=row.low_price,
+                    close_price=row.close_price,
+                    volume=row.volume,
+                    turnover=row.turnover,
+                    interval=interval,
+                    symbol=symbol
                 )
                 for row in result
             ]
@@ -145,7 +144,7 @@ class KlineRepository:
                               interval: Interval,
                               start_time: int,
                               end_time: int,
-                              limit: Optional[int] = None) -> List[KlineData]:
+                              limit: int | None = None) -> list[KlineData]:
         """
         Get kline data from continuous aggregate views.
 
@@ -195,15 +194,16 @@ class KlineRepository:
                 )
 
             return [
-                KlineData(
+                KlineData.from_raw_data(
                     timestamp=int(row.timestamp),
-                    open_price=Decimal(str(row.open_price)),
-                    high_price=Decimal(str(row.high_price)),
-                    low_price=Decimal(str(row.low_price)),
-                    close_price=Decimal(str(row.close_price)),
-                    volume=Decimal(str(row.volume)),
-                    turnover=Decimal(str(row.turnover)),
-                    interval=Interval(row.interval)
+                    open_price=row.open_price,
+                    high_price=row.high_price,
+                    low_price=row.low_price,
+                    close_price=row.close_price,
+                    volume=row.volume,
+                    turnover=row.turnover,
+                    interval=interval,
+                    symbol=symbol
                 )
                 for row in result
             ]
@@ -218,7 +218,7 @@ class KlineRepository:
                                   base_interval: Interval,
                                   start_time: int,
                                   end_time: int,
-                                  limit: Optional[int] = None) -> List[KlineData]:
+                                  limit: int | None = None) -> list[KlineData]:
         """
         Calculate klines on demand for non-stored intervals.
 
@@ -297,15 +297,16 @@ class KlineRepository:
                 )
 
             return [
-                KlineData(
+                KlineData.from_raw_data(
                     timestamp=int(row.timestamp),
-                    open_price=Decimal(str(row.open_price)),
-                    high_price=Decimal(str(row.high_price)),
-                    low_price=Decimal(str(row.low_price)),
-                    close_price=Decimal(str(row.close_price)),
-                    volume=Decimal(str(row.volume)),
-                    turnover=Decimal(str(row.turnover)),
-                    interval=Interval(row.interval)
+                    open_price=row.open_price,
+                    high_price=row.high_price,
+                    low_price=row.low_price,
+                    close_price=row.close_price,
+                    volume=row.volume,
+                    turnover=row.turnover,
+                    interval=interval,
+                    symbol=symbol
                 )
                 for row in result
             ]
@@ -314,7 +315,7 @@ class KlineRepository:
             logger.error(f"Error calculating klines for {symbol}: {e}")
             raise RepositoryError(f"Failed to calculate klines: {str(e)}")
 
-    async def insert_batch(self, symbol: SymbolInfo, klines: List[KlineData]) -> int:
+    async def insert_batch(self, symbol: SymbolInfo, klines: list[KlineData]) -> int:
         """
         Insert a batch of klines using PostgreSQL bulk insert.
 
@@ -384,7 +385,7 @@ class KlineRepository:
                            symbol: SymbolInfo,
                            interval: Interval,
                            start_time: int,
-                           end_time: int) -> List[Tuple[int, int]]:
+                           end_time: int) -> list[tuple[int, int]]:
         """
         Find gaps in time series data using TimescaleDB features.
 

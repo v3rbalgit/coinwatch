@@ -1,6 +1,6 @@
 import asyncio
 import json
-from typing import Any, Dict, Optional, Callable, Coroutine
+from typing import Any, Dict, Callable, Coroutine
 from websockets.asyncio.client import connect, ClientConnection
 from websockets.exceptions import ConnectionClosed
 
@@ -20,10 +20,10 @@ class BybitWebsocket:
 
     def __init__(self, config: BybitConfig):
         self._config = config
-        self._ws: Optional[ClientConnection] = None
+        self._ws: ClientConnection | None = None
         self._ws_url = self.TESTNET_WS_URL if self._config.testnet else self.WS_URL
         self._ws_lock = asyncio.Lock()
-        self._runner: Optional[asyncio.Task] = None
+        self._runner: asyncio.Task | None = None
         self._handlers: Dict[str, Callable] = {}
 
     async def start(self) -> None:

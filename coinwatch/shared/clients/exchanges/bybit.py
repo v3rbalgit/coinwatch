@@ -1,5 +1,4 @@
-from decimal import Decimal
-from typing import Any, AsyncGenerator, Callable, Coroutine, Dict, List, Optional
+from typing import Any, AsyncGenerator, Callable, Coroutine
 import aiohttp
 import asyncio
 import time
@@ -32,7 +31,7 @@ class BybitAdapter(ExchangeAdapter):
     TESTNET_URL = "https://api-testnet.bybit.com"
 
     # Class-level variables for circuit breaker
-    _rate_limit_reset: Optional[int] = None  # Shared timestamp when rate limit resets (in milliseconds)
+    _rate_limit_reset: int | None = None  # Shared timestamp when rate limit resets (in milliseconds)
     _circuit_breaker_lock = asyncio.Lock()   # Lock for thread-safe access
 
     def __init__(self, config: BybitConfig):
@@ -113,7 +112,7 @@ class BybitAdapter(ExchangeAdapter):
 
             return data.get('result', {})
 
-    async def get_symbols(self, symbol: Optional[str] = None) -> List[SymbolInfo]:
+    async def get_symbols(self, symbol: str | None = None) -> list[SymbolInfo]:
         """
         Get available trading pairs
 
@@ -135,7 +134,7 @@ class BybitAdapter(ExchangeAdapter):
                 params=params
             )
 
-            symbols: List[SymbolInfo] = []
+            symbols: list[SymbolInfo] = []
             for item in data.get('list', []):
                 if (item.get('status') == 'Trading' and
                     'USDT' in item.get('symbol', '')):
@@ -145,9 +144,13 @@ class BybitAdapter(ExchangeAdapter):
                         exchange='bybit',
                         base_asset=item['baseCoin'],
                         quote_asset=item['quoteCoin'],
-                        price_precision=str(item['priceFilter']['tickSize']).count('0'),
-                        qty_precision=str(item['lotSizeFilter']['qtyStep']).count('0'),
-                        min_order_qty=Decimal(str(item['lotSizeFilter']['minOrderQty'])),
+                        price_scale=int(item['priceScale']),
+                        tick_size=item['priceFilter']['tickSize'],
+                        qty_step=item['lotSizeFilter']['qtyStep'],
+                        max_qty=item['lotSizeFilter']['maxOrderQty'],
+                        min_notional=item['lotSizeFilter']['minNotionalValue'],
+                        max_leverage=item['leverageFilter']['maxLeverage'],
+                        funding_interval=item['fundingInterval'],
                         launch_time=int(item.get('launchTime', '0'))
                     ))
 
@@ -163,7 +166,7 @@ class BybitAdapter(ExchangeAdapter):
                         interval: Interval,
                         start_time: int,
                         end_time: int,
-                        limit: Optional[int] = None) -> AsyncGenerator[List[KlineData], None]:
+                        limit: int | None = None) -> AsyncGenerator[list[KlineData], None]:
         """
         Get kline (candlestick) data
 
@@ -201,15 +204,16 @@ class BybitAdapter(ExchangeAdapter):
                 )
 
                 # Process klines in ascending order
-                klines = [KlineData(
+                klines = [KlineData.from_raw_data(
                     timestamp=int(item[0]),
-                    open_price=Decimal(item[1]),
-                    high_price=Decimal(item[2]),
-                    low_price=Decimal(item[3]),
-                    close_price=Decimal(item[4]),
-                    volume=Decimal(item[5]),
-                    turnover=Decimal(item[6]),
-                    interval=interval
+                    open_price=item[1],
+                    high_price=item[2],
+                    low_price=item[3],
+                    close_price=item[4],
+                    volume=item[5],
+                    turnover=item[6],
+                    interval=interval,
+                    symbol=symbol
                 ) for item in reversed(data.get('list', []))]
 
                 logger.debug(f"Fetched {len(klines)} klines for {symbol.name} on {symbol.exchange}")
@@ -224,7 +228,7 @@ class BybitAdapter(ExchangeAdapter):
     async def subscribe_klines(self,
                              symbol: SymbolInfo,
                              interval: Interval,
-                             handler: Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]) -> None:
+                             handler: Callable[[dict[str, Any]], Coroutine[Any, Any, None]]) -> None:
         """Subscribe to real-time kline updates via websocket client"""
         await self._ws_client.subscribe_klines(symbol, interval, handler)
 
