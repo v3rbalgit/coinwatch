@@ -1,5 +1,3 @@
-# src/adapters/bybit.py
-
 from decimal import Decimal
 from typing import Any, AsyncGenerator, Callable, Coroutine, Dict, List, Optional
 import aiohttp
@@ -9,7 +7,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 from ..registry import ExchangeAdapter
 from shared.core.config import BybitConfig
-from shared.core.enums import Timeframe
+from shared.core.enums import Interval
 from shared.core.exceptions import AdapterError
 from shared.core.models import KlineData, SymbolInfo
 from shared.utils.logger import LoggerSetup
@@ -162,7 +160,7 @@ class BybitAdapter(ExchangeAdapter):
 
     async def get_klines(self,
                         symbol: SymbolInfo,
-                        timeframe: Timeframe,
+                        interval: Interval,
                         start_time: int,
                         end_time: int,
                         limit: Optional[int] = None) -> AsyncGenerator[List[KlineData], None]:
@@ -171,7 +169,7 @@ class BybitAdapter(ExchangeAdapter):
 
         Args:
             symbol (SymbolInfo): Symbol to get the klines for.
-            timeframe (Timeframe): Timeframe to use.
+            interval (Interval): Interval to use.
             start_time (int): Start timestamp of the klines.
             end_time (int): End timestamp of the klines.
             limit (Optional[int]): Number of klines to fetch (will default to config value).
@@ -183,12 +181,12 @@ class BybitAdapter(ExchangeAdapter):
             params = {
                 "category": "linear",
                 "symbol": symbol.name,
-                "interval": timeframe.value,
+                "interval": interval.value,
                 "limit": limit or self._config.kline_limit
             }
 
             current_start = start_time
-            chunk_size_ms = params['limit'] * timeframe.to_milliseconds()
+            chunk_size_ms = params['limit'] * interval.to_milliseconds()
 
             while current_start < end_time:
                 current_end = min(current_start + chunk_size_ms, end_time)
@@ -211,7 +209,7 @@ class BybitAdapter(ExchangeAdapter):
                     close_price=Decimal(item[4]),
                     volume=Decimal(item[5]),
                     turnover=Decimal(item[6]),
-                    timeframe=timeframe
+                    interval=interval
                 ) for item in reversed(data.get('list', []))]
 
                 logger.debug(f"Fetched {len(klines)} klines for {symbol.name} on {symbol.exchange}")
@@ -225,16 +223,16 @@ class BybitAdapter(ExchangeAdapter):
 
     async def subscribe_klines(self,
                              symbol: SymbolInfo,
-                             timeframe: Timeframe,
+                             interval: Interval,
                              handler: Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]) -> None:
         """Subscribe to real-time kline updates via websocket client"""
-        await self._ws_client.subscribe_klines(symbol, timeframe, handler)
+        await self._ws_client.subscribe_klines(symbol, interval, handler)
 
     async def unsubscribe_klines(self,
                                 symbol: SymbolInfo,
-                                timeframe: Timeframe) -> None:
+                                interval: Interval) -> None:
         """Unsubscribe from kline updates via websocket client"""
-        await self._ws_client.unsubscribe_klines(symbol, timeframe)
+        await self._ws_client.unsubscribe_klines(symbol, interval)
 
     async def cleanup(self) -> None:
         """Cleanup resources"""

@@ -43,7 +43,7 @@ class KlineMessage(BaseMessage):
     """Candlestick/kline updates"""
     symbol: str
     exchange: str
-    timeframe: str
+    interval: str
     kline_timestamp: int
     open_price: float
     high_price: float
@@ -56,14 +56,14 @@ class GapMessage(BaseMessage):
     """Data gap detection"""
     symbol: str
     exchange: str
-    timeframe: str
+    interval: str
     gaps: List[Tuple[int, int]]  # List of (start, end) timestamps
 
 class CollectionMessage(BaseMessage):
     """Initial or gap fill collection"""
     symbol: str
     exchange: str
-    timeframe: str
+    interval: str
     start_time: int
     end_time: int
     processed: int  # Number of klines processed
@@ -84,7 +84,7 @@ class SentimentMessage(BaseMessage):
     source: str  # e.g., "reddit", "twitter"
     score: float
     volume: int
-    timeframe: str
+    interval: str
 
 class MarketMetricsMessage(BaseMessage):
     """Market metrics updates"""

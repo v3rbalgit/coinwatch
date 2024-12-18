@@ -15,7 +15,7 @@ from pydantic import (
 )
 
 import shared.utils.time as TimeUtils
-from .enums import DataSource, Timeframe
+from .enums import DataSource, Interval
 
 class SymbolInfo(BaseModel):
     """
@@ -219,7 +219,7 @@ class KlineData(BaseModel):
         close_price: Closing price of the period
         volume: Trading volume during the period
         turnover: Trading turnover during the period
-        timeframe: Trading timeframe/interval
+        interval: Trading interval
     """
 
     # Model configuration
@@ -236,7 +236,7 @@ class KlineData(BaseModel):
                 "close_price": "60500.0",
                 "volume": "16.7",
                 "turnover": "1000000.0",
-                "timeframe": "60"
+                "interval": "60"
             }
         }
     )
@@ -285,9 +285,9 @@ class KlineData(BaseModel):
         ge=0,  # Built-in validation for greater than 0
         examples=["1000000.0"]
     )
-    timeframe: Timeframe = Field(
+    interval: Interval = Field(
         ...,
-        description="Trading timeframe/interval"
+        description="Trading interval"
     )
 
     @field_validator('timestamp')

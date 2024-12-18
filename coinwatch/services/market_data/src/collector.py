@@ -3,7 +3,7 @@ from typing import Any, AsyncGenerator, Callable, Coroutine, Dict, Optional, Set
 from decimal import Decimal
 
 from shared.clients.registry import ExchangeAdapterRegistry
-from shared.core.enums import Timeframe
+from shared.core.enums import Interval
 from shared.core.exceptions import ServiceError
 from shared.core.models import KlineData, SymbolInfo
 from shared.database.repositories.kline import KlineRepository
@@ -32,13 +32,13 @@ class DataCollector:
                  symbol_repository: SymbolRepository,
                  kline_repository: KlineRepository,
                  message_broker: MessageBroker,
-                 base_timeframe: Timeframe = Timeframe.MINUTE_5):
+                 base_interval: Interval = Interval.MINUTE_5):
         # Core dependencies
         self._adapter_registry = adapter_registry
         self._symbol_repository = symbol_repository
         self._kline_repository = kline_repository
         self._message_broker = message_broker
-        self._base_timeframe = base_timeframe
+        self._base_interval = base_interval
 
         # Adapters
         self._collection_adapter = None
@@ -73,7 +73,7 @@ class DataCollector:
                     return
 
             # Align the start and end timestamps to interval boundaries
-            start_time, end_time = TimeUtils.align_time_range_to_interval(start_time, end_time, self._base_timeframe)
+            start_time, end_time = TimeUtils.align_time_range_to_interval(start_time, end_time, self._base_interval)
             if start_time == end_time:
                 logger.info(f"No data to collect for {symbol.name} on {symbol.exchange}, skipping collection")
             else:
@@ -109,7 +109,7 @@ class DataCollector:
             progress = MarketDataProgress(
                 symbol=symbol,
                 time_range=(start_time, end_time),
-                timeframe=self._base_timeframe
+                interval=self._base_interval
             )
             self._collection_progress[symbol] = progress
 
@@ -138,7 +138,7 @@ class DataCollector:
                 start_time, end_time = time_range
                 context = {
                     "type": "gap_fill",
-                    "gap_size": (end_time - start_time) // self._base_timeframe.to_milliseconds()
+                    "gap_size": (end_time - start_time) // self._base_interval.to_milliseconds()
                 }
 
     async def _process_collection(self, symbol: SymbolInfo, start_time: int, end_time: int) -> AsyncGenerator[int, None]:
@@ -160,7 +160,7 @@ class DataCollector:
         # Process using generator pattern
         async for klines in self._collection_adapter.get_klines(
             symbol=symbol,
-            timeframe=self._base_timeframe,
+            interval=self._base_interval,
             start_time=start_time,
             end_time=end_time
         ):
@@ -191,7 +191,7 @@ class DataCollector:
 
         # Calculate the last completed interval
         current_time = TimeUtils.get_current_timestamp()
-        interval_ms = self._base_timeframe.to_milliseconds()
+        interval_ms = self._base_interval.to_milliseconds()
         last_complete = current_time - (current_time % interval_ms) - interval_ms
 
         # Check for gaps and fill if needed
@@ -216,7 +216,7 @@ class DataCollector:
                     handler = await self._create_kline_handler(symbol)
 
                     # Subscribe to klines
-                    await self._streaming_adapter.subscribe_klines(symbol, self._base_timeframe, handler)
+                    await self._streaming_adapter.subscribe_klines(symbol, self._base_interval, handler)
 
                     self._streaming_symbols.add(symbol)
                     logger.info(f"Streaming started for {symbol.name} on {symbol.exchange}")
@@ -235,7 +235,7 @@ class DataCollector:
                         self._streaming_adapter = self._adapter_registry.get_adapter(symbol.exchange)
 
                     # Unsubscribe from websocket
-                    await self._streaming_adapter.unsubscribe_klines(symbol, self._base_timeframe)
+                    await self._streaming_adapter.unsubscribe_klines(symbol, self._base_interval)
 
                     self._streaming_symbols.remove(symbol)
                     logger.info(f"Streaming stopped for {symbol.name} on {symbol.exchange}")
@@ -257,7 +257,7 @@ class DataCollector:
 
                 # Create KlineData object
                 kline = KlineData(
-                    timeframe=self._base_timeframe,
+                    interval=self._base_interval,
                     timestamp=int(kline_data['start']),
                     open_price=Decimal(str(kline_data['open'])),
                     high_price=Decimal(str(kline_data['high'])),
@@ -278,6 +278,17 @@ class DataCollector:
             except Exception as e:
                 logger.error(f"Error handling kline update for {symbol}: {e}")
                 await self._publish_error("StreamingError", str(e), symbol, 0, 0, {"type": "streaming_update"})
+                end_time = TimeUtils.get_current_timestamp()
+                start_time = end_time - (2 * self._base_interval.to_milliseconds())     # try to get last 2 candles on streaming error
+                await self.collect(
+                    symbol=symbol,
+                    start_time=start_time,
+                    end_time=end_time,
+                    context = {
+                        "type": "gap_fill",
+                        "gap_size": (end_time - start_time) // self._base_interval.to_milliseconds()
+                    }
+                )
 
         return handle_update
 
@@ -309,7 +320,7 @@ class DataCollector:
                 service="market_data",
                 type=MessageType.COLLECTION_COMPLETE,
                 timestamp=TimeUtils.get_current_timestamp(),
-                timeframe=self._base_timeframe.value,
+                interval=self._base_interval.value,
                 symbol=symbol.name,
                 exchange=symbol.exchange,
                 start_time=start_time,
@@ -329,7 +340,7 @@ class DataCollector:
                 timestamp=TimeUtils.get_current_timestamp(),
                 symbol=symbol.name,
                 exchange=symbol.exchange,
-                timeframe=self._base_timeframe.value,
+                interval=self._base_interval.value,
                 kline_timestamp=kline.timestamp,
                 open_price=float(kline.open_price),
                 high_price=float(kline.high_price),
@@ -358,7 +369,7 @@ class DataCollector:
                     "start_time": start_time,
                     "end_time": end_time,
                     "collection_type": context.get("type"),
-                    "timeframe": self._base_timeframe.value
+                    "interval": self._base_interval.value
                 }
             ).model_dump()
         )

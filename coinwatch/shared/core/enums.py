@@ -3,8 +3,7 @@ from enum import Enum
 from typing import Optional
 
 
-# Timeframe type
-class Timeframe(str, Enum):
+class Interval(str, Enum):
     MINUTE_1 = "1"
     MINUTE_3 = "3"
     MINUTE_5 = "5"
@@ -28,8 +27,8 @@ class Timeframe(str, Enum):
         }
         return view_mapping.get(self)
 
-    def is_stored_timeframe(self) -> bool:
-        """Check if this timeframe has a continuous aggregate view"""
+    def is_stored_interval(self) -> bool:
+        """Check if this interval has a continuous aggregate view"""
         return self.continuous_aggregate_view is not None
 
     def get_bucket_interval(self) -> timedelta:
@@ -39,12 +38,11 @@ class Timeframe(str, Enum):
         elif self == self.WEEK_1:
             return timedelta(days=7)
         else:
-            # Convert minutes to seconds for sub-day timeframes
             minutes = int(self.value) if self.value.isdigit() else 0
             return timedelta(minutes=minutes)
 
     def to_milliseconds(self) -> int:
-        """Convert timeframe to milliseconds"""
+        """Convert interval to milliseconds"""
         mapping = {
             "1": 1 * 60 * 1000,
             "3": 3 * 60 * 1000,
@@ -62,8 +60,7 @@ class Timeframe(str, Enum):
         return mapping[self.value]
 
 
-# Service status types
-class ServiceStatus(str, Enum):  # Also make this inherit from str for consistency
+class ServiceStatus(str, Enum):
     STARTING = "starting"
     RUNNING = "running"
     STOPPING = "stopping"

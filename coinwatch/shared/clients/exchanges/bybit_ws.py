@@ -4,7 +4,7 @@ from typing import Any, Dict, Optional, Callable, Coroutine
 from websockets.asyncio.client import connect, ClientConnection
 from websockets.exceptions import ConnectionClosed
 
-from shared.core.enums import Timeframe
+from shared.core.enums import Interval
 from shared.core.models import SymbolInfo
 from shared.core.config import BybitConfig
 from shared.utils.logger import LoggerSetup
@@ -104,10 +104,10 @@ class BybitWebsocket:
 
     async def subscribe_klines(self,
                              symbol: SymbolInfo,
-                             timeframe: Timeframe,
+                             interval: Interval,
                              handler: Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]) -> None:
         """Subscribe to kline updates"""
-        topic = f"kline.{timeframe.value}.{symbol.name}"
+        topic = f"kline.{interval.value}.{symbol.name}"
 
         if not self._runner:
             await self.start()
@@ -122,9 +122,9 @@ class BybitWebsocket:
 
     async def unsubscribe_klines(self,
                                 symbol: SymbolInfo,
-                                timeframe: Timeframe) -> None:
+                                interval: Interval) -> None:
         """Unsubscribe from kline updates"""
-        topic = f"kline.{timeframe.value}.{symbol.name}"
+        topic = f"kline.{interval.value}.{symbol.name}"
 
         if topic in self._handlers:
             self._handlers.pop(topic)

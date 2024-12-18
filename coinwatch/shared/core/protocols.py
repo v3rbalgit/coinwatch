@@ -1,8 +1,52 @@
-# src/adapters/base.py
-
 from typing import Optional, Any, Protocol
 import aiohttp
 import asyncio
+
+class Service(Protocol):
+    """
+    Base class for all services.
+
+    Features:
+    - Configuration management
+    - Service lifecycle (start/stop)
+    - Status reporting
+    - Message-based communication
+    """
+    async def start(self) -> None:
+        """
+        Start the service.
+
+        Each service must implement its startup logic:
+        - Initialize resources
+        - Connect to message broker
+        - Start background tasks
+        """
+        ...
+
+    async def stop(self) -> None:
+        """
+        Stop the service.
+
+        Each service must implement its cleanup logic:
+        - Close connections
+        - Cancel background tasks
+        - Release resources
+        """
+        ...
+
+    def get_service_status(self) -> str:
+        """
+        Generate detailed service status report.
+
+        Returns:
+            str: Multi-line status report including:
+                - Service state
+                - Resource usage
+                - Error counts
+                - Component health
+        """
+        ...
+
 
 class APIAdapter(Protocol):
     """

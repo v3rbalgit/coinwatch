@@ -6,7 +6,7 @@ from typing import Optional, Tuple
 
 import shared.utils.time as TimeUtils
 from shared.core.models import SymbolInfo
-from shared.core.enums import Timeframe
+from shared.core.enums import Interval
 
 
 @dataclass
@@ -14,15 +14,15 @@ class MarketDataProgress:
     """Tracks data collection progress of a symbol"""
 
     symbol: SymbolInfo
-    timeframe: Timeframe
+    interval: Interval
     processed_candles: int
     total_candles: int
     start_time: datetime
     last_processed_time: Optional[datetime]
 
-    def __init__(self, symbol: SymbolInfo, time_range: Tuple[int,int], timeframe: Timeframe) -> None:
+    def __init__(self, symbol: SymbolInfo, time_range: Tuple[int,int], interval: Interval) -> None:
         self.symbol = symbol
-        self.timeframe = timeframe
+        self.interval = interval
         self.processed_candles = 0
         self.total_candles = self.calculate_total_candles(time_range)
         self.start_time = TimeUtils.get_current_datetime()
@@ -39,7 +39,7 @@ class MarketDataProgress:
             int: Total number of candles to process.
 
         """
-        interval_ms = self.timeframe.to_milliseconds()
+        interval_ms = self.interval.to_milliseconds()
         return ((time_range[1] - time_range[0]) // interval_ms) + 1
 
     def update(self, processed: int) -> None:

@@ -1,5 +1,3 @@
-# src/repositories/symbol.py
-
 from typing import List, Optional
 from sqlalchemy import select, and_, text
 
@@ -115,12 +113,12 @@ class SymbolRepository:
                     WITH stats AS (
                         SELECT
                             symbol_id,
-                            timeframe,
+                            interval,
                             count(*) as kline_count,
                             min(start_time) as first_kline,
                             max(start_time) as last_kline
                         FROM kline_data
-                        GROUP BY symbol_id, timeframe
+                        GROUP BY symbol_id, interval
                     )
                     SELECT
                         s.id,
@@ -128,11 +126,11 @@ class SymbolRepository:
                         s.exchange,
                         s.first_trade_time,
                         json_agg(json_build_object(
-                            'timeframe', st.timeframe,
+                            'interval', st.interval,
                             'kline_count', st.kline_count,
                             'first_kline', st.first_kline,
                             'last_kline', st.last_kline
-                        )) as timeframe_stats
+                        )) as interval_stats
                     FROM symbols s
                     LEFT JOIN stats st ON s.id = st.symbol_id
                     WHERE s.exchange = :exchange

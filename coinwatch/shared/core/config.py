@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from sqlalchemy import AsyncAdaptedQueuePool
 
 from .exceptions import ConfigurationError
-from shared.core.enums import Timeframe
+from shared.core.enums import Interval
 
 @dataclass
 class MessageBrokerConfig:
@@ -76,6 +76,7 @@ class BybitConfig:
 @dataclass
 class CoingeckoConfig:
     """Coingecko-specific configuration"""
+    redis_url: str = ''
     api_key: Optional[str] = None
     pro_account: bool = False
     rate_limit: int = 30         # requests per window
@@ -100,15 +101,15 @@ class AdapterConfig:
 @dataclass
 class MarketDataConfig:
     """Market data service configuration"""
-    default_timeframe: str = '5'
+    default_interval: str = '5'
     batch_size: int = 1000
 
     def __post_init__(self) -> None:
         """Validate market data configuration"""
         if self.batch_size <= 0:
             raise ConfigurationError("Batch size must be positive")
-        if self.default_timeframe not in [tf.value for tf in Timeframe]:
-            raise ConfigurationError(f"Invalid timeframe '{self.default_timeframe}'")
+        if self.default_interval not in [tf.value for tf in Interval]:
+            raise ConfigurationError(f"Invalid interval '{self.default_interval}'")
 
 @dataclass
 class SentimentConfig:
@@ -247,7 +248,7 @@ class Config:
         """Initialize market data configuration"""
         try:
             return MarketDataConfig(
-                default_timeframe=os.getenv('DEFAULT_TIMEFRAME', '5'),
+                default_interval=os.getenv('DEFAULT_INTERVAL', '5'),
                 batch_size=int(os.getenv('MARKET_DATA_BATCH_SIZE', '1000'))
             )
         except Exception as e:
@@ -268,7 +269,8 @@ class Config:
                 pro_account=bool(int(os.getenv('COINGECKO_PRO_ACCOUNT','0'))),
                 rate_limit=int(os.getenv('COINGECKO_RATE_LIMIT', '30')),
                 rate_limit_window=int(os.getenv('COINGECKO_RATE_LIMIT_WINDOW', '60')),
-                monthly_limit=int(os.getenv('COINGECKO_MONTHLY_LIMIT', '10000'))
+                monthly_limit=int(os.getenv('COINGECKO_MONTHLY_LIMIT', '10000')),
+                redis_url=os.getenv('REDIS_URL','redis://redis:6379')
             )
             return AdapterConfig(bybit=bybit_config, coingecko=coingecko_config)
         except Exception as e:
