@@ -1,8 +1,5 @@
 from enum import Enum
-from typing import Any, Dict, Optional, List, Tuple
 from pydantic import BaseModel
-
-from shared.core.enums import ServiceStatus
 
 
 class MessageType(str, Enum):
@@ -37,7 +34,7 @@ class SymbolMessage(BaseMessage):
     exchange: str
     base_asset: str
     quote_asset: str
-    first_trade_time: Optional[int] = None
+    launch_time: int | None = None
 
 class KlineMessage(BaseMessage):
     """Candlestick/kline updates"""
@@ -57,7 +54,7 @@ class GapMessage(BaseMessage):
     symbol: str
     exchange: str
     interval: str
-    gaps: List[Tuple[int, int]]  # List of (start, end) timestamps
+    gaps: list[tuple[int, int]]  # List of (start, end) timestamps
 
 class CollectionMessage(BaseMessage):
     """Initial or gap fill collection"""
@@ -67,16 +64,16 @@ class CollectionMessage(BaseMessage):
     start_time: int
     end_time: int
     processed: int  # Number of klines processed
-    context: Dict[str, Any]  # Additional sync info like next_sync, resource usage
+    context: dict  # Additional sync info like next_sync, resource usage
 
 class MetadataMessage(BaseMessage):
     """Token metadata updates"""
     symbol: str
     name: str
-    description: Optional[str]
-    tags: List[str]
+    description: str | None
+    tags: list[str]
     platform: str
-    contract_address: Optional[str]
+    contract_address: str | None
 
 class SentimentMessage(BaseMessage):
     """Token sentiment updates"""
@@ -92,8 +89,8 @@ class MarketMetricsMessage(BaseMessage):
     market_cap: float
     volume_24h: float
     price_change_24h: float
-    total_supply: Optional[float]
-    circulating_supply: Optional[float]
+    total_supply: float | None
+    circulating_supply: float | None
 
 class ServiceStatusMessage(BaseMessage):
     """Service health status"""
@@ -101,14 +98,14 @@ class ServiceStatusMessage(BaseMessage):
     uptime: float
     error_count: int
     warning_count: int
-    metrics: Dict
+    metrics: dict
 
 class ErrorMessage(BaseMessage):
     """Error reporting"""
     error_type: str
     severity: str  # "warning", "error", "critical"
     message: str
-    context: Dict
+    context: dict
 
 class SystemAlertMessage(BaseMessage):
     """System-wide alerts"""
@@ -116,4 +113,4 @@ class SystemAlertMessage(BaseMessage):
     service_name: str
     message: str
     severity: str
-    context: Optional[Dict] = None
+    context: dict | None = None

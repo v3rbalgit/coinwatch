@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Optional
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, ClassVar
 from pydantic import (
     BaseModel,
@@ -33,12 +32,16 @@ class SymbolInfo(BaseModel):
             "example": {
                 "name": "BTCUSDT",
                 "exchange": "bybit",
-                "launch_time": 1573776000000,  # 2019-11-15
+                "launch_time": 1573776000000,
                 "base_asset": "BTC",
                 "quote_asset": "USDT",
-                "price_precision": 2,
-                "qty_precision": 6,
-                "min_order_qty": "0.000001"
+                "price_scale": 2,
+                "tick_size": "0.01",
+                "qty_step": "0.001",
+                "max_qty": "100",
+                "min_notional": "5",
+                "max_leverage": "100",
+                "funding_interval": 480
             }
         }
     )
@@ -54,7 +57,7 @@ class SymbolInfo(BaseModel):
         description="Trading symbol name (e.g., 'BTCUSDT')",
         min_length=5,
         max_length=50,
-        pattern="^[A-Z0-9]+$",  # Only uppercase letters and numbers
+        pattern="^[A-Z0-9]+$",
         examples=["BTCUSDT", "ETHUSDT"]
     )
 
@@ -63,7 +66,7 @@ class SymbolInfo(BaseModel):
         description="Exchange name",
         min_length=1,
         max_length=20,
-        pattern="^[a-z0-9_]+$",  # lowercase letters, numbers, underscore
+        pattern="^[a-z0-9_]+$",
         examples=["bybit", "binance"]
     )
 
@@ -90,7 +93,7 @@ class SymbolInfo(BaseModel):
         examples=["USDT", "USD"]
     )
 
-    price_precision: int = Field(
+    price_scale: int = Field(
         ...,
         description="Number of decimal places for price",
         ge=0,
@@ -98,19 +101,40 @@ class SymbolInfo(BaseModel):
         examples=[2]
     )
 
-    qty_precision: int = Field(
+    tick_size: str = Field(
         ...,
-        description="Number of decimal places for quantity",
-        ge=0,
-        le=18,
-        examples=[6]
+        description="Minimum price movement",
+        examples=["0.01"]
     )
 
-    min_order_qty: Decimal = Field(
+    qty_step: str = Field(
         ...,
-        description="Minimum order quantity",
-        gt=0,
-        examples=["0.000001"]
+        description="Minimum quantity movement",
+        examples=["0.001"]
+    )
+
+    max_qty: str = Field(
+        ...,
+        description="Maximum order quantity",
+        examples=["100"]
+    )
+
+    min_notional: str = Field(
+        ...,
+        description="Minimum order value in quote currency",
+        examples=["5"]
+    )
+
+    max_leverage: str | None = Field(
+        None,
+        description="Maximum allowed leverage",
+        examples=["100"]
+    )
+
+    funding_interval: int | None = Field(
+        None,
+        description="Funding interval in minutes",
+        examples=[480]
     )
 
     @field_validator('name')
@@ -206,7 +230,6 @@ class SymbolInfo(BaseModel):
         return bool(self.name and self.exchange)
 
 
-# Kline Model
 class KlineData(BaseModel):
     """
     Domain model for kline data with built-in validation
@@ -226,7 +249,7 @@ class KlineData(BaseModel):
     model_config = ConfigDict(
         frozen=True,
         validate_assignment=True,
-        strict=True,  # Ensures strict type checking
+        strict=True,
         json_schema_extra={
             "example": {
                 "timestamp": 1635724800000,
@@ -234,7 +257,7 @@ class KlineData(BaseModel):
                 "high_price": "61000.0",
                 "low_price": "59000.0",
                 "close_price": "60500.0",
-                "volume": "16.7",
+                "volume": "1000000.0",
                 "turnover": "1000000.0",
                 "interval": "60"
             }
@@ -276,19 +299,76 @@ class KlineData(BaseModel):
     volume: Decimal = Field(
         ...,
         description="Trading volume during the period",
-        ge=0,  # Built-in validation for greater than 0
-        examples=["16.7"]
+        ge=0,
+        examples=["1000000.0"]
     )
     turnover: Decimal = Field(
         ...,
         description="Trading turnover during the period",
-        ge=0,  # Built-in validation for greater than 0
+        ge=0,
         examples=["1000000.0"]
     )
     interval: Interval = Field(
         ...,
         description="Trading interval"
     )
+
+    @classmethod
+    def quantize_decimal(cls, value: str | float, precision: int) -> Decimal:
+        """
+        Quantize a decimal to the specified precision
+
+        Args:
+            value: Value to quantize
+            precision: Number of decimal places
+
+        Returns:
+            Quantized Decimal value
+        """
+        decimal_value = Decimal(str(value))
+        return decimal_value.quantize(
+            Decimal(f'0.{"0" * precision}'),
+            rounding=ROUND_HALF_UP
+        )
+
+    @classmethod
+    def from_raw_data(cls,
+                     timestamp: int,
+                     open_price: str | float,
+                     high_price: str | float,
+                     low_price: str | float,
+                     close_price: str | float,
+                     volume: str | float,
+                     turnover: str | float,
+                     interval: Interval,
+                     symbol: SymbolInfo) -> 'KlineData':
+        """
+        Create a new KlineData instance from raw data with proper precision
+
+        Args:
+            timestamp: Unix timestamp in milliseconds
+            open_price: Opening price
+            high_price: Highest price
+            low_price: Lowest price
+            close_price: Closing price
+            volume: Trading volume
+            turnover: Trading turnover
+            interval: Trading interval
+            symbol: Symbol info for precision settings
+
+        Returns:
+            New KlineData instance with quantized values
+        """
+        return cls(
+            timestamp=timestamp,
+            open_price=cls.quantize_decimal(open_price, symbol.price_scale),
+            high_price=cls.quantize_decimal(high_price, symbol.price_scale),
+            low_price=cls.quantize_decimal(low_price, symbol.price_scale),
+            close_price=cls.quantize_decimal(close_price, symbol.price_scale),
+            volume=cls.quantize_decimal(volume, symbol.price_scale),
+            turnover=cls.quantize_decimal(turnover, symbol.price_scale),
+            interval=interval
+        )
 
     @field_validator('timestamp')
     def validate_timestamp(value: Any) -> int:
@@ -380,7 +460,7 @@ class MACDResult(BaseModel):
     histogram: Decimal
 
     @classmethod
-    def from_series(cls, timestamp: int, macd_dict: Dict[str, float],
+    def from_series(cls, timestamp: int, macd_dict: dict[str, float],
                    fast: int = 12, slow: int = 26, signal: int = 9) -> 'MACDResult':
         # MACD column names format: 'MACD_12_26_9', 'MACDs_12_26_9', 'MACDh_12_26_9'
         suffix = f"_{fast}_{slow}_{signal}"
@@ -400,7 +480,7 @@ class BollingerBandsResult(BaseModel):
     bandwidth: Decimal
 
     @classmethod
-    def from_series(cls, timestamp: int, bb_dict: Dict[str, float],
+    def from_series(cls, timestamp: int, bb_dict: dict[str, float],
                    length: int = 20, std: float = 2.0) -> 'BollingerBandsResult':
         # BB column names format: 'BBL_20_2.0', 'BBM_20_2.0', 'BBU_20_2.0', 'BBB_20_2.0'
         suffix = f"_{length}_{std}.0"
@@ -456,21 +536,21 @@ class Metadata:
     name: str
     description: str
     market_cap_rank: int
-    categories: List[str]
+    categories: list[str]
     updated_at: int
-    launch_time: Optional[int]
-    hashing_algorithm: Optional[str]
-    website: Optional[str]
-    whitepaper: Optional[str]
-    reddit: Optional[str]
-    twitter: Optional[str]
-    telegram: Optional[str]
-    github: Optional[str]
-    images: Dict[str, str]
+    launch_time: int | None
+    hashing_algorithm: str | None
+    website: str | None
+    whitepaper: str | None
+    reddit: str | None
+    twitter: str | None
+    telegram: str | None
+    github: str | None
+    images: dict[str, str]
     data_source: DataSource
-    platforms: List[Platform] = field(default_factory=list)
+    platforms: list[Platform] = field(default_factory=list)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, str | list[str] | int | datetime | None]:
         """Convert metadata to database-friendly dictionary"""
         return {
             "id": self.id,
@@ -501,29 +581,29 @@ class MarketMetrics:
     id: str  # CoinGecko ID
     symbol: SymbolInfo
     current_price: Decimal
-    market_cap: Optional[Decimal]
-    market_cap_rank: Optional[int]
-    fully_diluted_valuation: Optional[Decimal]
+    market_cap: Decimal | None
+    market_cap_rank: int | None
+    fully_diluted_valuation: Decimal | None
     total_volume: Decimal
-    high_24h: Optional[Decimal]
-    low_24h: Optional[Decimal]
-    price_change_24h: Optional[Decimal]
-    price_change_percentage_24h: Optional[Decimal]
-    market_cap_change_24h: Optional[Decimal]
-    market_cap_change_percentage_24h: Optional[Decimal]
-    circulating_supply: Optional[Decimal]
-    total_supply: Optional[Decimal]
-    max_supply: Optional[Decimal]
-    ath: Optional[Decimal]
-    ath_change_percentage: Optional[Decimal]
-    ath_date: Optional[str]
-    atl: Optional[Decimal]
-    atl_change_percentage: Optional[Decimal]
-    atl_date: Optional[str]
+    high_24h: Decimal | None
+    low_24h: Decimal | None
+    price_change_24h: Decimal | None
+    price_change_percentage_24h: Decimal | None
+    market_cap_change_24h: Decimal | None
+    market_cap_change_percentage_24h: Decimal | None
+    circulating_supply: Decimal | None
+    total_supply: Decimal | None
+    max_supply: Decimal | None
+    ath: Decimal | None
+    ath_change_percentage: Decimal | None
+    ath_date: str | None
+    atl: Decimal | None
+    atl_change_percentage: Decimal | None
+    atl_date: str | None
     updated_at: int
     data_source: DataSource
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, str | int | float | datetime | None]:
         """Convert to dictionary for database storage"""
         return {
             'id': self.id,
@@ -560,24 +640,24 @@ class SentimentMetrics:
     symbol: SymbolInfo
 
     # Twitter metrics
-    twitter_followers: Optional[int]
-    twitter_following: Optional[int]
-    twitter_posts_24h: Optional[int]
-    twitter_engagement_rate: Optional[Decimal]
-    twitter_sentiment_score: Optional[Decimal]
+    twitter_followers: int | None
+    twitter_following: int | None
+    twitter_posts_24h: int | None
+    twitter_engagement_rate: Decimal | None
+    twitter_sentiment_score: Decimal | None
 
     # Reddit metrics
-    reddit_subscribers: Optional[int]
-    reddit_active_users: Optional[int]
-    reddit_posts_24h: Optional[int]
-    reddit_comments_24h: Optional[int]
-    reddit_sentiment_score: Optional[Decimal]
+    reddit_subscribers: int | None
+    reddit_active_users: int | None
+    reddit_posts_24h: int | None
+    reddit_comments_24h: int | None
+    reddit_sentiment_score: Decimal | None
 
     # Telegram metrics
-    telegram_members: Optional[int]
-    telegram_online_members: Optional[int]
-    telegram_messages_24h: Optional[int]
-    telegram_sentiment_score: Optional[Decimal]
+    telegram_members: int | None
+    telegram_online_members: int | None
+    telegram_messages_24h: int | None
+    telegram_sentiment_score: Decimal | None
 
     # Aggregated metrics
     overall_sentiment_score: Decimal  # Weighted average of platform sentiment scores
@@ -586,7 +666,7 @@ class SentimentMetrics:
     updated_at: int
     data_source: DataSource
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, str | int | float | datetime | None]:
         """Convert to dictionary for database storage"""
         return {
             'id': self.id,

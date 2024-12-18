@@ -1,5 +1,4 @@
 from datetime import datetime
-from typing import List, Optional
 from sqlalchemy import Text, BigInteger
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import JSONB
@@ -18,10 +17,10 @@ class TokenMetadata(FundamentalDataBase):
 
     # Core information
     description: Mapped[str] = mapped_column(Text, nullable=False)
-    categories: Mapped[List[str]] = mapped_column(JSONB, nullable=False, default=list)
-    launch_time: Mapped[Optional[datetime]] = mapped_column(nullable=True)
+    categories: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    launch_time: Mapped[datetime | None] = mapped_column(nullable=True)
     market_cap_rank: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    hashing_algorithm: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    hashing_algorithm: Mapped[str | None ] = mapped_column(Text, nullable=True)
 
     # Images
     image_thumb: Mapped[str] = mapped_column(Text, nullable=False)
@@ -29,15 +28,15 @@ class TokenMetadata(FundamentalDataBase):
     image_large: Mapped[str] = mapped_column(Text, nullable=False)
 
     # Links
-    website: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    whitepaper: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    reddit: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    twitter: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    telegram: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    github: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    website: Mapped[str | None ] = mapped_column(Text, nullable=True)
+    whitepaper: Mapped[str | None ] = mapped_column(Text, nullable=True)
+    reddit: Mapped[str | None ] = mapped_column(Text, nullable=True)
+    twitter: Mapped[str | None ] = mapped_column(Text, nullable=True)
+    telegram: Mapped[str | None ] = mapped_column(Text, nullable=True)
+    github: Mapped[str | None ] = mapped_column(Text, nullable=True)
 
     # Platform info (for tokens)
-    platforms: Mapped[List[TokenPlatform]] = relationship(
+    platforms: Mapped[list[TokenPlatform]] = relationship(
         "TokenPlatform",
         back_populates="token",
         cascade="all, delete-orphan"

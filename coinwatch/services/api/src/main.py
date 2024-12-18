@@ -1,5 +1,4 @@
 from contextlib import asynccontextmanager
-from typing import Optional
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -14,7 +13,7 @@ logger = LoggerSetup.setup(__name__)
 
 # Shared instances
 registry = ServiceRegistry()
-redis: Optional[aioredis.Redis] = None
+redis: aioredis.Redis | None = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

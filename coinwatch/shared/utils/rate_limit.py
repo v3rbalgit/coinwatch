@@ -1,6 +1,5 @@
 import time
 import asyncio
-from typing import Optional
 
 
 class RateLimiter:
@@ -11,7 +10,7 @@ class RateLimiter:
     monthly total limits simultaneously.
     """
 
-    def __init__(self, calls_per_window: int, window_size: int, max_monthly_calls: Optional[int] = None):
+    def __init__(self, calls_per_window: int, window_size: int, max_monthly_calls: int | None = None):
         self._calls_per_window = calls_per_window
         self._window_size = window_size
         self._tokens = calls_per_window

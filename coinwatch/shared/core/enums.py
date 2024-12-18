@@ -1,6 +1,5 @@
 from datetime import timedelta
 from enum import Enum
-from typing import Optional
 
 
 class Interval(str, Enum):
@@ -18,7 +17,7 @@ class Interval(str, Enum):
     WEEK_1 = "W"
 
     @property
-    def continuous_aggregate_view(self) -> Optional[str]:
+    def continuous_aggregate_view(self) -> str | None:
         """Get the corresponding continuous aggregate view name if it exists"""
         view_mapping = {
             self.HOUR_1: "kline_1h",

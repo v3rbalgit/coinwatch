@@ -1,6 +1,5 @@
 # src/adapters/reddit.py
 
-from typing import Dict, Optional
 import asyncpraw
 from datetime import datetime, timezone, timedelta
 
@@ -42,7 +41,7 @@ class RedditAdapter:
                 return parts[i + 1]
         return ''
 
-    async def get_subreddit_metrics(self, subreddit_url: str) -> Optional[Dict]:
+    async def get_subreddit_metrics(self, subreddit_url: str) -> dict | None:
         """
         Get metrics for a subreddit.
 
@@ -74,7 +73,7 @@ class RedditAdapter:
             logger.error(f"Error fetching Reddit metrics: {e}")
             return None
 
-    async def get_recent_activity(self, subreddit_url: str, hours: int = 24) -> Optional[Dict]:
+    async def get_recent_activity(self, subreddit_url: str, hours: int = 24) -> dict | None:
         """
         Get recent posts and comments from a subreddit.
 

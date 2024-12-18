@@ -2,7 +2,6 @@
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Tuple
 
 import shared.utils.time as TimeUtils
 from shared.core.models import SymbolInfo
@@ -18,17 +17,17 @@ class MarketDataProgress:
     processed_candles: int
     total_candles: int
     start_time: datetime
-    last_processed_time: Optional[datetime]
+    last_processed_time: datetime | None
 
-    def __init__(self, symbol: SymbolInfo, time_range: Tuple[int,int], interval: Interval) -> None:
+    def __init__(self, symbol: SymbolInfo, time_range: tuple[int,int], interval: Interval) -> None:
         self.symbol = symbol
         self.interval = interval
         self.processed_candles = 0
         self.total_candles = self.calculate_total_candles(time_range)
         self.start_time = TimeUtils.get_current_datetime()
-        self.last_processed_time: Optional[datetime] = None
+        self.last_processed_time: datetime | None = None
 
-    def calculate_total_candles(self, time_range: Tuple[int,int]) -> int:
+    def calculate_total_candles(self, time_range: tuple[int,int]) -> int:
         """
         Calculate total number of candles between aligned timestamps
 
@@ -110,13 +109,13 @@ class FundamentalDataProgress:
     symbol: str
     collector_type: str
     start_time: datetime
-    items_total: Optional[int] = None
+    items_total: int | None = None
     items_processed: int = 0
     status: str = "pending"
-    error: Optional[str] = None
-    last_update: Optional[datetime] = None
+    error: str | None = None
+    last_update: datetime | None = None
 
-    def update(self, processed: int, total: Optional[int] = None) -> None:
+    def update(self, processed: int, total: int | None = None) -> None:
         """Update progress"""
         self.items_processed = processed
         if total is not None:

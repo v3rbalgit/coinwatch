@@ -2,19 +2,18 @@
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Set
 
 @dataclass
 class ErrorRecord:
     """Records information about a specific type of error"""
     error_type: str
     count: int = 0
-    first_seen: Optional[datetime] = None
-    last_seen: Optional[datetime] = None
-    related_entities: Set[str] = field(default_factory=set)  # Changed from related_symbols for reusability
-    metadata: Dict[str, Any] = field(default_factory=dict)  # Added for flexible error context
+    first_seen: datetime | None = None
+    last_seen: datetime | None = None
+    related_entities: set[str] = field(default_factory=set)  # Changed from related_symbols for reusability
+    metadata: dict = field(default_factory=dict)  # Added for flexible error context
 
-    def update(self, entity: Optional[str] = None, **context) -> None:
+    def update(self, entity: str | None = None, **context) -> None:
         """Update error record with new occurrence"""
         now = datetime.now(timezone.utc)
         self.count += 1
@@ -29,13 +28,13 @@ class ErrorTracker:
     """Tracks error patterns and frequencies across the application"""
 
     def __init__(self, window_size: int = 3600):  # 1 hour window
-        self._errors: Dict[str, ErrorRecord] = {}
+        self._errors: dict[str, ErrorRecord] = {}
         self._window_size = window_size
         self._lock = asyncio.Lock()
 
     async def record_error(self,
                     error: Exception,
-                    entity: Optional[str] = None,
+                    entity: str | None = None,
                     **context) -> None:
         """
         Record an error occurrence
@@ -60,7 +59,7 @@ class ErrorTracker:
 
     async def get_error_frequency(self,
                                 error_type: str,
-                                window_minutes: Optional[int] = None) -> float:
+                                window_minutes: int | None = None) -> float:
         """Thread-safe error frequency calculation"""
         async with self._lock:
             if record := self._errors.get(error_type):
@@ -74,13 +73,13 @@ class ErrorTracker:
                         return (record.count / duration) * 3600
         return 0.0
 
-    def get_affected_entities(self, error_type: str) -> Set[str]:
+    def get_affected_entities(self, error_type: str) -> set[str]:
         """Get all entities affected by a specific error type"""
         if record := self._errors.get(error_type):
             return record.related_entities.copy()
         return set()
 
-    def get_recent_errors(self, window_minutes: int = 60) -> List[ErrorRecord]:
+    def get_recent_errors(self, window_minutes: int = 60) -> list[ErrorRecord]:
         """Get errors that occurred within the specified window"""
         window_start = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
         return [
@@ -88,7 +87,7 @@ class ErrorTracker:
             if record.last_seen and record.last_seen >= window_start
         ]
 
-    def get_error_summary(self, window_minutes: int = 60) -> Dict[str, int]:
+    def get_error_summary(self, window_minutes: int = 60) -> dict[str, int]:
         """Get summary of errors within time window"""
         recent = self.get_recent_errors(window_minutes)
         summary = {}

@@ -1,6 +1,7 @@
 import asyncio
-from typing import Any, AsyncGenerator, Callable, Coroutine, Dict, Optional, Set, Tuple
-from decimal import Decimal
+from typing import Any, AsyncGenerator, Callable, Coroutine
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from shared.clients.registry import ExchangeAdapterRegistry
 from shared.core.enums import Interval
@@ -47,12 +48,11 @@ class DataCollector:
         # State management - separate locks for collection and streaming
         self._collection_lock = asyncio.Lock()
         self._streaming_lock = asyncio.Lock()
-        self._collection_progress: Dict[SymbolInfo, MarketDataProgress] = {}
-        self._processing_symbols: Set[SymbolInfo] = set()
-        self._streaming_symbols: Set[SymbolInfo] = set()
+        self._collection_progress: dict[SymbolInfo, MarketDataProgress] = {}
+        self._processing_symbols: set[SymbolInfo] = set()
+        self._streaming_symbols: set[SymbolInfo] = set()
 
-
-    async def collect(self, symbol: SymbolInfo, start_time: int, end_time: int, context: Dict[str, Any]) -> None:
+    async def collect(self, symbol: SymbolInfo, start_time: int, end_time: int, context: dict) -> None:
         """
         Start price data collection for a symbol
 
@@ -93,7 +93,7 @@ class DataCollector:
                 self._processing_symbols.remove(symbol)
                 self._collection_progress.pop(symbol, None)
 
-    async def _collect_with_gaps(self, symbol: SymbolInfo, start_time: int, end_time: int, context: Dict[str, Any]) -> None:
+    async def _collect_with_gaps(self, symbol: SymbolInfo, start_time: int, end_time: int, context: dict[str, Any]) -> None:
         """
         Collect data for a time range and handle any gaps that are found.
         This method will continue collecting until all gaps are filled.
@@ -172,7 +172,7 @@ class DataCollector:
 
             yield processed
 
-    async def _verify_collection(self, symbol: SymbolInfo) -> Optional[Tuple[int,int]]:
+    async def _verify_collection(self, symbol: SymbolInfo) -> tuple[int,int] | None:
         """
         Check if historical data for symbol are up-to-date
 
@@ -203,6 +203,12 @@ class DataCollector:
             )
             return latest, last_complete
 
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=2, min=10, max=300),
+        retry=retry_if_exception_type((ConnectionClosed, ConnectionError, WebSocketException)),
+        reraise=True
+    )
     async def _start_streaming(self, symbol: SymbolInfo) -> None:
         """Start real-time data streaming for a symbol"""
         try:
@@ -244,9 +250,9 @@ class DataCollector:
                     logger.error(f"Error stopping streaming for {symbol}: {e}")
                     raise
 
-    async def _create_kline_handler(self, symbol: SymbolInfo) -> Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]:
+    async def _create_kline_handler(self, symbol: SymbolInfo) -> Callable[[dict[str, Any]], Coroutine[Any, Any, None]]:
         """Create a handler for kline updates"""
-        async def handle_update(data: Dict[str, Any]) -> None:
+        async def handle_update(data: dict[str, Any]) -> None:
             try:
                 # Extract kline data from the message
                 kline_data = data.get('data', [{}])[0]
@@ -255,16 +261,17 @@ class DataCollector:
                 if not kline_data.get('confirm', False):
                     return
 
-                # Create KlineData object
-                kline = KlineData(
-                    interval=self._base_interval,
+                # Create KlineData object with proper precision
+                kline = KlineData.from_raw_data(
                     timestamp=int(kline_data['start']),
-                    open_price=Decimal(str(kline_data['open'])),
-                    high_price=Decimal(str(kline_data['high'])),
-                    low_price=Decimal(str(kline_data['low'])),
-                    close_price=Decimal(str(kline_data['close'])),
-                    volume=Decimal(str(kline_data['volume'])),
-                    turnover=Decimal(str(kline_data['turnover']))
+                    open_price=kline_data['open'],
+                    high_price=kline_data['high'],
+                    low_price=kline_data['low'],
+                    close_price=kline_data['close'],
+                    volume=kline_data['volume'],
+                    turnover=kline_data['turnover'],
+                    interval=self._base_interval,
+                    symbol=symbol
                 )
 
                 # Store the kline
@@ -279,7 +286,7 @@ class DataCollector:
                 logger.error(f"Error handling kline update for {symbol}: {e}")
                 await self._publish_error("StreamingError", str(e), symbol, 0, 0, {"type": "streaming_update"})
                 end_time = TimeUtils.get_current_timestamp()
-                start_time = end_time - (2 * self._base_interval.to_milliseconds())     # try to get last 2 candles on streaming error
+                start_time = end_time - (5 * self._base_interval.to_milliseconds())     # try to get last 5 candles on streaming error
                 await self.collect(
                     symbol=symbol,
                     start_time=start_time,
@@ -312,7 +319,7 @@ class DataCollector:
         except Exception as e:
             logger.error(f"Error handling symbol delisting for {symbol}: {e}")
 
-    async def _publish_collection_complete(self, symbol: SymbolInfo, start_time: int, end_time: int, context: Dict[str, Any]) -> None:
+    async def _publish_collection_complete(self, symbol: SymbolInfo, start_time: int, end_time: int, context: dict[str, Any]) -> None:
         """Publish collection complete message"""
         await self._message_broker.publish(
             MessageType.COLLECTION_COMPLETE,
@@ -352,7 +359,7 @@ class DataCollector:
         )
 
     async def _publish_error(self, error_type: str, message: str, symbol: SymbolInfo,
-                             start_time: int, end_time: int, context: Dict[str, Any]) -> None:
+                             start_time: int, end_time: int, context: dict[str, Any]) -> None:
         """Publish error message"""
         await self._message_broker.publish(
             MessageType.ERROR_REPORTED,

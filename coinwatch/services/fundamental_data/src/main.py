@@ -1,6 +1,5 @@
 import os
 import asyncio
-from typing import Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,8 +20,8 @@ import shared.utils.time as TimeUtils
 logger = LoggerSetup.setup(__name__)
 
 # Service instance
-service: Optional[FundamentalDataService] = None
-metrics_task: Optional[asyncio.Task] = None
+service: FundamentalDataService | None = None
+metrics_task: asyncio.Task | None = None
 
 async def publish_metrics():
     """Periodically publish service metrics"""

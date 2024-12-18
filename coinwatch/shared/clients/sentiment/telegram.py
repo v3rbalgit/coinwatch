@@ -1,6 +1,5 @@
 # src/adapters/telegram.py
 
-from typing import Dict, Optional
 from telethon import TelegramClient
 from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.types import Channel, InputChannel
@@ -49,7 +48,7 @@ class TelegramAdapter:
             access_hash=channel.access_hash or 0
         )
 
-    async def get_channel_metrics(self, channel_url: str) -> Optional[Dict]:
+    async def get_channel_metrics(self, channel_url: str) -> dict | None:
         """
         Get metrics for a Telegram channel.
 
@@ -81,7 +80,7 @@ class TelegramAdapter:
             logger.error(f"Error fetching Telegram channel metrics: {e}")
             return None
 
-    async def get_recent_messages(self, channel_url: str, hours: int = 24) -> Optional[Dict]:
+    async def get_recent_messages(self, channel_url: str, hours: int = 24) -> dict | None:
         """
         Get recent messages from a channel.
 

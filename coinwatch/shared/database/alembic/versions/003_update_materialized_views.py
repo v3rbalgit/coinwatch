@@ -109,11 +109,6 @@ def upgrade() -> None:
         );
     """)
 
-    # Refresh the views to populate historical data
-    op.execute("CALL refresh_continuous_aggregate('market_data.kline_1h', NULL, NULL)")
-    op.execute("CALL refresh_continuous_aggregate('market_data.kline_4h', NULL, NULL)")
-    op.execute("CALL refresh_continuous_aggregate('market_data.kline_1d', NULL, NULL)")
-
 
 def downgrade() -> None:
     # Drop views with 'interval'

@@ -1,7 +1,6 @@
 # src/repositories/market.py
 
 from decimal import Decimal
-from typing import List, Optional
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 
@@ -21,7 +20,7 @@ class MarketMetricsRepository:
     def __init__(self, db_service: DatabaseConnection):
         self.db_service = db_service
 
-    async def upsert_market_metrics(self, metrics_list: List[MarketMetrics]) -> None:
+    async def upsert_market_metrics(self, metrics_list: list[MarketMetrics]) -> None:
         """
         Create or update market metrics for multiple symbols.
 
@@ -55,7 +54,7 @@ class MarketMetricsRepository:
             logger.error(f"Error in bulk market metrics upsert: {e}")
             raise RepositoryError(f"Failed to upsert market metrics batch: {str(e)}")
 
-    async def get_market_metrics(self, symbol: SymbolInfo) -> Optional[MarketMetrics]:
+    async def get_market_metrics(self, symbol: SymbolInfo) -> MarketMetrics | None:
         """
         Get stored market metrics for a symbol.
 

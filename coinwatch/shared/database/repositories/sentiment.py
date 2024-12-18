@@ -1,6 +1,5 @@
 # src/repositories/sentiment.py
 
-from typing import List, Optional
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 
@@ -27,7 +26,7 @@ class SentimentRepository:
         """
         self.db = db_service
 
-    async def get_sentiment_metrics(self, symbol: SymbolInfo) -> Optional[SentimentMetrics]:
+    async def get_sentiment_metrics(self, symbol: SymbolInfo) -> SentimentMetrics | None:
         """
         Get sentiment metrics for a symbol.
 
@@ -77,7 +76,7 @@ class SentimentRepository:
             logger.error(f"Error getting sentiment metrics for {symbol}: {e}")
             raise RepositoryError(f"Failed to get sentiment metrics: {str(e)}")
 
-    async def upsert_sentiment_metrics(self, metrics: List[SentimentMetrics]) -> None:
+    async def upsert_sentiment_metrics(self, metrics: list[SentimentMetrics]) -> None:
         """
         Create or update sentiment metrics for multiple symbols.
 

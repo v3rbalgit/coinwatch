@@ -1,5 +1,5 @@
 import json
-from typing import Any, Callable, Dict, Optional, cast, Awaitable
+from typing import Any, Callable, cast, Awaitable
 from aio_pika import (
     Message,
     ExchangeType,
@@ -14,7 +14,7 @@ from .schemas import BaseMessage
 
 logger = LoggerSetup.setup(__name__)
 
-MessageHandler = Callable[[Dict[str, Any]], Awaitable[None]]
+MessageHandler = Callable[[dict[str, Any]], Awaitable[None]]
 
 class MessageBroker:
     """
@@ -28,12 +28,12 @@ class MessageBroker:
     """
     def __init__(self, service_name: str):
         self.service_name = service_name
-        self._connection: Optional[RobustConnection] = None
-        self._channel: Optional[RobustChannel] = None
-        self._exchange: Optional[RobustExchange] = None
-        self._dlx: Optional[RobustExchange] = None
-        self._handlers: Dict[str, MessageHandler] = {}
-        self._queues: Dict[str, AbstractQueue] = {}
+        self._connection: RobustConnection | None = None
+        self._channel: RobustChannel | None = None
+        self._exchange: RobustExchange | None = None
+        self._dlx: RobustExchange | None = None
+        self._handlers: dict[str, MessageHandler] = {}
+        self._queues: dict[str, AbstractQueue] = {}
 
     async def connect(self, url: str = "amqp://guest:guest@rabbitmq/") -> None:
         """Connect to RabbitMQ server"""
@@ -77,7 +77,7 @@ class MessageBroker:
             self._dlx = None
             self._queues.clear()
 
-    async def publish(self, topic: str, message: Dict[str, Any]) -> None:
+    async def publish(self, topic: str, message: dict[str, Any]) -> None:
         """
         Publish message to a topic.
 

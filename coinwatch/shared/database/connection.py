@@ -1,4 +1,4 @@
-from typing import Optional, AsyncGenerator, Any
+from typing import AsyncGenerator, Any
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     create_async_engine,
@@ -20,7 +20,7 @@ class DatabaseConnection:
     def __init__(self, config: DatabaseConfig, schema: str):
         self.url = config.url
         self.schema = schema
-        self.engine: Optional[AsyncEngine] = None
+        self.engine: AsyncEngine | None = None
         self.session_factory = None
 
         # Connection pool settings

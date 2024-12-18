@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from datetime import datetime
 
 @dataclass
@@ -8,7 +8,7 @@ class ServiceMetrics:
     service_name: str
     status: str
     uptime_seconds: float
-    last_error: Optional[str]
+    last_error: str | None
     error_count: int
     warning_count: int
     timestamp: datetime

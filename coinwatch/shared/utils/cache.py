@@ -1,7 +1,7 @@
 from decimal import Decimal
 import json
 import functools
-from typing import Any, Dict, Optional, Callable, Awaitable, Type, cast, get_origin, get_args
+from typing import Any, Callable, Awaitable, Type, cast, get_origin, get_args
 from pydantic import BaseModel
 from redis.asyncio import Redis
 
@@ -34,7 +34,7 @@ class RedisCache:
         """Create namespaced key"""
         return f"{self.namespace}:{key}"
 
-    async def get(self, key: str) -> Optional[Any]:
+    async def get(self, key: str) -> Any | None:
         """Get value from cache"""
         try:
             value = await self.redis.get(self._make_key(key))
@@ -114,7 +114,7 @@ class redis_cached[T]:
             return Interval(value)
         return value
 
-    def _deserialize_model(self, data: Dict[str, Any], model_class: Type[BaseModel]) -> BaseModel:
+    def _deserialize_model(self, data: dict[str, Any], model_class: Type[BaseModel]) -> BaseModel:
         """Deserialize a single model instance with proper type handling"""
         # Get field types from model
         field_types = {

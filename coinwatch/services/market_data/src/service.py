@@ -1,5 +1,4 @@
 import asyncio
-from typing import Optional, Set, Dict, Any, List
 
 from shared.clients.registry import ExchangeAdapterRegistry
 from shared.core.config import MarketDataConfig
@@ -55,10 +54,10 @@ class MarketDataService(Service):
         )
 
         # Service state
-        self._active_symbols: Set[SymbolInfo] = set()
+        self._active_symbols: set[SymbolInfo] = set()
         self._status: ServiceStatus = ServiceStatus.STOPPED
-        self._start_time: Optional[int] = None
-        self._last_error: Optional[Exception] = None
+        self._start_time: int | None = None
+        self._last_error: Exception | None = None
         self._symbol_check_interval = 3600  # 1 hour
         self._symbol_lock = asyncio.Lock()
 
@@ -68,7 +67,7 @@ class MarketDataService(Service):
         self._collection_semaphore = asyncio.Semaphore(self._max_concurrent_collections)
 
         # Task management
-        self._monitor_task: Optional[asyncio.Task] = None
+        self._monitor_task: asyncio.Task | None = None
         self._monitor_running = asyncio.Event()
 
         # Error tracking and retry strategy
@@ -150,7 +149,7 @@ class MarketDataService(Service):
                 context={"type": "initial"}
             )
 
-    async def _process_symbols(self, symbols: List[SymbolInfo]) -> None:
+    async def _process_symbols(self, symbols: list[SymbolInfo]) -> None:
         """Process symbols in batches for better memory management"""
         for i in range(0, len(symbols), self._batch_size):
             batch = symbols[i:i + self._batch_size]
@@ -159,49 +158,45 @@ class MarketDataService(Service):
             # Process batch concurrently
             await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Optional: Add small delay between batches to prevent overwhelming
+            # Add small delay between batches to prevent overwhelming
             await asyncio.sleep(0)
 
     async def _monitor_symbols(self) -> None:
         """Monitor trading symbols across exchanges"""
         try:
             while self._monitor_running.is_set():
-                try:
-                    async with self._symbol_lock:
-                        for exchange in self.exchange_registry.get_registered():
-                            adapter = self.exchange_registry.get_adapter(exchange)
-                            try:
-                                symbols = await adapter.get_symbols()
+                async with self._symbol_lock:
+                    for exchange in self.exchange_registry.get_registered():
+                        adapter = self.exchange_registry.get_adapter(exchange)
+                        try:
+                            symbols = await adapter.get_symbols()
 
-                                # Process new symbols in batches with limited concurrency
-                                new_symbols = [s for s in symbols if s not in self._active_symbols]
-                                if new_symbols:
-                                    await self._process_symbols(new_symbols)
+                            # Process new symbols in batches with limited concurrency
+                            new_symbols = [s for s in symbols if s not in self._active_symbols]
+                            if new_symbols:
+                                await self._process_symbols(new_symbols)
 
-                                # Handle delisted symbols
-                                delisted = self._active_symbols - set(symbols)
-                                for symbol in delisted:
-                                    self._active_symbols.remove(symbol)
-                                    await self.data_collector.delist(symbol)
-                                    await self._publish_symbol_delisted(symbol)
+                            # Handle delisted symbols
+                            delisted = self._active_symbols - set(symbols)
+                            for symbol in delisted:
+                                self._active_symbols.remove(symbol)
+                                await self.data_collector.delist(symbol)
+                                await self._publish_symbol_delisted(symbol)
 
-                            except Exception as e:
-                                await self._handle_exchange_error(e, exchange)
+                        except Exception as e:
+                            await self._handle_exchange_error(e, exchange)
 
                     await asyncio.sleep(self._symbol_check_interval)
-
-                except Exception as e:
-                    logger.error(f"Error in symbol monitoring cycle: {e}")
-                    raise
 
         except asyncio.CancelledError:
             logger.info("Symbol monitoring cancelled")
             raise
 
         except Exception as e:
+            logger.error(f"Error in symbol monitoring cycle: {e}")
             await self._handle_critical_error(e)
 
-    async def _handle_gap_message(self, message: Dict[str, Any]) -> None:
+    async def _handle_gap_message(self, message: dict) -> None:
         """Handle gap detection message"""
         try:
             # Get symbol info from exchange
@@ -241,7 +236,7 @@ class MarketDataService(Service):
                 exchange=symbol.exchange,
                 base_asset=symbol.base_asset,
                 quote_asset=symbol.quote_asset,
-                first_trade_time=symbol.launch_time
+                launch_time=symbol.launch_time
             ).model_dump()
         )
 

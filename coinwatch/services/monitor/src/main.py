@@ -1,11 +1,10 @@
 import os
-from typing import Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
-from shared.core.config import MonitoringConfig
+from shared.core.config import MonitorConfig
 from shared.messaging.broker import MessageBroker
 from shared.utils.logger import LoggerSetup
 from .service import MonitoringService
@@ -13,7 +12,7 @@ from .service import MonitoringService
 logger = LoggerSetup.setup(__name__)
 
 # Service instance
-service: Optional[MonitoringService] = None
+service: MonitoringService | None = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -26,7 +25,7 @@ async def lifespan(app: FastAPI):
         await message_broker.connect(os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq/"))
 
         # Initialize service with config
-        service_config = MonitoringConfig(
+        service_config = MonitorConfig(
             check_intervals={
                 'system': int(os.getenv("SYSTEM_CHECK_INTERVAL", "60")),
                 'market': int(os.getenv("MARKET_CHECK_INTERVAL", "30")),

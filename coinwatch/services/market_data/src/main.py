@@ -1,6 +1,5 @@
 import os
 import asyncio
-from typing import Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,10 +21,10 @@ from shared.managers.indicator import IndicatorManager
 
 logger = LoggerSetup.setup(__name__)
 
-service: Optional[MarketDataService] = None
-metrics_task: Optional[asyncio.Task] = None
-kline_manager: Optional[KlineManager] = None
-indicator_manager: Optional[IndicatorManager] = None
+service: MarketDataService | None = None
+metrics_task: asyncio.Task | None = None
+kline_manager: KlineManager | None = None
+indicator_manager: IndicatorManager | None = None
 
 async def publish_metrics():
     """Periodically publish service metrics"""
@@ -158,7 +157,7 @@ async def get_symbols():
     try:
         symbols = sorted(list(service._active_symbols), key=lambda x: x.name)
         return {
-            "symbols": [symbol.model_dump() for symbol in symbols]
+            "symbols": [symbol.model_dump(exclude={'token_name','trading_pair'}) for symbol in symbols]
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch symbols: {str(e)}")
@@ -171,14 +170,12 @@ async def get_symbol(symbol: str):
 
     try:
         # Find symbol in active symbols
-        symbol_info = next(
-            (s for s in service._active_symbols if s.name == symbol),
-            None
-        )
+        symbol_info = next((s for s in service._active_symbols if s.name == symbol.upper()), None)
+
         if not symbol_info:
             raise HTTPException(status_code=404, detail=f"Symbol {symbol} not found")
 
-        return symbol_info.model_dump()
+        return symbol_info.model_dump(exclude={'token_name','trading_pair'})
     except HTTPException:
         raise
     except Exception as e:
@@ -188,9 +185,9 @@ async def get_symbol(symbol: str):
 async def get_klines(
     symbol: str,
     interval: str = Query(..., description="Candlestick interval (e.g., 5, 15, 60, D)"),
-    start_time: Optional[int] = None,
-    end_time: Optional[int] = None,
-    limit: Optional[int] = None
+    start: int | None = None,
+    end: int | None = None,
+    limit: int | None = None
 ):
     """
     Get candlestick data for a symbol
@@ -198,9 +195,9 @@ async def get_klines(
     Args:
         symbol: Trading pair symbol (e.g., BTCUSDT)
         interval: Candlestick interval (e.g., 5, 15, 60, D)
-        start_time: Optional start time in milliseconds
-        end_time: Optional end time in milliseconds
-        limit: Optional limit on number of candles
+        start: Start time in milliseconds
+        end: End time in milliseconds
+        limit: Limit on number of candles
     """
     if not service or not kline_manager:
         raise HTTPException(status_code=503, detail="Service not initialized")
@@ -227,25 +224,33 @@ async def get_klines(
         klines = await kline_manager.get_klines(
             symbol=symbol_info,
             interval=interval,
-            start_time=start_time,
-            end_time=end_time,
+            start_time=start,
+            end_time=end,
             limit=limit
         )
+
+        # Convert to list format matching Bybit's API response
+        # [timestamp, open, high, low, close, volume, turnover]
+        kline_data = [
+            list(kline.model_dump(
+                exclude={'interval'},
+                include={
+                    'timestamp',
+                    'open_price',
+                    'high_price',
+                    'low_price',
+                    'close_price',
+                    'volume',
+                    'turnover'
+                }
+            ).values())
+            for kline in klines
+        ]
 
         return {
             "symbol": symbol,
             "interval": interval.value,
-            "klines": [
-                {
-                    "timestamp": kline.timestamp,
-                    "open": str(kline.open_price),
-                    "high": str(kline.high_price),
-                    "low": str(kline.low_price),
-                    "close": str(kline.close_price),
-                    "volume": str(kline.volume),
-                    "turnover": str(kline.turnover)
-                } for kline in klines
-            ]
+            "klines": kline_data
         }
     except HTTPException:
         raise
@@ -257,13 +262,13 @@ async def get_indicator(
     symbol: str,
     indicator: str,
     interval: str = Query(..., description="Candlestick interval (e.g., 5, 15, 60, D)"),
-    start_time: Optional[int] = None,
-    end_time: Optional[int] = None,
-    length: Optional[int] = None,
-    fast_length: Optional[int] = None,
-    slow_length: Optional[int] = None,
-    signal_length: Optional[int] = None,
-    std_dev: Optional[float] = None
+    start_time: int | None = None,
+    end_time: int | None = None,
+    length: int | None = None,
+    fast_length: int | None = None,
+    slow_length: int | None = None,
+    signal_length: int | None = None,
+    std_dev: float | None = None
 ):
     """
     Get technical indicator values for a symbol
@@ -272,8 +277,8 @@ async def get_indicator(
         symbol: Trading pair symbol (e.g., BTCUSDT)
         indicator: Indicator type (rsi, macd, bb, sma, ema, obv)
         interval: Candlestick interval (e.g., 5, 15, 60, D)
-        start_time: Optional start time in milliseconds
-        end_time: Optional end time in milliseconds
+        start_time: Start time in milliseconds
+        end_time: End time in milliseconds
         length: Period length for RSI, BB, SMA, EMA
         fast_length: Fast period for MACD
         slow_length: Slow period for MACD

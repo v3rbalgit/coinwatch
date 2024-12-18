@@ -1,5 +1,5 @@
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 from fastapi import Request, HTTPException
 import aioredis
 from shared.utils.logger import LoggerSetup
@@ -46,7 +46,7 @@ class RateLimiter:
     async def check_rate_limit(
         self,
         request: Request,
-        endpoint: Optional[str] = None
+        endpoint: str | None = None
     ) -> Tuple[bool, Dict[str, int]]:
         """
         Check if request is within rate limits.
