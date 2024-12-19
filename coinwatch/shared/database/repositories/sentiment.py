@@ -5,14 +5,12 @@ from sqlalchemy.dialects.postgresql import insert
 
 from shared.core.enums import DataSource, IsolationLevel
 from shared.database.models import TokenSentiment
-from shared.core.models import SentimentMetrics, SymbolInfo
+from shared.core.models import SentimentMetrics, SymbolModel
 from shared.core.exceptions import RepositoryError
 from shared.database.connection import DatabaseConnection
 from shared.utils.logger import LoggerSetup
 import shared.utils.time as TimeUtils
 
-
-logger = LoggerSetup.setup(__name__)
 
 class SentimentRepository:
     """Repository for managing token sentiment metrics in the database"""
@@ -25,13 +23,14 @@ class SentimentRepository:
             db_service (DatabaseService): Service for database operations
         """
         self.db = db_service
+        self.logger = LoggerSetup.setup(__class__.__name__)
 
-    async def get_sentiment_metrics(self, symbol: SymbolInfo) -> SentimentMetrics | None:
+    async def get_sentiment_metrics(self, symbol: SymbolModel) -> SentimentMetrics | None:
         """
         Get sentiment metrics for a symbol.
 
         Args:
-            symbol (SymbolInfo): The symbol to retrieve sentiment metrics for.
+            symbol (SymbolModel): The symbol to retrieve sentiment metrics for.
 
         Returns:
             Optional[SentimentMetrics]: The sentiment metrics for the symbol, or None if not found.
@@ -73,7 +72,7 @@ class SentimentRepository:
                 return None
 
         except Exception as e:
-            logger.error(f"Error getting sentiment metrics for {symbol}: {e}")
+            self.logger.error(f"Error getting sentiment metrics for {symbol}: {e}")
             raise RepositoryError(f"Failed to get sentiment metrics: {str(e)}")
 
     async def upsert_sentiment_metrics(self, metrics: list[SentimentMetrics]) -> None:
@@ -102,10 +101,10 @@ class SentimentRepository:
                 )
                 await session.execute(stmt)
 
-                logger.debug(f"Updated sentiment metrics for {len(metrics)} tokens")
+                self.logger.debug(f"Updated sentiment metrics for {len(metrics)} tokens")
 
         except Exception as e:
-            logger.error(f"Error in bulk sentiment metrics upsert: {e}")
+            self.logger.error(f"Error in bulk sentiment metrics upsert: {e}")
             raise RepositoryError(f"Failed to upsert sentiment metrics batch: {str(e)}")
 
     async def delete_sentiment_metrics(self, symbol: str) -> None:
@@ -128,10 +127,10 @@ class SentimentRepository:
 
                 if sentiment_record:
                     await session.delete(sentiment_record)
-                    logger.info(f"Deleted sentiment metrics for symbol '{symbol.upper()}'")
+                    self.logger.info(f"Deleted sentiment metrics for symbol '{symbol.upper()}'")
                 else:
-                    logger.warning(f"No sentiment metrics found for symbol '{symbol.upper()}'")
+                    self.logger.warning(f"No sentiment metrics found for symbol '{symbol.upper()}'")
 
         except Exception as e:
-            logger.error(f"Error deleting sentiment metrics for {symbol}: {e}")
+            self.logger.error(f"Error deleting sentiment metrics for {symbol}: {e}")
             raise RepositoryError(f"Failed to delete sentiment metrics: {str(e)}")

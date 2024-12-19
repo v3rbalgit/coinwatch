@@ -7,7 +7,7 @@ from shared.clients.registry import ExchangeAdapterRegistry
 from shared.core.config import FundamentalDataConfig
 from shared.core.enums import ServiceStatus
 from shared.core.exceptions import ServiceError
-from shared.core.models import SymbolInfo
+from shared.core.models import SymbolModel
 from shared.core.protocols import Service
 from shared.database.repositories import MarketMetricsRepository, MetadataRepository, SentimentRepository
 from shared.messaging.schemas import MessageType, SymbolMessage
@@ -15,8 +15,6 @@ from shared.messaging.broker import MessageBroker
 from shared.utils.logger import LoggerSetup
 from shared.utils.error import ErrorTracker
 import shared.utils.time as TimeUtils
-
-logger = LoggerSetup.setup(__name__)
 
 
 class FundamentalDataService(Service):
@@ -65,7 +63,7 @@ class FundamentalDataService(Service):
 
         # Collection management
         self._collection_lock = asyncio.Lock()
-        self._processing: Set[SymbolInfo] = set()
+        self._processing: Set[SymbolModel] = set()
 
         # Initialize collectors
         self._collectors: Dict[str, FundamentalCollector] = {
@@ -86,6 +84,8 @@ class FundamentalDataService(Service):
                 config.collection_intervals['sentiment']
             )
         }
+
+        self.logger = LoggerSetup.setup(__class__.__name__)
 
     async def _setup_message_handlers(self) -> None:
         """Setup message handlers for market data events"""
@@ -117,7 +117,7 @@ class FundamentalDataService(Service):
                 self._active_tokens.discard(base_token)
                 for collector in self._collectors.values():
                     await collector.delete_symbol_data(base_token)
-                logger.info(f"Stopped tracking {base_token} - no longer traded")
+                self.logger.info(f"Stopped tracking {base_token} - no longer traded")
 
     async def _handle_symbol_added(self, message: Dict) -> None:
         """
@@ -135,7 +135,7 @@ class FundamentalDataService(Service):
                 for collector in self._collectors.values():
                     await collector.schedule_collection({base_token})
 
-                logger.info(f"Started fundamental data tracking for new token: {base_token}")
+                self.logger.info(f"Started fundamental data tracking for new token: {base_token}")
 
     async def _collect_active_symbols(self) -> None:
         """Initial collection of unique base tokens from all exchanges"""
@@ -153,7 +153,7 @@ class FundamentalDataService(Service):
         async with self._collection_lock:
             self._active_tokens.update(unique_tokens)
 
-        logger.info(f"Collecting fundamental data for {len(unique_tokens)} unique tokens")
+        self.logger.info(f"Collecting fundamental data for {len(unique_tokens)} unique tokens")
 
         for collector in self._collectors.values():
             await collector.schedule_collection(unique_tokens)
@@ -174,12 +174,12 @@ class FundamentalDataService(Service):
             await self._collect_active_symbols()
 
             self._status = ServiceStatus.RUNNING
-            logger.info("Fundamental data service started successfully")
+            self.logger.info("Fundamental data service started successfully")
 
         except Exception as e:
             self._status = ServiceStatus.ERROR
             self._last_error = e
-            logger.error(f"Failed to start fundamental data service: {e}")
+            self.logger.error(f"Failed to start fundamental data service: {e}")
             raise ServiceError(f"Service start failed: {str(e)}")
 
     async def stop(self) -> None:
@@ -195,11 +195,11 @@ class FundamentalDataService(Service):
             await self.message_broker.close()
 
             self._status = ServiceStatus.STOPPED
-            logger.info("Fundamental data service stopped successfully")
+            self.logger.info("Fundamental data service stopped successfully")
 
         except Exception as e:
             self._status = ServiceStatus.ERROR
-            logger.error(f"Error stopping fundamental data service: {e}")
+            self.logger.error(f"Error stopping fundamental data service: {e}")
             raise ServiceError(f"Service stop failed: {str(e)}")
 
     def get_service_status(self) -> str:

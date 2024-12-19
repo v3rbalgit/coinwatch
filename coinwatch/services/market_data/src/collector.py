@@ -6,7 +6,7 @@ from websockets.exceptions import ConnectionClosed, WebSocketException
 from shared.clients.registry import ExchangeAdapterRegistry
 from shared.core.enums import Interval
 from shared.core.exceptions import ServiceError
-from shared.core.models import KlineData, SymbolInfo
+from shared.core.models import KlineModel, SymbolModel
 from shared.database.repositories.kline import KlineRepository
 from shared.database.repositories.symbol import SymbolRepository
 from shared.messaging.broker import MessageBroker
@@ -14,8 +14,6 @@ from shared.messaging.schemas import MessageType, KlineMessage, ErrorMessage, Co
 from shared.utils.logger import LoggerSetup
 from shared.utils.progress import MarketDataProgress
 import shared.utils.time as TimeUtils
-
-logger = LoggerSetup.setup(__name__)
 
 
 class DataCollector:
@@ -48,16 +46,18 @@ class DataCollector:
         # State management - separate locks for collection and streaming
         self._collection_lock = asyncio.Lock()
         self._streaming_lock = asyncio.Lock()
-        self._collection_progress: dict[SymbolInfo, MarketDataProgress] = {}
-        self._processing_symbols: set[SymbolInfo] = set()
-        self._streaming_symbols: set[SymbolInfo] = set()
+        self._collection_progress: dict[SymbolModel, MarketDataProgress] = {}
+        self._processing_symbols: set[SymbolModel] = set()
+        self._streaming_symbols: set[SymbolModel] = set()
 
-    async def collect(self, symbol: SymbolInfo, start_time: int, end_time: int, context: dict) -> None:
+        self.logger = LoggerSetup.setup(__class__.__name__)
+
+    async def collect(self, symbol: SymbolModel, start_time: int, end_time: int, context: dict) -> None:
         """
         Start price data collection for a symbol
 
         Args:
-            symbol (SymbolInfo): Symbol to start the price data collection for.
+            symbol (SymbolModel): Symbol to start the price data collection for.
             start_time (int): Start timestamp for collection.
             end_time (int): End timestamp for collection.
             context (Dict[str, Any]): Additional context for collection (initial, gap_fill).
@@ -67,15 +67,15 @@ class DataCollector:
             async with self._collection_lock:
                 if symbol not in self._processing_symbols:
                     self._processing_symbols.add(symbol)
-                    logger.info(f"Collection started for {symbol.name} on {symbol.exchange}")
+                    self.logger.info(f"Collection started for {str(symbol)}")
                 else:
-                    logger.info(f"Collection already in progress for {symbol.name} on {symbol.exchange}, skipping")
+                    self.logger.info(f"Collection already in progress for {str(symbol)}, skipping")
                     return
 
             # Align the start and end timestamps to interval boundaries
             start_time, end_time = TimeUtils.align_time_range_to_interval(start_time, end_time, self._base_interval)
             if start_time == end_time:
-                logger.info(f"No data to collect for {symbol.name} on {symbol.exchange}, skipping collection")
+                self.logger.info(f"No data to collect for {str(symbol)}, skipping collection")
             else:
                 # Collect all required data including any gaps
                 await self._collect_with_gaps(symbol, start_time, end_time, context)
@@ -93,13 +93,13 @@ class DataCollector:
                 self._processing_symbols.remove(symbol)
                 self._collection_progress.pop(symbol, None)
 
-    async def _collect_with_gaps(self, symbol: SymbolInfo, start_time: int, end_time: int, context: dict[str, Any]) -> None:
+    async def _collect_with_gaps(self, symbol: SymbolModel, start_time: int, end_time: int, context: dict[str, Any]) -> None:
         """
         Collect data for a time range and handle any gaps that are found.
         This method will continue collecting until all gaps are filled.
 
         Args:
-            symbol (SymbolInfo): Symbol to start the price data collection for.
+            symbol (SymbolModel): Symbol to start the price data collection for.
             start_time (int): Start timestamp for collection.
             end_time (int): End timestamp for collection.
             context (Dict[str, Any]): Additional context for collection (initial, gap_fill).
@@ -120,11 +120,11 @@ class DataCollector:
                 processed_count += processed
                 if progress := self._collection_progress.get(symbol):
                     progress.update(processed_count)
-                    logger.info(progress)
+                    self.logger.info(progress)
 
             # Log completion of current range
             if progress := self._collection_progress.get(symbol):
-                logger.info(progress.get_completion_summary(TimeUtils.get_current_datetime()))
+                self.logger.info(progress.get_completion_summary(TimeUtils.get_current_datetime()))
 
             # Publish completion message
             await self._publish_collection_complete(symbol, start_time, end_time, context)
@@ -141,12 +141,12 @@ class DataCollector:
                     "gap_size": (end_time - start_time) // self._base_interval.to_milliseconds()
                 }
 
-    async def _process_collection(self, symbol: SymbolInfo, start_time: int, end_time: int) -> AsyncGenerator[int, None]:
+    async def _process_collection(self, symbol: SymbolModel, start_time: int, end_time: int) -> AsyncGenerator[int, None]:
         """
         Core collection logic for both historical and gap filling
 
         Args:
-            symbol (SymbolInfo): Symbol to process collection for.
+            symbol (SymbolModel): Symbol to process collection for.
             start_time (int): Aligned start timestamp.
             end_time (int): Aligned end timestamp.
 
@@ -168,16 +168,16 @@ class DataCollector:
                 break
 
             # Store batch
-            processed = await self._kline_repository.insert_batch(symbol, klines)
+            processed = await self._kline_repository.insert_klines(symbol, klines)
 
             yield processed
 
-    async def _verify_collection(self, symbol: SymbolInfo) -> tuple[int,int] | None:
+    async def _verify_collection(self, symbol: SymbolModel) -> tuple[int,int] | None:
         """
         Check if historical data for symbol are up-to-date
 
         Args:
-            symbol (SymbolInfo): Symbol to check.
+            symbol (SymbolModel): Symbol to check.
 
         Returns:
             Optional[Tuple[int,int]]: Range of timestamps if there is a gap, otherwise None.
@@ -196,8 +196,8 @@ class DataCollector:
 
         # Check for gaps and fill if needed
         if latest < last_complete:
-            logger.warning(
-                f"Missing historical data for {symbol.name} on {symbol.exchange} "
+            self.logger.warning(
+                f"Missing historical data for {str(symbol)} "
                 f"from {TimeUtils.from_timestamp(latest)} "
                 f"to {TimeUtils.from_timestamp(last_complete)}"
             )
@@ -205,11 +205,10 @@ class DataCollector:
 
     @retry(
         stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=2, min=10, max=300),
-        retry=retry_if_exception_type((ConnectionClosed, ConnectionError, WebSocketException)),
-        reraise=True
+        wait=wait_exponential(multiplier=2, min=1, max=60),
+        retry=retry_if_exception_type((ConnectionClosed, ConnectionError, WebSocketException))
     )
-    async def _start_streaming(self, symbol: SymbolInfo) -> None:
+    async def _start_streaming(self, symbol: SymbolModel) -> None:
         """Start real-time data streaming for a symbol"""
         try:
             async with self._streaming_lock:
@@ -225,14 +224,14 @@ class DataCollector:
                     await self._streaming_adapter.subscribe_klines(symbol, self._base_interval, handler)
 
                     self._streaming_symbols.add(symbol)
-                    logger.info(f"Streaming started for {symbol.name} on {symbol.exchange}")
+                    self.logger.info(f"Kline streaming started for {str(symbol)}")
 
         except Exception as e:
-            logger.error(f"Failed to start streaming for {symbol}: {e}")
+            self.logger.error(f"Failed to start streaming klines after 5 retries for {symbol}: {e}")
             await self._publish_error("StreamingError", str(e), symbol, 0, 0, {"type": "streaming"})
             raise
 
-    async def _stop_streaming(self, symbol: SymbolInfo) -> None:
+    async def _stop_streaming(self, symbol: SymbolModel) -> None:
         """Stop streaming for a symbol"""
         async with self._streaming_lock:
             if symbol in self._streaming_symbols:
@@ -244,13 +243,13 @@ class DataCollector:
                     await self._streaming_adapter.unsubscribe_klines(symbol, self._base_interval)
 
                     self._streaming_symbols.remove(symbol)
-                    logger.info(f"Streaming stopped for {symbol.name} on {symbol.exchange}")
+                    self.logger.info(f"Streaming stopped for {str(symbol)}")
 
                 except Exception as e:
-                    logger.error(f"Error stopping streaming for {symbol}: {e}")
+                    self.logger.error(f"Error stopping streaming for {symbol}: {e}")
                     raise
 
-    async def _create_kline_handler(self, symbol: SymbolInfo) -> Callable[[dict[str, Any]], Coroutine[Any, Any, None]]:
+    async def _create_kline_handler(self, symbol: SymbolModel) -> Callable[[dict[str, Any]], Coroutine[Any, Any, None]]:
         """Create a handler for kline updates"""
         async def handle_update(data: dict[str, Any]) -> None:
             try:
@@ -261,8 +260,8 @@ class DataCollector:
                 if not kline_data.get('confirm', False):
                     return
 
-                # Create KlineData object with proper precision
-                kline = KlineData.from_raw_data(
+                # Create KlineModel object with proper precision
+                kline = KlineModel.from_raw_data(
                     timestamp=int(kline_data['start']),
                     open_price=kline_data['open'],
                     high_price=kline_data['high'],
@@ -270,20 +269,19 @@ class DataCollector:
                     close_price=kline_data['close'],
                     volume=kline_data['volume'],
                     turnover=kline_data['turnover'],
-                    interval=self._base_interval,
-                    symbol=symbol
+                    interval=self._base_interval
                 )
 
                 # Store the kline
-                await self._kline_repository.insert_batch(symbol, [kline])
+                await self._kline_repository.insert_klines(symbol, [kline])
 
                 # Publish update
                 await self._publish_kline_update(symbol, kline)
 
-                logger.info(f"New kline for {symbol.name} on {symbol.exchange}")
+                self.logger.info(f"New kline for {str(symbol)}: {kline.time_range}")
 
             except Exception as e:
-                logger.error(f"Error handling kline update for {symbol}: {e}")
+                self.logger.error(f"Error handling kline update for {symbol}: {e}")
                 await self._publish_error("StreamingError", str(e), symbol, 0, 0, {"type": "streaming_update"})
                 end_time = TimeUtils.get_current_timestamp()
                 start_time = end_time - (5 * self._base_interval.to_milliseconds())     # try to get last 5 candles on streaming error
@@ -299,27 +297,27 @@ class DataCollector:
 
         return handle_update
 
-    async def delist(self, symbol: SymbolInfo) -> None:
+    async def delist(self, symbol: SymbolModel) -> None:
         """Handle symbol delisting"""
         try:
             await self._stop_streaming(symbol)
-            logger.info(f"Stopped streaming for delisted symbol {symbol}")
+            self.logger.info(f"Stopped streaming for delisted symbol {symbol}")
 
             # Remove from collection if in progress
             async with self._collection_lock:
                 if symbol in self._processing_symbols:
                     self._processing_symbols.remove(symbol)
-                    logger.info(f"Removed delisted symbol from collection {symbol}")
+                    self.logger.info(f"Removed delisted symbol from collection {symbol}")
 
             # Clean up data
             await self._symbol_repository.delete_symbol(symbol)
             await self._kline_repository.delete_symbol_data(symbol)
-            logger.info(f"Cleaned up data for delisted symbol {symbol}")
+            self.logger.info(f"Cleaned up data for delisted symbol {symbol}")
 
         except Exception as e:
-            logger.error(f"Error handling symbol delisting for {symbol}: {e}")
+            self.logger.error(f"Error handling symbol delisting for {symbol}: {e}")
 
-    async def _publish_collection_complete(self, symbol: SymbolInfo, start_time: int, end_time: int, context: dict[str, Any]) -> None:
+    async def _publish_collection_complete(self, symbol: SymbolModel, start_time: int, end_time: int, context: dict[str, Any]) -> None:
         """Publish collection complete message"""
         await self._message_broker.publish(
             MessageType.COLLECTION_COMPLETE,
@@ -337,7 +335,7 @@ class DataCollector:
             ).model_dump()
         )
 
-    async def _publish_kline_update(self, symbol: SymbolInfo, kline: KlineData) -> None:
+    async def _publish_kline_update(self, symbol: SymbolModel, kline: KlineModel) -> None:
         """Publish kline update message"""
         await self._message_broker.publish(
             MessageType.KLINE_UPDATED,
@@ -358,7 +356,7 @@ class DataCollector:
             ).model_dump()
         )
 
-    async def _publish_error(self, error_type: str, message: str, symbol: SymbolInfo,
+    async def _publish_error(self, error_type: str, message: str, symbol: SymbolModel,
                              start_time: int, end_time: int, context: dict[str, Any]) -> None:
         """Publish error message"""
         await self._message_broker.publish(
@@ -383,7 +381,7 @@ class DataCollector:
 
     async def cleanup(self) -> None:
         """Cleanup resources"""
-        logger.info("Cleaning up DataCollector")
+        self.logger.info("Cleaning up DataCollector")
 
         try:
             # Stop all streaming
@@ -397,10 +395,10 @@ class DataCollector:
 
             self._streaming_symbols.clear()
             self._processing_symbols.clear()
-            logger.info("DataCollector cleanup completed")
+            self.logger.info("DataCollector cleanup completed")
 
         except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
+            self.logger.error(f"Error during cleanup: {e}")
             raise
 
     def get_collection_status(self) -> str:

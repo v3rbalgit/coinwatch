@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Index, BigInteger, Float, PrimaryKeyConstraint, Text, ForeignKey, UniqueConstraint
+from sqlalchemy import Index, BigInteger, Numeric, PrimaryKeyConstraint, Text, ForeignKey, UniqueConstraint
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -36,12 +36,15 @@ class Kline(MarketDataBase):
         comment='Time interval of the kline (e.g., "1m", "5m", "1h")'
     )
 
-    open_price: Mapped[float] = mapped_column(Float(precision=18, decimal_return_scale=8), nullable=False)
-    high_price: Mapped[float] = mapped_column(Float(precision=18, decimal_return_scale=8), nullable=False)
-    low_price: Mapped[float] = mapped_column(Float(precision=18, decimal_return_scale=8), nullable=False)
-    close_price: Mapped[float] = mapped_column(Float(precision=18, decimal_return_scale=8), nullable=False)
-    volume: Mapped[float] = mapped_column(Float(precision=18, decimal_return_scale=8), nullable=False)
-    turnover: Mapped[float] = mapped_column(Float(precision=18, decimal_return_scale=8), nullable=False)
+    # Price fields use precision=18, scale=8 for exact decimal arithmetic
+    open_price: Mapped[float] = mapped_column(Numeric(precision=18, scale=8), nullable=False)
+    high_price: Mapped[float] = mapped_column(Numeric(precision=18, scale=8), nullable=False)
+    low_price: Mapped[float] = mapped_column(Numeric(precision=18, scale=8), nullable=False)
+    close_price: Mapped[float] = mapped_column(Numeric(precision=18, scale=8), nullable=False)
+
+    # Volume fields use precision=36, scale=8 to handle large numbers while maintaining precision
+    volume: Mapped[float] = mapped_column(Numeric(precision=36, scale=8), nullable=False)
+    turnover: Mapped[float] = mapped_column(Numeric(precision=36, scale=8), nullable=False)
 
     # Relationships
     symbol: Mapped[Symbol] = relationship('Symbol', back_populates='klines')

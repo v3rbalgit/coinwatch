@@ -3,7 +3,7 @@ import asyncio
 from shared.clients.registry import ExchangeAdapterRegistry
 from shared.core.config import MarketDataConfig
 from shared.core.enums import ServiceStatus, Interval
-from shared.core.models import SymbolInfo
+from shared.core.models import SymbolModel
 from shared.core.exceptions import ServiceError
 from shared.core.protocols import Service
 from shared.database.repositories import KlineRepository, SymbolRepository
@@ -12,10 +12,7 @@ from shared.messaging.schemas import MessageType, SymbolMessage, ErrorMessage
 from shared.utils.logger import LoggerSetup
 import shared.utils.time as TimeUtils
 from shared.utils.error import ErrorTracker
-
 from .collector import DataCollector
-
-logger = LoggerSetup.setup(__name__)
 
 
 class MarketDataService(Service):
@@ -54,7 +51,7 @@ class MarketDataService(Service):
         )
 
         # Service state
-        self._active_symbols: set[SymbolInfo] = set()
+        self._active_symbols: set[SymbolModel] = set()
         self._status: ServiceStatus = ServiceStatus.STOPPED
         self._start_time: int | None = None
         self._last_error: Exception | None = None
@@ -73,12 +70,14 @@ class MarketDataService(Service):
         # Error tracking and retry strategy
         self._error_tracker = ErrorTracker()
 
+        self.logger = LoggerSetup.setup(__class__.__name__)
+
     async def start(self) -> None:
         """Start market data service"""
         try:
             self._status = ServiceStatus.STARTING
             self._start_time = TimeUtils.get_current_timestamp()
-            logger.info("Starting market data service")
+            self.logger.info("Starting market data service")
 
             # Connect to message broker and register handlers
             await self.message_broker.connect()
@@ -89,19 +88,19 @@ class MarketDataService(Service):
             self._monitor_task = asyncio.create_task(self._monitor_symbols())
 
             self._status = ServiceStatus.RUNNING
-            logger.info("Market data service started successfully")
+            self.logger.info("Market data service started successfully")
 
         except Exception as e:
             self._status = ServiceStatus.ERROR
             self._last_error = e
-            logger.error(f"Failed to start market data service: {e}")
+            self.logger.error(f"Failed to start market data service: {e}")
             raise ServiceError(f"Service start failed: {str(e)}")
 
     async def stop(self) -> None:
         """Stop market data service"""
         try:
             self._status = ServiceStatus.STOPPING
-            logger.info("Stopping market data service")
+            self.logger.info("Stopping market data service")
 
             # Stop monitoring
             self._monitor_running.clear()
@@ -122,15 +121,15 @@ class MarketDataService(Service):
             self._last_error = None
 
             self._status = ServiceStatus.STOPPED
-            logger.info("Market data service stopped successfully")
+            self.logger.info("Market data service stopped successfully")
 
         except Exception as e:
             self._status = ServiceStatus.ERROR
             self._last_error = e
-            logger.error(f"Error during service shutdown: {e}")
+            self.logger.error(f"Error during service shutdown: {e}")
             raise ServiceError(f"Service stop failed: {str(e)}")
 
-    async def _process_symbol(self, symbol: SymbolInfo) -> None:
+    async def _process_symbol(self, symbol: SymbolModel) -> None:
         """Process a single symbol with semaphore control"""
         async with self._collection_semaphore:
             checked_symbol = symbol.check_retention_time(self._retention_days)
@@ -149,7 +148,7 @@ class MarketDataService(Service):
                 context={"type": "initial"}
             )
 
-    async def _process_symbols(self, symbols: list[SymbolInfo]) -> None:
+    async def _process_symbols(self, symbols: list[SymbolModel]) -> None:
         """Process symbols in batches for better memory management"""
         for i in range(0, len(symbols), self._batch_size):
             batch = symbols[i:i + self._batch_size]
@@ -189,11 +188,11 @@ class MarketDataService(Service):
                     await asyncio.sleep(self._symbol_check_interval)
 
         except asyncio.CancelledError:
-            logger.info("Symbol monitoring cancelled")
+            self.logger.info("Symbol monitoring cancelled")
             raise
 
         except Exception as e:
-            logger.error(f"Error in symbol monitoring cycle: {e}")
+            self.logger.error(f"Error in symbol monitoring cycle: {e}")
             await self._handle_critical_error(e)
 
     async def _handle_gap_message(self, message: dict) -> None:
@@ -203,7 +202,7 @@ class MarketDataService(Service):
             adapter = self.exchange_registry.get_adapter(message["exchange"])
             symbols = await adapter.get_symbols(message["symbol"])
             if not symbols:
-                logger.warning(f"Symbol {message['symbol']} not found on {message['exchange']}")
+                self.logger.warning(f"Symbol {message['symbol']} not found on {message['exchange']}")
                 return
             symbol = symbols[0]
 
@@ -222,9 +221,9 @@ class MarketDataService(Service):
                         })
 
         except Exception as e:
-            logger.error(f"Error handling gap for {message['symbol']}: {e}")
+            self.logger.error(f"Error handling gap for {message['symbol']}: {e}")
 
-    async def _publish_symbol_added(self, symbol: SymbolInfo) -> None:
+    async def _publish_symbol_added(self, symbol: SymbolModel) -> None:
         """Publish symbol added event"""
         await self.message_broker.publish(
             MessageType.SYMBOL_ADDED,
@@ -240,7 +239,7 @@ class MarketDataService(Service):
             ).model_dump()
         )
 
-    async def _publish_symbol_delisted(self, symbol: SymbolInfo) -> None:
+    async def _publish_symbol_delisted(self, symbol: SymbolModel) -> None:
         """Publish symbol delisted event"""
         await self.message_broker.publish(
             MessageType.SYMBOL_DELISTED,

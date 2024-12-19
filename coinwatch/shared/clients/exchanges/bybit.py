@@ -8,12 +8,10 @@ from ..registry import ExchangeAdapter
 from shared.core.config import BybitConfig
 from shared.core.enums import Interval
 from shared.core.exceptions import AdapterError
-from shared.core.models import KlineData, SymbolInfo
+from shared.core.models import KlineModel, SymbolModel
 from shared.utils.logger import LoggerSetup
 from shared.utils.rate_limit import RateLimiter
 from .bybit_ws import BybitWebsocket
-
-logger = LoggerSetup.setup(__name__)
 
 
 class BybitAdapter(ExchangeAdapter):
@@ -46,6 +44,8 @@ class BybitAdapter(ExchangeAdapter):
 
         # Websocket client for streaming
         self._ws_client = BybitWebsocket(config)
+
+        self.logger = LoggerSetup.setup(__class__.__name__)
 
     async def _create_session(self) -> aiohttp.ClientSession:
         """Create new session with Bybit configuration"""
@@ -83,7 +83,7 @@ class BybitAdapter(ExchangeAdapter):
             current_time = int(time.time() * 1000)
             if self.__class__._rate_limit_reset and current_time < self.__class__._rate_limit_reset:
                 sleep_time = (self.__class__._rate_limit_reset - current_time) / 1000
-                logger.warning(f"Rate limit active! Sleeping for {sleep_time:.2f}s")
+                self.logger.warning(f"Rate limit active! Sleeping for {sleep_time:.2f}s")
                 await asyncio.sleep(sleep_time)
 
         async with session.request(method, endpoint, **kwargs) as response:
@@ -92,7 +92,7 @@ class BybitAdapter(ExchangeAdapter):
                 async with self.__class__._circuit_breaker_lock:
                     self.__class__._rate_limit_reset = reset_timestamp
                     wait_time = (reset_timestamp - current_time) / 1000
-                    logger.warning(
+                    self.logger.warning(
                         f"Rate limit hit! Next retry in {wait_time:.2f}s. "
                         f"Endpoint: {endpoint}"
                     )
@@ -112,7 +112,7 @@ class BybitAdapter(ExchangeAdapter):
 
             return data.get('result', {})
 
-    async def get_symbols(self, symbol: str | None = None) -> list[SymbolInfo]:
+    async def get_symbols(self, symbol: str | None = None) -> list[SymbolModel]:
         """
         Get available trading pairs
 
@@ -120,7 +120,7 @@ class BybitAdapter(ExchangeAdapter):
             symbol (Optional[str]): Name of a symbol to fetch from Bybit.
 
         Returns:
-            List[SymbolInfo]: List of SymbolInfo objects.
+            List[SymbolModel]: List of SymbolModel objects.
         """
         try:
             params = {'category': 'linear'}
@@ -134,12 +134,10 @@ class BybitAdapter(ExchangeAdapter):
                 params=params
             )
 
-            symbols: list[SymbolInfo] = []
+            symbols: list[SymbolModel] = []
             for item in data.get('list', []):
-                if (item.get('status') == 'Trading' and
-                    'USDT' in item.get('symbol', '')):
-
-                    symbols.append(SymbolInfo(
+                if (item.get('status') == 'Trading' and 'USDT' in item.get('symbol', '')):
+                    symbols.append(SymbolModel(
                         name=item['symbol'],
                         exchange='bybit',
                         base_asset=item['baseCoin'],
@@ -154,31 +152,31 @@ class BybitAdapter(ExchangeAdapter):
                         launch_time=int(item.get('launchTime', '0'))
                     ))
 
-            logger.debug(f"Fetched {len(symbols)} active USDT pairs")
+            self.logger.debug(f"Fetched {len(symbols)} active USDT pairs")
             return symbols
 
         except Exception as e:
-            logger.error(f"Failed to fetch symbols: {str(e)}")
+            self.logger.error(f"Failed to fetch symbols: {str(e)}")
             raise
 
     async def get_klines(self,
-                        symbol: SymbolInfo,
+                        symbol: SymbolModel,
                         interval: Interval,
                         start_time: int,
                         end_time: int,
-                        limit: int | None = None) -> AsyncGenerator[list[KlineData], None]:
+                        limit: int | None = None) -> AsyncGenerator[list[KlineModel], None]:
         """
         Get kline (candlestick) data
 
         Args:
-            symbol (SymbolInfo): Symbol to get the klines for.
+            symbol (SymbolModel): Symbol to get the klines for.
             interval (Interval): Interval to use.
             start_time (int): Start timestamp of the klines.
             end_time (int): End timestamp of the klines.
             limit (Optional[int]): Number of klines to fetch (will default to config value).
 
         Yields:
-            List[KlineData]: List of KlineData objects.
+            List[KlineModel]: List of KlineModel objects.
         """
         try:
             params = {
@@ -204,7 +202,7 @@ class BybitAdapter(ExchangeAdapter):
                 )
 
                 # Process klines in ascending order
-                klines = [KlineData.from_raw_data(
+                klines = [KlineModel.from_raw_data(
                     timestamp=int(item[0]),
                     open_price=item[1],
                     high_price=item[2],
@@ -212,28 +210,29 @@ class BybitAdapter(ExchangeAdapter):
                     close_price=item[4],
                     volume=item[5],
                     turnover=item[6],
-                    interval=interval,
-                    symbol=symbol
+                    interval=interval
                 ) for item in reversed(data.get('list', []))]
 
-                logger.debug(f"Fetched {len(klines)} klines for {symbol.name} on {symbol.exchange}")
+                self.logger.debug(f"Fetched {len(klines)} klines for {str(symbol)} in time range "
+                             f"{klines[0].start_time} - {klines[-1].start_time}")
+
                 yield klines
 
                 current_start = current_end
 
         except Exception as e:
-            logger.error(f"Failed to fetch klines for {symbol}: {str(e)}")
+            self.logger.error(f"Failed to fetch klines for {symbol}: {e}")
             raise
 
     async def subscribe_klines(self,
-                             symbol: SymbolInfo,
+                             symbol: SymbolModel,
                              interval: Interval,
                              handler: Callable[[dict[str, Any]], Coroutine[Any, Any, None]]) -> None:
         """Subscribe to real-time kline updates via websocket client"""
         await self._ws_client.subscribe_klines(symbol, interval, handler)
 
     async def unsubscribe_klines(self,
-                                symbol: SymbolInfo,
+                                symbol: SymbolModel,
                                 interval: Interval) -> None:
         """Unsubscribe from kline updates via websocket client"""
         await self._ws_client.unsubscribe_klines(symbol, interval)

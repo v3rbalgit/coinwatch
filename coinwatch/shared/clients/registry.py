@@ -3,10 +3,8 @@ from typing import AsyncGenerator, Callable, Coroutine, Any
 from shared.core.protocols import APIAdapter
 from shared.core.enums import Interval
 from shared.core.exceptions import AdapterError
-from shared.core.models import KlineData, SymbolInfo
+from shared.core.models import KlineModel, SymbolModel
 from shared.utils.logger import LoggerSetup
-
-logger = LoggerSetup.setup(__name__)
 
 
 class ExchangeAdapter(APIAdapter):
@@ -15,28 +13,28 @@ class ExchangeAdapter(APIAdapter):
     Defines required methods for exchange data collection.
     """
 
-    async def get_symbols(self, symbol: str | None = None) -> list[SymbolInfo]:
+    async def get_symbols(self, symbol: str | None = None) -> list[SymbolModel]:
         """Get available trading pairs"""
         ...
 
     async def get_klines(self,
-                        symbol: SymbolInfo,
+                        symbol: SymbolModel,
                         interval: Interval,
                         start_time: int,
                         end_time: int,
-                        limit: int | None = None) -> AsyncGenerator[list[KlineData], None]:
+                        limit: int | None = None) -> AsyncGenerator[list[KlineModel], None]:
         """Get kline data"""
         ...
 
     async def subscribe_klines(self,
-                             symbol: SymbolInfo,
+                             symbol: SymbolModel,
                              interval: Interval,
                              handler: Callable[[dict[str, Any]], Coroutine[Any, Any, None]]) -> None:
         """Subscribe to real-time kline updates for a symbol"""
         ...
 
     async def unsubscribe_klines(self,
-                                symbol: SymbolInfo,
+                                symbol: SymbolModel,
                                 interval: Interval) -> None:
         """Unsubscribe from kline updates for a symbol"""
         ...
@@ -47,6 +45,7 @@ class ExchangeAdapterRegistry:
 
     def __init__(self):
         self._adapters: dict[str, ExchangeAdapter] = {}
+        self.logger = LoggerSetup.setup(__class__.__name__)
 
     def register(self, name: str, adapter: ExchangeAdapter) -> None:
         """Register a new exchange adapter"""
@@ -55,10 +54,10 @@ class ExchangeAdapterRegistry:
                 raise AdapterError(f"Adapter already registered for exchange: {name}")
 
             self._adapters[name] = adapter
-            logger.info(f"Registered adapter for exchange: {name}")
+            self.logger.info(f"Registered adapter for exchange: {name}")
 
         except Exception as e:
-            logger.error(f"Failed to register adapter for {name}: {e}")
+            self.logger.error(f"Failed to register adapter for {name}: {e}")
             raise AdapterError(f"Adapter registration failed: {str(e)}")
 
     def unregister(self, name: str) -> None:
@@ -68,10 +67,10 @@ class ExchangeAdapterRegistry:
                 raise AdapterError(f"Adapter already unregistered for exchange: {name}")
 
             del self._adapters[name]
-            logger.info(f"Unregistered adapter for exchange: {name}")
+            self.logger.info(f"Unregistered adapter for exchange: {name}")
 
         except Exception as e:
-            logger.error(f"Failed to unregister adapter for {name}: {e}")
+            self.logger.error(f"Failed to unregister adapter for {name}: {e}")
             raise AdapterError(f"Adapter unregistration failed: {str(e)}")
 
     def get_adapter(self, name: str) -> ExchangeAdapter:

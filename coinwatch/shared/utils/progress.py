@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 import shared.utils.time as TimeUtils
-from shared.core.models import SymbolInfo
+from shared.core.models import SymbolModel
 from shared.core.enums import Interval
 
 
@@ -12,14 +12,14 @@ from shared.core.enums import Interval
 class MarketDataProgress:
     """Tracks data collection progress of a symbol"""
 
-    symbol: SymbolInfo
+    symbol: SymbolModel
     interval: Interval
     processed_candles: int
     total_candles: int
     start_time: datetime
     last_processed_time: datetime | None
 
-    def __init__(self, symbol: SymbolInfo, time_range: tuple[int,int], interval: Interval) -> None:
+    def __init__(self, symbol: SymbolModel, time_range: tuple[int,int], interval: Interval) -> None:
         self.symbol = symbol
         self.interval = interval
         self.processed_candles = 0
@@ -90,7 +90,7 @@ class MarketDataProgress:
 
         return " | ".join(summary)
 
-    def __lt__(self, other: 'SymbolInfo') -> bool:
+    def __lt__(self, other: 'SymbolModel') -> bool:
       """Enable sorting by symbol"""
       if not isinstance(other, MarketDataProgress):
           return NotImplemented

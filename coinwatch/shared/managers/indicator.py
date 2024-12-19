@@ -3,12 +3,10 @@ import polars_talib as plta
 
 from shared.core.exceptions import ValidationError
 from shared.core.models import (
-    KlineData,
+    KlineModel,
     RSIResult, BollingerBandsResult, MACDResult, MAResult, OBVResult
 )
-from shared.utils.logger import LoggerSetup
 from shared.utils.cache import RedisCache, redis_cached
-logger = LoggerSetup.setup(__name__)
 
 
 class IndicatorManager:
@@ -29,7 +27,7 @@ class IndicatorManager:
         """
         self.cache = RedisCache(redis_url, namespace="indicators")
 
-    def _validate_klines(self, klines: list[KlineData]) -> None:
+    def _validate_klines(self, klines: list[KlineModel]) -> None:
         """Validate kline data for indicator calculation"""
         if not klines:
             raise ValidationError("No kline data provided")
@@ -38,8 +36,8 @@ class IndicatorManager:
                 f"Insufficient kline data. Need at least 30 candles, got {len(klines)}"
             )
 
-    def _prepare_dataframe(self, klines: list[KlineData]) -> pl.DataFrame:
-        """Convert KlineData to Polars DataFrame"""
+    def _prepare_dataframe(self, klines: list[KlineModel]) -> pl.DataFrame:
+        """Convert KlineModel to Polars DataFrame"""
         return pl.DataFrame({
             'timestamp': [k.timestamp for k in klines],
             'open': [float(k.open_price) for k in klines],
@@ -51,7 +49,7 @@ class IndicatorManager:
 
     @redis_cached[list[RSIResult]](ttl=60)  # Fast indicator, shorter TTL
     async def calculate_rsi(self,
-                          klines: list[KlineData],
+                          klines: list[KlineModel],
                           length: int = 14) -> list[RSIResult]:
         """Calculate Relative Strength Index"""
         self._validate_klines(klines)
@@ -75,7 +73,7 @@ class IndicatorManager:
 
     @redis_cached[list[BollingerBandsResult]](ttl=300)
     async def calculate_bollinger_bands(self,
-                                     klines: list[KlineData],
+                                     klines: list[KlineModel],
                                      length: int = 20,
                                      std_dev: float = 2.0) -> list[BollingerBandsResult]:
         """Calculate Bollinger Bands"""
@@ -119,7 +117,7 @@ class IndicatorManager:
 
     @redis_cached[list[MACDResult]](ttl=300)
     async def calculate_macd(self,
-                           klines: list[KlineData],
+                           klines: list[KlineModel],
                            fast: int = 12,
                            slow: int = 26,
                            signal: int = 9) -> list[MACDResult]:
@@ -164,7 +162,7 @@ class IndicatorManager:
 
     @redis_cached[list[MAResult]](ttl=300)
     async def calculate_sma(self,
-                          klines: list[KlineData],
+                          klines: list[KlineModel],
                           period: int = 20) -> list[MAResult]:
         """Calculate Simple Moving Average"""
         self._validate_klines(klines)
@@ -187,7 +185,7 @@ class IndicatorManager:
 
     @redis_cached[list[MAResult]](ttl=300)
     async def calculate_ema(self,
-                          klines: list[KlineData],
+                          klines: list[KlineModel],
                           period: int = 20) -> list[MAResult]:
         """Calculate Exponential Moving Average"""
         self._validate_klines(klines)
@@ -209,7 +207,7 @@ class IndicatorManager:
         ]
 
     @redis_cached[list[OBVResult]](ttl=60)  # Fast indicator, shorter TTL
-    async def calculate_obv(self, klines: list[KlineData]) -> list[OBVResult]:
+    async def calculate_obv(self, klines: list[KlineModel]) -> list[OBVResult]:
         """Calculate On Balance Volume"""
         self._validate_klines(klines)
         df = self._prepare_dataframe(klines)

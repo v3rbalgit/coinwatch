@@ -5,20 +5,20 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 
 from shared.core.enums import DataSource, IsolationLevel
-from shared.core.models import SymbolInfo, MarketMetrics
+from shared.core.models import SymbolModel, MarketMetrics
 from shared.database.connection import DatabaseConnection
 from shared.database.models.fundamental_data import TokenMarketMetrics
 from shared.core.exceptions import RepositoryError
 from shared.utils.logger import LoggerSetup
 import shared.utils.time as TimeUtils
 
-logger = LoggerSetup.setup(__name__)
 
 class MarketMetricsRepository:
     """Repository for token market metrics operations"""
 
     def __init__(self, db_service: DatabaseConnection):
         self.db_service = db_service
+        self.logger = LoggerSetup.setup(__class__.__name__)
 
     async def upsert_market_metrics(self, metrics_list: list[MarketMetrics]) -> None:
         """
@@ -48,18 +48,18 @@ class MarketMetricsRepository:
                 )
                 await session.execute(stmt)
 
-                logger.debug(f"Updated market metrics for {len(metrics_list)} tokens")
+                self.logger.debug(f"Updated market metrics for {len(metrics_list)} tokens")
 
         except Exception as e:
-            logger.error(f"Error in bulk market metrics upsert: {e}")
+            self.logger.error(f"Error in bulk market metrics upsert: {e}")
             raise RepositoryError(f"Failed to upsert market metrics batch: {str(e)}")
 
-    async def get_market_metrics(self, symbol: SymbolInfo) -> MarketMetrics | None:
+    async def get_market_metrics(self, symbol: SymbolModel) -> MarketMetrics | None:
         """
         Get stored market metrics for a symbol.
 
         Args:
-            symbol (SymbolInfo): The symbol to retrieve market metrics for.
+            symbol (SymbolModel): The symbol to retrieve market metrics for.
 
         Returns:
             Optional[MarketMetrics]: The market metrics for the symbol, or None if not found.
@@ -105,7 +105,7 @@ class MarketMetricsRepository:
                 return None
 
         except Exception as e:
-            logger.error(f"Error getting market metrics for {symbol}: {e}")
+            self.logger.error(f"Error getting market metrics for {symbol}: {e}")
             raise RepositoryError(f"Failed to get market metrics: {str(e)}")
 
     async def delete_market_metrics(self, symbol: str) -> None:
@@ -129,10 +129,10 @@ class MarketMetricsRepository:
 
                 if market_metrics_record:
                     await session.delete(market_metrics_record)
-                    logger.info(f"Deleted market metrics for symbol '{symbol.upper()}'")
+                    self.logger.info(f"Deleted market metrics for symbol '{symbol.upper()}'")
                 else:
-                    logger.warning(f"No market metrics found for symbol '{symbol.upper()}'")
+                    self.logger.warning(f"No market metrics found for symbol '{symbol.upper()}'")
 
         except Exception as e:
-            logger.error(f"Error deleting market metrics for {symbol}: {e}")
+            self.logger.error(f"Error deleting market metrics for {symbol}: {e}")
             raise RepositoryError(f"Failed to delete market metrics: {str(e)}")

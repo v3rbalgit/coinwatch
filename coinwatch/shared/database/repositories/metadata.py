@@ -6,20 +6,19 @@ from sqlalchemy.dialects.postgresql import insert
 
 from shared.core.enums import IsolationLevel, DataSource
 from shared.database.connection import DatabaseConnection
-from shared.core.models import Platform, SymbolInfo, Metadata
+from shared.core.models import Platform, SymbolModel, Metadata
 from shared.core.exceptions import RepositoryError
 from shared.database.models import TokenMetadata, TokenPlatform
 import shared.utils.time as TimeUtils
 from shared.utils.logger import LoggerSetup
 
 
-logger = LoggerSetup.setup(__name__)
-
 class MetadataRepository:
     """Repository for token metadata operations"""
 
     def __init__(self, db_service: DatabaseConnection):
         self.db_service = db_service
+        self.logger = LoggerSetup.setup(__class__.__name__)
 
     async def upsert_metadata(self, metadata_list: list[Metadata]) -> None:
         """
@@ -68,15 +67,15 @@ class MetadataRepository:
                     )
 
         except Exception as e:
-            logger.error(f"Error in bulk metadata upsert: {e}")
+            self.logger.error(f"Error in bulk metadata upsert: {e}")
             raise RepositoryError(f"Failed to upsert metadata batch: {str(e)}")
 
-    async def get_metadata(self, symbol: SymbolInfo) -> Metadata | None:
+    async def get_metadata(self, symbol: SymbolModel) -> Metadata | None:
         """
         Get stored metadata for a symbol.
 
         Args:
-            symbol (SymbolInfo): Symbol to get metadata for (e.g., BTCUSDT on bybit).
+            symbol (SymbolModel): Symbol to get metadata for (e.g., BTCUSDT on bybit).
 
         Returns:
             Optional[Metadata]: Metadata domain object if found, None otherwise.
@@ -134,7 +133,7 @@ class MetadataRepository:
                 return None
 
         except Exception as e:
-            logger.error(f"Error getting metadata for {symbol}: {e}")
+            self.logger.error(f"Error getting metadata for {symbol}: {e}")
             raise RepositoryError(f"Failed to get metadata: {str(e)}")
 
     async def delete_metadata(self, symbol: str) -> None:
@@ -159,10 +158,10 @@ class MetadataRepository:
 
                 if metadata_record:
                     await session.delete(metadata_record)
-                    logger.info(f"Deleted metadata for symbol '{symbol.upper()}'")
+                    self.logger.info(f"Deleted metadata for symbol '{symbol.upper()}'")
                 else:
-                    logger.warning(f"No metadata found for symbol '{symbol.upper()}'")
+                    self.logger.warning(f"No metadata found for symbol '{symbol.upper()}'")
 
         except Exception as e:
-            logger.error(f"Error deleting metadata for {symbol}: {e}")
+            self.logger.error(f"Error deleting metadata for {symbol}: {e}")
             raise RepositoryError(f"Failed to delete metadata: {str(e)}")

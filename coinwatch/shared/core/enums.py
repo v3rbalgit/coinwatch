@@ -60,6 +60,7 @@ class Interval(str, Enum):
 
 
 class ServiceStatus(str, Enum):
+    """Service statuses"""
     STARTING = "starting"
     RUNNING = "running"
     STOPPING = "stopping"

@@ -9,7 +9,6 @@ from shared.utils.cache import redis_cached, RedisCache
 from shared.utils.rate_limit import RateLimiter
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-logger = LoggerSetup.setup(__name__)
 
 class CoinGeckoAdapter(APIAdapter):
     """
@@ -48,6 +47,8 @@ class CoinGeckoAdapter(APIAdapter):
             redis_url=config.redis_url,
             namespace="coingecko"
         )
+
+        self.logger = LoggerSetup.setup(__class__.__name__)
 
     async def _create_session(self) -> aiohttp.ClientSession:
         """Create new session with CoinGecko configuration"""
@@ -89,7 +90,7 @@ class CoinGeckoAdapter(APIAdapter):
         async with session.request(method, endpoint, **kwargs) as response:
             if response.status == 429:  # Rate limit exceeded
                 retry_after = int(response.headers.get('Retry-After', 60))
-                logger.warning(f"Rate limit exceeded, waiting {retry_after}s")
+                self.logger.warning(f"Rate limit exceeded, waiting {retry_after}s")
                 await asyncio.sleep(retry_after)
                 raise aiohttp.ClientError("Coingecko API Rate limit exceeded")
 
@@ -115,7 +116,7 @@ class CoinGeckoAdapter(APIAdapter):
             return None
 
         except Exception as e:
-            logger.error(f"Error getting coin ID for {symbol}: {e}")
+            self.logger.error(f"Error getting coin ID for {symbol}: {e}")
             return None
 
     async def get_coin_info(self, coin_id: str) -> dict:
@@ -134,7 +135,7 @@ class CoinGeckoAdapter(APIAdapter):
             )
 
         except Exception as e:
-            logger.error(f"Error getting coin info for {coin_id}: {e}")
+            self.logger.error(f"Error getting coin info for {coin_id}: {e}")
             raise AdapterError(f"Failed to get coin info: {str(e)}")
 
     async def get_market_data(self, coin_ids: list[str]) -> list[dict]:
@@ -186,10 +187,10 @@ class CoinGeckoAdapter(APIAdapter):
             received_ids = {result['id'] for result in all_results}
             missing_ids = set(coin_ids) - received_ids
             if missing_ids:
-                logger.warning(f"Missing market data for coins: {missing_ids}")
+                self.logger.warning(f"Missing market data for coins: {missing_ids}")
 
             return all_results
 
         except Exception as e:
-            logger.error(f"Error getting market data for {len(coin_ids)} coins: {e}")
+            self.logger.error(f"Error getting market data for {len(coin_ids)} coins: {e}")
             raise
