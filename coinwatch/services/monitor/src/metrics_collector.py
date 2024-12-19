@@ -2,11 +2,9 @@ import asyncio
 import psutil
 from typing import Dict, Any
 
-from shared.messaging.broker import MessageBroker
 import shared.utils.time as TimeUtils
 from shared.utils.logger import LoggerSetup
 
-logger = LoggerSetup.setup(__name__)
 
 class MetricsCollector:
     """
@@ -27,6 +25,7 @@ class MetricsCollector:
             'database': {}
         }
         self._collection_lock = asyncio.Lock()
+        self.logger = LoggerSetup.setup(__class__.__name__)
 
     def update_service_metrics(self, service: str, metrics: Dict[str, Any]) -> None:
         """Update metrics for a service"""
@@ -62,7 +61,7 @@ class MetricsCollector:
                 'error_count': 0
             }
         except Exception as e:
-            logger.error(f"Error collecting system metrics: {e}")
+            self.logger.error(f"Error collecting system metrics: {e}")
             return {
                 'status': 'error',
                 'timestamp': TimeUtils.get_current_timestamp(),

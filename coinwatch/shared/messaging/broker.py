@@ -12,8 +12,6 @@ from aio_pika.abc import AbstractIncomingMessage, AbstractQueue
 from shared.utils.logger import LoggerSetup
 from .schemas import BaseMessage
 
-logger = LoggerSetup.setup(__name__)
-
 MessageHandler = Callable[[dict[str, Any]], Awaitable[None]]
 
 class MessageBroker:
@@ -34,6 +32,7 @@ class MessageBroker:
         self._dlx: RobustExchange | None = None
         self._handlers: dict[str, MessageHandler] = {}
         self._queues: dict[str, AbstractQueue] = {}
+        self.logger = LoggerSetup.setup(__class__.__name__)
 
     async def connect(self, url: str = "amqp://guest:guest@rabbitmq/") -> None:
         """Connect to RabbitMQ server"""
@@ -61,10 +60,10 @@ class MessageBroker:
             )
             self._dlx = cast(RobustExchange, dlx)
 
-            logger.info(f"Connected to RabbitMQ: {self.service_name}")
+            self.logger.info(f"Connected to RabbitMQ: {self.service_name}")
 
         except Exception as e:
-            logger.error(f"Failed to connect to RabbitMQ: {e}")
+            self.logger.error(f"Failed to connect to RabbitMQ: {e}")
             raise
 
     async def close(self) -> None:
@@ -110,10 +109,10 @@ class MessageBroker:
                 routing_key=topic
             )
 
-            logger.debug(f"Published message to {topic}: {message}")
+            self.logger.debug(f"Published message to {topic}: {message}")
 
         except Exception as e:
-            logger.error(f"Failed to publish message: {e}")
+            self.logger.error(f"Failed to publish message: {e}")
             raise
 
     async def subscribe(self, topic: str, callback: MessageHandler) -> None:
@@ -148,10 +147,10 @@ class MessageBroker:
             # Start consuming
             await queue.consume(self._message_handler)
 
-            logger.info(f"Subscribed to {topic}")
+            self.logger.info(f"Subscribed to {topic}")
 
         except Exception as e:
-            logger.error(f"Failed to subscribe to {topic}: {e}")
+            self.logger.error(f"Failed to subscribe to {topic}: {e}")
             raise
 
     async def _message_handler(self, message: AbstractIncomingMessage) -> None:
@@ -168,10 +167,10 @@ class MessageBroker:
                 if handler:
                     await handler(payload)
                 else:
-                    logger.warning(f"No handler for topic: {topic}")
+                    self.logger.warning(f"No handler for topic: {topic}")
 
             except Exception as e:
-                logger.error(f"Error processing message: {e}")
+                self.logger.error(f"Error processing message: {e}")
                 # Message will be dead-lettered
                 raise
 
@@ -192,8 +191,8 @@ class MessageBroker:
             # Remove handler
             self._handlers.pop(topic, None)
 
-            logger.info(f"Unsubscribed from {topic}")
+            self.logger.info(f"Unsubscribed from {topic}")
 
         except Exception as e:
-            logger.error(f"Failed to unsubscribe from {topic}: {e}")
+            self.logger.error(f"Failed to unsubscribe from {topic}: {e}")
             raise

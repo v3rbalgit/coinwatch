@@ -6,8 +6,6 @@ import shared.utils.time as TimeUtils
 from shared.utils.logger import LoggerSetup
 from shared.utils.progress import FundamentalDataProgress
 
-logger = LoggerSetup.setup(__name__)
-
 
 class FundamentalCollector(ABC):
     """
@@ -36,6 +34,8 @@ class FundamentalCollector(ABC):
 
         # Start collection worker
         self._queue_processor = asyncio.create_task(self._collection_worker())
+
+        self.logger = LoggerSetup.setup(__class__.__name__)
 
     @property
     @abstractmethod
@@ -117,13 +117,13 @@ class FundamentalCollector(ABC):
                     try:
                         await self._process_symbols(symbols)
                     except Exception as e:
-                        logger.error(f"Error collecting {symbols}: {e}")
+                        self.logger.error(f"Error collecting {symbols}: {e}")
                     finally:
                         self._collection_queue.task_done()
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Worker error: {e}")
+                self.logger.error(f"Worker error: {e}")
                 await asyncio.sleep(1)
 
     async def _process_symbols(self, tokens: set[str]) -> None:
@@ -171,7 +171,7 @@ class FundamentalCollector(ABC):
                 if progress := self._progress.get(token):
                     progress.status = "error"
                     progress.error = str(e)
-            logger.error(f"Error processing tokens {processed_tokens}: {e}")
+            self.logger.error(f"Error processing tokens {processed_tokens}: {e}")
             raise
 
         finally:

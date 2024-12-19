@@ -2,14 +2,12 @@ from sqlalchemy import select, and_, text
 from sqlalchemy.dialects.postgresql import insert
 
 from shared.core.enums import IsolationLevel, Interval
-from shared.core.models import KlineData, SymbolInfo
+from shared.core.models import KlineModel, SymbolModel
 from shared.database.connection import DatabaseConnection
 from shared.database.models.market_data import Symbol, Kline
 from shared.core.exceptions import RepositoryError
 from shared.utils.logger import LoggerSetup
 import shared.utils.time as TimeUtils
-
-logger = LoggerSetup.setup(__name__)
 
 
 class KlineRepository:
@@ -22,14 +20,14 @@ class KlineRepository:
 
     def __init__(self, db: DatabaseConnection):
         self.db = db
-        self._batch_size = 1000
+        self.logger = LoggerSetup.setup(__class__.__name__)
 
-    async def get_latest_timestamp(self, symbol: SymbolInfo) -> int | None:
+    async def get_latest_timestamp(self, symbol: SymbolModel) -> int | None:
         """
         Get the latest timestamp for a symbol.
 
         Args:
-            symbol (SymbolInfo): The symbol to query.
+            symbol (SymbolModel): The symbol to query.
 
         Returns:
             Optional[int]: The latest timestamp, or None if no data exists
@@ -53,37 +51,37 @@ class KlineRepository:
                 latest = result.scalar_one_or_none()
 
                 if latest is not None:
-                    logger.debug(
-                        f"Latest timestamp for {symbol.name} on {symbol.exchange}: "
-                        f"{TimeUtils.from_timestamp(latest).strftime('%d-%m-%Y, %H:%M:%S')}"
+                    self.logger.debug(
+                        f"Latest timestamp for {str(symbol)}: "
+                        f"{TimeUtils.from_timestamp(latest).strftime('%d-%m-%Y %H:%M')}"
                     )
                     return latest
                 else:
-                    logger.debug(f"No latest timestamp found for {symbol.name} on {symbol.exchange}")
+                    self.logger.debug(f"No latest timestamp found for {str(symbol)}")
                     return None
 
         except Exception as e:
-            logger.error(f"Error getting latest timestamp: {e}")
-            raise RepositoryError(f"Failed to get latest timestamp: {str(e)}")
+            self.logger.error(f"Error getting latest timestamp for {symbol}: {e}")
+            raise RepositoryError(f"Failed to get latest timestamp for {symbol}: {str(e)}")
 
     async def get_base_klines(self,
-                            symbol: SymbolInfo,
-                            interval: Interval,
+                            symbol: SymbolModel,
+                            base_interval: Interval,
                             start_time: int,
                             end_time: int,
-                            limit: int | None = None) -> list[KlineData]:
+                            limit: int | None = None) -> list[KlineModel]:
         """
         Get kline data directly at base interval without any aggregation.
 
         Args:
             symbol: Symbol to get data for
-            interval: Base interval
+            base_interval: Base interval
             start_time: Start timestamp
             end_time: End timestamp
             limit: Optional limit on number of klines
 
         Returns:
-            List[KlineData]: Kline data in ascending order
+            List[KlineModel]: Kline data in ascending order
         """
         try:
             async with self.db.session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
@@ -113,50 +111,48 @@ class KlineRepository:
                     {
                         "symbol": symbol.name,
                         "exchange": symbol.exchange,
-                        "interval": interval.value,
+                        "interval": base_interval.value,
                         "start_time": TimeUtils.from_timestamp(start_time),
                         "end_time": TimeUtils.from_timestamp(end_time),
                         "limit": limit or 2147483647
                     }
                 )
-
-            return [
-                KlineData.from_raw_data(
-                    timestamp=TimeUtils.to_timestamp(row.timestamp),
-                    open_price=row.open_price,
-                    high_price=row.high_price,
-                    low_price=row.low_price,
-                    close_price=row.close_price,
-                    volume=row.volume,
-                    turnover=row.turnover,
-                    interval=interval,
-                    symbol=symbol
-                )
-                for row in result
-            ]
+                return [
+                    KlineModel.from_raw_data(
+                        timestamp=TimeUtils.to_timestamp(row.timestamp),
+                        open_price=row.open_price,
+                        high_price=row.high_price,
+                        low_price=row.low_price,
+                        close_price=row.close_price,
+                        volume=row.volume,
+                        turnover=row.turnover,
+                        interval=base_interval
+                    )
+                    for row in result
+                ]
 
         except Exception as e:
-            logger.error(f"Error getting base klines for {symbol}: {e}")
+            self.logger.error(f"Error getting base klines for {symbol}: {e}")
             raise RepositoryError(f"Failed to get base klines: {str(e)}")
 
     async def get_stored_klines(self,
-                              symbol: SymbolInfo,
-                              interval: Interval,
+                              symbol: SymbolModel,
+                              target_interval: Interval,
                               start_time: int,
                               end_time: int,
-                              limit: int | None = None) -> list[KlineData]:
+                              limit: int | None = None) -> list[KlineModel]:
         """
         Get kline data from continuous aggregate views.
 
         Args:
             symbol: Symbol to get data for
-            interval: Target interval (must be a continuous aggregate interval)
+            target_interval: Target interval (must be a continuous aggregate interval)
             start_time: Start timestamp
             end_time: End timestamp
             limit: Optional limit on number of klines
 
         Returns:
-            List[KlineData]: Kline data in ascending order
+            List[KlineModel]: Kline data in ascending order
         """
         try:
             async with self.db.session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
@@ -172,7 +168,7 @@ class KlineRepository:
                         s.name AS symbol_name,
                         s.exchange AS symbol_exchange,
                         k.interval
-                    FROM {interval.continuous_aggregate_view} k
+                    FROM {target_interval.continuous_aggregate_view} k
                     JOIN market_data.symbols s ON k.symbol_id = s.id
                     WHERE s.name = :symbol_name
                     AND s.exchange = :exchange
@@ -188,50 +184,48 @@ class KlineRepository:
                         "exchange": symbol.exchange,
                         "start_time": TimeUtils.from_timestamp(start_time),
                         "end_time": TimeUtils.from_timestamp(end_time),
-                        "bucket": interval.get_bucket_interval(),
+                        "bucket": target_interval.get_bucket_interval(),
                         "limit": limit or 2147483647
                     }
                 )
-
-            return [
-                KlineData.from_raw_data(
-                    timestamp=int(row.timestamp),
-                    open_price=row.open_price,
-                    high_price=row.high_price,
-                    low_price=row.low_price,
-                    close_price=row.close_price,
-                    volume=row.volume,
-                    turnover=row.turnover,
-                    interval=interval,
-                    symbol=symbol
-                )
-                for row in result
-            ]
+                return [
+                    KlineModel.from_raw_data(
+                        timestamp=int(row.timestamp),
+                        open_price=row.open_price,
+                        high_price=row.high_price,
+                        low_price=row.low_price,
+                        close_price=row.close_price,
+                        volume=row.volume,
+                        turnover=row.turnover,
+                        interval=target_interval
+                    )
+                    for row in result
+                ]
 
         except Exception as e:
-            logger.error(f"Error getting stored klines for {symbol}: {e}")
+            self.logger.error(f"Error getting stored klines for {symbol}: {e}")
             raise RepositoryError(f"Failed to get stored klines: {str(e)}")
 
     async def get_calculated_klines(self,
-                                  symbol: SymbolInfo,
-                                  interval: Interval,
+                                  symbol: SymbolModel,
+                                  target_interval: Interval,
                                   base_interval: Interval,
                                   start_time: int,
                                   end_time: int,
-                                  limit: int | None = None) -> list[KlineData]:
+                                  limit: int | None = None) -> list[KlineModel]:
         """
         Calculate klines on demand for non-stored intervals.
 
         Args:
             symbol: Symbol to get data for
-            interval: Target interval to calculate
+            target_interval: Target interval to calculate
             base_interval: Base interval to calculate from
             start_time: Start timestamp
             end_time: End timestamp
             limit: Optional limit on number of klines
 
         Returns:
-            List[KlineData]: Kline data in ascending order
+            List[KlineModel]: Kline data in ascending order
         """
         try:
             async with self.db.session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
@@ -279,7 +273,7 @@ class KlineRepository:
                     ORDER BY bucket_timestamp DESC;
                 """)
 
-                min_candles = interval.to_milliseconds() // base_interval.to_milliseconds()
+                min_candles = target_interval.to_milliseconds() // base_interval.to_milliseconds()
 
                 result = await session.execute(
                     stmt,
@@ -287,47 +281,46 @@ class KlineRepository:
                         "symbol_name": symbol.name,
                         "exchange": symbol.exchange,
                         "base_interval": base_interval.value,
-                        "target_interval": interval.value,
+                        "target_interval": target_interval.value,
                         "start_time": TimeUtils.from_timestamp(start_time),
                         "end_time": TimeUtils.from_timestamp(end_time),
-                        "bucket": interval.get_bucket_interval(),
+                        "bucket": target_interval.get_bucket_interval(),
                         "min_candles": min_candles,
                         "limit": limit or 2147483647
                     }
                 )
-
-            return [
-                KlineData.from_raw_data(
-                    timestamp=int(row.timestamp),
-                    open_price=row.open_price,
-                    high_price=row.high_price,
-                    low_price=row.low_price,
-                    close_price=row.close_price,
-                    volume=row.volume,
-                    turnover=row.turnover,
-                    interval=interval,
-                    symbol=symbol
-                )
-                for row in result
-            ]
+                return [
+                    KlineModel.from_raw_data(
+                        timestamp=int(row.timestamp),
+                        open_price=row.open_price,
+                        high_price=row.high_price,
+                        low_price=row.low_price,
+                        close_price=row.close_price,
+                        volume=row.volume,
+                        turnover=row.turnover,
+                        interval=target_interval
+                    )
+                    for row in result
+                ]
 
         except Exception as e:
-            logger.error(f"Error calculating klines for {symbol}: {e}")
+            self.logger.error(f"Error calculating klines for {symbol}: {e}")
             raise RepositoryError(f"Failed to calculate klines: {str(e)}")
 
-    async def insert_batch(self, symbol: SymbolInfo, klines: list[KlineData]) -> int:
+    async def insert_klines(self, symbol: SymbolModel, klines: list[KlineModel]) -> int:
         """
-        Insert a batch of klines using PostgreSQL bulk insert.
+        Insert a list of klines using PostgreSQL bulk insert.
 
         Args:
-            symbol (SymbolInfo): The symbol information for the klines.
-            klines (List[KlineData]): A list of kline data.
+            symbol (SymbolModel): The symbol information for the klines.
+            klines (List[KlineModel]): A list of kline data.
 
         Returns:
             int: The number of klines successfully inserted.
+        Raises:
+            RepositoryError: If the symbol is not found in database.
         """
         try:
-            inserted_count = 0
             async with self.db.session() as session:
                 symbol_stmt = select(Symbol.id).where(
                     and_(
@@ -336,53 +329,43 @@ class KlineRepository:
                     )
                 )
                 result = await session.execute(symbol_stmt)
-                symbol_id = result.scalar_one()
+                symbol_id = result.scalar_one_or_none()
 
-                # Process klines in batches
-                for i in range(0, len(klines), self._batch_size):
-                    batch = klines[i:i + self._batch_size]
-                    valid_klines = [{
-                                    "symbol_id": symbol_id,
-                                    "interval": k.interval.value,
-                                    "timestamp": TimeUtils.from_timestamp(k.timestamp),
-                                    "open_price": k.open_price,
-                                    "high_price": k.high_price,
-                                    "low_price": k.low_price,
-                                    "close_price": k.close_price,
-                                    "volume": k.volume,
-                                    "turnover": k.turnover
-                                } for k in batch]
+                if not symbol_id:
+                    raise RepositoryError(f"Unknown symbol {symbol}")
 
-                    if valid_klines:
-                        stmt = insert(Kline).values(valid_klines)
-                        stmt = stmt.on_conflict_do_update(
-                            index_elements=['symbol_id', 'interval', 'timestamp'],
-                            set_=dict(
-                                open_price=stmt.excluded.open_price,
-                                high_price=stmt.excluded.high_price,
-                                low_price=stmt.excluded.low_price,
-                                close_price=stmt.excluded.close_price,
-                                volume=stmt.excluded.volume,
-                                turnover=stmt.excluded.turnover
-                            )
-                        )
-                        await session.execute(stmt)
-                        inserted_count += len(valid_klines)
+                dict_klines = [k.model_dump() | {
+                        "timestamp": TimeUtils.from_timestamp(k.timestamp),
+                        "symbol_id": symbol_id
+                    } for k in klines]
 
-            if klines:
-                logger.debug(
-                    f"Inserted {inserted_count} klines for {symbol.name} on {symbol.exchange}, "
-                    f"last timestamp: {TimeUtils.from_timestamp(klines[-1].timestamp)}"
+                stmt = insert(Kline).values(dict_klines)
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=['symbol_id', 'interval', 'timestamp'],
+                    set_=dict(
+                        open_price=stmt.excluded.open_price,
+                        high_price=stmt.excluded.high_price,
+                        low_price=stmt.excluded.low_price,
+                        close_price=stmt.excluded.close_price,
+                        volume=stmt.excluded.volume,
+                        turnover=stmt.excluded.turnover
+                    )
+                )
+                await session.execute(stmt)
+
+                self.logger.debug(
+                    f"Inserted {len(dict_klines)} klines for {str(symbol)}: "
+                    f"{klines[0].start_time} - {klines[-1].end_time}"
                 )
 
-            return inserted_count
+                return len(dict_klines)
 
         except Exception as e:
-            logger.error(f"Error inserting klines for {symbol}: {e}")
+            self.logger.error(f"Error inserting klines for {symbol}: {e}")
             raise RepositoryError(f"Failed to insert klines: {str(e)}")
 
     async def get_data_gaps(self,
-                           symbol: SymbolInfo,
+                           symbol: SymbolModel,
                            interval: Interval,
                            start_time: int,
                            end_time: int) -> list[tuple[int, int]]:
@@ -390,7 +373,7 @@ class KlineRepository:
         Find gaps in time series data using TimescaleDB features.
 
         Args:
-            symbol (SymbolInfo): The symbol to check for gaps.
+            symbol (SymbolModel): The symbol to check for gaps.
             interval (Interval): The interval of the data.
             start_time (Timestamp): The start time of the range to check.
             end_time (Timestamp): The end time of the range to check.
@@ -438,15 +421,15 @@ class KlineRepository:
                     for row in result]
 
         except Exception as e:
-            logger.error(f"Error finding data gaps: {e}")
+            self.logger.error(f"Error finding data gaps: {e}")
             raise RepositoryError(f"Failed to find data gaps: {str(e)}")
 
-    async def delete_symbol_data(self, symbol: SymbolInfo) -> None:
+    async def delete_symbol_data(self, symbol: SymbolModel) -> None:
         """
         Delete all kline data for a specific symbol.
 
         Args:
-            symbol (SymbolInfo): The symbol whose data should be deleted.
+            symbol (SymbolModel): The symbol whose data should be deleted.
 
         Raises:
             RepositoryError: If there's an error during the deletion process.
@@ -469,10 +452,10 @@ class KlineRepository:
                     """)
                     await session.execute(delete_stmt, {"symbol_id": symbol_id})
                     await session.flush()
-                    logger.info(f"Deleted all kline data for {symbol.name} from {symbol.exchange}")
+                    self.logger.info(f"Deleted all kline data for {str(symbol)}")
                 else:
-                    logger.warning(f"No kline data found for {symbol.name} from {symbol.exchange}")
+                    self.logger.warning(f"No kline data found for {str(symbol)}")
 
         except Exception as e:
-            logger.error(f"Error deleting kline data: {e}")
+            self.logger.error(f"Error deleting kline data: {e}")
             raise RepositoryError(f"Failed to delete kline data: {str(e)}")

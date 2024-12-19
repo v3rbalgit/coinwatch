@@ -4,7 +4,6 @@ from fastapi import Request, HTTPException
 from shared.utils.logger import LoggerSetup
 from ..service_registry import ServiceRegistry
 
-logger = LoggerSetup.setup(__name__)
 
 class RequestForwarder:
     """
@@ -94,7 +93,6 @@ class RequestForwarder:
         except HTTPException:
             raise  # Re-raise HTTP exceptions
         except Exception as e:
-            logger.error(f"Error forwarding request to {service}: {e}")
             raise HTTPException(
                 status_code=500,
                 detail=f"Error forwarding request to {service}: {str(e)}"

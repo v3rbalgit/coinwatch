@@ -6,13 +6,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from shared.database.models import TokenPlatform
 from shared.utils.logger import LoggerSetup
 
-logger = LoggerSetup.setup(__name__)
 
 class PlatformRepository:
     """Repository for managing TokenPlatform data in the database"""
 
     def __init__(self, session: AsyncSession):
         self._session = session
+        self.logger = LoggerSetup.setup(__class__.__name__)
 
     async def delete_token_platforms(self, token_id: str) -> None:
         """
@@ -28,7 +28,7 @@ class PlatformRepository:
 
         except Exception as e:
             await self._session.rollback()
-            logger.error(f"Failed to delete platform records for {token_id}: {e}")
+            self.logger.error(f"Failed to delete platform records for {token_id}: {e}")
             raise
 
     async def get_token_platforms(self, token_id: str) -> list[TokenPlatform]:
@@ -47,5 +47,5 @@ class PlatformRepository:
             return list(result.scalars().all())
 
         except Exception as e:
-            logger.error(f"Failed to get platform records for {token_id}: {e}")
+            self.logger.error(f"Failed to get platform records for {token_id}: {e}")
             raise

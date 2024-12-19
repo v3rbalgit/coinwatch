@@ -11,7 +11,6 @@ from shared.database.repositories.market import MarketMetricsRepository
 from shared.utils.logger import LoggerSetup
 import shared.utils.time as TimeUtils
 
-logger = LoggerSetup.setup(__name__)
 
 class MarketMetricsCollector(FundamentalCollector):
     """
@@ -41,6 +40,7 @@ class MarketMetricsCollector(FundamentalCollector):
         super().__init__(collection_interval)
         self.market_metrics_repository = market_metrics_repository
         self.coingecko = coingecko
+        self.logger = LoggerSetup.setup(__class__.__name__)
 
     @property
     def collector_type(self) -> str:
@@ -99,7 +99,7 @@ class MarketMetricsCollector(FundamentalCollector):
             return metrics
 
         except Exception as e:
-            logger.error(f"Error collecting market metrics: {e}")
+            self.logger.error(f"Error collecting market metrics: {e}")
             raise ServiceError(f"Market metrics collection failed: {str(e)}")
 
     async def store_symbol_data(self, data: list[MarketMetrics]) -> None:

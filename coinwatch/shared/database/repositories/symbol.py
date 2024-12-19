@@ -1,13 +1,11 @@
 from sqlalchemy import select, and_, text
 
-from shared.core.models import SymbolInfo
+from shared.core.models import SymbolModel
 from shared.database.connection import DatabaseConnection, IsolationLevel
 from shared.database.models import Symbol
 from shared.core.exceptions import RepositoryError
 from shared.utils.logger import LoggerSetup
 import shared.utils.time as TimeUtils
-
-logger = LoggerSetup.setup(__name__)
 
 
 class SymbolRepository:
@@ -15,13 +13,14 @@ class SymbolRepository:
 
     def __init__(self, db_service: DatabaseConnection):
         self.db_service = db_service
+        self.logger = LoggerSetup.setup(__class__.__name__)
 
-    async def get_symbol(self, symbol: SymbolInfo) -> Symbol | None:
+    async def get_symbol(self, symbol: SymbolModel) -> SymbolModel | None:
         """
         Retrieve a symbol by its information.
 
         Args:
-            symbol (SymbolInfo): The symbol information to search by.
+            symbol (SymbolModel): The symbol information to search by.
 
         Returns:
             Optional[Symbol]: The found Symbol entity or None if not found.
@@ -40,18 +39,18 @@ class SymbolRepository:
                 result = await session.execute(stmt)
                 existing_symbol = result.scalar_one_or_none()
 
-                return existing_symbol
+                return symbol if existing_symbol else None
 
         except Exception as e:
-            logger.error(f"Error getting symbol: {e}")
+            self.logger.error(f"Error getting symbol: {e}")
             raise RepositoryError(f"Failed to get symbol: {str(e)}")
 
-    async def create_symbol(self, symbol: SymbolInfo) -> bool:
+    async def create_symbol(self, symbol: SymbolModel) -> bool:
         """
         Create a new symbol in the database.
 
         Args:
-            symbol (SymbolInfo): The symbol information to create.
+            symbol (SymbolModel): The symbol information to create.
 
         Returns:
             bool: True if creation was successful, False otherwise.
@@ -70,7 +69,7 @@ class SymbolRepository:
                 )
                 result = await session.execute(stmt)
                 if result.scalar_one_or_none() is not None:
-                    logger.debug(f"Symbol {symbol.name} already exists for {symbol.exchange}")
+                    self.logger.debug(f"Symbol {symbol.name} already exists for {symbol.exchange}")
                     return False
 
                 # Create new symbol with all fields
@@ -92,14 +91,14 @@ class SymbolRepository:
                 await session.flush()
                 await session.refresh(new_symbol)
 
-                logger.debug(
+                self.logger.debug(
                     f"Created new symbol {symbol.name} for {symbol.exchange} "
-                    f"with launch time {TimeUtils.from_timestamp(symbol.launch_time)}"
+                    f"with launch time {TimeUtils.from_timestamp(symbol.launch_time).strftime("%d-%m-%Y %H:%M:%S")}"
                 )
                 return True
 
         except Exception as e:
-            logger.error(f"Error creating symbol: {e}")
+            self.logger.error(f"Error creating symbol: {e}")
             raise RepositoryError(f"Failed to create symbol: {str(e)}")
 
     async def get_symbols_with_stats(self, exchange: str) -> list[dict]:
@@ -163,15 +162,15 @@ class SymbolRepository:
                 return [dict(row) for row in result]
 
         except Exception as e:
-            logger.error(f"Error getting symbol stats: {e}")
+            self.logger.error(f"Error getting symbol stats: {e}")
             raise RepositoryError(f"Failed to get symbol statistics: {str(e)}")
 
-    async def delete_symbol(self, symbol: SymbolInfo) -> None:
+    async def delete_symbol(self, symbol: SymbolModel) -> None:
         """
         Delete a symbol and its associated data from the database.
 
         Args:
-            symbol (SymbolInfo): The symbol information to delete.
+            symbol (SymbolModel): The symbol information to delete.
 
         Raises:
             RepositoryError: If there's an error during the deletion process.
@@ -191,10 +190,10 @@ class SymbolRepository:
                 if symbol_record:
                     await session.delete(symbol_record)
                     await session.flush()
-                    logger.info(f"Deleted symbol {symbol.name} from {symbol.exchange}")
+                    self.logger.info(f"Deleted symbol {symbol.name} from {symbol.exchange}")
                 else:
-                    logger.warning(f"Symbol {symbol.name} from {symbol.exchange} not found for deletion")
+                    self.logger.warning(f"Symbol {symbol.name} from {symbol.exchange} not found for deletion")
 
         except Exception as e:
-            logger.error(f"Error deleting symbol: {e}")
+            self.logger.error(f"Error deleting symbol: {e}")
             raise RepositoryError(f"Failed to delete symbol: {str(e)}")

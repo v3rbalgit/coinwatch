@@ -5,13 +5,12 @@ from prometheus_client import generate_latest
 from shared.core.config import MonitorConfig
 from shared.core.protocols import Service
 from shared.messaging.broker import MessageBroker
-from shared.messaging.schemas import MessageType, ServiceStatusMessage
+from shared.messaging.schemas import MessageType
 import shared.utils.time as TimeUtils
 from shared.utils.logger import LoggerSetup
 from .metrics_collector import MetricsCollector
 from .monitor_metrics import MonitoringMetrics
 
-logger = LoggerSetup.setup(__name__)
 
 class MonitoringService(Service):
     """
@@ -39,11 +38,13 @@ class MonitoringService(Service):
         self._collection_task: asyncio.Task | None = None
         self._running = False
 
+        self.logger = LoggerSetup.setup(__class__.__name__)
+
     async def start(self) -> None:
         """Start monitoring service"""
         try:
             self._status = "starting"
-            logger.info("Starting monitoring service")
+            self.logger.info("Starting monitoring service")
 
             # Connect to message broker
             await self.message_broker.connect()
@@ -56,7 +57,7 @@ class MonitoringService(Service):
             self._collection_task = asyncio.create_task(self._collect_metrics_loop())
 
             self._status = "running"
-            logger.info("Monitoring service started successfully")
+            self.logger.info("Monitoring service started successfully")
 
             # Publish initial service status
             await self.message_broker.publish(
@@ -72,14 +73,14 @@ class MonitoringService(Service):
 
         except Exception as e:
             self._status = "error"
-            logger.error(f"Failed to start monitoring service: {e}")
+            self.logger.error(f"Failed to start monitoring service: {e}")
             raise
 
     async def stop(self) -> None:
         """Stop monitoring service"""
         try:
             self._status = "stopping"
-            logger.info("Stopping monitoring service")
+            self.logger.info("Stopping monitoring service")
 
             # Stop metrics collection
             self._running = False
@@ -94,11 +95,11 @@ class MonitoringService(Service):
             await self.message_broker.close()
 
             self._status = "stopped"
-            logger.info("Monitoring service stopped successfully")
+            self.logger.info("Monitoring service stopped successfully")
 
         except Exception as e:
             self._status = "error"
-            logger.error(f"Error stopping monitoring service: {e}")
+            self.logger.error(f"Error stopping monitoring service: {e}")
             raise
 
     async def _setup_message_handlers(self) -> None:
@@ -140,7 +141,7 @@ class MonitoringService(Service):
                 ).inc(warning_count)
 
         except Exception as e:
-            logger.error(f"Error handling service status: {e}")
+            self.logger.error(f"Error handling service status: {e}")
 
     async def _handle_error(self, message: Dict[str, Any]) -> None:
         """Handle error reports"""
@@ -162,13 +163,13 @@ class MonitoringService(Service):
 
             # Log critical errors
             if severity == "critical":
-                logger.critical(
+                self.logger.critical(
                     f"Critical error in {service}: {message.get('message')}\n"
                     f"Context: {message.get('context')}"
                 )
 
         except Exception as e:
-            logger.error(f"Error handling error report: {e}")
+            self.logger.error(f"Error handling error report: {e}")
 
     async def _collect_metrics_loop(self) -> None:
         """Continuously collect and update metrics"""
@@ -191,7 +192,7 @@ class MonitoringService(Service):
                 await asyncio.sleep(self._check_intervals.get("system", 60))
 
             except Exception as e:
-                logger.error(f"Error in metrics collection: {e}")
+                self.logger.error(f"Error in metrics collection: {e}")
                 await asyncio.sleep(5)  # Short delay on error
 
     async def get_prometheus_metrics(self) -> bytes:

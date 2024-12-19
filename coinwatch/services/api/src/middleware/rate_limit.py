@@ -4,7 +4,6 @@ from fastapi import Request, HTTPException
 import aioredis
 from shared.utils.logger import LoggerSetup
 
-logger = LoggerSetup.setup(__name__)
 
 class RateLimiter:
     """
@@ -42,6 +41,8 @@ class RateLimiter:
 
         # Window size in seconds
         self._window_size = 60
+
+        self.logger = LoggerSetup.setup(__class__.__name__)
 
     async def check_rate_limit(
         self,
@@ -109,7 +110,7 @@ class RateLimiter:
             }
 
         except Exception as e:
-            logger.error(f"Rate limit check error: {e}")
+            self.logger.error(f"Rate limit check error: {e}")
             # Allow request on error
             return True, {
                 "limit": 0,

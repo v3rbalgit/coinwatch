@@ -1,4 +1,3 @@
-# src/utils/logger.py
 import os
 import logging
 import sys
@@ -10,22 +9,52 @@ class LoggerSetup:
     Provides consistent logging across all modules with both console and file output.
     """
     _initialized = False
-    _logs_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'logs')
+    # Use absolute path that matches Docker volume mount
+    _logs_dir = '/app/logs'
 
     @classmethod
-    def setup(cls, module_name: str) -> logging.Logger:
+    def _get_log_path(cls, name: str) -> str:
         """
-        Set up and return a logger for a specific module.
+        Generate a log file path based on the name.
+        For module paths (contains dots), creates directory structure.
+        For class names (no dots), creates direct log file.
+
         Args:
-            module_name: Name of the module requesting the logger
+            name: Name to create log file for (module path or class name)
+        Returns:
+            str: Path for the log file
+        """
+        # All logs go to the mounted directory since Docker already mounts to service-specific directory
+        if '.' in name:
+            # For module paths, use the last part
+            filename = f"{name.split('.')[-1]}.log"
+        else:
+            # For class names, use as is
+            filename = f"{name}.log"
+
+        return os.path.join(cls._logs_dir, filename)
+
+    @classmethod
+    def setup(cls, name: str) -> logging.Logger:
+        """
+        Set up and return a logger.
+        Automatically handles both module paths and class names.
+
+        Args:
+            name: Logger name (__name__ for modules or __class__.__name__ for classes)
         Returns:
             logging.Logger: Configured logger instance
         Example:
-            from src.utils.logger import LoggerSetup
+            # For module-level logging:
             logger = LoggerSetup.setup(__name__)
+            # Creates collector.log from services.market_data.src.collector
+
+            # For class-level logging:
+            logger = LoggerSetup.setup(__class__.__name__)
+            # Creates KlineManager.log
         """
         # Get or create logger
-        logger = logging.getLogger(module_name)
+        logger = logging.getLogger(name)
         logger.setLevel(logging.DEBUG)
 
         # Avoid adding handlers multiple times
@@ -42,11 +71,13 @@ class LoggerSetup:
             # Only add file handler if not in test environment
             if "pytest" not in sys.modules:
                 try:
-                    # Create logs directory if it doesn't exist
-                    os.makedirs(cls._logs_dir, exist_ok=True)
+                    # Get the organized log file path
+                    debug_log_file = cls._get_log_path(name)
+
+                    # Create the directory structure
+                    os.makedirs(os.path.dirname(debug_log_file), exist_ok=True)
 
                     # File handler for debug logs with rotation
-                    debug_log_file = os.path.join(cls._logs_dir, f'{module_name.split(".")[-1]}.log')
                     file_handler = RotatingFileHandler(
                         debug_log_file,
                         maxBytes=10*1024*1024,  # 10MB per file
@@ -74,31 +105,31 @@ class LoggerSetup:
         return logger
 
     @classmethod
-    def get_logger(cls, module_name: str) -> logging.Logger:
+    def get_logger(cls, name: str) -> logging.Logger:
         """
         Get an existing logger or create a new one.
         Args:
-            module_name: Name of the module requesting the logger
+            name: Logger name (module path or class name)
         Returns:
             logging.Logger: Logger instance
         """
-        logger = logging.getLogger(module_name)
+        logger = logging.getLogger(name)
         if not logger.handlers:
-            logger = cls.setup(module_name)
+            logger = cls.setup(name)
         return logger
 
     @classmethod
-    def update_log_level(cls, module_name: str,
+    def update_log_level(cls, name: str,
                         console_level: int | None = None,
                         file_level: int | None = None) -> None:
         """
         Update log levels for an existing logger.
         Args:
-            module_name: Name of the module
+            name: Name of the logger
             console_level: New console handler log level (if None, level remains unchanged)
             file_level: New file handler log level (if None, level remains unchanged)
         """
-        logger = logging.getLogger(module_name)
+        logger = logging.getLogger(name)
         for handler in logger.handlers:
             if isinstance(handler, logging.StreamHandler) and not isinstance(handler, RotatingFileHandler):
                 if console_level is not None:
@@ -108,15 +139,15 @@ class LoggerSetup:
                     handler.setLevel(file_level)
 
     @classmethod
-    def setup_test_logger(cls, module_name: str) -> logging.Logger:
+    def setup_test_logger(cls, name: str) -> logging.Logger:
         """
         Set up a simplified logger for testing environments.
         Args:
-            module_name: Name of the module requesting the logger
+            name: Logger name
         Returns:
             logging.Logger: Configured test logger instance
         """
-        logger = logging.getLogger(module_name)
+        logger = logging.getLogger(name)
         logger.setLevel(logging.DEBUG)
 
         if not logger.handlers:

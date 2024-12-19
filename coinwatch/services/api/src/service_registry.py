@@ -3,7 +3,6 @@ import aiohttp
 from fastapi import HTTPException
 from shared.utils.logger import LoggerSetup
 
-logger = LoggerSetup.setup(__name__)
 
 class ServiceRegistry:
     """
@@ -43,6 +42,7 @@ class ServiceRegistry:
             'fundamental_data': False,
             'monitor': False
         }
+        self.logger = LoggerSetup.setup(__class__.__name__)
 
     async def get_service_url(self, service_name: str) -> str:
         """
@@ -102,14 +102,14 @@ class ServiceRegistry:
                         self._failure_counts[service_name] = 0  # Reset failure count
                         return True
 
-                    logger.warning(
+                    self.logger.warning(
                         f"Health check failed for {service_name}: "
                         f"Status {response.status}"
                     )
                     return False
 
         except Exception as e:
-            logger.error(f"Error checking {service_name} health: {e}")
+            self.logger.error(f"Error checking {service_name} health: {e}")
             return False
 
     async def check_all_services(self) -> Dict[str, bool]:
@@ -133,7 +133,7 @@ class ServiceRegistry:
         if service_name in self._circuit_broken:
             self._circuit_broken[service_name] = False
             self._failure_counts[service_name] = 0
-            logger.info(f"Circuit reset for {service_name}")
+            self.logger.info(f"Circuit reset for {service_name}")
 
     def get_service_status(self) -> Dict[str, Dict]:
         """

@@ -5,11 +5,9 @@ from websockets.asyncio.client import connect, ClientConnection
 from websockets.exceptions import ConnectionClosed
 
 from shared.core.enums import Interval
-from shared.core.models import SymbolInfo
+from shared.core.models import SymbolModel
 from shared.core.config import BybitConfig
 from shared.utils.logger import LoggerSetup
-
-logger = LoggerSetup.setup(__name__)
 
 
 class BybitWebsocket:
@@ -25,6 +23,8 @@ class BybitWebsocket:
         self._ws_lock = asyncio.Lock()
         self._runner: asyncio.Task | None = None
         self._handlers: Dict[str, Callable] = {}
+
+        self.logger = LoggerSetup.setup(__class__.__name__)
 
     async def start(self) -> None:
         """Start websocket client"""
@@ -55,22 +55,22 @@ class BybitWebsocket:
             try:
                 async with self._ws_lock:
                     self._ws = websocket
-                    logger.info(f"Connected to {self._ws_url}")
+                    self.logger.info(f"Connected to {self._ws_url}")
 
                     # Subscribe to all pending topics
                     if self._handlers:
                         subscribe_msg = { "op": "subscribe", "args": list(self._handlers.keys()) }
                         await websocket.send(json.dumps(subscribe_msg))
-                        logger.debug(f"Resubscribed to topics: {list(self._handlers.keys())}")
+                        self.logger.debug(f"Resubscribed to topics: {list(self._handlers.keys())}")
 
                 await self._process_messages(websocket)
 
             except ConnectionClosed:
-                logger.info("Connection closed, reconnecting...")
+                self.logger.info("Connection closed, reconnecting...")
                 self._ws = None
                 continue
             except Exception as e:
-                logger.error(f"Websocket error: {e}")
+                self.logger.error(f"Websocket error: {e}")
                 self._ws = None
                 continue
 
@@ -85,9 +85,9 @@ class BybitWebsocket:
                     if data['op'] in ('subscribe', 'unsubscribe'):
                         success = data.get('success', False)
                         if success:
-                            logger.debug(f"Successfully {data['op']}d to topics")
+                            self.logger.debug(f"Successfully {data['op']}d to topics")
                         else:
-                            logger.error(f"Failed to {data['op']}: {data.get('ret_msg')}")
+                            self.logger.error(f"Failed to {data['op']}: {data.get('ret_msg')}")
                         continue
 
                 # Handle kline updates
@@ -100,10 +100,10 @@ class BybitWebsocket:
                             await handler(data)
 
             except Exception as e:
-                logger.error(f"Error processing message: {e}")
+                self.logger.error(f"Error processing message: {e}")
 
     async def subscribe_klines(self,
-                             symbol: SymbolInfo,
+                             symbol: SymbolModel,
                              interval: Interval,
                              handler: Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]) -> None:
         """Subscribe to kline updates"""
@@ -121,7 +121,7 @@ class BybitWebsocket:
                 await self._ws.send(json.dumps(subscribe_msg))
 
     async def unsubscribe_klines(self,
-                                symbol: SymbolInfo,
+                                symbol: SymbolModel,
                                 interval: Interval) -> None:
         """Unsubscribe from kline updates"""
         topic = f"kline.{interval.value}.{symbol.name}"

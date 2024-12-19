@@ -7,7 +7,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from shared.managers.indicator import IndicatorManager
-from shared.core.models import KlineData, RSIResult, BollingerBandsResult, MACDResult, MAResult, OBVResult
+from shared.core.models import KlineModel, RSIResult, BollingerBandsResult, MACDResult, MAResult, OBVResult
 from shared.core.enums import Interval
 from shared.core.exceptions import ValidationError
 from shared.utils.time import to_timestamp
@@ -35,7 +35,7 @@ def sample_klines():
     """Generate sample kline data for testing"""
     base_time = to_timestamp(datetime(2023, 1, 1, tzinfo=timezone.utc))
     return [
-        KlineData(
+        KlineModel(
             timestamp=base_time + (i * 60000),  # 1 minute intervals
             open_price=Decimal(str(100 + i)),
             high_price=Decimal(str(105 + i)),
@@ -64,7 +64,7 @@ async def test_validate_klines_empty(indicator_manager):
 
 async def test_validate_klines_insufficient(indicator_manager):
     """Test validation with insufficient klines"""
-    klines = [KlineData(
+    klines = [KlineModel(
         timestamp=to_timestamp(datetime(2023, 1, 1, tzinfo=timezone.utc)),
         open_price=Decimal("100"),
         high_price=Decimal("105"),

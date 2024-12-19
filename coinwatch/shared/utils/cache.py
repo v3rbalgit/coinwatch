@@ -7,12 +7,10 @@ from redis.asyncio import Redis
 
 from shared.core.enums import Interval
 from shared.core.models import (
-    KlineData,
+    KlineModel,
     RSIResult, BollingerBandsResult, MACDResult, MAResult, OBVResult
 )
 from shared.utils.logger import LoggerSetup
-
-logger = LoggerSetup.setup(__name__)
 
 
 class RedisCache:
@@ -29,6 +27,7 @@ class RedisCache:
     def __init__(self, redis_url: str, namespace: str = "market_data"):
         self.redis = Redis.from_url(redis_url, decode_responses=True)
         self.namespace = namespace
+        self.logger = LoggerSetup.setup(__class__.__name__)
 
     def _make_key(self, key: str) -> str:
         """Create namespaced key"""
@@ -40,7 +39,7 @@ class RedisCache:
             value = await self.redis.get(self._make_key(key))
             return json.loads(value) if value else None
         except Exception as e:
-            logger.error(f"Redis get error: {e}")
+            self.logger.error(f"Redis get error: {e}")
             return None
 
     async def set(self, key: str, value: Any, ttl: int = 300) -> bool:
@@ -61,7 +60,7 @@ class RedisCache:
                 ex=ttl
             )
         except Exception as e:
-            logger.error(f"Redis set error: {e}")
+            self.logger.error(f"Redis set error: {e}")
             return False
 
     async def delete(self, key: str) -> bool:
@@ -69,7 +68,7 @@ class RedisCache:
         try:
             return bool(await self.redis.delete(self._make_key(key)))
         except Exception as e:
-            logger.error(f"Redis delete error: {e}")
+            self.logger.error(f"Redis delete error: {e}")
             return False
 
     async def clear_namespace(self) -> bool:
@@ -80,7 +79,7 @@ class RedisCache:
                 return bool(await self.redis.delete(*keys))
             return True
         except Exception as e:
-            logger.error(f"Redis clear error: {e}")
+            self.logger.error(f"Redis clear error: {e}")
             return False
 
     async def close(self) -> None:
@@ -88,15 +87,15 @@ class RedisCache:
         try:
             await self.redis.close()
         except Exception as e:
-            logger.error(f"Redis close error: {e}")
+            self.logger.error(f"Redis close error: {e}")
 
 class redis_cached[T]:
     """
     Decorator class for caching async function results in Redis.
 
     Example:
-        @redis_cached[list[KlineData]]()
-        async def get_klines(...) -> list[KlineData]:
+        @redis_cached[list[KlineModel]]()
+        async def get_klines(...) -> list[KlineModel]:
             ...
     """
     def __init__(self, ttl: int = 300):
@@ -104,8 +103,16 @@ class redis_cached[T]:
 
     def _convert_to_decimal(self, value: Any) -> Any:
         """Convert string values back to Decimal where needed"""
-        if isinstance(value, str) and value.replace('.', '').replace('-', '').isdigit():
-            return Decimal(value)
+        if isinstance(value, str):
+            try:
+                # First convert through float to handle scientific notation
+                float_val = float(value)
+                # Then convert to string with full precision
+                decimal_str = f"{float_val:.10f}"
+                # Finally convert to Decimal and normalize
+                return Decimal(decimal_str).normalize()
+            except ValueError:
+                pass
         return value
 
     def _convert_to_enum(self, value: Any, field_type: Any) -> Any:
@@ -144,7 +151,7 @@ class redis_cached[T]:
             model_class = args[0]
 
             # Handle different model types
-            if model_class in (KlineData, RSIResult, MACDResult,
+            if model_class in (KlineModel, RSIResult, MACDResult,
                              BollingerBandsResult, MAResult, OBVResult):
                 return cast(T, [
                     self._deserialize_model(item, model_class)

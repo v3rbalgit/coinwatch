@@ -8,12 +8,11 @@ from shared.clients.sentiment import RedditAdapter, TelegramAdapter, TwitterAdap
 from shared.core.config import SentimentConfig
 from shared.core.enums import DataSource
 from shared.core.exceptions import ServiceError
-from shared.core.models import SentimentMetrics, Metadata, SymbolInfo
+from shared.core.models import SentimentMetrics, Metadata, SymbolModel
 from shared.database.repositories import MetadataRepository, SentimentRepository
 from shared.utils.logger import LoggerSetup
 import shared.utils.time as TimeUtils
 
-logger = LoggerSetup.setup(__name__)
 
 class SentimentMetricsCollector(FundamentalCollector):
     """
@@ -49,6 +48,8 @@ class SentimentMetricsCollector(FundamentalCollector):
         self.reddit = RedditAdapter(**sentiment_config.get_reddit_config())
         self.telegram = TelegramAdapter(**sentiment_config.get_telegram_config())
 
+        self.logger = LoggerSetup.setup(__class__.__name__)
+
     @property
     def collector_type(self) -> str:
         """
@@ -82,7 +83,7 @@ class SentimentMetricsCollector(FundamentalCollector):
 
         return Decimal(str(sum(sentiment_scores) / len(sentiment_scores)))
 
-    async def collect_symbol_data(self, tokens: list[SymbolInfo]) -> list[SentimentMetrics]:
+    async def collect_symbol_data(self, tokens: list[SymbolModel]) -> list[SentimentMetrics]:
         """
         Collect sentiment metrics for multiple tokens across social media platforms.
 
@@ -93,7 +94,7 @@ class SentimentMetricsCollector(FundamentalCollector):
         4. Combines all metrics into a SentimentMetrics object
 
         Args:
-            tokens (List[SymbolInfo]): List of tokens to collect sentiment data for.
+            tokens (List[SymbolModel]): List of tokens to collect sentiment data for.
 
         Returns:
             List[SentimentMetrics]: List of collected sentiment metrics for each token.
@@ -182,7 +183,7 @@ class SentimentMetricsCollector(FundamentalCollector):
             return metrics
 
         except Exception as e:
-            logger.error(f"Error collecting sentiment metrics: {e}")
+            self.logger.error(f"Error collecting sentiment metrics: {e}")
             raise ServiceError(f"Sentiment metrics collection failed: {str(e)}")
 
     async def _collect_twitter_metrics(self, metadata: Metadata) -> dict | None:
@@ -224,7 +225,7 @@ class SentimentMetricsCollector(FundamentalCollector):
             }
 
         except Exception as e:
-            logger.error(f"Error collecting Twitter metrics: {e}")
+            self.logger.error(f"Error collecting Twitter metrics: {e}")
             return None
 
     async def _collect_reddit_metrics(self, metadata: Metadata) -> dict | None:
@@ -265,7 +266,7 @@ class SentimentMetricsCollector(FundamentalCollector):
             }
 
         except Exception as e:
-            logger.error(f"Error collecting Reddit metrics: {e}")
+            self.logger.error(f"Error collecting Reddit metrics: {e}")
             return None
 
     async def _collect_telegram_metrics(self, metadata: Metadata) -> dict | None:
@@ -305,7 +306,7 @@ class SentimentMetricsCollector(FundamentalCollector):
             }
 
         except Exception as e:
-            logger.error(f"Error collecting Telegram metrics: {e}")
+            self.logger.error(f"Error collecting Telegram metrics: {e}")
             return None
 
     async def store_symbol_data(self, data: list[SentimentMetrics]) -> None:

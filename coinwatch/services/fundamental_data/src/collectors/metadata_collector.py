@@ -11,8 +11,6 @@ from shared.database.repositories.metadata import MetadataRepository
 from shared.utils.logger import LoggerSetup
 import shared.utils.time as TimeUtils
 
-logger = LoggerSetup.setup(__name__)
-
 
 class MetadataCollector(FundamentalCollector):
     """
@@ -38,6 +36,8 @@ class MetadataCollector(FundamentalCollector):
         super().__init__(collection_interval)
         self.metadata_repository = metadata_repository
         self.coingecko = coingecko
+
+        self.logger = LoggerSetup.setup(__class__.__name__)
 
     @property
     def collector_type(self) -> str:
@@ -69,7 +69,7 @@ class MetadataCollector(FundamentalCollector):
                             dt = datetime.strptime(genesis_date, "%Y-%m-%d")
                             launch_time = TimeUtils.to_timestamp(dt)
                         except (ValueError, TypeError):
-                            logger.warning(f"Invalid launch time format for {token}")
+                            self.logger.warning(f"Invalid launch time format for {token}")
 
                     # Process platforms data
                     platforms = []
@@ -108,13 +108,13 @@ class MetadataCollector(FundamentalCollector):
                     collected_metadata.append(metadata)
 
                 except Exception as e:
-                    logger.error(f"Error collecting metadata for {token}: {e}")
+                    self.logger.error(f"Error collecting metadata for {token}: {e}")
                     continue
 
             return collected_metadata
 
         except Exception as e:
-            logger.error(f"Error in bulk metadata collection: {e}")
+            self.logger.error(f"Error in bulk metadata collection: {e}")
             raise ServiceError(f"Metadata collection failed: {str(e)}")
 
     async def store_symbol_data(self, data: list[Metadata]) -> None:

@@ -8,15 +8,16 @@ from pydantic import (
     ValidationInfo,
     model_validator,
     field_validator,
-    computed_field,
     ValidationError,
     ConfigDict
 )
 
+
 import shared.utils.time as TimeUtils
 from .enums import DataSource, Interval
 
-class SymbolInfo(BaseModel):
+
+class SymbolModel(BaseModel):
     """
     Domain model for cryptocurrency trading symbol information.
 
@@ -150,8 +151,8 @@ class SymbolInfo(BaseModel):
     @field_validator('launch_time')
     def validate_launch_time(value: Any) -> int:
         """Validate launch time is within acceptable range"""
-        if value < SymbolInfo.MIN_LAUNCH_TIME:
-            raise ValidationError(f"Launch time cannot be before {SymbolInfo.MIN_LAUNCH_TIME}")
+        if value < SymbolModel.MIN_LAUNCH_TIME:
+            raise ValidationError(f"Launch time cannot be before {SymbolModel.MIN_LAUNCH_TIME}")
 
         max_time = TimeUtils.get_current_timestamp() + (24 * 60 * 60 * 1000)
         if value > max_time:
@@ -159,19 +160,17 @@ class SymbolInfo(BaseModel):
 
         return value
 
-    @computed_field
     @property
     def token_name(self) -> str:
         """Lowercase base asset name"""
         return self.base_asset.lower()
 
-    @computed_field
     @property
     def trading_pair(self) -> str:
         """Trading pair in format BASE/QUOTE"""
         return f"{self.base_asset}/{self.quote_asset}"
 
-    def check_retention_time(self, retention_days: int) -> 'SymbolInfo':
+    def check_retention_time(self, retention_days: int) -> 'SymbolModel':
         """
         Create new instance with adjusted launch time based on retention period.
 
@@ -179,7 +178,7 @@ class SymbolInfo(BaseModel):
             retention_days: Number of days to retain data
 
         Returns:
-            New SymbolInfo instance with adjusted launch time
+            New SymbolModel instance with adjusted launch time
         """
         if retention_days <= 0:
             return self
@@ -195,14 +194,14 @@ class SymbolInfo(BaseModel):
 
     def __eq__(self, other: object) -> bool:
         """Equality based on name and exchange"""
-        if not isinstance(other, SymbolInfo):
+        if not isinstance(other, SymbolModel):
             return NotImplemented
         return (self.name == other.name and
                 self.exchange == other.exchange)
 
-    def __lt__(self, other: 'SymbolInfo') -> bool:
+    def __lt__(self, other: 'SymbolModel') -> bool:
         """Enable sorting of symbols by name and exchange"""
-        if not isinstance(other, SymbolInfo):
+        if not isinstance(other, SymbolModel):
             return NotImplemented
         return (self.name, self.exchange) < (other.name, other.exchange)
 
@@ -230,7 +229,7 @@ class SymbolInfo(BaseModel):
         return bool(self.name and self.exchange)
 
 
-class KlineData(BaseModel):
+class KlineModel(BaseModel):
     """
     Domain model for kline data with built-in validation
 
@@ -313,23 +312,20 @@ class KlineData(BaseModel):
         description="Trading interval"
     )
 
-    @classmethod
-    def quantize_decimal(cls, value: str | float, precision: int) -> Decimal:
-        """
-        Quantize a decimal to the specified precision
+    @property
+    def start_time(self) -> str:
+        """Timestamp formatted as a datetime string"""
+        return TimeUtils.from_timestamp(self.timestamp).strftime('%d-%m-%Y %H:%M')
 
-        Args:
-            value: Value to quantize
-            precision: Number of decimal places
+    @property
+    def end_time(self) -> str:
+        """Calculated end time based on an interval as a datetime string"""
+        return TimeUtils.from_timestamp(self.timestamp + self.interval.to_milliseconds()).strftime('%d-%m-%Y %H:%M')
 
-        Returns:
-            Quantized Decimal value
-        """
-        decimal_value = Decimal(str(value))
-        return decimal_value.quantize(
-            Decimal(f'0.{"0" * precision}'),
-            rounding=ROUND_HALF_UP
-        )
+    @property
+    def time_range(self) -> str:
+        """Time range covered by the kline"""
+        return f"{self.start_time} - {self.end_time}"
 
     @classmethod
     def from_raw_data(cls,
@@ -340,33 +336,38 @@ class KlineData(BaseModel):
                      close_price: str | float,
                      volume: str | float,
                      turnover: str | float,
-                     interval: Interval,
-                     symbol: SymbolInfo) -> 'KlineData':
+                     interval: Interval) -> 'KlineModel':
         """
-        Create a new KlineData instance from raw data with proper precision
+        Create a new KlineModel instance from raw data with proper precision
 
         Args:
             timestamp: Unix timestamp in milliseconds
-            open_price: Opening price
-            high_price: Highest price
-            low_price: Lowest price
-            close_price: Closing price
-            volume: Trading volume
-            turnover: Trading turnover
+            open_price: Opening price (as string or float)
+            high_price: Highest price (as string or float)
+            low_price: Lowest price (as string or float)
+            close_price: Closing price (as string or float)
+            volume: Trading volume (as string or float)
+            turnover: Trading turnover (as string or float)
             interval: Trading interval
-            symbol: Symbol info for precision settings
 
         Returns:
-            New KlineData instance with quantized values
+            New KlineModel instance with normalized decimal values
         """
+        def to_normalized_decimal(value: str | float) -> Decimal:
+            """Convert any numeric input to a normalized Decimal"""
+            if isinstance(value, float):
+                # Convert float to string without scientific notation
+                value = f"{value:.8f}"
+            return Decimal(str(value)).normalize()
+
         return cls(
             timestamp=timestamp,
-            open_price=cls.quantize_decimal(open_price, symbol.price_scale),
-            high_price=cls.quantize_decimal(high_price, symbol.price_scale),
-            low_price=cls.quantize_decimal(low_price, symbol.price_scale),
-            close_price=cls.quantize_decimal(close_price, symbol.price_scale),
-            volume=cls.quantize_decimal(volume, symbol.price_scale),
-            turnover=cls.quantize_decimal(turnover, symbol.price_scale),
+            open_price=to_normalized_decimal(open_price),
+            high_price=to_normalized_decimal(high_price),
+            low_price=to_normalized_decimal(low_price),
+            close_price=to_normalized_decimal(close_price),
+            volume=to_normalized_decimal(volume),
+            turnover=to_normalized_decimal(turnover),
             interval=interval
         )
 
@@ -379,8 +380,8 @@ class KlineData(BaseModel):
                 {'timestamp': f'Must be 13 digits, got {len(str(abs(value)))}'}
             )
 
-        if value < KlineData.BYBIT_LAUNCH_DATE:
-            launch_date = TimeUtils.from_timestamp(KlineData.BYBIT_LAUNCH_DATE)
+        if value < KlineModel.BYBIT_LAUNCH_DATE:
+            launch_date = TimeUtils.from_timestamp(KlineModel.BYBIT_LAUNCH_DATE)
             raise ValidationError(
                 'Invalid timestamp range',
                 {'timestamp': f'Cannot be before exchange launch ({launch_date})'}
@@ -389,7 +390,7 @@ class KlineData(BaseModel):
         current_time = TimeUtils.get_current_timestamp()
         dt = TimeUtils.from_timestamp(value)
         max_allowed = TimeUtils.from_timestamp(current_time) + timedelta(
-            seconds=KlineData.MAX_FUTURE_TOLERANCE
+            seconds=KlineModel.MAX_FUTURE_TOLERANCE
         )
 
         if dt > max_allowed:
@@ -418,7 +419,7 @@ class KlineData(BaseModel):
             )
 
     @model_validator(mode='after')
-    def validate_price_relationships(self) -> 'KlineData':
+    def validate_price_relationships(self) -> 'KlineModel':
         """Validate OHLC price relationships follow market logic"""
         if not (self.low_price <= min(self.open_price, self.close_price) <=
                 max(self.open_price, self.close_price) <= self.high_price):
@@ -437,7 +438,32 @@ class KlineData(BaseModel):
         return self
 
 # Technical Indicator Models
-class RSIResult(BaseModel):
+class IndicatorBase(BaseModel):
+    """Base class for all indicator models with common decimal handling"""
+    model_config = ConfigDict(
+        frozen=True,
+        validate_assignment=True,
+        strict=True,
+        json_encoders={
+            # Convert Decimal to string without scientific notation
+            Decimal: lambda v: f"{v:f}"
+        }
+    )
+
+    @field_validator('*')
+    def validate_decimal_fields(cls, value: Any, info: ValidationInfo) -> Any:
+        """Convert any numeric field to normalized Decimal"""
+        if isinstance(value, (Decimal, int)):
+            return value
+        if isinstance(value, str) and info.field_name != 'timestamp':
+            try:
+                # Handle scientific notation by converting through float
+                return Decimal(str(float(value))).normalize()
+            except (ValueError, InvalidOperation):
+                raise ValidationError(f'Invalid decimal value: {value}')
+        return value
+
+class RSIResult(IndicatorBase):
     """Relative Strength Index result"""
     timestamp: int
     value: Decimal
@@ -452,7 +478,7 @@ class RSIResult(BaseModel):
             length=length
         )
 
-class MACDResult(BaseModel):
+class MACDResult(IndicatorBase):
     """MACD result"""
     timestamp: int
     macd: Decimal
@@ -471,7 +497,7 @@ class MACDResult(BaseModel):
             histogram=Decimal(str(macd_dict[f'MACDh{suffix}']))
         )
 
-class BollingerBandsResult(BaseModel):
+class BollingerBandsResult(IndicatorBase):
     """Bollinger Bands result"""
     timestamp: int
     upper: Decimal
@@ -492,7 +518,7 @@ class BollingerBandsResult(BaseModel):
             bandwidth=Decimal(str(bb_dict[f'BBB{suffix}']))
         )
 
-class MAResult(BaseModel):
+class MAResult(IndicatorBase):
     """Moving Average result"""
     timestamp: int
     value: Decimal
@@ -507,7 +533,7 @@ class MAResult(BaseModel):
             length=length
         )
 
-class OBVResult(BaseModel):
+class OBVResult(IndicatorBase):
     """On Balance Volume result"""
     timestamp: int
     value: Decimal
@@ -519,6 +545,7 @@ class OBVResult(BaseModel):
             timestamp=timestamp,
             value=Decimal(str(value))
         )
+
 
 # Platform Model
 @dataclass
@@ -532,7 +559,7 @@ class Platform:
 class Metadata:
     """Domain model for token metadata"""
     id: str
-    symbol: SymbolInfo
+    symbol: SymbolModel
     name: str
     description: str
     market_cap_rank: int
@@ -579,7 +606,7 @@ class Metadata:
 class MarketMetrics:
     """Market metrics for a token"""
     id: str  # CoinGecko ID
-    symbol: SymbolInfo
+    symbol: SymbolModel
     current_price: Decimal
     market_cap: Decimal | None
     market_cap_rank: int | None
@@ -637,7 +664,7 @@ class MarketMetrics:
 class SentimentMetrics:
     """Social media sentiment metrics for a token"""
     id: str  # CoinGecko ID
-    symbol: SymbolInfo
+    symbol: SymbolModel
 
     # Twitter metrics
     twitter_followers: int | None
