@@ -1,15 +1,13 @@
-# src/repositories/sentiment.py
-
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 
 from shared.core.enums import DataSource, IsolationLevel
 from shared.database.models import TokenSentiment
-from shared.core.models import SentimentMetrics, SymbolModel
+from shared.core.models import SentimentMetricsModel
 from shared.core.exceptions import RepositoryError
 from shared.database.connection import DatabaseConnection
 from shared.utils.logger import LoggerSetup
-import shared.utils.time as TimeUtils
+
 
 
 class SentimentRepository:
@@ -25,15 +23,16 @@ class SentimentRepository:
         self.db = db_service
         self.logger = LoggerSetup.setup(__class__.__name__)
 
-    async def get_sentiment_metrics(self, symbol: SymbolModel) -> SentimentMetrics | None:
+
+    async def get_sentiment_metrics(self, tokens: set[str]) -> list[SentimentMetricsModel]:
         """
-        Get sentiment metrics for a symbol.
+        Get stored sentiment metrics for multiple tokens.
 
         Args:
-            symbol (SymbolModel): The symbol to retrieve sentiment metrics for.
+            tokens (set[str]): Set of token symbols to get sentiment metrics for.
 
         Returns:
-            Optional[SentimentMetrics]: The sentiment metrics for the symbol, or None if not found.
+            list[SentimentMetricsModel]: List of sentiment metrics for found tokens. Empty list if none found.
 
         Raises:
             RepositoryError: If the retrieval operation fails.
@@ -41,41 +40,40 @@ class SentimentRepository:
         try:
             async with self.db.session() as session:
                 stmt = select(TokenSentiment).where(
-                    TokenSentiment.symbol == symbol.name.lower()
+                    TokenSentiment.symbol.in_(tokens)
                 )
                 result = await session.execute(stmt)
-                db_metrics = result.scalar_one_or_none()
+                db_metrics_list = result.scalars().all()
 
-                if db_metrics:
-                    return SentimentMetrics(
-                        id=db_metrics.id,
-                        symbol=symbol,
-                        twitter_followers=db_metrics.twitter_followers,
-                        twitter_following=db_metrics.twitter_following,
-                        twitter_posts_24h=db_metrics.twitter_posts_24h,
-                        twitter_engagement_rate=db_metrics.twitter_engagement_rate,
-                        twitter_sentiment_score=db_metrics.twitter_sentiment_score,
-                        reddit_subscribers=db_metrics.reddit_subscribers,
-                        reddit_active_users=db_metrics.reddit_active_users,
-                        reddit_posts_24h=db_metrics.reddit_posts_24h,
-                        reddit_comments_24h=db_metrics.reddit_comments_24h,
-                        reddit_sentiment_score=db_metrics.reddit_sentiment_score,
-                        telegram_members=db_metrics.telegram_members,
-                        telegram_online_members=db_metrics.telegram_online_members,
-                        telegram_messages_24h=db_metrics.telegram_messages_24h,
-                        telegram_sentiment_score=db_metrics.telegram_sentiment_score,
-                        overall_sentiment_score=db_metrics.overall_sentiment_score,
-                        social_score=db_metrics.social_score,
-                        updated_at=TimeUtils.to_timestamp(db_metrics.updated_at),
-                        data_source=DataSource(db_metrics.data_source)
-                    )
-                return None
+                return [SentimentMetricsModel(
+                    id=db_metrics.id,
+                    symbol=db_metrics.symbol,
+                    twitter_followers=db_metrics.twitter_followers,
+                    twitter_following=db_metrics.twitter_following,
+                    twitter_posts_24h=db_metrics.twitter_posts_24h,
+                    twitter_engagement_rate=db_metrics.twitter_engagement_rate,
+                    twitter_sentiment_score=db_metrics.twitter_sentiment_score,
+                    reddit_subscribers=db_metrics.reddit_subscribers,
+                    reddit_active_users=db_metrics.reddit_active_users,
+                    reddit_posts_24h=db_metrics.reddit_posts_24h,
+                    reddit_comments_24h=db_metrics.reddit_comments_24h,
+                    reddit_sentiment_score=db_metrics.reddit_sentiment_score,
+                    telegram_members=db_metrics.telegram_members,
+                    telegram_online_members=db_metrics.telegram_online_members,
+                    telegram_messages_24h=db_metrics.telegram_messages_24h,
+                    telegram_sentiment_score=db_metrics.telegram_sentiment_score,
+                    overall_sentiment_score=db_metrics.overall_sentiment_score,
+                    social_score=db_metrics.social_score,
+                    updated_at=db_metrics.updated_at,
+                    data_source=DataSource(db_metrics.data_source)
+                ) for db_metrics in db_metrics_list]
 
         except Exception as e:
-            self.logger.error(f"Error getting sentiment metrics for {symbol}: {e}")
+            self.logger.error(f"Error getting sentiment metrics for {len(tokens)} tokens: {e}")
             raise RepositoryError(f"Failed to get sentiment metrics: {str(e)}")
 
-    async def upsert_sentiment_metrics(self, metrics: list[SentimentMetrics]) -> None:
+
+    async def upsert_sentiment_metrics(self, metrics: list[SentimentMetricsModel]) -> None:
         """
         Create or update sentiment metrics for multiple symbols.
 
@@ -88,7 +86,7 @@ class SentimentRepository:
         try:
             async with self.db.session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
                 # Convert all metrics to database format
-                db_data = [metrics.to_dict() for metrics in metrics]
+                db_data = [metrics.model_dump() for metrics in metrics]
 
                 stmt = insert(TokenSentiment).values(db_data)
                 stmt = stmt.on_conflict_do_update(
@@ -107,12 +105,13 @@ class SentimentRepository:
             self.logger.error(f"Error in bulk sentiment metrics upsert: {e}")
             raise RepositoryError(f"Failed to upsert sentiment metrics batch: {str(e)}")
 
-    async def delete_sentiment_metrics(self, symbol: str) -> None:
+
+    async def delete_sentiment_metrics(self, tokens: set[str]) -> None:
         """
-        Delete sentiment metrics for a token.
+        Delete sentiment metrics for multiple tokens.
 
         Args:
-            symbol (str): Symbol representing the token to delete sentiment metrics for.
+            tokens (set[str]): Set of tokens to delete sentiment metrics for.
 
         Raises:
             RepositoryError: If the deletion operation fails.
@@ -120,17 +119,19 @@ class SentimentRepository:
         try:
             async with self.db.session() as session:
                 stmt = select(TokenSentiment).where(
-                    TokenSentiment.symbol == symbol.lower()
+                    TokenSentiment.symbol.in_(tokens)
                 )
                 result = await session.execute(stmt)
-                sentiment_record = result.scalar_one_or_none()
+                sentiment_records = result.scalars().all()
 
-                if sentiment_record:
-                    await session.delete(sentiment_record)
-                    self.logger.info(f"Deleted sentiment metrics for symbol '{symbol.upper()}'")
+                if sentiment_records:
+                    for record in sentiment_records:
+                        await session.delete(record)
+                    await session.flush()
+                    self.logger.info(f"Deleted sentiment metrics for {len(sentiment_records)} tokens")
                 else:
-                    self.logger.warning(f"No sentiment metrics found for symbol '{symbol.upper()}'")
+                    self.logger.warning(f"No sentiment metrics found for tokens: {tokens}")
 
         except Exception as e:
-            self.logger.error(f"Error deleting sentiment metrics for {symbol}: {e}")
+            self.logger.error(f"Error deleting sentiment metrics for {len(tokens)} tokens: {e}")
             raise RepositoryError(f"Failed to delete sentiment metrics: {str(e)}")

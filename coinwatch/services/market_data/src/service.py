@@ -7,12 +7,11 @@ from shared.core.models import SymbolModel
 from shared.core.exceptions import ServiceError
 from shared.core.protocols import Service
 from shared.database.repositories import KlineRepository, SymbolRepository
-from shared.messaging.broker import MessageBroker
-from shared.messaging.schemas import MessageType, SymbolMessage, ErrorMessage
 from shared.utils.logger import LoggerSetup
-import shared.utils.time as TimeUtils
 from shared.utils.error import ErrorTracker
 from .collector import DataCollector
+from shared.utils.time import get_current_timestamp
+
 
 
 class MarketDataService(Service):
@@ -30,23 +29,20 @@ class MarketDataService(Service):
                  symbol_repository: SymbolRepository,
                  kline_repository: KlineRepository,
                  exchange_registry: ExchangeAdapterRegistry,
-                 message_broker: MessageBroker,
                  config: MarketDataConfig):
 
         # Core dependencies
         self.symbol_repository = symbol_repository
         self.kline_repository = kline_repository
         self.exchange_registry = exchange_registry
-        self.message_broker = message_broker
         self.base_interval = Interval(config.default_interval)
-        self._retention_days = 90
+        self._retention_days = config.retention_days
 
         # Core components
         self.data_collector = DataCollector(
             adapter_registry=exchange_registry,
             symbol_repository=symbol_repository,
             kline_repository=kline_repository,
-            message_broker=message_broker,
             base_interval=self.base_interval
         )
 
@@ -72,16 +68,13 @@ class MarketDataService(Service):
 
         self.logger = LoggerSetup.setup(__class__.__name__)
 
+
     async def start(self) -> None:
         """Start market data service"""
         try:
             self._status = ServiceStatus.STARTING
-            self._start_time = TimeUtils.get_current_timestamp()
+            self._start_time = get_current_timestamp()
             self.logger.info("Starting market data service")
-
-            # Connect to message broker and register handlers
-            await self.message_broker.connect()
-            await self.message_broker.subscribe(MessageType.GAP_DETECTED, self._handle_gap_message)
 
             # Start monitoring
             self._monitor_running.set()
@@ -95,6 +88,7 @@ class MarketDataService(Service):
             self._last_error = e
             self.logger.error(f"Failed to start market data service: {e}")
             raise ServiceError(f"Service start failed: {str(e)}")
+
 
     async def stop(self) -> None:
         """Stop market data service"""
@@ -114,7 +108,6 @@ class MarketDataService(Service):
 
             # Cleanup components
             await self.data_collector.cleanup()
-            await self.message_broker.close()
 
             # Clear service state
             self._active_symbols.clear()
@@ -129,24 +122,24 @@ class MarketDataService(Service):
             self.logger.error(f"Error during service shutdown: {e}")
             raise ServiceError(f"Service stop failed: {str(e)}")
 
+
     async def _process_symbol(self, symbol: SymbolModel) -> None:
         """Process a single symbol with semaphore control"""
         async with self._collection_semaphore:
-            checked_symbol = symbol.check_retention_time(self._retention_days)
-            self._active_symbols.add(checked_symbol)
+            symbol = symbol.adjust_launch_time(self._retention_days)
+            self._active_symbols.add(symbol)
 
-            if not await self.symbol_repository.get_symbol(checked_symbol):
-                await self.symbol_repository.create_symbol(checked_symbol)
-                await self._publish_symbol_added(checked_symbol)
+            if not await self.symbol_repository.get_symbol(symbol):
+                await self.symbol_repository.create_symbol(symbol)
 
-            latest_timestamp = await self.kline_repository.get_latest_timestamp(checked_symbol)
+            timestamp_range = await self.kline_repository.get_timestamp_range(symbol)
 
             await self.data_collector.collect(
-                symbol=checked_symbol,
-                start_time=latest_timestamp if latest_timestamp else checked_symbol.launch_time,
-                end_time=TimeUtils.get_current_timestamp(),
-                context={"type": "initial"}
+                symbol=symbol,
+                start_time=timestamp_range[1] if timestamp_range else symbol.launch_time,
+                end_time=get_current_timestamp()
             )
+
 
     async def _process_symbols(self, symbols: list[SymbolModel]) -> None:
         """Process symbols in batches for better memory management"""
@@ -158,7 +151,8 @@ class MarketDataService(Service):
             await asyncio.gather(*tasks, return_exceptions=True)
 
             # Add small delay between batches to prevent overwhelming
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.05)
+
 
     async def _monitor_symbols(self) -> None:
         """Monitor trading symbols across exchanges"""
@@ -167,23 +161,21 @@ class MarketDataService(Service):
                 async with self._symbol_lock:
                     for exchange in self.exchange_registry.get_registered():
                         adapter = self.exchange_registry.get_adapter(exchange)
-                        try:
-                            symbols = await adapter.get_symbols()
 
-                            # Process new symbols in batches with limited concurrency
-                            new_symbols = [s for s in symbols if s not in self._active_symbols]
-                            if new_symbols:
-                                await self._process_symbols(new_symbols)
+                        symbols = await adapter.get_symbols()
 
-                            # Handle delisted symbols
-                            delisted = self._active_symbols - set(symbols)
-                            for symbol in delisted:
-                                self._active_symbols.remove(symbol)
-                                await self.data_collector.delist(symbol)
-                                await self._publish_symbol_delisted(symbol)
+                        # Process new symbols in batches with limited concurrency
+                        new_symbols = [s for s in symbols if s not in self._active_symbols]
+                        if new_symbols:
+                            self.logger.info(f"New symbols: {new_symbols}")
+                            await self._process_symbols(new_symbols)
 
-                        except Exception as e:
-                            await self._handle_exchange_error(e, exchange)
+                        # Handle delisted symbols
+                        delisted = self._active_symbols - set(symbols)
+                        for symbol in delisted:
+                            self.logger.info(f"Delisted symbols: {delisted}")
+                            self._active_symbols.remove(symbol)
+                            await self.data_collector.delist(symbol)
 
                     await asyncio.sleep(self._symbol_check_interval)
 
@@ -193,104 +185,7 @@ class MarketDataService(Service):
 
         except Exception as e:
             self.logger.error(f"Error in symbol monitoring cycle: {e}")
-            await self._handle_critical_error(e)
 
-    async def _handle_gap_message(self, message: dict) -> None:
-        """Handle gap detection message"""
-        try:
-            # Get symbol info from exchange
-            adapter = self.exchange_registry.get_adapter(message["exchange"])
-            symbols = await adapter.get_symbols(message["symbol"])
-            if not symbols:
-                self.logger.warning(f"Symbol {message['symbol']} not found on {message['exchange']}")
-                return
-            symbol = symbols[0]
-
-            # Only process if symbol is active and not in historical collection
-            if symbol in self._active_symbols and symbol not in self.data_collector._processing_symbols:
-
-                gaps = message["gaps"]
-                for start, end in gaps:
-                    await self.data_collector.collect(
-                        symbol=symbol,
-                        start_time=start,
-                        end_time=end,
-                        context={
-                            "type": "gap_fill",
-                            "gap_size": (end - start) // self.base_interval.to_milliseconds()
-                        })
-
-        except Exception as e:
-            self.logger.error(f"Error handling gap for {message['symbol']}: {e}")
-
-    async def _publish_symbol_added(self, symbol: SymbolModel) -> None:
-        """Publish symbol added event"""
-        await self.message_broker.publish(
-            MessageType.SYMBOL_ADDED,
-            SymbolMessage(
-                service="market_data",
-                type=MessageType.SYMBOL_ADDED,
-                timestamp=TimeUtils.get_current_timestamp(),
-                symbol=symbol.name,
-                exchange=symbol.exchange,
-                base_asset=symbol.base_asset,
-                quote_asset=symbol.quote_asset,
-                launch_time=symbol.launch_time
-            ).model_dump()
-        )
-
-    async def _publish_symbol_delisted(self, symbol: SymbolModel) -> None:
-        """Publish symbol delisted event"""
-        await self.message_broker.publish(
-            MessageType.SYMBOL_DELISTED,
-            SymbolMessage(
-                service="market_data",
-                type=MessageType.SYMBOL_DELISTED,
-                timestamp=TimeUtils.get_current_timestamp(),
-                symbol=symbol.name,
-                exchange=symbol.exchange,
-                base_asset=symbol.base_asset,
-                quote_asset=symbol.quote_asset
-            ).model_dump()
-        )
-
-    async def _handle_exchange_error(self, error: Exception, exchange: str) -> None:
-        """Handle exchange-specific errors"""
-        await self._error_tracker.record_error(error, exchange)
-        await self.message_broker.publish(
-            MessageType.ERROR_REPORTED,
-            ErrorMessage(
-                service="market_data",
-                type=MessageType.ERROR_REPORTED,
-                timestamp=TimeUtils.get_current_timestamp(),
-                error_type="ExchangeError",
-                severity="error",
-                message=str(error),
-                context={
-                    "exchange": exchange
-                }
-            ).model_dump()
-        )
-
-    async def _handle_critical_error(self, error: Exception) -> None:
-        """Handle critical service errors"""
-        self._status = ServiceStatus.ERROR
-        self._last_error = error
-        await self.message_broker.publish(
-            MessageType.ERROR_REPORTED,
-            ErrorMessage(
-                service="market_data",
-                type=MessageType.ERROR_REPORTED,
-                timestamp=TimeUtils.get_current_timestamp(),
-                error_type="CriticalError",
-                severity="critical",
-                message=str(error),
-                context={
-                    "component": "monitor",
-                    "active_symbols": len(self._active_symbols)
-                }
-            ).model_dump()
-        )
 
     def get_service_status(self) -> str:
         """Get comprehensive service status"""

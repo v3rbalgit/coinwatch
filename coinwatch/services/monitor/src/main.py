@@ -4,8 +4,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
-from shared.core.config import MonitorConfig
-from shared.messaging.broker import MessageBroker
+from shared.core.config import Config
 from shared.utils.logger import LoggerSetup
 from .service import MonitoringService
 
@@ -20,23 +19,9 @@ async def lifespan(app: FastAPI):
     global service
 
     try:
-        # Initialize message broker
-        message_broker = MessageBroker("monitor")
-        await message_broker.connect(os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq/"))
+        config = Config()
 
-        # Initialize service with config
-        service_config = MonitorConfig(
-            check_intervals={
-                'system': int(os.getenv("SYSTEM_CHECK_INTERVAL", "60")),
-                'market': int(os.getenv("MARKET_CHECK_INTERVAL", "30")),
-                'database': int(os.getenv("DATABASE_CHECK_INTERVAL", "30"))
-            }
-        )
-
-        service = MonitoringService(
-            message_broker=message_broker,
-            config=service_config
-        )
+        service = MonitoringService(config=config.monitoring)
 
         # Start service
         await service.start()
@@ -90,7 +75,7 @@ async def get_metrics():
         metrics = await service.get_prometheus_metrics()
         return Response(
             content=metrics,
-            media_type="text/plain"
+            media_type="application/openmetrics-text"
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to collect metrics: {str(e)}")

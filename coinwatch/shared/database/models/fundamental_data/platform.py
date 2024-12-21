@@ -13,14 +13,14 @@ class TokenPlatform(FundamentalDataBase):
 
     token_id: Mapped[str] = mapped_column(
         Text,
-        ForeignKey('fundamental_data.token_metadata.id', ondelete='CASCADE'),
+        ForeignKey('fundamental_data.token_metadata.id'),
         primary_key=True
     )
     platform_id: Mapped[str] = mapped_column(Text, primary_key=True)  # e.g., 'ethereum', 'polygon-pos'
     contract_address: Mapped[str] = mapped_column(Text, nullable=False)
 
     # Relationship back to metadata
-    token: Mapped["TokenMetadata"] = relationship("TokenMetadata", back_populates="platforms")
+    token: Mapped['TokenMetadata'] = relationship("TokenMetadata", back_populates="platforms")
 
     def __repr__(self) -> str:
         return f"TokenPlatform(platform_id={self.platform_id}, contract_address='{self.contract_address}'"

@@ -1,236 +1,63 @@
 # Coinwatch
 
-A cryptocurrency data collection and analysis system that aggregates market data, fundamental metrics, and social sentiment information from multiple sources, now implemented as a microservices architecture.
+Coinwatch is a comprehensive cryptocurrency data collection and analysis system designed to provide real-time and historical insights into the crypto market. It aggregates data from various sources, including cryptocurrency exchanges, on-chain data providers, and social media platforms, to offer a holistic view of market activity, fundamental metrics, and social sentiment. This system is built using a microservices architecture for scalability and maintainability.
+
+## Features
+
+- **Market Data Aggregation:** Collects and stores real-time and historical price data from various cryptocurrency exchanges.
+- **Fundamental Data Collection:** Gathers fundamental metrics such as market capitalization, supply, and other relevant data.
+- **Social Sentiment Analysis:** Aggregates and analyzes social sentiment data from platforms like Reddit, Twitter, and Telegram.
+- **REST API:** Provides a comprehensive RESTful API for accessing collected and analyzed data.
+- **Microservices Architecture:** Built using a microservices architecture for scalability, resilience, and independent deployment.
+- **Containerized with Docker:** Easy to deploy and manage using Docker and Docker Compose.
+- **Comprehensive Monitoring:** Monitors the health and performance of all services.
 
 ## System Architecture
 
-### Message-Based Communication
-The system uses RabbitMQ for inter-service communication, replacing the previous ServiceCoordinator with a more scalable, loosely-coupled approach.
+Coinwatch is implemented using a microservices architecture. Each service is designed to handle specific aspects of the system, such as collecting market data, processing fundamental data, monitoring system health, and providing a unified API. The services communicate with each other primarily through synchronous HTTP requests.
 
-Message Types:
-```python
-class MarketDataMessage(str, Enum):
-    SYMBOL_ADDED = "market.symbol.added"
-    SYMBOL_UPDATED = "market.symbol.updated"
-    SYMBOL_DELISTED = "market.symbol.delisted"
-    DATA_SYNCHRONIZED = "market.data.synchronized"
+The core components of the architecture are:
 
-class FundamentalDataMessage(str, Enum):
-    METADATA_UPDATED = "fundamental.metadata.updated"
-    METRICS_UPDATED = "fundamental.metrics.updated"
-    SENTIMENT_UPDATED = "fundamental.sentiment.updated"
+- **API Gateway (api):** The entry point for all external requests. It routes requests to the appropriate backend services, handles authentication and authorization, and can implement rate limiting.
+- **Market Data Service (market_data):** Responsible for collecting, processing, and storing real-time market data from various cryptocurrency exchanges.
+- **Fundamental Data Service (fundamental_data):** Collects and processes fundamental data, such as token metadata, market metrics, and social sentiment, from various sources.
+- **Monitor Service (monitor):** Monitors the health and performance of the system and its components, collecting metrics and providing alerts.
 
-class MonitorMessage(str, Enum):
-    SERVICE_ERROR = "monitor.service.error"
-    METRICS_COLLECTED = "monitor.metrics.collected"
-```
+### Inter-service Communication
 
-Services can:
-- Publish messages to topics
-- Subscribe to message topics
-- Process messages asynchronously
-- Handle message failures with DLQ
+Services communicate with each other using **synchronous HTTP requests**. The API Gateway acts as a reverse proxy, routing external requests to the appropriate internal services. Internal services may also make direct HTTP requests to other services when necessary.
 
-Example message flow:
-```python
-# Publishing a message
-await message_broker.publish(
-    "market.symbols",
-    MarketDataMessage(
-        type=MarketDataMessage.SYMBOL_ADDED,
-        data={"symbol": symbol_info}
-    )
-)
+For example, when a client requests market data for a specific symbol, the API Gateway routes the request to the Market Data Service. The Market Data Service then retrieves the requested data from its database and returns it to the API Gateway, which in turn sends it back to the client.
 
-# Subscribing to messages
-@message_broker.subscribe("market.symbols")
-async def handle_symbol_update(message: MarketDataMessage):
-    if message.type == MarketDataMessage.SYMBOL_ADDED:
-        await process_new_symbol(message.data["symbol"])
-```
+### Data Flow
 
-## Architecture Evolution
+1. **Collecting Market Data:**
+   - The Market Data Service periodically fetches market data from cryptocurrency exchanges.
+   - It processes and stores this data in its PostgreSQL database.
+   - Other services can retrieve this data by sending HTTP requests to the Market Data Service's API endpoints.
 
-### Key Improvements
+2. **Collecting Fundamental Data:**
+   - The Fundamental Data Service collects metadata, market metrics, and sentiment data from various sources (e.g., CoinGecko API, social media platforms).
+   - This data is processed and stored in its PostgreSQL database.
+   - Other services can access this data via HTTP requests to the Fundamental Data Service.
 
-1. Service Independence
-```
-Old:
-- Services shared same process
-- Direct method calls
-- Tight coupling
-- Single point of failure
+3. **API Request:**
+   - A client sends a request to the API Gateway.
+   - The API Gateway routes the request to the appropriate backend service based on the request path.
+   - The backend service processes the request and retrieves data from its database or other services.
+   - The backend service sends a response back to the API Gateway.
+   - The API Gateway sends the response back to the client.
 
-New:
-- Independent processes
-- Message-based communication
-- Loose coupling
-- Fault isolation
-```
+### Technology Stack
 
-2. Scalability
-```
-Old:
-- Vertical scaling only
-- Shared resources
-- Memory constraints
-- Single database connection pool
+- **FastAPI:** A modern, fast (high-performance), web framework for building APIs with Python. Used by all services.
+- **Uvicorn:** An ASGI server, used to run the FastAPI applications.
+- **PostgreSQL:** The primary database used by the Market Data and Fundamental Data services to store collected data.
+- **Redis:** Used for caching and rate limiting within the API Gateway.
+- **Docker:** Used for containerizing the services, ensuring consistent deployment and scalability.
+- **Docker Compose:** Used to define and manage multi-container Docker applications.
 
-New:
-- Horizontal & vertical scaling
-- Isolated resources
-- Independent scaling
-- Service-specific pools
-```
-
-3. Reliability
-```
-Old:
-- Service failures affect entire system
-- Complex error recovery
-- Monolithic deployment
-- All-or-nothing updates
-
-New:
-- Isolated failures
-- Built-in retry mechanisms
-- Independent deployments
-- Rolling updates
-```
-
-4. Development
-```
-Old:
-- Large codebase
-- Complex dependencies
-- Difficult testing
-- Long deployment cycles
-
-New:
-- Smaller, focused codebases
-- Clear boundaries
-- Easier testing
-- Quick deployments
-```
-
-### Migration Benefits
-
-1. Performance
-- Independent service scaling
-- Optimized resource usage
-- Better cache utilization
-- Reduced memory pressure
-
-2. Maintainability
-- Clear service boundaries
-- Easier debugging
-- Simpler deployments
-- Better monitoring
-
-3. Development
-- Parallel development
-- Focused testing
-- Clear ownership
-- Faster iterations
-
-4. Operations
-- Granular scaling
-- Better resource utilization
-- Simplified troubleshooting
-- Flexible deployment options
-
-### Architectural Patterns
-
-1. Message Patterns
-```python
-# Old: Direct service calls
-await market_data_service.add_symbol(symbol)
-
-# New: Message-based communication
-await message_broker.publish(
-    "market.symbols",
-    MarketDataMessage(
-        type=MarketDataMessage.SYMBOL_ADDED,
-        data={"symbol": symbol}
-    )
-)
-```
-
-2. Service Discovery
-```python
-# Old: Direct service references
-service = coordinator.get_service("market_data")
-
-# New: Dynamic service discovery
-service_url = await registry.get_service_url("market_data")
-```
-
-3. Error Handling
-```python
-# Old: Direct error propagation
-try:
-    await service.process()
-except ServiceError:
-    await coordinator.handle_error()
-
-# New: Message-based error handling
-@message_broker.subscribe("monitor.errors")
-async def handle_error(error_message):
-    await error_handler.process(error_message)
-```
-
-4. Configuration
-```python
-# Old: Shared configuration
-config = Config()
-market_data = config.market_data
-
-# New: Service-specific configuration
-market_data_config = MarketDataConfig()
-fundamental_data_config = FundamentalDataConfig()
-```
-
-### Data Flow Examples
-
-1. Adding New Symbol
-```
-Old:
-Client -> API -> ServiceCoordinator -> MarketDataService
-                                  -> FundamentalDataService
-
-New:
-Client -> API Gateway -> Market Data Service
-                     -> Message: SYMBOL_ADDED
-                        -> Fundamental Data Service
-                        -> Monitor Service
-```
-
-2. Collecting Market Data
-```
-Old:
-MarketDataService -> ServiceCoordinator -> Database
-                                      -> MonitorService
-
-New:
-Market Data Service -> Database
-                   -> Message: DATA_SYNCHRONIZED
-                      -> Monitor Service
-                      -> Fundamental Service
-```
-
-3. Error Handling
-```
-Old:
-Service -> ServiceCoordinator -> MonitorService
-                             -> Log Files
-
-New:
-Service -> Error Message -> Monitor Service
-                        -> Metrics
-                        -> Alerts
-```
-
-This evolution represents a significant improvement in system architecture, providing better scalability, reliability, and maintainability while maintaining all the functionality of the original system.
+This microservices architecture allows for independent scaling and deployment of individual services, improving the system's resilience and maintainability.
 
 ### Services
 
@@ -387,15 +214,6 @@ shared/database/
 └── connection.py       # DB connection
 ```
 
-#### 2. Message Broker
-Located in shared/messaging/:
-```python
-shared/messaging/
-├── broker.py          # Message broker client
-├── schemas.py         # Message schemas
-└── handlers.py        # Message handlers
-```
-
 #### 3. Core Utilities
 Located in shared/core/:
 ```python
@@ -411,12 +229,6 @@ shared/core/
 - Time-series optimized storage
 - Automatic data partitioning
 - Efficient time-range queries
-
-#### 2. Message Broker (RabbitMQ)
-- Topic-based routing
-- Message persistence
-- Dead letter queues
-- Publisher confirms
 
 #### 3. Cache (Redis)
 - API rate limiting
@@ -498,71 +310,34 @@ uvicorn src.main:app --reload
 open http://localhost:8000/api/docs
 ```
 
-## Current Status
+## Usage
 
-### Completed Features
-- Basic service separation
-- Message broker integration
-- API Gateway implementation
-- Service discovery
-- Rate limiting
-- Health monitoring
+To use the Coinwatch API, follow these steps:
 
-### In Progress
-- Service-specific tests
-- Documentation updates
-- Monitoring dashboards
-- Development tooling
+1. **Start the application** as described in the "Development Setup" section.
+2. **Access the API documentation** at `http://localhost:8000/api/docs` to explore available endpoints and their parameters.
+3. **Send requests** to the API endpoints using your preferred HTTP client.
 
-### Pending Tasks
-- Remove old src/ directory
-- Complete service migrations
-- Add integration tests
-- Setup CI/CD pipeline
+**Example API Endpoints:**
 
-## Migration Guide
-
-### Phase 1: Infrastructure (Completed)
-- Setup message broker
-- Configure databases
-- Setup monitoring
-
-### Phase 2: Services (In Progress)
-- Implement new services
-- Add health checks
-- Setup logging
-
-### Phase 3: Testing (Pending)
-- Unit tests
-- Integration tests
-- Performance tests
-
-### Phase 4: Cleanup (Pending)
-- Remove old code
-- Update documentation
-- Optimize configurations
+- `GET /market/klines/{symbol}`: Get kline data for a specific symbol.
+- `GET /fundamental/metadata/{symbol}`: Get metadata for a specific symbol.
+- `GET /sentiment/{symbol}`: Get social sentiment data for a specific symbol.
 
 ## Contributing
 
-1. Code Structure:
-```
-coinwatch/
-├── services/          # Microservices
-├── shared/           # Shared code
-├── scripts/          # Development scripts
-└── docs/            # Documentation
-```
+Contributions to Coinwatch are welcome! To contribute, please follow these guidelines:
 
-2. Development Guidelines:
-- Follow service structure
-- Add tests for changes
-- Update documentation
-- Use shared components
+1. **Fork the repository** on GitHub.
+2. **Create a new branch** for your feature or bug fix.
+3. **Implement your changes** and ensure they are well-tested.
+4. **Follow the project's coding standards.**
+5. **Submit a pull request** with a clear description of your changes.
 
 ## License
 
-[Your License Here]
+This project is licensed under the MIT License.
 
 ## Contact
 
-[Your Contact Information]
+For questions or issues, please visit the project repository at [https://github.com/v3rbalgit/coinwatch](https://github.com/v3rbalgit/coinwatch).

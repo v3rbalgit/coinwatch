@@ -3,6 +3,14 @@ from enum import Enum
 
 
 class Interval(str, Enum):
+    """
+    Trading interval enumeration with built-in validation and utility methods.
+
+    This enum represents valid trading intervals and provides methods for:
+    - Interval validation and comparison
+    - Time conversion and calculations
+    - Database view mapping
+    """
     MINUTE_1 = "1"
     MINUTE_3 = "3"
     MINUTE_5 = "5"
@@ -42,21 +50,39 @@ class Interval(str, Enum):
 
     def to_milliseconds(self) -> int:
         """Convert interval to milliseconds"""
-        mapping = {
-            "1": 1 * 60 * 1000,
-            "3": 3 * 60 * 1000,
-            "5": 5 * 60 * 1000,
-            "15": 15 * 60 * 1000,
-            "30": 30 * 60 * 1000,
-            "60": 60 * 60 * 1000,
-            "120": 2 * 60 * 60 * 1000,
-            "240": 4 * 60 * 60 * 1000,
-            "360": 6 * 60 * 60 * 1000,
-            "720": 12 * 60 * 60 * 1000,
-            "D": 24 * 60 * 60 * 1000,
-            "W": 7 * 24 * 60 * 60 * 1000
-        }
-        return mapping[self.value]
+        if self.value == "D":
+            return 24 * 60 * 60 * 1000
+        elif self.value == "W":
+            return 7 * 24 * 60 * 60 * 1000
+        else:
+            return int(self.value) * 60 * 1000
+
+    def is_valid_for_base(self, base_interval: 'Interval') -> bool:
+        """
+        Check if this interval can be calculated from the given base interval.
+        An interval is valid if it's a multiple of the base interval.
+
+        Args:
+            base_interval: The base interval to check against
+
+        Returns:
+            bool: True if this interval can be calculated from the base interval
+        """
+        return (self.to_milliseconds() >= base_interval.to_milliseconds() and
+                self.to_milliseconds() % base_interval.to_milliseconds() == 0)
+
+    @classmethod
+    def get_valid_intervals(cls, base_interval: 'Interval') -> set['Interval']:
+        """
+        Get all valid intervals that can be calculated from a base interval.
+
+        Args:
+            base_interval: The base interval to calculate from
+
+        Returns:
+            Set of valid intervals that can be derived from the base interval
+        """
+        return {interval for interval in cls if interval.is_valid_for_base(base_interval)}
 
 
 class ServiceStatus(str, Enum):
@@ -66,6 +92,7 @@ class ServiceStatus(str, Enum):
     STOPPING = "stopping"
     STOPPED = "stopped"
     ERROR = "error"
+    UNKNOWN = "unknown"
 
 
 class IsolationLevel(str, Enum):

@@ -1,3 +1,4 @@
+from typing import AsyncGenerator
 import aiohttp
 import asyncio
 
@@ -8,6 +9,7 @@ from shared.utils.logger import LoggerSetup
 from shared.utils.cache import redis_cached, RedisCache
 from shared.utils.rate_limit import RateLimiter
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
 
 
 class CoinGeckoAdapter(APIAdapter):
@@ -22,8 +24,8 @@ class CoinGeckoAdapter(APIAdapter):
     - Proper connection pooling
     """
 
-    BASE_URL = "https://api.coingecko.com/api/v3"
-    PRO_URL = "https://pro-api.coingecko.com/api/v3"
+    BASE_URL = "https://api.coingecko.com/api/v3/"
+    PRO_URL = "https://pro-api.coingecko.com/api/v3/"
 
     def __init__(self, config: CoingeckoConfig):
         super().__init__()
@@ -50,6 +52,7 @@ class CoinGeckoAdapter(APIAdapter):
 
         self.logger = LoggerSetup.setup(__class__.__name__)
 
+
     async def _create_session(self) -> aiohttp.ClientSession:
         """Create new session with CoinGecko configuration"""
         headers = {
@@ -66,6 +69,7 @@ class CoinGeckoAdapter(APIAdapter):
             timeout=aiohttp.ClientTimeout(total=30),
             headers=headers
         )
+
 
     @retry(
         stop=stop_after_attempt(3),
@@ -88,43 +92,71 @@ class CoinGeckoAdapter(APIAdapter):
         await self._rate_limiter.acquire()
 
         async with session.request(method, endpoint, **kwargs) as response:
-            if response.status == 429:  # Rate limit exceeded
-                retry_after = int(response.headers.get('Retry-After', 60))
-                self.logger.warning(f"Rate limit exceeded, waiting {retry_after}s")
-                await asyncio.sleep(retry_after)
-                raise aiohttp.ClientError("Coingecko API Rate limit exceeded")
+            try:
+                response.raise_for_status()
+                return await response.json()
+            except aiohttp.ClientResponseError as e:
+                if e.status == 429:  # Rate limit exceeded
+                    retry_after = int(response.headers.get('retry-after', 60))
+                    self.logger.warning(f"Rate limit exceeded, waiting {retry_after}s")
+                    await asyncio.sleep(retry_after)
+                    # Retry the request after waiting
+                    return await self._request(method, endpoint, **kwargs)
+                raise
 
-            response.raise_for_status()
-            return await response.json()
 
-    @redis_cached[str | None](ttl=86400)  # Cache for 24 hours
-    async def get_coin_id(self, symbol: str) -> str | None:
-        """Get CoinGecko coin ID for a symbol"""
+    @redis_cached[list[dict]](ttl=86400)  # Cache for 24 hours
+    async def get_coin_ids(self) -> list[dict]:
+        """Get a list of CoinGecko coin IDs"""
         try:
             # Use coins/list endpoint for efficient lookup
             coins = await self._request(
                 'GET',
-                '/coins/list',
+                'coins/list',
                 params={'include_platform': 'false'}
             )
+            return coins
 
-            # Find matching symbol (case-insensitive)
-            for coin in coins:
-                if coin['symbol'].lower() == symbol.lower():
-                    return coin['id']
+        except Exception as e:
+            self.logger.error(f"Error getting coin IDs: {e}")
+            return []
+
+
+    async def get_coin_id(self, token: str) -> str | None:
+        """Get CoinGecko coin ID for a token"""
+        try:
+            coins = await self.get_coin_ids()
+
+            # Create a dictionary with lowercase tokens and their corresponding IDs
+            coin_map = {coin['symbol']: coin['id'] for coin in coins}
+
+            # First try with original token
+            coin_id = coin_map.get(token)
+            if coin_id:
+                return coin_id
+
+            # If not found and token starts with numbers, try without the numeric prefix
+            if any(c.isdigit() for c in token):
+                # Strip leading numbers
+                stripped_token = ''.join(c for c in token if not c.isdigit())
+                coin_id = coin_map.get(stripped_token)
+                if coin_id:
+                    self.logger.info(f"Found coin ID for {token} by stripping numeric prefix -> {stripped_token}")
+                    return coin_id
 
             return None
 
         except Exception as e:
-            self.logger.error(f"Error getting coin ID for {symbol}: {e}")
+            self.logger.error(f"Error getting coin ID for {token}: {e}")
             return None
 
-    async def get_coin_info(self, coin_id: str) -> dict:
-        """Get detailed coin information"""
+
+    async def get_metadata(self, coin_id: str) -> dict:
+        """Get detailed coin metadata"""
         try:
             return await self._request(
                 'GET',
-                f'/coins/{coin_id}',
+                f'coins/{coin_id}',
                 params={
                     'localization': 'false',
                     'tickers': 'false',
@@ -138,24 +170,25 @@ class CoinGeckoAdapter(APIAdapter):
             self.logger.error(f"Error getting coin info for {coin_id}: {e}")
             raise AdapterError(f"Failed to get coin info: {str(e)}")
 
-    async def get_market_data(self, coin_ids: list[str]) -> list[dict]:
+
+    async def get_market_data(self, coin_ids: list[str]) -> AsyncGenerator[dict, None]:
         """
         Get market data for multiple coins handling pagination.
 
         Args:
             coin_ids: List of CoinGecko coin IDs
 
-        Returns:
-            List of market data dictionaries for all requested coins
+        Yields:
+            Market data dictionary for each coin as it's received
         """
         try:
-            all_results = []
-            page = 1
             per_page = 250  # Maximum allowed by CoinGecko
-            ids_chunks = [coin_ids[i:i + 250] for i in range(0, len(coin_ids), 250)]
+            received_ids = set()
+            ids_chunks = [coin_ids[i:i + per_page] for i in range(0, len(coin_ids), per_page)]
 
             # Process each chunk of IDs
             for chunk in ids_chunks:
+                page = 1
                 while True:
                     params = {
                         'ids': ','.join(chunk),
@@ -163,19 +196,22 @@ class CoinGeckoAdapter(APIAdapter):
                         'order': 'market_cap_desc',
                         'per_page': per_page,
                         'page': page,
-                        'sparkline': False
+                        'sparkline': 'false'
                     }
 
                     results = await self._request(
                         'GET',
-                        '/coins/markets',
+                        'coins/markets',
                         params=params
                     )
 
                     if not results:
                         break
 
-                    all_results.extend(results)
+                    # Yield each result as we get it
+                    for result in results:
+                        received_ids.add(result['id'])
+                        yield result
 
                     # If we got less than per_page results, we've hit the last page
                     if len(results) < per_page:
@@ -183,13 +219,10 @@ class CoinGeckoAdapter(APIAdapter):
 
                     page += 1
 
-            # Ensure we got data for all requested coins
-            received_ids = {result['id'] for result in all_results}
+            # Final check for any missing IDs
             missing_ids = set(coin_ids) - received_ids
             if missing_ids:
                 self.logger.warning(f"Missing market data for coins: {missing_ids}")
-
-            return all_results
 
         except Exception as e:
             self.logger.error(f"Error getting market data for {len(coin_ids)} coins: {e}")

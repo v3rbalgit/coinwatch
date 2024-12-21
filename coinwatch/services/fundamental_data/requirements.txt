@@ -8,13 +8,15 @@ sqlalchemy>=1.4.0
 asyncpg>=0.24.0
 alembic>=1.7.0
 
-# Message Broker
-aio-pika>=9.0.0
-
 # API Clients
 aiohttp>=3.8.0  # For CoinGecko API
+asyncpraw>=7.8.0  # For Reddit API
+telethon>=1.38.0  # For Telegram API
 beautifulsoup4>=4.9.0  # For web scraping
 lxml>=4.9.0  # For HTML parsing
+
+# Cache
+redis[hiredis]>=5.0.0
 
 # NLP and Sentiment Analysis
 nltk>=3.6.0

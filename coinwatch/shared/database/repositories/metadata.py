@@ -1,16 +1,14 @@
-# src/repositories/metadata.py
-
 from sqlalchemy import delete, select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.dialects.postgresql import insert
 
-from shared.core.enums import IsolationLevel, DataSource
+from shared.core.enums import DataSource
 from shared.database.connection import DatabaseConnection
-from shared.core.models import Platform, SymbolModel, Metadata
+from shared.core.models import PlatformModel, MetadataModel
 from shared.core.exceptions import RepositoryError
 from shared.database.models import TokenMetadata, TokenPlatform
-import shared.utils.time as TimeUtils
 from shared.utils.logger import LoggerSetup
+
 
 
 class MetadataRepository:
@@ -20,148 +18,149 @@ class MetadataRepository:
         self.db_service = db_service
         self.logger = LoggerSetup.setup(__class__.__name__)
 
-    async def upsert_metadata(self, metadata_list: list[Metadata]) -> None:
+
+    async def upsert_metadata(self, metadata_set: list[MetadataModel]) -> None:
         """
         Create or update metadata for multiple symbols using PostgreSQL upsert.
+        Handles platform records independently to allow sharing between tokens.
 
         Args:
-            metadata_list (List[Metadata]): List of metadata objects to upsert.
+            metadata_list (List[Metadata]): Set of metadata objects to upsert.
 
         Raises:
             RepositoryError: If the upsert operation fails.
         """
         try:
-            async with self.db_service.session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
-                metadata_values = [metadata.to_dict() for metadata in metadata_list]
-                stmt = insert(TokenMetadata).values(metadata_values)
-                stmt = stmt.on_conflict_do_update(
+            async with self.db_service.session() as session:
+                # Single transaction for all operations
+
+                # 1. Upsert metadata records
+                metadata_values = [metadata.model_dump() for metadata in metadata_set]
+                metadata_stmt = insert(TokenMetadata).values(metadata_values)
+                metadata_stmt = metadata_stmt.on_conflict_do_update(
                     index_elements=['id'],
                     set_={
-                        col.name: stmt.excluded[col.name]
+                        col.name: metadata_stmt.excluded[col.name]
                         for col in TokenMetadata.__table__.columns
                         if col.name != 'id'
                     }
                 )
-                await session.execute(stmt)
+                await session.execute(metadata_stmt)
 
-                # Bulk delete existing platforms for all tokens
-                token_ids = [metadata.id for metadata in metadata_list]
-                delete_stmt = delete(TokenPlatform).where(
-                    TokenPlatform.token_id.in_(token_ids)
-                )
-                await session.execute(delete_stmt)
-
-                # Bulk insert new platforms
-                platform_values = [
-                    {
-                        'token_id': metadata.id,
-                        'platform_id': platform.platform_id,
-                        'contract_address': platform.contract_address
-                    }
-                    for metadata in metadata_list
-                    for platform in metadata.platforms
-                ]
-                if platform_values:
-                    await session.execute(
-                        insert(TokenPlatform).values(platform_values)
+                # 2. Handle platform records
+                for metadata in metadata_set:
+                    # Remove existing token-platform relationships for this token
+                    delete_stmt = delete(TokenPlatform).where(
+                        TokenPlatform.token_id == metadata.id
                     )
+                    await session.execute(delete_stmt)
+
+                    # Create new token-platform relationships
+                    if metadata.platforms:
+                        platform_values = [platform.model_dump() for platform in metadata.platforms]
+                        # Use on_conflict_do_update to handle cases where the platform
+                        # exists but contract address might have changed
+                        platform_stmt = insert(TokenPlatform).values(platform_values)
+                        platform_stmt = platform_stmt.on_conflict_do_update(
+                            index_elements=['token_id', 'platform_id'],
+                            set_={
+                                'contract_address': platform_stmt.excluded.contract_address
+                            }
+                        )
+                        await session.execute(platform_stmt)
+
+                self.logger.debug(f"Upserted {len(metadata_set)} metadata records into database")
 
         except Exception as e:
             self.logger.error(f"Error in bulk metadata upsert: {e}")
             raise RepositoryError(f"Failed to upsert metadata batch: {str(e)}")
 
-    async def get_metadata(self, symbol: SymbolModel) -> Metadata | None:
+
+    async def get_metadata(self, tokens: set[str]) -> list[MetadataModel]:
         """
-        Get stored metadata for a symbol.
+        Get stored metadata for multiple tokens.
 
         Args:
-            symbol (SymbolModel): Symbol to get metadata for (e.g., BTCUSDT on bybit).
+            tokens (Set[str]): Set of symbols to get metadata for (e.g., {'btc', 'eth', 'doge'}).
 
         Returns:
-            Optional[Metadata]: Metadata domain object if found, None otherwise.
+            List[Metadata]: List of Metadata domain objects for found tokens. Empty list if none found.
 
         Raises:
             RepositoryError: If the retrieval operation fails.
         """
         try:
             async with self.db_service.session() as session:
-                base_token = symbol.name.lower().replace('usdt', '')
-
-                # Find metadata by CoinGecko symbol
+                # Find metadata by CoinGecko symbols
                 stmt = (
                     select(TokenMetadata)
                     .outerjoin(TokenPlatform)
-                    .where(TokenMetadata.symbol == base_token)
+                    .where(TokenMetadata.symbol.in_(tokens))
                     .options(selectinload(TokenMetadata.platforms))
                 )
                 result = await session.execute(stmt)
-                metadata_record = result.scalar_one_or_none()
+                metadata_records = result.scalars().all()
 
-                if metadata_record:
-                    platforms = [
-                        Platform(
-                            platform_id=p.platform_id,
-                            contract_address=p.contract_address
-                        )
-                        for p in metadata_record.platforms
-                    ]
-
-                    return Metadata(
-                        id=metadata_record.id,
-                        symbol=symbol,
-                        name=metadata_record.name,
-                        description=metadata_record.description,
-                        categories=metadata_record.categories,
-                        market_cap_rank=metadata_record.market_cap_rank,
-                        hashing_algorithm=metadata_record.hashing_algorithm,
-                        launch_time=TimeUtils.to_timestamp(metadata_record.launch_time) if metadata_record.launch_time else None,
-                        platforms=platforms,
-                        website=metadata_record.website,
-                        whitepaper=metadata_record.whitepaper,
-                        reddit=metadata_record.reddit,
-                        twitter=metadata_record.twitter,
-                        telegram=metadata_record.telegram,
-                        github=metadata_record.github,
+                return [
+                    MetadataModel(
+                        id=record.id,
+                        symbol=record.symbol,
+                        name=record.name,
+                        description=record.description,
+                        categories=record.categories,
+                        market_cap_rank=record.market_cap_rank,
+                        hashing_algorithm=record.hashing_algorithm,
+                        launch_time=record.launch_time,
+                        platforms=[PlatformModel.model_validate(p.__dict__) for p in record.platforms],
+                        website=record.website,
+                        whitepaper=record.whitepaper,
+                        reddit=record.reddit,
+                        twitter=record.twitter,
+                        telegram=record.telegram,
+                        github=record.github,
                         images={
-                            'thumb': metadata_record.image_thumb,
-                            'small': metadata_record.image_small,
-                            'large': metadata_record.image_large
+                            'thumb': record.image_thumb,
+                            'small': record.image_small,
+                            'large': record.image_large
                         },
-                        updated_at=TimeUtils.to_timestamp(metadata_record.updated_at),
-                        data_source=DataSource(metadata_record.data_source)
+                        updated_at=record.updated_at,
+                        data_source=DataSource(record.data_source)
                     )
-                return None
+                    for record in metadata_records
+                ]
 
         except Exception as e:
-            self.logger.error(f"Error getting metadata for {symbol}: {e}")
+            self.logger.error(f"Error getting metadata for {len(tokens)}: {e}")
             raise RepositoryError(f"Failed to get metadata: {str(e)}")
 
-    async def delete_metadata(self, symbol: str) -> None:
+
+    async def delete_metadata(self, tokens: set[str]) -> None:
         """
-        Delete metadata for a token.
+        Delete metadata for multiple tokens.
 
         Args:
-            symbol (str): Symbol representing the token to delete metadata for.
+            tokens (set[str]): Set of tokens to delete metadata for.
 
         Raises:
             RepositoryError: If the deletion operation fails.
         """
         try:
             async with self.db_service.session() as session:
-
-                # Find and delete metadata by CoinGecko symbol
+                # Find and delete metadata by CoinGecko symbols
                 stmt = select(TokenMetadata).where(
-                    TokenMetadata.symbol == symbol
+                    TokenMetadata.symbol.in_(tokens)
                 )
                 result = await session.execute(stmt)
-                metadata_record = result.scalar_one_or_none()
+                metadata_records = result.scalars().all()
 
-                if metadata_record:
-                    await session.delete(metadata_record)
-                    self.logger.info(f"Deleted metadata for symbol '{symbol.upper()}'")
+                if metadata_records:
+                    for record in metadata_records:
+                        await session.delete(record)
+                    await session.flush()
+                    self.logger.info(f"Deleted metadata for {len(metadata_records)} tokens")
                 else:
-                    self.logger.warning(f"No metadata found for symbol '{symbol.upper()}'")
+                    self.logger.warning(f"No metadata found for tokens: {tokens}")
 
         except Exception as e:
-            self.logger.error(f"Error deleting metadata for {symbol}: {e}")
+            self.logger.error(f"Error deleting metadata for {len(tokens)} tokens: {e}")
             raise RepositoryError(f"Failed to delete metadata: {str(e)}")

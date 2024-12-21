@@ -7,17 +7,15 @@ from fastapi.responses import JSONResponse
 
 from .service import MarketDataService
 from shared.core.config import Config
-from shared.core.enums import ServiceStatus, Interval
+from shared.core.enums import Interval
 from shared.database.connection import DatabaseConnection
 from shared.database.repositories import SymbolRepository, KlineRepository
-from shared.messaging.broker import MessageBroker
-from shared.messaging.schemas import MessageType, ServiceStatusMessage
 from shared.clients.exchanges import BybitAdapter
 from shared.clients.registry import ExchangeAdapterRegistry
 from shared.utils.logger import LoggerSetup
-import shared.utils.time as TimeUtils
 from shared.managers.kline import KlineManager
 from shared.managers.indicator import IndicatorManager
+from shared.utils.time import get_current_timestamp
 
 logger = LoggerSetup.setup(__name__)
 
@@ -26,48 +24,6 @@ metrics_task: asyncio.Task | None = None
 kline_manager: KlineManager | None = None
 indicator_manager: IndicatorManager | None = None
 
-async def publish_metrics():
-    """Periodically publish service metrics"""
-    while True:
-        try:
-            if service and service._status == ServiceStatus.RUNNING:
-                # Collect current metrics
-                recent_errors = service._error_tracker.get_recent_errors(60)
-                collection_errors = len([e for e in recent_errors if "collection" in str(e).lower()])
-                streaming_errors = len([e for e in recent_errors if "streaming" in str(e).lower()])
-
-                uptime = 0.0
-                if service._start_time is not None:
-                    uptime = (TimeUtils.get_current_timestamp() - service._start_time) / 1000
-
-                # Publish service status with metrics
-                await service.message_broker.publish(
-                    MessageType.SERVICE_STATUS,
-                    ServiceStatusMessage(
-                        service="market_data",
-                        type=MessageType.SERVICE_STATUS,
-                        timestamp=TimeUtils.get_current_timestamp(),
-                        status=service._status.value,
-                        uptime=uptime,
-                        error_count=len(recent_errors),
-                        warning_count=len([e for e in recent_errors if "warning" in str(e).lower()]),
-                        metrics={
-                            "active_symbols": len(service._active_symbols),
-                            "active_collections": len(service.data_collector._processing_symbols),
-                            "streaming_symbols": len(service.data_collector._streaming_symbols),
-                            "streaming_errors": streaming_errors,
-                            "collection_errors": collection_errors,
-                            "batch_size": service._batch_size,
-                            "last_error": str(service._last_error) if service._last_error else None
-                        }
-                    ).model_dump()
-                )
-
-        except Exception as e:
-            logger.error(f"Error publishing metrics: {e}")
-
-        # Sleep for metrics interval
-        await asyncio.sleep(30)  # Configurable interval
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -89,24 +45,19 @@ async def lifespan(app: FastAPI):
         exchange_registry = ExchangeAdapterRegistry()
         exchange_registry.register("bybit", BybitAdapter(config.adapters.bybit))
 
-        # Initialize message broker
-        message_broker = MessageBroker("market_data")
-
         # Initialize managers
-        kline_manager = KlineManager(message_broker, kline_repository, config.redis_url)
+        kline_manager = KlineManager(kline_repository, config.redis_url)
         indicator_manager = IndicatorManager(config.redis_url)
 
         service = MarketDataService(
             symbol_repository=symbol_repository,
             kline_repository=kline_repository,
             exchange_registry=exchange_registry,
-            message_broker=message_broker,
             config=config.market_data
         )
 
-        # Start service and metrics publishing
+        # Start service
         await service.start()
-        metrics_task = asyncio.create_task(publish_metrics())
 
         yield  # Service is running
 
@@ -157,7 +108,7 @@ async def get_symbols():
     try:
         symbols = sorted(list(service._active_symbols), key=lambda x: x.name)
         return {
-            "symbols": [symbol.model_dump(exclude={'token_name','trading_pair'}) for symbol in symbols]
+            "symbols": [symbol.model_dump() for symbol in symbols]
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch symbols: {str(e)}")
@@ -175,7 +126,7 @@ async def get_symbol(symbol: str):
         if not symbol_info:
             raise HTTPException(status_code=404, detail=f"Symbol {symbol} not found")
 
-        return symbol_info.model_dump(exclude={'token_name','trading_pair'})
+        return symbol_info.model_dump()
     except HTTPException:
         raise
     except Exception as e:
@@ -373,31 +324,54 @@ async def health_check():
 
 @app.get("/metrics")
 async def get_metrics():
-    """Get service metrics (for local debugging)"""
+    """Get service metrics"""
     if not service:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     try:
+        # Calculate uptime
         uptime = 0.0
         if service._start_time is not None:
-            uptime = (TimeUtils.get_current_timestamp() - service._start_time) / 1000
+            uptime = (get_current_timestamp() - service._start_time) / 1000
 
+        # Get error metrics
         recent_errors = service._error_tracker.get_recent_errors(60)
-        collection_errors = len([e for e in recent_errors if "collection" in str(e).lower()])
-        streaming_errors = len([e for e in recent_errors if "streaming" in str(e).lower()])
+        error_types = {
+            "collection": len([e for e in recent_errors if "collection" in str(e).lower()]),
+            "streaming": len([e for e in recent_errors if "streaming" in str(e).lower()]),
+            "warning": len([e for e in recent_errors if "warning" in str(e).lower()])
+        }
+
+        # Get collection progress for active collections
+        collection_progress = {}
+        for symbol in service.data_collector._collection_symbols:
+            if progress := service.data_collector._collection_progress.get(symbol):
+                collection_progress[symbol.name] = {
+                    "processed_candles": progress.processed_candles,
+                    "total_candles": progress.total_candles,
+                    "percentage": progress.get_percentage()
+                }
 
         return {
-            "status": service._status.value,
-            "uptime_seconds": uptime,
-            "last_error": str(service._last_error) if service._last_error else None,
-            "error_count": len(recent_errors),
-            "warning_count": len([e for e in recent_errors if "warning" in str(e).lower()]),
-            "active_symbols": len(service._active_symbols),
-            "active_collections": len(service.data_collector._processing_symbols),
-            "streaming_symbols": len(service.data_collector._streaming_symbols),
-            "streaming_errors": streaming_errors,
-            "collection_errors": collection_errors,
-            "batch_size": service._batch_size
+            # Service health metrics
+            "service": {
+                "status": service._status.value,
+                "uptime_seconds": uptime,
+                "last_error": str(service._last_error) if service._last_error else None,
+                "batch_size": service._batch_size
+            },
+            # Error metrics
+            "errors": {
+                "total": len(recent_errors),
+                "by_type": error_types
+            },
+            # Collection metrics
+            "collection": {
+                "active_symbols": len(service._active_symbols),
+                "active_collections": len(service.data_collector._collection_symbols),
+                "streaming_symbols": len(service.data_collector._streaming_symbols),
+                "progress": collection_progress
+            }
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to collect metrics: {str(e)}")

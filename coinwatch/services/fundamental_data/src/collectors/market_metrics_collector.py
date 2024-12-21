@@ -1,15 +1,11 @@
-# src/services/fundamental_data/market_metrics_collector.py
-
-from decimal import Decimal
+from typing import AsyncGenerator
 
 from .collector import FundamentalCollector
 from shared.clients.coingecko import CoinGeckoAdapter
-from shared.core.enums import DataSource
-from shared.core.models import MarketMetrics
+from shared.core.models import MarketMetricsModel
 from shared.core.exceptions import ServiceError
 from shared.database.repositories.market import MarketMetricsRepository
 from shared.utils.logger import LoggerSetup
-import shared.utils.time as TimeUtils
 
 
 class MarketMetricsCollector(FundamentalCollector):
@@ -26,7 +22,7 @@ class MarketMetricsCollector(FundamentalCollector):
     def __init__(self,
                  market_metrics_repository: MarketMetricsRepository,
                  coingecko: CoinGeckoAdapter,
-                 collection_interval: int = 3600
+                 collection_interval: int
                 ):
 
         """
@@ -42,6 +38,7 @@ class MarketMetricsCollector(FundamentalCollector):
         self.coingecko = coingecko
         self.logger = LoggerSetup.setup(__class__.__name__)
 
+
     @property
     def collector_type(self) -> str:
         """
@@ -52,70 +49,62 @@ class MarketMetricsCollector(FundamentalCollector):
         """
         return "market_metrics"
 
-    async def collect_symbol_data(self, tokens: set[str]) -> list[MarketMetrics]:
-        """Collect market metrics for multiple tokens"""
-        try:
-            # Get CoinGecko IDs for all tokens (using cached values)
-            coin_ids = []
-            for token in tokens:
+
+    async def fetch_token_data(self, tokens: set[str]) -> AsyncGenerator[MarketMetricsModel, None]:
+        """Fetch market metrics from Coingecko API for multiple tokens"""
+        # Get CoinGecko IDs for all tokens (using cached values)
+        coin_ids = []
+        failed_tokens = set()
+
+        for token in tokens:
+            try:
                 if coin_id := await self.coingecko.get_coin_id(token):
                     coin_ids.append(coin_id)
+                else:
+                    failed_tokens.add(token)
+                    self.logger.warning(f"Could not find CoinGecko ID for token: {token}")
+            except Exception as e:
+                failed_tokens.add(token)
+                self.logger.warning(f"Error getting CoinGecko ID for token {token}: {str(e)}")
 
-            if not coin_ids:
-                return []
+        if failed_tokens:
+            self.logger.warning(f"Skipping tokens without CoinGecko IDs: {failed_tokens}")
 
-            # Collect market data in bulk (handles pagination internally)
-            market_data = await self.coingecko.get_market_data(coin_ids)
-
-            metrics = []
-            for data in market_data:
-                metrics.append(MarketMetrics(
-                    id=data['id'],
-                    symbol=data['symbol'],
-                    current_price=Decimal(str(data['current_price'])),
-                    market_cap=Decimal(str(data['market_cap'])) if data.get('market_cap') else None,
-                    market_cap_rank=data.get('market_cap_rank'),
-                    fully_diluted_valuation=Decimal(str(data['fully_diluted_valuation'])) if data.get('fully_diluted_valuation') else None,
-                    total_volume=Decimal(str(data['total_volume'])),
-                    high_24h=Decimal(str(data['high_24h'])) if data.get('high_24h') else None,
-                    low_24h=Decimal(str(data['low_24h'])) if data.get('low_24h') else None,
-                    price_change_24h=Decimal(str(data['price_change_24h'])) if data.get('price_change_24h') else None,
-                    price_change_percentage_24h=Decimal(str(data['price_change_percentage_24h'])) if data.get('price_change_percentage_24h') else None,
-                    market_cap_change_24h=Decimal(str(data['market_cap_change_24h'])) if data.get('market_cap_change_24h') else None,
-                    market_cap_change_percentage_24h=Decimal(str(data['market_cap_change_percentage_24h'])) if data.get('market_cap_change_percentage_24h') else None,
-                    circulating_supply=Decimal(str(data['circulating_supply'])) if data.get('circulating_supply') else None,
-                    total_supply=Decimal(str(data['total_supply'])) if data.get('total_supply') else None,
-                    max_supply=Decimal(str(data['max_supply'])) if data.get('max_supply') else None,
-                    ath=Decimal(str(data['ath'])) if data.get('ath') else None,
-                    ath_change_percentage=Decimal(str(data['ath_change_percentage'])) if data.get('ath_change_percentage') else None,
-                    ath_date=data.get('ath_date'),
-                    atl=Decimal(str(data['atl'])) if data.get('atl') else None,
-                    atl_change_percentage=Decimal(str(data['atl_change_percentage'])) if data.get('atl_change_percentage') else None,
-                    atl_date=data.get('atl_date'),
-                    updated_at=TimeUtils.get_current_timestamp(),
-                    data_source=DataSource.COINGECKO
-                ))
-
-            return metrics
+        try:
+            # Process each market data item yielded by the adapter
+            async for market_data in self.coingecko.get_market_data(coin_ids):
+                try:
+                    model = MarketMetricsModel.from_raw_data(market_data)
+                    yield model
+                except Exception as e:
+                    self.logger.warning(f"Failed to process market data for {market_data.get('id', 'unknown')}: {str(e)}")
+                    continue
 
         except Exception as e:
             self.logger.error(f"Error collecting market metrics: {e}")
             raise ServiceError(f"Market metrics collection failed: {str(e)}")
 
-    async def store_symbol_data(self, data: list[MarketMetrics]) -> None:
+
+    async def get_token_data(self, tokens: set[str]) -> list[MarketMetricsModel]:
+        """Get stored metadata for multiple tokens"""
+        return await self.market_metrics_repository.get_market_metrics(tokens)
+
+
+    async def store_token_data(self, data: list[MarketMetricsModel]) -> None:
         """
         Store collected market metrics for multiple symbols.
 
         Args:
-            data (List[MarketMetrics]): List of MarketMetrics objects to be stored.
+            data (set[MarketMetrics]): List of MarketMetrics objects to be stored.
         """
         await self.market_metrics_repository.upsert_market_metrics(data)
 
-    async def delete_symbol_data(self, token: str) -> None:
+
+    async def delete_token_data(self, tokens: set[str]) -> None:
         """
-        Delete market metrics for a specific symbol.
+        Delete market metrics for multiple tokens.
 
         Args:
-            token (str): The token symbol for which to delete market metrics.
+            tokens (set[str]): Set of tokens to delete market metrics for.
         """
-        await self.market_metrics_repository.delete_market_metrics(token)
+        await self.market_metrics_repository.delete_market_metrics(tokens)

@@ -1,9 +1,11 @@
 import os
 import asyncio
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
+from shared.core.models import MarketMetricsModel, MetadataModel
 
 from .service import FundamentalDataService
 from shared.clients.coingecko import CoinGeckoAdapter
@@ -12,10 +14,8 @@ from shared.clients.registry import ExchangeAdapterRegistry
 from shared.core.config import Config
 from shared.database.connection import DatabaseConnection
 from shared.database.repositories import MetadataRepository, MarketMetricsRepository, SentimentRepository
-from shared.messaging.broker import MessageBroker
-from shared.messaging.schemas import MessageType, ServiceStatusMessage
 from shared.utils.logger import LoggerSetup
-import shared.utils.time as TimeUtils
+from shared.utils.time import get_current_timestamp
 
 logger = LoggerSetup.setup(__name__)
 
@@ -23,54 +23,6 @@ logger = LoggerSetup.setup(__name__)
 service: FundamentalDataService | None = None
 metrics_task: asyncio.Task | None = None
 
-async def publish_metrics():
-    """Periodically publish service metrics"""
-    while True:
-        try:
-            if service and service._status == "running":
-                # Collect current metrics
-                collector_metrics = {
-                    name: collector.get_collection_status()
-                    for name, collector in service._collectors.items()
-                }
-
-                uptime = 0.0
-                if service._start_time is not None:
-                    uptime = (TimeUtils.get_current_timestamp() - service._start_time) / 1000
-
-                # Get recent errors
-                recent_errors = service._error_tracker.get_recent_errors(60)
-                metadata_errors = len([e for e in recent_errors if "metadata" in str(e).lower()])
-                market_errors = len([e for e in recent_errors if "market" in str(e).lower()])
-                sentiment_errors = len([e for e in recent_errors if "sentiment" in str(e).lower()])
-
-                # Publish service status with metrics
-                await service.message_broker.publish(
-                    MessageType.SERVICE_STATUS,
-                    ServiceStatusMessage(
-                        service="fundamental_data",
-                        type=MessageType.SERVICE_STATUS,
-                        timestamp=TimeUtils.get_current_timestamp(),
-                        status=service._status,
-                        uptime=uptime,
-                        error_count=len(recent_errors),
-                        warning_count=len([e for e in recent_errors if "warning" in str(e).lower()]),
-                        metrics={
-                            "active_tokens": len(service._active_tokens),
-                            "metadata_errors": metadata_errors,
-                            "market_errors": market_errors,
-                            "sentiment_errors": sentiment_errors,
-                            "collectors": collector_metrics,
-                            "last_error": str(service._last_error) if service._last_error else None
-                        }
-                    ).dict()
-                )
-
-        except Exception as e:
-            logger.error(f"Error publishing metrics: {e}")
-
-        # Sleep for metrics interval
-        await asyncio.sleep(30)  # Configurable interval
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -88,9 +40,6 @@ async def lifespan(app: FastAPI):
         market_metrics_repository = MarketMetricsRepository(db)
         sentiment_repository = SentimentRepository(db)
 
-        # Initialize message broker
-        message_broker = MessageBroker("fundamental_data")
-
         # Initialize exchange registry
         exchange_registry = ExchangeAdapterRegistry()
         exchange_registry.register("bybit", BybitAdapter(config.adapters.bybit))
@@ -104,13 +53,11 @@ async def lifespan(app: FastAPI):
             sentiment_repository=sentiment_repository,
             exchange_registry=exchange_registry,
             coingecko_adapter=coingecko_adapter,
-            message_broker=message_broker,
             config=config.fundamental_data
         )
 
         # Start service and metrics publishing
         await service.start()
-        metrics_task = asyncio.create_task(publish_metrics())
 
         yield  # Service is running
 
@@ -147,65 +94,66 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    if not service:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-
-    return {
-        "status": "healthy",
-        "service_status": service._status,
-        "active_tokens": len(service._active_tokens)
-    }
-
-@app.get("/metrics")
-async def get_metrics():
-    """Get service metrics (for local debugging)"""
+# Business endpoints
+@app.get("/tokens/metadata", response_model=list[MetadataModel])
+async def get_tokens_metadata(
+    symbols: list[str] = Query(..., description="List of token symbols to fetch metadata for")
+):
+    """Get metadata for specified tokens"""
     if not service:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     try:
-        uptime = 0.0
-        if service._start_time is not None:
-            uptime = (TimeUtils.get_current_timestamp() - service._start_time) / 1000
-
-        recent_errors = service._error_tracker.get_recent_errors(60)
-        metadata_errors = len([e for e in recent_errors if "metadata" in str(e).lower()])
-        market_errors = len([e for e in recent_errors if "market" in str(e).lower()])
-        sentiment_errors = len([e for e in recent_errors if "sentiment" in str(e).lower()])
-
-        return {
-            "status": service._status,
-            "uptime_seconds": uptime,
-            "last_error": str(service._last_error) if service._last_error else None,
-            "error_count": len(recent_errors),
-            "warning_count": len([e for e in recent_errors if "warning" in str(e).lower()]),
-            "active_tokens": len(service._active_tokens),
-            "metadata_errors": metadata_errors,
-            "market_errors": market_errors,
-            "sentiment_errors": sentiment_errors,
-            "collectors": {
-                name: collector.get_collection_status()
-                for name, collector in service._collectors.items()
-            }
-        }
+        metadata = await service.metadata_repository.get_metadata(set(symbols))
+        if not metadata:
+            raise HTTPException(status_code=404, detail="No metadata found for specified tokens")
+        return metadata
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to collect metrics: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch metadata: {str(e)}")
 
-@app.get("/status")
-async def get_status():
-    """Get detailed service status"""
+@app.get("/tokens/market", response_model=list[MarketMetricsModel])
+async def get_tokens_market_metrics(
+    symbols: list[str] = Query(..., description="List of token symbols to fetch metadata for")
+):
+    """Get market metrics for specified tokens"""
     if not service:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
-    return {
-        "status": service.get_service_status(),
-        "collectors": {
-            name: collector.get_collection_status()
-            for name, collector in service._collectors.items()
-        }
-    }
+    try:
+        metadata = await service.market_metrics_repository.get_market_metrics(set(symbols))
+        if not metadata:
+            raise HTTPException(status_code=404, detail="No market metrics found for specified tokens")
+        return metadata
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch market metrics : {str(e)}")
+
+@app.get("/tokens/{symbol}/metadata", response_model=MetadataModel)
+async def get_token_metadata(symbol: str):
+    """Get metadata for a specific token"""
+    if not service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    try:
+        metadata = await service.metadata_repository.get_metadata({symbol})
+        if not metadata:
+            raise HTTPException(status_code=404, detail=f"No metadata found for token {symbol}")
+        return metadata[0]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch metadata: {str(e)}")
+
+@app.get("/tokens/{symbol}/market", response_model=MarketMetricsModel)
+async def get_token_market_metrics(symbol: str):
+    """Get market metrics for a specific token"""
+    if not service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    try:
+        metrics = await service.market_metrics_repository.get_market_metrics({symbol})
+        if not metrics:
+            raise HTTPException(status_code=404, detail=f"No market metrics found for token {symbol}")
+        return metrics
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch market metrics: {str(e)}")
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
@@ -223,3 +171,91 @@ if __name__ == "__main__":
         port=8002,
         reload=bool(os.getenv("DEBUG", False))
     )
+
+# Service endpoints
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    if not service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    return {
+        "status": "healthy",
+        "service_status": service._status,
+        "active_tokens": len(service._active_tokens)
+    }
+
+@app.get("/metrics")
+async def get_metrics():
+    """Get service metrics"""
+    if not service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    try:
+        # Calculate uptime
+        uptime = 0.0
+        if service._start_time is not None:
+            uptime = (get_current_timestamp() - service._start_time) / 1000
+
+        # Get error metrics
+        recent_errors = service._error_tracker.get_recent_errors(60)
+        error_types = {
+            "metadata": len([e for e in recent_errors if "metadata" in str(e).lower()]),
+            "market": len([e for e in recent_errors if "market" in str(e).lower()]),
+            "warning": len([e for e in recent_errors if "warning" in str(e).lower()])
+        }
+
+        # Get collector metrics
+        collectors = {}
+        for name, collector in service._collectors.items():
+            # Convert progress dataclass to dict if it exists
+            current_progress = None
+            if collector._current_progress:
+                current_progress = {
+                    "collector_type": collector._current_progress.collector_type,
+                    "start_time": collector._current_progress.start_time.isoformat(),
+                    "total_tokens": collector._current_progress.total_tokens,
+                    "processed_tokens": collector._current_progress.processed_tokens,
+                    "last_processed_token": collector._current_progress.last_processed_token
+                }
+
+            collectors[name] = {
+                "running": collector._running,
+                "active_tokens": len(collector._processing),
+                "collection_interval": collector._collection_interval,
+                "last_collection": collector._last_collection,
+                "current_progress": current_progress
+            }
+
+        return {
+            # Service metrics
+            "service": {
+                "status": service._status.value,
+                "uptime_seconds": uptime,
+                "last_error": str(service._last_error) if service._last_error else None,
+                "active_tokens": len(service._active_tokens)
+            },
+            # Error metrics
+            "errors": {
+                "total": len(recent_errors),
+                "by_type": error_types
+            },
+            # Collector metrics
+            "collectors": collectors
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to collect metrics: {str(e)}")
+
+@app.get("/status")
+async def get_status():
+    """Get detailed service status"""
+    if not service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    return {
+        "status": service.get_service_status(),
+        "collectors": {
+            name: collector.get_collection_status()
+            for name, collector in service._collectors.items()
+        }
+    }

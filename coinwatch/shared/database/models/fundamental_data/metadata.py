@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Text, BigInteger
+from sqlalchemy import Text, BigInteger, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import JSONB
 
@@ -18,7 +18,7 @@ class TokenMetadata(FundamentalDataBase):
     # Core information
     description: Mapped[str] = mapped_column(Text, nullable=False)
     categories: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
-    launch_time: Mapped[datetime | None] = mapped_column(nullable=True)
+    launch_time: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     market_cap_rank: Mapped[int] = mapped_column(BigInteger, nullable=False)
     hashing_algorithm: Mapped[str | None ] = mapped_column(Text, nullable=True)
 
@@ -38,12 +38,11 @@ class TokenMetadata(FundamentalDataBase):
     # Platform info (for tokens)
     platforms: Mapped[list[TokenPlatform]] = relationship(
         "TokenPlatform",
-        back_populates="token",
-        cascade="all, delete-orphan"
+        back_populates="token"
     )
 
     # Metadata management
-    updated_at: Mapped[datetime] = mapped_column(nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
     data_source: Mapped[str] = mapped_column(Text, default='coingecko')
 
     def __repr__(self) -> str:

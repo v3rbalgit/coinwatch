@@ -102,13 +102,16 @@ class MarketDataConfig:
     """Market data service configuration"""
     default_interval: str = '5'
     batch_size: int = 1000
+    retention_days: int = 0
 
     def __post_init__(self) -> None:
         """Validate market data configuration"""
         if self.batch_size <= 0:
-            raise ConfigurationError("Batch size must be positive")
+            raise ConfigurationError(f"Batch size '{self.batch_size}' must be positive")
         if self.default_interval not in [tf.value for tf in Interval]:
             raise ConfigurationError(f"Invalid interval '{self.default_interval}'")
+        if self.retention_days < 0:
+            raise ConfigurationError(f"Retention days '{self.retention_days}' can't be negative")
 
 @dataclass
 class SentimentConfig:
@@ -248,7 +251,8 @@ class Config:
         try:
             return MarketDataConfig(
                 default_interval=os.getenv('DEFAULT_INTERVAL', '5'),
-                batch_size=int(os.getenv('MARKET_DATA_BATCH_SIZE', '1000'))
+                batch_size=int(os.getenv('MARKET_DATA_BATCH_SIZE', '1000')),
+                retention_days=int(os.getenv('RETENTION_DAYS', '0'))
             )
         except Exception as e:
             raise ConfigurationError(f"Invalid market data configuration: {e}")
