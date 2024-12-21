@@ -25,7 +25,7 @@ def to_timestamp(dt: datetime) -> int:
         dt = dt.astimezone(timezone.utc)
     return int(dt.timestamp() * 1000)
 
-def align_time_range_to_interval(start_time: int, end_time: int, base_interval: Interval) -> Tuple[int, int]:
+def align_time_range(start_time: int, end_time: int, base_interval: Interval) -> Tuple[int, int]:
     """
     Align start and end timestamps to base interval taking into account the last closed timestamp.
 
@@ -36,6 +36,7 @@ def align_time_range_to_interval(start_time: int, end_time: int, base_interval: 
 
     Returns:
         Tuple[int,int]: Aligned range of timestamps.
+            Both timestamps are rounded down and end time is aligned to the last complete interval
     """
     interval_ms = base_interval.to_milliseconds()
     aligned_start = start_time - (start_time % interval_ms)
@@ -134,3 +135,15 @@ def format_time_difference(time_difference_ms: int) -> str:
         return f"{minutes}m {seconds}s"
     else:
         return f"{seconds}s"
+
+def format_timestamp(timestamp: int) -> str:
+    """
+    Helper function for displaying timestamps as formatted datetime string.
+
+    Args:
+        timestamp (int): Timestamp to format.
+
+    Returns:
+        str: Timestamp formatted as a datetime string (e.g., 06-10-2024 15:20).
+    """
+    return from_timestamp(timestamp).strftime('%d-%m-%Y %H:%M')

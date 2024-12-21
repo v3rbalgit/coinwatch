@@ -1,4 +1,3 @@
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, ClassVar
@@ -8,15 +7,13 @@ from pydantic import (
     ValidationInfo,
     model_validator,
     field_validator,
-    ValidationError,
     ConfigDict
 )
-
-
-import shared.utils.time as TimeUtils
 from .enums import DataSource, Interval
+from shared.utils.time import to_timestamp, from_timestamp, get_current_timestamp, get_current_datetime
 
 
+# Market data models
 class SymbolModel(BaseModel):
     """
     Domain model for cryptocurrency trading symbol information.
@@ -48,7 +45,7 @@ class SymbolModel(BaseModel):
     )
 
     # Constants
-    MIN_LAUNCH_TIME: ClassVar[int] = TimeUtils.to_timestamp(
+    MIN_LAUNCH_TIME: ClassVar[int] = to_timestamp(
         datetime(2009, 1, 3)  # Bitcoin genesis block date
     )
 
@@ -145,18 +142,18 @@ class SymbolModel(BaseModel):
         if 'base_asset' in data and 'quote_asset' in data:
             expected = f"{data['base_asset']}{data['quote_asset']}"
             if value != expected:
-                raise ValidationError(f'Expected {expected}, got {value}')
+                raise ValueError(f'Expected {expected}, got {value}')
         return value
 
     @field_validator('launch_time')
     def validate_launch_time(value: Any) -> int:
         """Validate launch time is within acceptable range"""
         if value < SymbolModel.MIN_LAUNCH_TIME:
-            raise ValidationError(f"Launch time cannot be before {SymbolModel.MIN_LAUNCH_TIME}")
+            raise ValueError(f"Launch time cannot be before {SymbolModel.MIN_LAUNCH_TIME}")
 
-        max_time = TimeUtils.get_current_timestamp() + (24 * 60 * 60 * 1000)
+        max_time = get_current_timestamp() + (24 * 60 * 60 * 1000)
         if value > max_time:
-            raise ValidationError(f"Launch time cannot be more than 1 day in future")
+            raise ValueError(f"Launch time cannot be more than 1 day in future")
 
         return value
 
@@ -170,7 +167,7 @@ class SymbolModel(BaseModel):
         """Trading pair in format BASE/QUOTE"""
         return f"{self.base_asset}/{self.quote_asset}"
 
-    def check_retention_time(self, retention_days: int) -> 'SymbolModel':
+    def adjust_launch_time(self, retention_days: int) -> 'SymbolModel':
         """
         Create new instance with adjusted launch time based on retention period.
 
@@ -183,7 +180,7 @@ class SymbolModel(BaseModel):
         if retention_days <= 0:
             return self
 
-        retention_start = TimeUtils.get_current_timestamp() - (retention_days * 24 * 60 * 60 * 1000)
+        retention_start = get_current_timestamp() - (retention_days * 24 * 60 * 60 * 1000)
         new_launch_time = max(self.launch_time, retention_start)
 
         return self.model_copy(update={'launch_time': new_launch_time})
@@ -264,7 +261,7 @@ class KlineModel(BaseModel):
     )
 
     # Class variables (constants)
-    BYBIT_LAUNCH_DATE: ClassVar[int] = TimeUtils.to_timestamp(
+    BYBIT_LAUNCH_DATE: ClassVar[int] = to_timestamp(
         datetime(2019, 11, 1, tzinfo=timezone.utc)
     )
     MAX_FUTURE_TOLERANCE: ClassVar[int] = 60  # seconds
@@ -315,12 +312,12 @@ class KlineModel(BaseModel):
     @property
     def start_time(self) -> str:
         """Timestamp formatted as a datetime string"""
-        return TimeUtils.from_timestamp(self.timestamp).strftime('%d-%m-%Y %H:%M')
+        return from_timestamp(self.timestamp).strftime('%d-%m-%Y %H:%M')
 
     @property
     def end_time(self) -> str:
         """Calculated end time based on an interval as a datetime string"""
-        return TimeUtils.from_timestamp(self.timestamp + self.interval.to_milliseconds()).strftime('%d-%m-%Y %H:%M')
+        return from_timestamp(self.timestamp + self.interval.to_milliseconds()).strftime('%d-%m-%Y %H:%M')
 
     @property
     def time_range(self) -> str:
@@ -328,114 +325,100 @@ class KlineModel(BaseModel):
         return f"{self.start_time} - {self.end_time}"
 
     @classmethod
-    def from_raw_data(cls,
-                     timestamp: int,
-                     open_price: str | float,
-                     high_price: str | float,
-                     low_price: str | float,
-                     close_price: str | float,
-                     volume: str | float,
-                     turnover: str | float,
-                     interval: Interval) -> 'KlineModel':
-        """
-        Create a new KlineModel instance from raw data with proper precision
-
-        Args:
-            timestamp: Unix timestamp in milliseconds
-            open_price: Opening price (as string or float)
-            high_price: Highest price (as string or float)
-            low_price: Lowest price (as string or float)
-            close_price: Closing price (as string or float)
-            volume: Trading volume (as string or float)
-            turnover: Trading turnover (as string or float)
-            interval: Trading interval
-
-        Returns:
-            New KlineModel instance with normalized decimal values
-        """
-        def to_normalized_decimal(value: str | float) -> Decimal:
-            """Convert any numeric input to a normalized Decimal"""
+    def _to_decimal(cls, value: Any) -> Decimal:
+        """Convert any numeric input to a normalized Decimal"""
+        if value is None:
+            raise ValueError("Value cannot be None")
+        try:
             if isinstance(value, float):
                 # Convert float to string without scientific notation
                 value = f"{value:.8f}"
             return Decimal(str(value)).normalize()
+        except (ValueError, InvalidOperation) as e:
+            raise ValueError(f"Cannot convert {value} to Decimal: {str(e)}")
 
+    @classmethod
+    def from_raw_data(cls, data: list[Any], interval: Interval) -> 'KlineModel':
+        """
+        Create a new KlineModel instance from raw data with proper precision
+
+        Args:
+            data (list[Any]): List of price data
+            interval (Interval): Trading interval of the price data
+
+        Returns:
+            New KlineModel instance with normalized decimal values
+        """
         return cls(
-            timestamp=timestamp,
-            open_price=to_normalized_decimal(open_price),
-            high_price=to_normalized_decimal(high_price),
-            low_price=to_normalized_decimal(low_price),
-            close_price=to_normalized_decimal(close_price),
-            volume=to_normalized_decimal(volume),
-            turnover=to_normalized_decimal(turnover),
+            timestamp=int(data[0]),
+            open_price=data[1],
+            high_price=data[2],
+            low_price=data[3],
+            close_price=data[4],
+            volume=data[5],
+            turnover=data[6],
             interval=interval
         )
 
-    @field_validator('timestamp')
-    def validate_timestamp(value: Any) -> int:
-        """Validate timestamp is within acceptable range"""
+    @field_validator('open_price', 'high_price', 'low_price', 'close_price', 'volume', 'turnover', mode='before')
+    def validate_and_convert_decimal(cls, value: Any, info: ValidationInfo) -> Decimal:
+        """Convert and validate numeric values to Decimal"""
+        try:
+            decimal_value = cls._to_decimal(value)
+            if decimal_value < 0:
+                raise ValueError(f'Must be non-negative, got {value}')
+            return decimal_value
+        except (ValueError, TypeError, InvalidOperation) as e:
+            raise ValueError(f'Cannot convert {value} to Decimal: {str(e)}')
+
+    @field_validator('timestamp', mode='before')
+    def validate_timestamp(cls, value: Any) -> int:
+        """Convert and validate timestamp"""
+        if isinstance(value, Decimal):
+            value = int(value)
+        elif isinstance(value, datetime):
+            value = int(value.timestamp() * 1000)
+
         if len(str(abs(value))) != 13:
-            raise ValidationError(
-                'Invalid timestamp length',
-                {'timestamp': f'Must be 13 digits, got {len(str(abs(value)))}'}
-            )
+            raise ValueError(f'Must be 13 digits, got {len(str(abs(value)))}')
 
         if value < KlineModel.BYBIT_LAUNCH_DATE:
-            launch_date = TimeUtils.from_timestamp(KlineModel.BYBIT_LAUNCH_DATE)
-            raise ValidationError(
-                'Invalid timestamp range',
-                {'timestamp': f'Cannot be before exchange launch ({launch_date})'}
-            )
+            launch_date = from_timestamp(KlineModel.BYBIT_LAUNCH_DATE)
+            raise ValueError(f'Cannot be before exchange launch ({launch_date})')
 
-        current_time = TimeUtils.get_current_timestamp()
-        dt = TimeUtils.from_timestamp(value)
-        max_allowed = TimeUtils.from_timestamp(current_time) + timedelta(
+        current_time = get_current_timestamp()
+        dt = from_timestamp(value)
+        max_allowed = from_timestamp(current_time) + timedelta(
             seconds=KlineModel.MAX_FUTURE_TOLERANCE
         )
 
         if dt > max_allowed:
-            raise ValidationError(
-                'Future timestamp',
-                {'timestamp': f'Cannot be in future: {dt} > {max_allowed}'}
-            )
+            raise ValueError(f'Cannot be in future: {dt} > {max_allowed}')
 
         return value
 
-    @field_validator('open_price', 'high_price', 'low_price', 'close_price', 'volume', 'turnover')
-    def validate_numeric(value: Any, info: Any) -> Decimal:
-        """Validate and convert numeric values to Decimal"""
-        try:
-            decimal_value = Decimal(str(value))
-            if decimal_value < 0:
-                raise ValidationError(
-                    'Negative value',
-                    {info.field_name: f'Must be non-negative, got {value}'}
-                )
-            return decimal_value
-        except (ValueError, TypeError, InvalidOperation):
-            raise ValidationError(
-                'Invalid decimal',
-                {info.field_name: f'Cannot convert {value} to Decimal'}
-            )
+    @field_validator('interval', mode='before')
+    def validate_interval(cls, value: Any) -> Interval:
+        """Convert string to Interval enum"""
+        if isinstance(value, str):
+            try:
+                return Interval(value)
+            except ValueError:
+                raise ValueError(f"Invalid interval value: {value}")
+        return value
 
     @model_validator(mode='after')
     def validate_price_relationships(self) -> 'KlineModel':
         """Validate OHLC price relationships follow market logic"""
         if not (self.low_price <= min(self.open_price, self.close_price) <=
                 max(self.open_price, self.close_price) <= self.high_price):
-            raise ValidationError(
-                'Invalid OHLC relationships',
-                {
-                    'prices': {
-                        'open': self.open_price,
-                        'high': self.high_price,
-                        'low': self.low_price,
-                        'close': self.close_price,
-                        'message': 'Price relationships must follow: low ≤ open/close ≤ high'
-                    }
-                }
+            raise ValueError(
+                f'Invalid OHLC relationships: Price relationships must follow: '
+                f'low ({self.low_price}) ≤ open ({self.open_price})/close ({self.close_price}) '
+                f'≤ high ({self.high_price})'
             )
         return self
+
 
 # Technical Indicator Models
 class IndicatorBase(BaseModel):
@@ -460,7 +443,7 @@ class IndicatorBase(BaseModel):
                 # Handle scientific notation by converting through float
                 return Decimal(str(float(value))).normalize()
             except (ValueError, InvalidOperation):
-                raise ValidationError(f'Invalid decimal value: {value}')
+                raise ValueError(f'Invalid decimal value: {value}')
         return value
 
 class RSIResult(IndicatorBase):
@@ -547,173 +530,420 @@ class OBVResult(IndicatorBase):
         )
 
 
-# Platform Model
-@dataclass
-class Platform:
+# Fundamental data models
+class PlatformModel(BaseModel):
     """Platform information for a token"""
-    platform_id: str
-    contract_address: str
+    model_config = ConfigDict(
+        frozen=True,
+        validate_assignment=True,
+        strict=True,
+        json_schema_extra={
+            "example": {
+                "token_id": "ethereum",
+                "platform_id": "ethereum",
+                "contract_address": "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984"
+            }
+        }
+    )
 
-# Metadata Model
-@dataclass
-class Metadata:
+    token_id: str = Field(
+        ...,
+        description="Token id (lowercase base asset)",
+        min_length=1,
+        examples=['dexpad','fedoracoin']
+    )
+    platform_id: str = Field(
+        ...,
+        description="Platform identifier (e.g., 'ethereum', 'binance-smart-chain')",
+        min_length=1,
+        examples=["ethereum", "polygon-pos"]
+    )
+    contract_address: str = Field(
+        ...,
+        description="Token contract address on the platform",
+        min_length=1,
+        examples=["0x1f9840a85d5af5bf1d1762f925bdaddc4201f984"]
+    )
+
+
+class MetadataModel(BaseModel):
     """Domain model for token metadata"""
-    id: str
-    symbol: SymbolModel
-    name: str
-    description: str
-    market_cap_rank: int
-    categories: list[str]
-    updated_at: int
-    launch_time: int | None
-    hashing_algorithm: str | None
-    website: str | None
-    whitepaper: str | None
-    reddit: str | None
-    twitter: str | None
-    telegram: str | None
-    github: str | None
-    images: dict[str, str]
-    data_source: DataSource
-    platforms: list[Platform] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, str | list[str] | int | datetime | None]:
-        """Convert metadata to database-friendly dictionary"""
-        return {
-            "id": self.id,
-            "symbol": self.symbol.name,
-            "name": self.name,
-            "description": self.description,
-            "market_cap_rank": int(self.market_cap_rank) if self.market_cap_rank else None,
-            "categories": self.categories,
-            "launch_time": TimeUtils.from_timestamp(self.launch_time) if self.launch_time else None,
-            "hashing_algorithm": self.hashing_algorithm,
-            "website": self.website,
-            "whitepaper": self.whitepaper,
-            "reddit": self.reddit,
-            "twitter": self.twitter,
-            "telegram": self.telegram,
-            "github": self.github,
-            "image_thumb": self.images.get('thumb'),
-            "image_small": self.images.get('small'),
-            "image_large": self.images.get('large'),
-            "updated_at": TimeUtils.from_timestamp(self.updated_at),
-            "data_source": self.data_source.value
+    model_config = ConfigDict(
+        frozen=True,
+        validate_assignment=True,
+        strict=True,
+        populate_by_name=True,
+        json_schema_extra={
+            "example": {
+                "id": "bitcoin",
+                "symbol": "btc",
+                "name": "Bitcoin",
+                "description": "Bitcoin is the first successful internet money...",
+                "market_cap_rank": 1,
+                "categories": ["Cryptocurrency", "Layer 1 (L1)"],
+                "launch_time": "2009-01-03T00:00:00Z",
+                "hashing_algorithm": "SHA-256",
+                "website": "http://www.bitcoin.org",
+                "whitepaper": "https://bitcoin.org/bitcoin.pdf",
+                "reddit": "https://www.reddit.com/r/Bitcoin/",
+                "twitter": "bitcoin",
+                "telegram": "",
+                "github": "https://github.com/bitcoin/bitcoin",
+                "images": {
+                    "thumb": "https://example.com/thumb.png",
+                    "small": "https://example.com/small.png",
+                    "large": "https://example.com/large.png"
+                },
+                "platforms": [],
+                "updated_at": "2024-01-10T00:00:00Z",
+                "data_source": "coingecko"
+            }
         }
+    )
 
-# Market Metrics Model
-@dataclass
-class MarketMetrics:
+    id: str = Field(..., description="Unique identifier", min_length=1)
+    symbol: str = Field(..., description="Token symbol", min_length=1)
+    name: str = Field(..., description="Token name", min_length=1)
+    description: str = Field(..., description="Token description")
+    market_cap_rank: int = Field(..., description="Market cap rank")
+    categories: list[str] = Field(default_factory=list, description="Token categories")
+    launch_time: datetime | None = Field(None, description="Token launch time")
+    hashing_algorithm: str | None = Field(None, description="Mining algorithm")
+    website: str | None = Field(None, description="Official website URL")
+    whitepaper: str | None = Field(None, description="Whitepaper URL")
+    reddit: str | None = Field(None, description="Reddit URL")
+    twitter: str | None = Field(None, description="Twitter handle")
+    telegram: str | None = Field(None, description="Telegram channel")
+    github: str | None = Field(None, description="GitHub repository URL")
+    images: dict[str, str] = Field(
+        ...,
+        description="Token images in different sizes",
+        json_schema_extra={
+            "example": {
+                "thumb": "https://example.com/thumb.png",
+                "small": "https://example.com/small.png",
+                "large": "https://example.com/large.png"
+            }
+        },
+        exclude=True  # Exclude from serialization for database operations
+    )
+    platforms: list[PlatformModel] = Field(
+        default_factory=list,
+        description="List of platforms where token is available",
+        exclude=True  # Exclude from serialization for database
+    )
+    updated_at: datetime = Field(..., description="Last update timestamp")
+    data_source: DataSource = Field(..., description="Data source identifier")
+
+    # Database-specific fields
+    image_thumb: str = Field(
+        default="",
+        description="Thumbnail image URL",
+        validation_alias="images.thumb"
+    )
+    image_small: str = Field(
+        default="",
+        description="Small image URL",
+        validation_alias="images.small"
+    )
+    image_large: str = Field(
+        default="",
+        description="Large image URL",
+        validation_alias="images.large"
+    )
+
+    @field_validator('symbol', mode='before')
+    def convert_symbol_to_lowercase(cls, v: str) -> str:
+        """Convert symbol to lowercase"""
+        return v.lower() if isinstance(v, str) else v
+
+    @field_validator('market_cap_rank', mode='before')
+    def handle_missing_market_cap_rank(cls, v: Any) -> int:
+        """Convert symbol to lowercase"""
+        return int(v) if v is not None else -1
+
+    @field_validator('data_source', mode='before')
+    def convert_data_source(cls, v: Any) -> DataSource:
+        """Convert string to DataSource enum"""
+        if isinstance(v, DataSource):
+            return v
+        return DataSource(v)
+
+
+class MarketMetricsModel(BaseModel):
     """Market metrics for a token"""
-    id: str  # CoinGecko ID
-    symbol: SymbolModel
-    current_price: Decimal
-    market_cap: Decimal | None
-    market_cap_rank: int | None
-    fully_diluted_valuation: Decimal | None
-    total_volume: Decimal
-    high_24h: Decimal | None
-    low_24h: Decimal | None
-    price_change_24h: Decimal | None
-    price_change_percentage_24h: Decimal | None
-    market_cap_change_24h: Decimal | None
-    market_cap_change_percentage_24h: Decimal | None
-    circulating_supply: Decimal | None
-    total_supply: Decimal | None
-    max_supply: Decimal | None
-    ath: Decimal | None
-    ath_change_percentage: Decimal | None
-    ath_date: str | None
-    atl: Decimal | None
-    atl_change_percentage: Decimal | None
-    atl_date: str | None
-    updated_at: int
-    data_source: DataSource
-
-    def to_dict(self) -> dict[str, str | int | float | datetime | None]:
-        """Convert to dictionary for database storage"""
-        return {
-            'id': self.id,
-            'symbol': self.symbol.name,
-            'current_price': float(self.current_price),
-            'market_cap': float(self.market_cap) if self.market_cap else None,
-            'market_cap_rank': self.market_cap_rank,
-            'fully_diluted_valuation': float(self.fully_diluted_valuation) if self.fully_diluted_valuation else None,
-            'total_volume': float(self.total_volume),
-            'high_24h': float(self.high_24h) if self.high_24h else None,
-            'low_24h': float(self.low_24h) if self.low_24h else None,
-            'price_change_24h': float(self.price_change_24h) if self.price_change_24h else None,
-            'price_change_percentage_24h': float(self.price_change_percentage_24h) if self.price_change_percentage_24h else None,
-            'market_cap_change_24h': float(self.market_cap_change_24h) if self.market_cap_change_24h else None,
-            'market_cap_change_percentage_24h': float(self.market_cap_change_percentage_24h) if self.market_cap_change_percentage_24h else None,
-            'circulating_supply': float(self.circulating_supply) if self.circulating_supply else None,
-            'total_supply': float(self.total_supply) if self.total_supply else None,
-            'max_supply': float(self.max_supply) if self.max_supply else None,
-            'ath': float(self.ath) if self.ath else None,
-            'ath_change_percentage': float(self.ath_change_percentage) if self.ath_change_percentage else None,
-            'ath_date': self.ath_date,
-            'atl': float(self.atl) if self.atl else None,
-            'atl_change_percentage': float(self.atl_change_percentage) if self.atl_change_percentage else None,
-            'atl_date': self.atl_date,
-            'updated_at': TimeUtils.from_timestamp(self.updated_at),
-            'data_source': self.data_source.value
+    model_config = ConfigDict(
+        frozen=True,
+        validate_assignment=True,
+        strict=True,
+        json_encoders={
+            Decimal: lambda v: f"{v:f}"  # Format decimals without scientific notation
+        },
+        json_schema_extra={
+            "example": {
+                "id": "bitcoin",
+                "symbol": "btc",
+                "current_price": "45000.00",
+                "market_cap": "850000000000.00",
+                "market_cap_rank": 1,
+                "fully_diluted_valuation": "945000000000.00",
+                "total_volume": "25000000000.00",
+                "high_24h": "46000.00",
+                "low_24h": "44000.00",
+                "price_change_24h": "1000.00",
+                "price_change_percentage_24h": "2.25",
+                "market_cap_change_24h": "20000000000.00",
+                "market_cap_change_percentage_24h": "2.35",
+                "circulating_supply": "19000000.00",
+                "total_supply": "21000000.00",
+                "max_supply": "21000000.00",
+                "ath": "69000.00",
+                "ath_change_percentage": "-34.78",
+                "ath_date": "2021-11-10T14:24:11.849Z",
+                "atl": "67.81",
+                "atl_change_percentage": "66256.00",
+                "atl_date": "2013-07-06T00:00:00.000Z",
+                "updated_at": "2024-01-10T00:00:00Z",
+                "data_source": "coingecko"
+            }
         }
+    )
 
-# Sentiment Metrics Model
-@dataclass
-class SentimentMetrics:
+    # Identifiers (required fields)
+    id: str = Field(..., description="Unique identifier", min_length=1)
+    symbol: str = Field(..., description="Token symbol", min_length=1)
+
+    # Price fields (all nullable)
+    current_price: Decimal | None = Field(default=None, description="Current token price", max_digits=20, decimal_places=10)
+    high_24h: Decimal | None = Field(default=None, description="24h high", max_digits=20, decimal_places=10)
+    low_24h: Decimal | None = Field(default=None, description="24h low", max_digits=20, decimal_places=10)
+    price_change_24h: Decimal | None = Field(default=None, description="24h price change", max_digits=20, decimal_places=10)
+    ath: Decimal | None = Field(default=None, description="All-time high price", max_digits=20, decimal_places=10)
+    atl: Decimal | None = Field(default=None, description="All-time low price", max_digits=20, decimal_places=10)
+
+    # Percentage fields (all nullable)
+    price_change_percentage_24h: Decimal | None = Field(default=None, description="24h price change percentage", max_digits=16, decimal_places=4)
+    market_cap_change_percentage_24h: Decimal | None = Field(default=None, description="24h market cap change percentage", max_digits=16, decimal_places=4)
+    ath_change_percentage: Decimal | None = Field(default=None, description="Change from ATH percentage", max_digits=16, decimal_places=4)
+    atl_change_percentage: Decimal | None = Field(default=None, description="Change from ATL percentage", max_digits=16, decimal_places=4)
+
+    # Large number fields (all nullable)
+    market_cap: Decimal | None = Field(default=None, description="Market capitalization", max_digits=30, decimal_places=2)
+    fully_diluted_valuation: Decimal | None = Field(default=None, description="Fully diluted valuation", max_digits=30, decimal_places=2)
+    total_volume: Decimal | None = Field(default=None, description="24h trading volume", max_digits=30, decimal_places=2)
+    market_cap_change_24h: Decimal | None = Field(default=None, description="24h market cap change", max_digits=30, decimal_places=2)
+
+    # Supply fields (all nullable)
+    circulating_supply: Decimal | None = Field(default=None, description="Circulating supply", max_digits=30, decimal_places=8)
+    total_supply: Decimal | None = Field(default=None, description="Total supply", max_digits=30, decimal_places=8)
+    max_supply: Decimal | None = Field(default=None, description="Maximum supply", max_digits=30, decimal_places=8)
+
+    # Other fields (all nullable except required management fields)
+    market_cap_rank: int | None = Field(default=None, description="Market cap rank")
+    ath_date: datetime | None = Field(default=None, description="ATH date")
+    atl_date: datetime | None = Field(default=None, description="ATL date")
+
+    # Management fields (required)
+    updated_at: datetime = Field(..., description="Last update timestamp")
+    data_source: DataSource = Field(..., description="Data source identifier")
+
+    @classmethod
+    def _to_decimal(cls, value: Any) -> Decimal:
+        """Convert any numeric value to Decimal safely"""
+        if value is None:
+            raise ValueError("Value cannot be None")
+        try:
+            if isinstance(value, float):
+                # Convert float to string without scientific notation
+                value = f"{value:.10f}"
+            return Decimal(str(value)).normalize()
+        except (ValueError, InvalidOperation) as e:
+            raise ValueError(f"Cannot convert {value} to Decimal: {str(e)}")
+
+    @classmethod
+    def _parse_date(cls, date_str: str) -> datetime:
+        """Parse ISO datetime string to datetime object"""
+        try:
+            # Handle various ISO formats
+            if 'Z' in date_str:
+                date_str = date_str.replace('Z', '+00:00')
+            elif '+' not in date_str and '-' not in date_str[10:]:
+                date_str = f"{date_str}+00:00"
+            return datetime.fromisoformat(date_str)
+        except (ValueError, AttributeError):
+            return get_current_datetime()
+
+    @classmethod
+    def from_raw_data(cls, data: dict[str, Any]) -> 'MarketMetricsModel':
+        """Create instance from raw CoinGecko API response"""
+        def normalize_decimal(value: Any, precision: int = 10, max_digits: int = 20, default: str = '0') -> Decimal:
+            """Convert and normalize any numeric value to Decimal within constraints"""
+            if value is None:
+                return Decimal(default)
+            try:
+                # Convert to float first to handle scientific notation
+                if isinstance(value, str):
+                    value = value.replace(',', '').strip()
+                    if value.endswith('%'):
+                        value = value[:-1]
+                    if not value:
+                        return Decimal(default)
+
+                try:
+                    if isinstance(value, (int, Decimal)):
+                        float_val = float(value)
+                    else:
+                        float_val = float(value)
+                except (ValueError, TypeError):
+                    return Decimal(default)
+
+                # Handle invalid values
+                if (float_val == float('inf') or float_val == float('-inf')
+                    or float_val != float_val):  # Check for inf/-inf/nan
+                    return Decimal(default)
+
+                # Convert to decimal and normalize
+                decimal_val = Decimal(str(float_val)).normalize()
+
+                # Handle very small numbers
+                if abs(decimal_val) < Decimal('1e-10'):
+                    return Decimal('0')
+
+                # Handle large numbers by rounding to millions if needed
+                if abs(decimal_val) > Decimal('1e12'):
+                    decimal_val = (decimal_val / Decimal('1000000')).quantize(Decimal('1')) * Decimal('1000000')
+
+                # Apply precision
+                scale = Decimal('0.' + '0' * (precision - 1) + '1')
+                return decimal_val.quantize(scale, rounding=ROUND_HALF_UP)
+
+            except (ValueError, InvalidOperation, TypeError, OverflowError) as e:
+                print(f"Warning: Could not convert value '{value}' ({type(value)}) to Decimal: {str(e)}")
+                return Decimal(default)
+
+        def round_pct(value: Any, default: str = '0') -> Decimal:
+            """Round percentage values to 4 decimal places"""
+            return normalize_decimal(value, precision=4, max_digits=16, default=default)
+
+        # Process price fields with appropriate constraints
+        def process_price(value: Any) -> Decimal:
+            result = normalize_decimal(value, precision=10, max_digits=20, default='0.0000000001')
+            return max(result, Decimal('0.0000000001'))  # Ensure minimum price
+
+        # Process supply fields with appropriate constraints
+        def process_supply(value: Any) -> Decimal:
+            return normalize_decimal(value, precision=8, max_digits=20, default='0')
+
+        # Process market cap and volume fields
+        def process_market_value(value: Any) -> Decimal:
+            return normalize_decimal(value, precision=2, max_digits=30, default='0')
+
+        return cls(
+            id=data.get('id', ''),
+            symbol=data.get('symbol', ''),
+            current_price=None if data.get('current_price') is None else process_price(data['current_price']),
+            market_cap=None if data.get('market_cap') is None else process_market_value(data['market_cap']),
+            market_cap_rank=data.get('market_cap_rank'),
+            fully_diluted_valuation=None if data.get('fully_diluted_valuation') is None else process_market_value(data['fully_diluted_valuation']),
+            total_volume=None if data.get('total_volume') is None else process_market_value(data['total_volume']),
+            high_24h=None if data.get('high_24h') is None else process_price(data['high_24h']),
+            low_24h=None if data.get('low_24h') is None else process_price(data['low_24h']),
+            price_change_24h=None if data.get('price_change_24h') is None else process_price(data['price_change_24h']),
+            price_change_percentage_24h=None if data.get('price_change_percentage_24h') is None else round_pct(data['price_change_percentage_24h']),
+            market_cap_change_24h=None if data.get('market_cap_change_24h') is None else process_market_value(data['market_cap_change_24h']),
+            market_cap_change_percentage_24h=None if data.get('market_cap_change_percentage_24h') is None else round_pct(data['market_cap_change_percentage_24h']),
+            circulating_supply=None if data.get('circulating_supply') is None else process_supply(data['circulating_supply']),
+            total_supply=None if data.get('total_supply') is None else process_supply(data['total_supply']),
+            max_supply=None if data.get('max_supply') is None else process_supply(data['max_supply']),
+            ath=None if data.get('ath') is None else process_price(data['ath']),
+            ath_change_percentage=None if data.get('ath_change_percentage') is None else round_pct(data['ath_change_percentage']),
+            ath_date=None if data.get('ath_date') is None else cls._parse_date(data['ath_date']),
+            atl=None if data.get('atl') is None else process_price(data.get('atl')),
+            atl_change_percentage=None if data.get('atl_change_percentage') is None else round_pct(data['atl_change_percentage']),
+            atl_date=None if data.get('atl_date') is None else cls._parse_date(data['atl_date']),
+            updated_at=get_current_datetime(),
+            data_source=DataSource.COINGECKO
+        )
+
+    @field_validator('symbol', mode='before')
+    def convert_symbol_to_lowercase(cls, v: str) -> str:
+        """Convert symbol to lowercase"""
+        return v.lower() if isinstance(v, str) else v
+
+    @field_validator(
+        'current_price', 'high_24h', 'low_24h', 'price_change_24h',
+        'ath', 'atl', 'price_change_percentage_24h', 'market_cap_change_percentage_24h',
+        'ath_change_percentage', 'atl_change_percentage', 'market_cap',
+        'fully_diluted_valuation', 'total_volume', 'market_cap_change_24h',
+        'circulating_supply', 'total_supply',
+        mode='before'
+    )
+    def convert_to_decimal(cls, v: Any) -> Decimal | None:
+        """Convert numeric values to Decimal safely, allowing None values"""
+        if v is None:
+            return None
+        try:
+            return cls._to_decimal(v)
+        except ValueError:
+            return None
+
+    @field_validator('market_cap_rank', mode='before')
+    def handle_missing_market_cap_rank(cls, v: Any) -> int:
+        """Convert symbol to lowercase"""
+        return int(v) if v is not None else -1
+
+    @field_validator('data_source', mode='before')
+    def convert_data_source(cls, v: Any) -> DataSource:
+        """Convert string to DataSource enum"""
+        if isinstance(v, DataSource):
+            return v
+        return DataSource(v)
+
+
+class SentimentMetricsModel(BaseModel):
     """Social media sentiment metrics for a token"""
-    id: str  # CoinGecko ID
-    symbol: SymbolModel
+    model_config = ConfigDict(
+        frozen=True,
+        validate_assignment=True,
+        strict=True,
+        json_encoders={
+            Decimal: lambda v: f"{v:f}"  # Format decimals without scientific notation
+        }
+    )
+
+    id: str = Field(..., description="CoinGecko ID")
+    symbol: str = Field(..., description="Token symbol")
 
     # Twitter metrics
-    twitter_followers: int | None
-    twitter_following: int | None
-    twitter_posts_24h: int | None
-    twitter_engagement_rate: Decimal | None
-    twitter_sentiment_score: Decimal | None
+    twitter_followers: int | None = Field(None, description="Number of Twitter followers")
+    twitter_following: int | None = Field(None, description="Number of Twitter accounts following")
+    twitter_posts_24h: int | None = Field(None, description="Number of Twitter posts in the last 24 hours")
+    twitter_engagement_rate: Decimal | None = Field(None, description="Twitter engagement rate")
+    twitter_sentiment_score: Decimal | None = Field(None, description="Twitter sentiment score")
 
     # Reddit metrics
-    reddit_subscribers: int | None
-    reddit_active_users: int | None
-    reddit_posts_24h: int | None
-    reddit_comments_24h: int | None
-    reddit_sentiment_score: Decimal | None
+    reddit_subscribers: int | None = Field(None, description="Number of Reddit subscribers")
+    reddit_active_users: int | None = Field(None, description="Number of active Reddit users")
+    reddit_posts_24h: int | None = Field(None, description="Number of Reddit posts in the last 24 hours")
+    reddit_comments_24h: int | None = Field(None, description="Number of Reddit comments in the last 24 hours")
+    reddit_sentiment_score: Decimal | None = Field(None, description="Reddit sentiment score")
 
     # Telegram metrics
-    telegram_members: int | None
-    telegram_online_members: int | None
-    telegram_messages_24h: int | None
-    telegram_sentiment_score: Decimal | None
+    telegram_members: int | None = Field(None, description="Number of Telegram members")
+    telegram_online_members: int | None = Field(None, description="Number of online Telegram members")
+    telegram_messages_24h: int | None = Field(None, description="Number of Telegram messages in the last 24 hours")
+    telegram_sentiment_score: Decimal | None = Field(None, description="Telegram sentiment score")
 
     # Aggregated metrics
-    overall_sentiment_score: Decimal  # Weighted average of platform sentiment scores
-    social_score: Decimal  # Weighted engagement score
+    overall_sentiment_score: Decimal = Field(..., description="Weighted average of platform sentiment scores")
+    social_score: Decimal = Field(..., description="Weighted engagement score")
 
-    updated_at: int
-    data_source: DataSource
+    updated_at: datetime = Field(..., description="Last update timestamp")
+    data_source: DataSource = Field(..., description="Data source identifier")
 
-    def to_dict(self) -> dict[str, str | int | float | datetime | None]:
-        """Convert to dictionary for database storage"""
-        return {
-            'id': self.id,
-            'symbol': self.symbol.name,
-            'twitter_followers': self.twitter_followers,
-            'twitter_following': self.twitter_following,
-            'twitter_posts_24h': self.twitter_posts_24h,
-            'twitter_engagement_rate': float(self.twitter_engagement_rate) if self.twitter_engagement_rate else None,
-            'twitter_sentiment_score': float(self.twitter_sentiment_score) if self.twitter_sentiment_score else None,
-            'reddit_subscribers': self.reddit_subscribers,
-            'reddit_active_users': self.reddit_active_users,
-            'reddit_posts_24h': self.reddit_posts_24h,
-            'reddit_comments_24h': self.reddit_comments_24h,
-            'reddit_sentiment_score': float(self.reddit_sentiment_score) if self.reddit_sentiment_score else None,
-            'telegram_members': self.telegram_members,
-            'telegram_online_members': self.telegram_online_members,
-            'telegram_messages_24h': self.telegram_messages_24h,
-            'telegram_sentiment_score': float(self.telegram_sentiment_score) if self.telegram_sentiment_score else None,
-            'overall_sentiment_score': float(self.overall_sentiment_score),
-            'social_score': float(self.social_score),
-            'updated_at': TimeUtils.from_timestamp(self.updated_at),
-            'data_source': self.data_source.value
-        }
+    @field_validator('data_source', mode='before')
+    def convert_data_source(cls, v: Any) -> DataSource:
+        """Convert string to DataSource enum"""
+        if isinstance(v, DataSource):
+            return v
+        return DataSource(v)

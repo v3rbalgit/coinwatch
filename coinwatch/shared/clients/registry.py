@@ -22,7 +22,7 @@ class ExchangeAdapter(APIAdapter):
                         interval: Interval,
                         start_time: int,
                         end_time: int,
-                        limit: int | None = None) -> AsyncGenerator[list[KlineModel], None]:
+                        limit: int | None = None) -> AsyncGenerator[tuple[list[KlineModel], int], None]:
         """Get kline data"""
         ...
 

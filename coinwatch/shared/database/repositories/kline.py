@@ -7,7 +7,8 @@ from shared.database.connection import DatabaseConnection
 from shared.database.models.market_data import Symbol, Kline
 from shared.core.exceptions import RepositoryError
 from shared.utils.logger import LoggerSetup
-import shared.utils.time as TimeUtils
+from shared.utils.time import format_timestamp, from_timestamp
+
 
 
 class KlineRepository:
@@ -22,21 +23,24 @@ class KlineRepository:
         self.db = db
         self.logger = LoggerSetup.setup(__class__.__name__)
 
-    async def get_latest_timestamp(self, symbol: SymbolModel) -> int | None:
+
+    async def get_timestamp_range(self, symbol: SymbolModel) -> tuple[int, int] | None:
         """
-        Get the latest timestamp for a symbol.
+        Get the oldest and latest timestamp for a symbol.
 
         Args:
             symbol (SymbolModel): The symbol to query.
 
         Returns:
-            Optional[int]: The latest timestamp, or None if no data exists
+            Optional[tuple[int, int]]: The oldest and latest timestamp, or None if no data for given symbol exists
         """
         try:
             async with self.db.session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
                 # First check if we have any data
                 stmt = text("""
-                    SELECT (EXTRACT(EPOCH FROM MAX(timestamp)) * 1000)::BIGINT as latest_time
+                    SELECT
+                        (EXTRACT(EPOCH FROM MIN(timestamp)) * 1000)::BIGINT as oldest_time,
+                        (EXTRACT(EPOCH FROM MAX(timestamp)) * 1000)::BIGINT as latest_time
                     FROM kline_data k
                     JOIN symbols s ON k.symbol_id = s.id
                     WHERE s.name = :symbol_name
@@ -48,21 +52,22 @@ class KlineRepository:
                     "exchange": symbol.exchange
                 })
 
-                latest = result.scalar_one_or_none()
-
-                if latest is not None:
-                    self.logger.debug(
-                        f"Latest timestamp for {str(symbol)}: "
-                        f"{TimeUtils.from_timestamp(latest).strftime('%d-%m-%Y %H:%M')}"
-                    )
-                    return latest
-                else:
-                    self.logger.debug(f"No latest timestamp found for {str(symbol)}")
+                row = result.first()
+                if row is None or row.oldest_time is None or row.latest_time is None:
+                    self.logger.debug(f"No timestamp range found for {str(symbol)}")
                     return None
 
+                self.logger.debug(
+                    f"Timestamp range for {str(symbol)}: "
+                    f"Oldest: {format_timestamp(row.oldest_time)}, "
+                    f"Latest: {format_timestamp(row.latest_time)}"
+                )
+                return row.oldest_time, row.latest_time
+
         except Exception as e:
-            self.logger.error(f"Error getting latest timestamp for {symbol}: {e}")
-            raise RepositoryError(f"Failed to get latest timestamp for {symbol}: {str(e)}")
+            self.logger.error(f"Error getting timestamp range for {symbol}: {e}")
+            raise RepositoryError(f"Failed to get timestamp range for {symbol}: {str(e)}")
+
 
     async def get_base_klines(self,
                             symbol: SymbolModel,
@@ -112,28 +117,18 @@ class KlineRepository:
                         "symbol": symbol.name,
                         "exchange": symbol.exchange,
                         "interval": base_interval.value,
-                        "start_time": TimeUtils.from_timestamp(start_time),
-                        "end_time": TimeUtils.from_timestamp(end_time),
+                        "start_time": from_timestamp(start_time),
+                        "end_time": from_timestamp(end_time),
                         "limit": limit or 2147483647
                     }
                 )
-                return [
-                    KlineModel.from_raw_data(
-                        timestamp=TimeUtils.to_timestamp(row.timestamp),
-                        open_price=row.open_price,
-                        high_price=row.high_price,
-                        low_price=row.low_price,
-                        close_price=row.close_price,
-                        volume=row.volume,
-                        turnover=row.turnover,
-                        interval=base_interval
-                    )
-                    for row in result
-                ]
+
+                return [KlineModel.model_validate(dict(row)) for row in result.mappings()]
 
         except Exception as e:
             self.logger.error(f"Error getting base klines for {symbol}: {e}")
             raise RepositoryError(f"Failed to get base klines: {str(e)}")
+
 
     async def get_stored_klines(self,
                               symbol: SymbolModel,
@@ -182,29 +177,19 @@ class KlineRepository:
                     {
                         "symbol_name": symbol.name,
                         "exchange": symbol.exchange,
-                        "start_time": TimeUtils.from_timestamp(start_time),
-                        "end_time": TimeUtils.from_timestamp(end_time),
+                        "start_time": from_timestamp(start_time),
+                        "end_time": from_timestamp(end_time),
                         "bucket": target_interval.get_bucket_interval(),
                         "limit": limit or 2147483647
                     }
                 )
-                return [
-                    KlineModel.from_raw_data(
-                        timestamp=int(row.timestamp),
-                        open_price=row.open_price,
-                        high_price=row.high_price,
-                        low_price=row.low_price,
-                        close_price=row.close_price,
-                        volume=row.volume,
-                        turnover=row.turnover,
-                        interval=target_interval
-                    )
-                    for row in result
-                ]
+
+                return [KlineModel.model_validate(dict(row)) for row in result.mappings()]
 
         except Exception as e:
             self.logger.error(f"Error getting stored klines for {symbol}: {e}")
             raise RepositoryError(f"Failed to get stored klines: {str(e)}")
+
 
     async def get_calculated_klines(self,
                                   symbol: SymbolModel,
@@ -282,34 +267,24 @@ class KlineRepository:
                         "exchange": symbol.exchange,
                         "base_interval": base_interval.value,
                         "target_interval": target_interval.value,
-                        "start_time": TimeUtils.from_timestamp(start_time),
-                        "end_time": TimeUtils.from_timestamp(end_time),
+                        "start_time": from_timestamp(start_time),
+                        "end_time": from_timestamp(end_time),
                         "bucket": target_interval.get_bucket_interval(),
                         "min_candles": min_candles,
                         "limit": limit or 2147483647
                     }
                 )
-                return [
-                    KlineModel.from_raw_data(
-                        timestamp=int(row.timestamp),
-                        open_price=row.open_price,
-                        high_price=row.high_price,
-                        low_price=row.low_price,
-                        close_price=row.close_price,
-                        volume=row.volume,
-                        turnover=row.turnover,
-                        interval=target_interval
-                    )
-                    for row in result
-                ]
+
+                return [KlineModel.model_validate(dict(row)) for row in result.mappings()]
 
         except Exception as e:
             self.logger.error(f"Error calculating klines for {symbol}: {e}")
             raise RepositoryError(f"Failed to calculate klines: {str(e)}")
 
-    async def insert_klines(self, symbol: SymbolModel, klines: list[KlineModel]) -> int:
+
+    async def upsert_klines(self, symbol: SymbolModel, klines: list[KlineModel]) -> int:
         """
-        Insert a list of klines using PostgreSQL bulk insert.
+        Insert or update a list of klines using PostgreSQL bulk upsert with batching.
 
         Args:
             symbol (SymbolModel): The symbol information for the klines.
@@ -321,6 +296,7 @@ class KlineRepository:
             RepositoryError: If the symbol is not found in database.
         """
         try:
+            # Get symbol ID first
             async with self.db.session() as session:
                 symbol_stmt = select(Symbol.id).where(
                     and_(
@@ -334,11 +310,13 @@ class KlineRepository:
                 if not symbol_id:
                     raise RepositoryError(f"Unknown symbol {symbol}")
 
-                dict_klines = [k.model_dump() | {
-                        "timestamp": TimeUtils.from_timestamp(k.timestamp),
-                        "symbol_id": symbol_id
-                    } for k in klines]
+            # Convert all klines to dict format
+            dict_klines = [k.model_dump() | {
+                    "timestamp": from_timestamp(k.timestamp),
+                    "symbol_id": symbol_id
+                } for k in klines]
 
+            async with self.db.session() as session:
                 stmt = insert(Kline).values(dict_klines)
                 stmt = stmt.on_conflict_do_update(
                     index_elements=['symbol_id', 'interval', 'timestamp'],
@@ -354,15 +332,15 @@ class KlineRepository:
                 await session.execute(stmt)
 
                 self.logger.debug(
-                    f"Inserted {len(dict_klines)} klines for {str(symbol)}: "
-                    f"{klines[0].start_time} - {klines[-1].end_time}"
+                    f"Upserted batch of {len(klines)} klines for {str(symbol)}"
                 )
 
-                return len(dict_klines)
+            return len(klines)
 
         except Exception as e:
             self.logger.error(f"Error inserting klines for {symbol}: {e}")
             raise RepositoryError(f"Failed to insert klines: {str(e)}")
+
 
     async def get_data_gaps(self,
                            symbol: SymbolModel,
@@ -387,7 +365,7 @@ class KlineRepository:
         try:
             async with self.db.session(isolation_level=IsolationLevel.REPEATABLE_READ) as session:
                 # Calculate expected interval in milliseconds
-                expected_interval = interval.to_milliseconds()
+                interval_ms = interval.to_milliseconds()
 
                 stmt = text("""
                     WITH time_series AS (
@@ -411,22 +389,21 @@ class KlineRepository:
                     "symbol": symbol.name,
                     "exchange": symbol.exchange,
                     "interval_value": interval.value,
-                    "start_time": TimeUtils.from_timestamp(start_time),
-                    "end_time": TimeUtils.from_timestamp(end_time),
-                    "expected_interval": expected_interval
+                    "start_time": from_timestamp(start_time),
+                    "end_time": from_timestamp(end_time),
+                    "expected_interval": interval_ms
                 })
 
-            return [(int(row.ts_start + expected_interval),
-                        int(row.ts_next))
-                    for row in result]
+            return [(int(row.ts_start + interval_ms), int(row.ts_next)) for row in result]
 
         except Exception as e:
             self.logger.error(f"Error finding data gaps: {e}")
             raise RepositoryError(f"Failed to find data gaps: {str(e)}")
 
+
     async def delete_symbol_data(self, symbol: SymbolModel) -> None:
         """
-        Delete all kline data for a specific symbol.
+        Delete all kline data for a specific symbol in batches (due to compression policy).
 
         Args:
             symbol (SymbolModel): The symbol whose data should be deleted.
@@ -435,6 +412,7 @@ class KlineRepository:
             RepositoryError: If there's an error during the deletion process.
         """
         try:
+            # First get the symbol ID
             async with self.db.session(isolation_level=IsolationLevel.SERIALIZABLE) as session:
                 symbol_stmt = select(Symbol.id).where(
                     and_(
@@ -445,16 +423,45 @@ class KlineRepository:
                 result = await session.execute(symbol_stmt)
                 symbol_id = result.scalar_one_or_none()
 
-                if symbol_id:
-                    delete_stmt = text("""
-                        DELETE FROM kline_data
-                        WHERE symbol_id = :symbol_id
-                    """)
-                    await session.execute(delete_stmt, {"symbol_id": symbol_id})
-                    await session.flush()
-                    self.logger.info(f"Deleted all kline data for {str(symbol)}")
-                else:
+                if not symbol_id:
                     self.logger.warning(f"No kline data found for {str(symbol)}")
+                    return
+
+            # Delete data in batches with separate transactions
+            total_deleted = 0
+
+            while True:
+                deleted_count = 0
+                async with self.db.session(isolation_level=IsolationLevel.SERIALIZABLE) as session:
+                    delete_stmt = text("""
+                        WITH batch AS (
+                            SELECT id
+                            FROM kline_data
+                            WHERE symbol_id = :symbol_id
+                            LIMIT :batch_size
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        DELETE FROM kline_data
+                        WHERE id IN (SELECT id FROM batch)
+                        RETURNING id
+                    """)
+                    result = await session.execute(
+                        delete_stmt,
+                        {
+                            "symbol_id": symbol_id,
+                            "batch_size": 10000
+                        }
+                    )
+                    deleted_ids = result.scalars().all()
+                    deleted_count = len(deleted_ids)
+
+                if deleted_count == 0:
+                    break
+
+                total_deleted += deleted_count
+                self.logger.debug(f"Deleted batch of {deleted_count} klines for {str(symbol)}")
+
+            self.logger.info(f"Completed deletion of {total_deleted} klines for {str(symbol)}")
 
         except Exception as e:
             self.logger.error(f"Error deleting kline data: {e}")

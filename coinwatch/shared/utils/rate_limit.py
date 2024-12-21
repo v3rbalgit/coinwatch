@@ -70,7 +70,24 @@ class RateLimiter:
 
         This method will wait until a token becomes available.
         """
-        while not await self._acquire_token():
-            # Calculate minimum wait time
-            min_wait = self._window_size / self._calls_per_window
-            await asyncio.sleep(min_wait)
+        async with self._lock:
+            current_time = time.time()
+            elapsed = current_time - self._last_refill
+
+            if self._tokens == 0:
+                # Calculate time until next token is available
+                if elapsed >= self._window_size:
+                    # Window has passed, reset tokens
+                    self._tokens = self._calls_per_window
+                    self._last_refill = current_time
+                else:
+                    # Calculate exact wait time needed for next token
+                    time_per_token = self._window_size / self._calls_per_window
+                    wait_time = time_per_token - (elapsed % time_per_token)
+                    await asyncio.sleep(wait_time)
+                    self._tokens = 1  # We get at least one token after waiting
+                    self._last_refill = time.time()
+
+            self._tokens -= 1
+            if self._max_monthly_calls:
+                self._monthly_calls += 1

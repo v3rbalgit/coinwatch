@@ -1,6 +1,6 @@
 import asyncio
 import json
-from typing import Any, Dict, Callable, Coroutine
+from typing import Any, Callable, Coroutine
 from websockets.asyncio.client import connect, ClientConnection
 from websockets.exceptions import ConnectionClosed
 
@@ -22,7 +22,7 @@ class BybitWebsocket:
         self._ws_url = self.TESTNET_WS_URL if self._config.testnet else self.WS_URL
         self._ws_lock = asyncio.Lock()
         self._runner: asyncio.Task | None = None
-        self._handlers: Dict[str, Callable] = {}
+        self._handlers: dict[str, Callable] = {}
 
         self.logger = LoggerSetup.setup(__class__.__name__)
 
@@ -83,11 +83,15 @@ class BybitWebsocket:
                 # Handle subscription responses
                 if 'op' in data:
                     if data['op'] in ('subscribe', 'unsubscribe'):
-                        success = data.get('success', False)
-                        if success:
+                        if data.get('success', False):
                             self.logger.debug(f"Successfully {data['op']}d to topics")
                         else:
-                            self.logger.error(f"Failed to {data['op']}: {data.get('ret_msg')}")
+                            ret_msg: str = data.get('ret_msg', '')
+                            if 'already subscribed' in ret_msg:
+                                topic = ret_msg.split("topic:")[1].strip()
+                                self.logger.debug(f"Already {data['op']}d to {topic}")
+                                continue
+                            self.logger.warning(f"Failed to {data['op']}: {ret_msg}")
                         continue
 
                 # Handle kline updates
@@ -105,17 +109,16 @@ class BybitWebsocket:
     async def subscribe_klines(self,
                              symbol: SymbolModel,
                              interval: Interval,
-                             handler: Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]) -> None:
+                             handler: Callable[[dict[str, Any]], Coroutine[Any, Any, None]]) -> None:
         """Subscribe to kline updates"""
         topic = f"kline.{interval.value}.{symbol.name}"
 
         if not self._runner:
             await self.start()
 
-        self._handlers[topic] = handler
-
         # Send subscription through existing connection
         async with self._ws_lock:
+            self._handlers[topic] = handler
             if self._ws:
                 subscribe_msg = { "op": "subscribe", "args": [topic] }
                 await self._ws.send(json.dumps(subscribe_msg))

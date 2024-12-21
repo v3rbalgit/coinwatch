@@ -1,11 +1,9 @@
-# src/utils/progress.py
-
 from dataclasses import dataclass
 from datetime import datetime
 
-import shared.utils.time as TimeUtils
 from shared.core.models import SymbolModel
 from shared.core.enums import Interval
+from shared.utils.time import get_current_datetime
 
 
 @dataclass
@@ -24,7 +22,7 @@ class MarketDataProgress:
         self.interval = interval
         self.processed_candles = 0
         self.total_candles = self.calculate_total_candles(time_range)
-        self.start_time = TimeUtils.get_current_datetime()
+        self.start_time = get_current_datetime()
         self.last_processed_time: datetime | None = None
 
     def calculate_total_candles(self, time_range: tuple[int,int]) -> int:
@@ -35,21 +33,22 @@ class MarketDataProgress:
             time_range (Tuple[int,int]): Tuple of start and end timestamps aligned to interval.
 
         Returns:
-            int: Total number of candles to process.
-
+            int: Total number of candles in the time range.
         """
         interval_ms = self.interval.to_milliseconds()
         return ((time_range[1] - time_range[0]) // interval_ms) + 1
 
-    def update(self, processed: int) -> None:
+    def update(self, processed: int, gap: int) -> None:
         """
-        Update progress with new counts
+        Update progress with new counts.
 
         Args:
-            processed (int): Number of processed candles.
+            processed (int): Number of processed candles in this batch.
         """
-        self.processed_candles = processed
-        self.last_processed_time = TimeUtils.get_current_datetime()
+        if gap > 0:
+            self.total_candles -= gap
+        self.processed_candles += processed  # Accumulate processed count
+        self.last_processed_time = get_current_datetime()
 
     def get_percentage(self) -> float:
         """
@@ -62,30 +61,32 @@ class MarketDataProgress:
 
     def __str__(self) -> str:
         """Human-readable progress representation"""
-        status = [f"Collection progress for {self.symbol.name} on {self.symbol.exchange}"]
+        status = [f"Collection progress for {str(self.symbol)}"]
 
         if percentage := self.get_percentage():
             status.append(f"{percentage:.1f}%")
 
         if self.total_candles:
-            status.append(f"({self.processed_candles}/{self.total_candles} candles)")
+            status.append(f"{self.processed_candles}/{self.total_candles} klines")
 
         if self.last_processed_time:
-            elapsed = (TimeUtils.get_current_datetime() - self.start_time).total_seconds()
+            elapsed = (get_current_datetime() - self.start_time).total_seconds()
             status.append(f"elapsed: {elapsed:.1f}s")
 
         return " | ".join(status)
 
-    def get_completion_summary(self, end_time: datetime) -> str:
+    def get_completion_summary(self) -> str:
         """Generate detailed completion summary"""
-        elapsed = (end_time - self.start_time).total_seconds()
+        percentage = self.get_percentage()
+        elapsed = (get_current_datetime() - self.start_time).total_seconds()
         rate = self.processed_candles / elapsed if elapsed > 0 else 0
 
         summary = [
-            f"Collection completed for {self.symbol.name} on {self.symbol.exchange}",
-            f"Processed: {self.processed_candles:,} candles",
+            f"Collection completed for {str(self.symbol)}",
+            f"{percentage:.1f}%",
+            f"Processed: {self.processed_candles:,} klines",
             f"Duration: {elapsed:.1f}s",
-            f"Rate: {rate:.1f} candles/s"
+            f"Rate: {rate:.1f} klines/s"
         ]
 
         return " | ".join(summary)
@@ -106,49 +107,33 @@ class MarketDataProgress:
 @dataclass
 class FundamentalDataProgress:
     """Generic progress tracking for data collection"""
-    symbol: str
     collector_type: str
     start_time: datetime
-    items_total: int | None = None
-    items_processed: int = 0
-    status: str = "pending"
-    error: str | None = None
+    total_tokens: int
+    processed_tokens: int = 0
     last_update: datetime | None = None
+    last_processed_token: str | None = None
 
-    def update(self, processed: int, total: int | None = None) -> None:
-        """Update progress"""
-        self.items_processed = processed
-        if total is not None:
-            self.items_total = total
-        self.last_update = TimeUtils.get_current_datetime()
-
-    def get_completion_summary(self, end_time: datetime) -> str:
+    def get_completion_summary(self) -> str:
         """Generate detailed completion summary"""
-        elapsed = (end_time - self.start_time).total_seconds()
+        elapsed = (get_current_datetime() - self.start_time).total_seconds()
 
         summary = [
-            f"Collection completed for {self.symbol}",
+            f"Collection completed",
             f"Type: {self.collector_type}",
             f"Duration: {elapsed:.1f}s",
-            f"Status: {self.status}"
+            f"Progress: {self.processed_tokens}/{self.total_tokens} tokens"
         ]
-
-        if self.items_total:
-            percentage = (self.items_processed / self.items_total) * 100
-            summary.append(
-                f"Progress: {percentage:.1f}% "
-                f"({self.items_processed}/{self.items_total} items)"
-            )
-
-        if self.error:
-            summary.append(f"Error: {self.error}")
 
         return " | ".join(summary)
 
     def __str__(self) -> str:
         """Human-readable progress representation"""
-        if self.items_total:
-            percentage = (self.items_processed / self.items_total) * 100
-            return (f"{self.collector_type} Progress: {percentage:.1f}% "
-                   f"({self.items_processed}/{self.items_total})")
-        return f"{self.collector_type} Progress: {self.status}"
+        percentage = (self.processed_tokens / self.total_tokens) * 100 if self.total_tokens > 0 else 0
+        status = [
+            f"{self.collector_type} Progress: {percentage:.1f}%",
+            f"{self.processed_tokens}/{self.total_tokens} tokens"
+        ]
+        if self.last_processed_token:
+            status.append(f"Last: {self.last_processed_token}")
+        return " | ".join(status)

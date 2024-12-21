@@ -1,5 +1,4 @@
 import asyncio
-from typing import Dict, Set
 
 from .collectors import FundamentalCollector, MetadataCollector, MarketMetricsCollector, SentimentMetricsCollector
 from shared.clients.coingecko import CoinGeckoAdapter
@@ -7,14 +6,12 @@ from shared.clients.registry import ExchangeAdapterRegistry
 from shared.core.config import FundamentalDataConfig
 from shared.core.enums import ServiceStatus
 from shared.core.exceptions import ServiceError
-from shared.core.models import SymbolModel
 from shared.core.protocols import Service
 from shared.database.repositories import MarketMetricsRepository, MetadataRepository, SentimentRepository
-from shared.messaging.schemas import MessageType, SymbolMessage
-from shared.messaging.broker import MessageBroker
 from shared.utils.logger import LoggerSetup
 from shared.utils.error import ErrorTracker
-import shared.utils.time as TimeUtils
+from shared.utils.time import get_current_timestamp
+
 
 
 class FundamentalDataService(Service):
@@ -31,7 +28,6 @@ class FundamentalDataService(Service):
                  sentiment_repository: SentimentRepository,
                  exchange_registry: ExchangeAdapterRegistry,
                  coingecko_adapter: CoinGeckoAdapter,
-                 message_broker: MessageBroker,
                  config: FundamentalDataConfig):
         """
         Initialize the FundamentalDataService.
@@ -50,12 +46,11 @@ class FundamentalDataService(Service):
         self.market_metrics_repository = market_metrics_repository
         self.sentiment_repository = sentiment_repository
         self.coingecko_adapter = coingecko_adapter
-        self.message_broker = message_broker
 
         # Service state
         self._status: ServiceStatus = ServiceStatus.STOPPED
-        self._active_tokens: Set[str] = set()
-        self._start_time = TimeUtils.get_current_timestamp()
+        self._active_tokens: set[str] = set()
+        self._start_time = get_current_timestamp()
 
         # Error tracking
         self._error_tracker = ErrorTracker()
@@ -63,10 +58,13 @@ class FundamentalDataService(Service):
 
         # Collection management
         self._collection_lock = asyncio.Lock()
-        self._processing: Set[SymbolModel] = set()
+        self._collector_tasks: dict[str, asyncio.Task] = {}
+        self._monitor_task: asyncio.Task | None = None
+        self._monitor_running = asyncio.Event()
+        self._symbol_check_interval = 3600  # 1 hour
 
         # Initialize collectors
-        self._collectors: Dict[str, FundamentalCollector] = {
+        self._collectors: dict[str, FundamentalCollector] = {
             'metadata': MetadataCollector(
                 self.metadata_repository,
                 self.coingecko_adapter,
@@ -77,101 +75,67 @@ class FundamentalDataService(Service):
                 self.coingecko_adapter,
                 config.collection_intervals['market']
             ),
-            'sentiment': SentimentMetricsCollector(
-                self.sentiment_repository,
-                self.metadata_repository,
-                config.sentiment,
-                config.collection_intervals['sentiment']
-            )
+            # 'sentiment': SentimentMetricsCollector(
+            #     self.sentiment_repository,
+            #     self.metadata_repository,
+            #     config.sentiment,
+            #     config.collection_intervals['sentiment']
+            # )
         }
 
         self.logger = LoggerSetup.setup(__class__.__name__)
 
-    async def _setup_message_handlers(self) -> None:
-        """Setup message handlers for market data events"""
-        await self.message_broker.subscribe(
-            MessageType.SYMBOL_ADDED,
-            self._handle_symbol_added
-        )
-        await self.message_broker.subscribe(
-            MessageType.SYMBOL_DELISTED,
-            self._handle_symbol_delisted
-        )
 
-    async def _handle_symbol_delisted(self, message: Dict) -> None:
-        """Handle symbol delisting"""
-        symbol = SymbolMessage(**message)
-        base_token = symbol.base_asset
+    async def _monitor_symbols(self) -> None:
+        """Monitor trading symbols across exchanges"""
+        try:
+            while self._monitor_running.is_set():
+                async with self._collection_lock:
+                    # Get currently available tokens across all exchanges
+                    current_tokens = set()
+                    for exchange in self.exchange_registry.get_registered():
+                        adapter = self.exchange_registry.get_adapter(exchange)
+                        symbols = await adapter.get_symbols()
+                        current_tokens.update({symbol.token_name for symbol in symbols})
 
-        # Check if token is still traded on other exchanges
-        still_active = False
-        for exchange in self.exchange_registry.get_registered():
-            adapter = self.exchange_registry.get_adapter(exchange)
-            symbols = await adapter.get_symbols()
-            if any(s.token_name == base_token for s in symbols):
-                still_active = True
-                break
+                    # Detect new and delisted tokens
+                    new_tokens = current_tokens - self._active_tokens
+                    delisted_tokens = self._active_tokens - current_tokens
 
-        if not still_active:
-            async with self._collection_lock:
-                self._active_tokens.discard(base_token)
-                for collector in self._collectors.values():
-                    await collector.delete_symbol_data(base_token)
-                self.logger.info(f"Stopped tracking {base_token} - no longer traded")
+                    if new_tokens:
+                        self.logger.info(f"New tokens: {new_tokens}")
+                        self._active_tokens.update(new_tokens)
+                        # Add new tokens to all collectors
+                        for name, collector in self._collectors.items():
+                            await collector.add_tokens(new_tokens)
+                            if not collector._running and name not in self._collector_tasks:
+                                self._collector_tasks[name] = asyncio.create_task(collector.run())
 
-    async def _handle_symbol_added(self, message: Dict) -> None:
-        """
-        Handle new symbol addition.
-        Only schedule collection if we're not already tracking this token.
-        """
-        symbol = SymbolMessage(**message)
-        base_token = symbol.base_asset
+                    if delisted_tokens:
+                        self.logger.info(f"Delisted tokens: {delisted_tokens}")
+                        self._active_tokens.difference_update(delisted_tokens)
+                        # Remove delisted tokens from all collectors
+                        for collector in self._collectors.values():
+                            await collector.remove_tokens(delisted_tokens)
 
-        if base_token not in self._active_tokens:
-            async with self._collection_lock:
-                self._active_tokens.add(base_token)
+                await asyncio.sleep(self._symbol_check_interval)
 
-                # Schedule collection for new token
-                for collector in self._collectors.values():
-                    await collector.schedule_collection({base_token})
+        except asyncio.CancelledError:
+            self.logger.info("Symbol monitoring cancelled")
+            raise
 
-                self.logger.info(f"Started fundamental data tracking for new token: {base_token}")
-
-    async def _collect_active_symbols(self) -> None:
-        """Initial collection of unique base tokens from all exchanges"""
-        unique_tokens: Set[str] = set()
-
-        for exchange in self.exchange_registry.get_registered():
-            adapter = self.exchange_registry.get_adapter(exchange)
-            symbols = await adapter.get_symbols()
-
-            # Extract unique base tokens and keep one symbol instance
-            for symbol in symbols:
-                base_token = symbol.token_name
-                unique_tokens.add(base_token)
-
-        async with self._collection_lock:
-            self._active_tokens.update(unique_tokens)
-
-        self.logger.info(f"Collecting fundamental data for {len(unique_tokens)} unique tokens")
-
-        for collector in self._collectors.values():
-            await collector.schedule_collection(unique_tokens)
+        except Exception as e:
+            self.logger.error(f"Error in symbol monitoring cycle: {e}")
 
     async def start(self) -> None:
         """Start the service"""
         try:
             self._status = ServiceStatus.STARTING
-            self._start_time = TimeUtils.get_current_timestamp()
+            self._start_time = get_current_timestamp()
 
-            # Connect to the message broker
-            await self.message_broker.connect()
-
-            # Setup message handlers
-            await self._setup_message_handlers()
-
-            # Initial collection of all active symbols
-            await self._collect_active_symbols()
+            # Start monitoring
+            self._monitor_running.set()
+            self._monitor_task = asyncio.create_task(self._monitor_symbols())
 
             self._status = ServiceStatus.RUNNING
             self.logger.info("Fundamental data service started successfully")
@@ -182,17 +146,37 @@ class FundamentalDataService(Service):
             self.logger.error(f"Failed to start fundamental data service: {e}")
             raise ServiceError(f"Service start failed: {str(e)}")
 
+
     async def stop(self) -> None:
         """Stop the service"""
         try:
             self._status = ServiceStatus.STOPPING
+            self._monitor_running.clear()
+
+            # Stop monitor task
+            if self._monitor_task:
+                self._monitor_task.cancel()
+                try:
+                    await self._monitor_task
+                except asyncio.CancelledError:
+                    pass
+                self._monitor_task = None
 
             # Stop collectors
             for collector in self._collectors.values():
                 await collector.cleanup()
 
-            # Close message broker connection
-            await self.message_broker.close()
+            # Cancel collector tasks
+            for name, task in self._collector_tasks.items():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            self._collector_tasks.clear()
+
+            # Clear state
+            self._active_tokens.clear()
 
             self._status = ServiceStatus.STOPPED
             self.logger.info("Fundamental data service stopped successfully")
@@ -201,6 +185,7 @@ class FundamentalDataService(Service):
             self._status = ServiceStatus.ERROR
             self.logger.error(f"Error stopping fundamental data service: {e}")
             raise ServiceError(f"Service stop failed: {str(e)}")
+
 
     def get_service_status(self) -> str:
         """

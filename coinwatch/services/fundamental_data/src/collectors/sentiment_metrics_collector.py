@@ -1,6 +1,5 @@
-# src/services/fundamental_data/sentiment_metrics_collector.py
-
 from decimal import Decimal
+from typing import AsyncGenerator
 from textblob import TextBlob
 
 from .collector import FundamentalCollector
@@ -8,10 +7,11 @@ from shared.clients.sentiment import RedditAdapter, TelegramAdapter, TwitterAdap
 from shared.core.config import SentimentConfig
 from shared.core.enums import DataSource
 from shared.core.exceptions import ServiceError
-from shared.core.models import SentimentMetrics, Metadata, SymbolModel
+from shared.core.models import SentimentMetricsModel, MetadataModel
 from shared.database.repositories import MetadataRepository, SentimentRepository
 from shared.utils.logger import LoggerSetup
-import shared.utils.time as TimeUtils
+from shared.utils.time import get_current_datetime
+
 
 
 class SentimentMetricsCollector(FundamentalCollector):
@@ -28,7 +28,7 @@ class SentimentMetricsCollector(FundamentalCollector):
                  sentiment_repository: SentimentRepository,
                  metadata_repository: MetadataRepository,
                  sentiment_config: SentimentConfig,
-                 collection_interval: int = 3600  # Default 1 hour
+                 collection_interval: int
                 ):
         """
         Initialize the SentimentMetricsCollector.
@@ -50,6 +50,7 @@ class SentimentMetricsCollector(FundamentalCollector):
 
         self.logger = LoggerSetup.setup(__class__.__name__)
 
+
     @property
     def collector_type(self) -> str:
         """
@@ -59,6 +60,7 @@ class SentimentMetricsCollector(FundamentalCollector):
             str: The collector type ("sentiment_metrics").
         """
         return "sentiment_metrics"
+
 
     def _analyze_sentiment(self, texts: list[str]) -> Decimal | None:
         """
@@ -83,7 +85,8 @@ class SentimentMetricsCollector(FundamentalCollector):
 
         return Decimal(str(sum(sentiment_scores) / len(sentiment_scores)))
 
-    async def collect_symbol_data(self, tokens: list[SymbolModel]) -> list[SentimentMetrics]:
+
+    async def fetch_token_data(self, tokens: set[str]) -> AsyncGenerator[SentimentMetricsModel, None]:
         """
         Collect sentiment metrics for multiple tokens across social media platforms.
 
@@ -94,7 +97,7 @@ class SentimentMetricsCollector(FundamentalCollector):
         4. Combines all metrics into a SentimentMetrics object
 
         Args:
-            tokens (List[SymbolModel]): List of tokens to collect sentiment data for.
+            tokens (Set[str]): Set of tokens to collect sentiment data for.
 
         Returns:
             List[SentimentMetrics]: List of collected sentiment metrics for each token.
@@ -104,15 +107,8 @@ class SentimentMetricsCollector(FundamentalCollector):
         """
         try:
             # Get metadata for all tokens to access social media links
-            metadata_list: list[Metadata] = []
-            for token in tokens:
-                if metadata := await self.metadata_repository.get_metadata(token):
-                    metadata_list.append(metadata)
+            metadata_list: list[MetadataModel] = await self.metadata_repository.get_metadata(tokens)
 
-            if not metadata_list:
-                return []
-
-            metrics = []
             for metadata in metadata_list:
                 # Collect metrics from each platform
                 twitter_metrics = await self._collect_twitter_metrics(metadata) if metadata.twitter else None
@@ -153,7 +149,7 @@ class SentimentMetricsCollector(FundamentalCollector):
                     if engagement_scores else Decimal('0')
                 )
 
-                metrics.append(SentimentMetrics(
+                yield SentimentMetricsModel(
                     id=metadata.id,
                     symbol=metadata.symbol,
                     # Twitter metrics
@@ -176,17 +172,16 @@ class SentimentMetricsCollector(FundamentalCollector):
                     # Aggregated metrics
                     overall_sentiment_score=overall_sentiment,
                     social_score=social_score,
-                    updated_at=TimeUtils.get_current_timestamp(),
+                    updated_at=get_current_datetime(),
                     data_source=DataSource.INTERNAL
-                ))
-
-            return metrics
+                )
 
         except Exception as e:
             self.logger.error(f"Error collecting sentiment metrics: {e}")
             raise ServiceError(f"Sentiment metrics collection failed: {str(e)}")
 
-    async def _collect_twitter_metrics(self, metadata: Metadata) -> dict | None:
+
+    async def _collect_twitter_metrics(self, metadata: MetadataModel) -> dict | None:
         """
         Collect metrics from Twitter for a given token.
 
@@ -228,7 +223,8 @@ class SentimentMetricsCollector(FundamentalCollector):
             self.logger.error(f"Error collecting Twitter metrics: {e}")
             return None
 
-    async def _collect_reddit_metrics(self, metadata: Metadata) -> dict | None:
+
+    async def _collect_reddit_metrics(self, metadata: MetadataModel) -> dict | None:
         """
         Collect metrics from Reddit for a given token.
 
@@ -269,7 +265,8 @@ class SentimentMetricsCollector(FundamentalCollector):
             self.logger.error(f"Error collecting Reddit metrics: {e}")
             return None
 
-    async def _collect_telegram_metrics(self, metadata: Metadata) -> dict | None:
+
+    async def _collect_telegram_metrics(self, metadata: MetadataModel) -> dict | None:
         """
         Collect metrics from Telegram for a given token.
 
@@ -279,7 +276,7 @@ class SentimentMetricsCollector(FundamentalCollector):
         - Sentiment analysis of message content
 
         Args:
-            metadata (Metadata): Token metadata containing Telegram channel ID.
+            metadata (MetadataModel): Token metadata containing Telegram channel ID.
 
         Returns:
             Optional[Dict]: Dictionary of Telegram metrics or None if collection fails.
@@ -309,7 +306,21 @@ class SentimentMetricsCollector(FundamentalCollector):
             self.logger.error(f"Error collecting Telegram metrics: {e}")
             return None
 
-    async def store_symbol_data(self, data: list[SentimentMetrics]) -> None:
+
+    async def get_token_data(self, tokens: set[str]) -> list[SentimentMetricsModel]:
+        """
+        Get existing sentiment metrics for tokens stored in the database.
+
+        Args:
+            token (Set[str]): Set of tokens to get data for.
+
+        Returns:
+            List[SentimentMetricsModel]: Stored sentiment metrics for the tokens.
+        """
+        return await self.sentiment_repository.get_sentiment_metrics(tokens)
+
+
+    async def store_token_data(self, data: list[SentimentMetricsModel]) -> None:
         """
         Store collected sentiment metrics for multiple tokens.
 
@@ -318,15 +329,12 @@ class SentimentMetricsCollector(FundamentalCollector):
         """
         await self.sentiment_repository.upsert_sentiment_metrics(data)
 
-    async def delete_symbol_data(self, token: str) -> None:
+
+    async def delete_token_data(self, tokens: set[str]) -> None:
         """
-        Delete sentiment metrics for a specific token.
+        Delete sentiment metrics for multiple tokens.
 
         Args:
-            token (str): The token symbol for which to delete sentiment metrics.
+            tokens (set[str]): Set of tokens to delete sentiment metrics for.
         """
-        await self.sentiment_repository.delete_sentiment_metrics(token)
-
-    async def cleanup(self) -> None:
-        """Clean up resources"""
-        await super().cleanup()
+        await self.sentiment_repository.delete_sentiment_metrics(tokens)

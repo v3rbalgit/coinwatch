@@ -12,6 +12,7 @@ from shared.core.models import KlineModel, SymbolModel
 from shared.utils.logger import LoggerSetup
 from shared.utils.rate_limit import RateLimiter
 from .bybit_ws import BybitWebsocket
+from shared.utils.time import format_timestamp
 
 
 class BybitAdapter(ExchangeAdapter):
@@ -47,6 +48,7 @@ class BybitAdapter(ExchangeAdapter):
 
         self.logger = LoggerSetup.setup(__class__.__name__)
 
+
     async def _create_session(self) -> aiohttp.ClientSession:
         """Create new session with Bybit configuration"""
         return aiohttp.ClientSession(
@@ -54,6 +56,7 @@ class BybitAdapter(ExchangeAdapter):
             timeout=aiohttp.ClientTimeout(total=30),
             headers={'Content-Type': 'application/json'}
         )
+
 
     @retry(
         stop=stop_after_attempt(3),
@@ -112,6 +115,7 @@ class BybitAdapter(ExchangeAdapter):
 
             return data.get('result', {})
 
+
     async def get_symbols(self, symbol: str | None = None) -> list[SymbolModel]:
         """
         Get available trading pairs
@@ -134,37 +138,49 @@ class BybitAdapter(ExchangeAdapter):
                 params=params
             )
 
-            symbols: list[SymbolModel] = []
-            for item in data.get('list', []):
-                if (item.get('status') == 'Trading' and 'USDT' in item.get('symbol', '')):
-                    symbols.append(SymbolModel(
-                        name=item['symbol'],
-                        exchange='bybit',
-                        base_asset=item['baseCoin'],
-                        quote_asset=item['quoteCoin'],
-                        price_scale=int(item['priceScale']),
-                        tick_size=item['priceFilter']['tickSize'],
-                        qty_step=item['lotSizeFilter']['qtyStep'],
-                        max_qty=item['lotSizeFilter']['maxOrderQty'],
-                        min_notional=item['lotSizeFilter']['minNotionalValue'],
-                        max_leverage=item['leverageFilter']['maxLeverage'],
-                        funding_interval=item['fundingInterval'],
-                        launch_time=int(item.get('launchTime', '0'))
-                    ))
+            # Group symbols, using sort priority to prefer USDT over USDC (USDC indicates LinearPerps)
+            symbol_groups = {
+                item['baseCoin']: item
+                for item in sorted(
+                    [i for i in data.get('list', [])
+                    if i.get('status') == 'Trading' and
+                    i.get('quoteCoin') in {'USDT', 'USDC'}],
+                    key=lambda x: x['quoteCoin'] != 'USDT'  # USDT first, then USDC
+                )
+            }
 
-            self.logger.debug(f"Fetched {len(symbols)} active USDT pairs")
+            symbols = [
+                SymbolModel(
+                    name=item['symbol'],
+                    exchange='bybit',
+                    base_asset=item['baseCoin'],
+                    quote_asset=item['quoteCoin'],
+                    price_scale=int(item['priceScale']),
+                    tick_size=item['priceFilter']['tickSize'],
+                    qty_step=item['lotSizeFilter']['qtyStep'],
+                    max_qty=item['lotSizeFilter']['maxOrderQty'],
+                    min_notional=item['lotSizeFilter']['minNotionalValue'],
+                    max_leverage=item['leverageFilter']['maxLeverage'],
+                    funding_interval=item['fundingInterval'],
+                    launch_time=int(item.get('launchTime', '0'))
+                )
+                for item in symbol_groups.values()
+            ]
+
+            self.logger.debug(f"Fetched {len(symbols)} active trading pairs")
             return symbols
 
         except Exception as e:
             self.logger.error(f"Failed to fetch symbols: {str(e)}")
             raise
 
+
     async def get_klines(self,
                         symbol: SymbolModel,
                         interval: Interval,
                         start_time: int,
                         end_time: int,
-                        limit: int | None = None) -> AsyncGenerator[list[KlineModel], None]:
+                        limit: int | None = None) -> AsyncGenerator[tuple[list[KlineModel], int], None]:
         """
         Get kline (candlestick) data
 
@@ -187,13 +203,10 @@ class BybitAdapter(ExchangeAdapter):
             }
 
             current_start = start_time
-            chunk_size_ms = params['limit'] * interval.to_milliseconds()
 
             while current_start < end_time:
-                current_end = min(current_start + chunk_size_ms, end_time)
-
+                # Only set the start parameter, let the API determine the end
                 params['start'] = current_start
-                params['end'] = current_end
 
                 data = await self._request(
                     'GET',
@@ -201,28 +214,38 @@ class BybitAdapter(ExchangeAdapter):
                     params=params
                 )
 
-                # Process klines in ascending order
-                klines = [KlineModel.from_raw_data(
-                    timestamp=int(item[0]),
-                    open_price=item[1],
-                    high_price=item[2],
-                    low_price=item[3],
-                    close_price=item[4],
-                    volume=item[5],
-                    turnover=item[6],
-                    interval=interval
-                ) for item in reversed(data.get('list', []))]
+                # Process and filter klines in ascending order
+                klines = [
+                    KlineModel.from_raw_data(item, interval)
+                    for item in reversed(data.get('list', []))
+                    if int(item[0]) <= end_time
+                ]
 
-                self.logger.debug(f"Fetched {len(klines)} klines for {str(symbol)} in time range "
-                             f"{klines[0].start_time} - {klines[-1].start_time}")
+                if not klines:
+                    break
 
-                yield klines
+                # Calculate the gap in number of intervals
+                start_gap = (klines[0].timestamp - current_start) // interval.to_milliseconds()
+                if start_gap > 0:
+                    self.logger.debug(
+                        f"Gap detected for {str(symbol)}: "
+                        f"Requested start: {format_timestamp(current_start)}, "
+                        f"First available: {format_timestamp(klines[0].timestamp)}, "
+                        f"Missing intervals: {start_gap}"
+                    )
 
-                current_start = current_end
+                self.logger.debug(f"Fetched {len(klines)} klines for {str(symbol)} "
+                                f"{klines[0].start_time} - {klines[-1].start_time}")
+
+                yield klines, start_gap
+
+                # Set next start time based on the last kline received
+                current_start = klines[-1].timestamp + interval.to_milliseconds()
 
         except Exception as e:
             self.logger.error(f"Failed to fetch klines for {symbol}: {e}")
             raise
+
 
     async def subscribe_klines(self,
                              symbol: SymbolModel,
@@ -231,11 +254,13 @@ class BybitAdapter(ExchangeAdapter):
         """Subscribe to real-time kline updates via websocket client"""
         await self._ws_client.subscribe_klines(symbol, interval, handler)
 
+
     async def unsubscribe_klines(self,
                                 symbol: SymbolModel,
                                 interval: Interval) -> None:
         """Unsubscribe from kline updates via websocket client"""
         await self._ws_client.unsubscribe_klines(symbol, interval)
+
 
     async def cleanup(self) -> None:
         """Cleanup resources"""

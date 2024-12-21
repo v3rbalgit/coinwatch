@@ -5,7 +5,7 @@ from shared.database.connection import DatabaseConnection, IsolationLevel
 from shared.database.models import Symbol
 from shared.core.exceptions import RepositoryError
 from shared.utils.logger import LoggerSetup
-import shared.utils.time as TimeUtils
+from shared.utils.time import from_timestamp
 
 
 class SymbolRepository:
@@ -93,7 +93,7 @@ class SymbolRepository:
 
                 self.logger.debug(
                     f"Created new symbol {symbol.name} for {symbol.exchange} "
-                    f"with launch time {TimeUtils.from_timestamp(symbol.launch_time).strftime("%d-%m-%Y %H:%M:%S")}"
+                    f"with launch time {from_timestamp(symbol.launch_time).strftime("%d-%m-%Y %H:%M:%S")}"
                 )
                 return True
 
