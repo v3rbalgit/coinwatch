@@ -117,9 +117,14 @@ class MonitoringService(Service):
             self.prometheus_metrics.market_total_candles.labels(symbol=symbol).set(progress.get("total_candles", 0))
 
         # Update error metrics
-        error_metrics = metrics.get("errors", {})
-        for error_type, count in error_metrics.get("by_type", {}).items():
-            self.prometheus_metrics.market_errors.labels(type=error_type).inc(count)
+        error_count = metrics.get('error_count', 0)
+        if error_count > 0:
+            self.prometheus_metrics.service_error_rate.labels(
+                service='market_data',
+                endpoint='metrics',
+                error_type='collection'
+            ).inc(error_count)
+
 
     async def _collect_fundamental_metrics(self) -> None:
         """Collect fundamental data service metrics"""
@@ -162,10 +167,13 @@ class MonitoringService(Service):
                 ).set(progress.get("total_tokens", 0))
 
         # Update error metrics
-        for error_type, count in metrics.get("errors", {}).get("by_type", {}).items():
-            self.prometheus_metrics.fundamental_errors.labels(
-                type=error_type
-            ).inc(count)
+        error_count = metrics.get('error_count', 0)
+        if error_count > 0:
+            self.prometheus_metrics.service_error_rate.labels(
+                service='fundamental_data',
+                endpoint='metrics',
+                error_type='collection'
+            ).inc(error_count)
 
 
     async def _collect_metrics_loop(self) -> None:
@@ -184,6 +192,23 @@ class MonitoringService(Service):
                 self.prometheus_metrics.system_network_rx.set(system["network_rx_mb"])
                 self.prometheus_metrics.system_network_tx.set(system["network_tx_mb"])
                 self.prometheus_metrics.system_process_count.set(system["process_count"])
+
+                # Update service status and error metrics
+                for service_name, service_metrics in metrics.items():
+                    # Update service status
+                    status = service_metrics.get('status', ServiceStatus.UNKNOWN)
+                    self.prometheus_metrics.service_up.labels(
+                        service=service_name,
+                        status=status.value
+                    ).set(1 if status == ServiceStatus.RUNNING else 0)
+
+                    # Update error counts
+                    error_count = service_metrics.get('error_count', 0)
+                    if error_count > 0:
+                        self.prometheus_metrics.error_count.labels(
+                            service=service_name,
+                            severity='error'
+                        ).inc(error_count)
 
                 # Collect service-specific metrics
                 await self._collect_service_metrics("market_data")
@@ -249,6 +274,10 @@ class MonitoringService(Service):
             ])
             for service, count in errors.items():
                 if count > 0:
-                    status_lines.append(f"  {service}: {count} errors")
+                    metrics = self.metrics_collector.get_service_metrics(service)
+                    error_msg = metrics.get('error', 'Unknown error')
+                    last_error = metrics.get('last_error', '')
+                    error_detail = last_error if last_error else error_msg
+                    status_lines.append(f"  {service}: {count} errors (Last error: {error_detail})")
 
         return "\n".join(status_lines)

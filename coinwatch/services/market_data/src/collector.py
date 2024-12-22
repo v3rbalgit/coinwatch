@@ -14,7 +14,7 @@ from shared.utils.time import align_time_range, get_current_timestamp, format_ti
 
 
 
-class DataCollector:
+class KlineCollector:
     """
     Handles market data collection and real-time streaming.
 
@@ -308,7 +308,7 @@ class DataCollector:
 
     async def cleanup(self) -> None:
         """Cleanup resources"""
-        self.logger.info("Cleaning up DataCollector")
+        self.logger.info("Cleaning up KlineCollector")
 
         try:
             # Stop all streaming
@@ -322,7 +322,7 @@ class DataCollector:
 
             self._streaming_symbols.clear()
             self._collection_symbols.clear()
-            self.logger.info("DataCollector cleanup completed")
+            self.logger.info("KlineCollector cleanup completed")
 
         except Exception as e:
             self.logger.error(f"Error during cleanup: {e}")

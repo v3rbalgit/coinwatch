@@ -8,8 +8,7 @@ from shared.core.exceptions import ServiceError
 from shared.core.protocols import Service
 from shared.database.repositories import KlineRepository, SymbolRepository
 from shared.utils.logger import LoggerSetup
-from shared.utils.error import ErrorTracker
-from .collector import DataCollector
+from .collector import KlineCollector
 from shared.utils.time import get_current_timestamp
 
 
@@ -39,7 +38,7 @@ class MarketDataService(Service):
         self._retention_days = config.retention_days
 
         # Core components
-        self.data_collector = DataCollector(
+        self.kline_collector = KlineCollector(
             adapter_registry=exchange_registry,
             symbol_repository=symbol_repository,
             kline_repository=kline_repository,
@@ -62,9 +61,6 @@ class MarketDataService(Service):
         # Task management
         self._monitor_task: asyncio.Task | None = None
         self._monitor_running = asyncio.Event()
-
-        # Error tracking and retry strategy
-        self._error_tracker = ErrorTracker()
 
         self.logger = LoggerSetup.setup(__class__.__name__)
 
@@ -107,7 +103,7 @@ class MarketDataService(Service):
                 self._monitor_task = None
 
             # Cleanup components
-            await self.data_collector.cleanup()
+            await self.kline_collector.cleanup()
 
             # Clear service state
             self._active_symbols.clear()
@@ -134,7 +130,7 @@ class MarketDataService(Service):
 
             timestamp_range = await self.kline_repository.get_timestamp_range(symbol)
 
-            await self.data_collector.collect(
+            await self.kline_collector.collect(
                 symbol=symbol,
                 start_time=timestamp_range[1] if timestamp_range else symbol.launch_time,
                 end_time=get_current_timestamp()
@@ -175,7 +171,7 @@ class MarketDataService(Service):
                         for symbol in delisted:
                             self.logger.info(f"Delisted symbols: {len(delisted)}")
                             self._active_symbols.remove(symbol)
-                            await self.data_collector.delist(symbol)
+                            await self.kline_collector.delist(symbol)
 
                     await asyncio.sleep(self._symbol_check_interval)
 
@@ -185,6 +181,7 @@ class MarketDataService(Service):
 
         except Exception as e:
             self.logger.error(f"Error in symbol monitoring cycle: {e}")
+            self._last_error = e
 
 
     def get_service_status(self) -> str:
@@ -195,16 +192,9 @@ class MarketDataService(Service):
             f"Active Symbols: {len(self._active_symbols)}",
             "",
             "Collection Status:",
-            self.data_collector.get_collection_status()
+            self.kline_collector.get_collection_status(),
+            "Recent Error:",
+            f"{type(self._last_error).__name__} {str(self._last_error)}"
         ]
-
-        error_summary = self._error_tracker.get_error_summary(window_minutes=60)
-        if error_summary:
-            status_lines.extend([
-                "",
-                "Recent Errors:"
-            ])
-            for error_type, count in error_summary.items():
-                status_lines.append(f"  {error_type}: {count} in last hour")
 
         return "\n".join(status_lines)

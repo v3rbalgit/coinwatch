@@ -9,7 +9,6 @@ from shared.core.exceptions import ServiceError
 from shared.core.protocols import Service
 from shared.database.repositories import MarketMetricsRepository, MetadataRepository, SentimentRepository
 from shared.utils.logger import LoggerSetup
-from shared.utils.error import ErrorTracker
 from shared.utils.time import get_current_timestamp
 
 
@@ -51,9 +50,6 @@ class FundamentalDataService(Service):
         self._status: ServiceStatus = ServiceStatus.STOPPED
         self._active_tokens: set[str] = set()
         self._start_time = get_current_timestamp()
-
-        # Error tracking
-        self._error_tracker = ErrorTracker()
         self._last_error: Exception | None = None
 
         # Collection management
@@ -126,6 +122,7 @@ class FundamentalDataService(Service):
 
         except Exception as e:
             self.logger.error(f"Error in symbol monitoring cycle: {e}")
+            self._last_error = e
 
     async def start(self) -> None:
         """Start the service"""
@@ -186,7 +183,8 @@ class FundamentalDataService(Service):
 
         except Exception as e:
             self._status = ServiceStatus.ERROR
-            self.logger.error(f"Error stopping fundamental data service: {e}")
+            self._last_error = e
+            self.logger.error(f"Error during service shutdown: {e}")
             raise ServiceError(f"Service stop failed: {str(e)}")
 
 
@@ -207,5 +205,8 @@ class FundamentalDataService(Service):
         for name, collector in self._collectors.items():
             status_lines.append(f"\n{name.title()} Collector:")
             status_lines.append(collector.get_collection_status())
+
+        status_lines.extend(["Recent Error:",
+            f"{type(self._last_error).__name__} {str(self._last_error)}"])
 
         return "\n".join(status_lines)

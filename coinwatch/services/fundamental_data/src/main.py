@@ -181,14 +181,6 @@ async def get_metrics():
         if service._start_time is not None:
             uptime = (get_current_timestamp() - service._start_time) / 1000
 
-        # Get error metrics
-        recent_errors = service._error_tracker.get_recent_errors(60)
-        error_types = {
-            "metadata": len([e for e in recent_errors if "metadata" in str(e).lower()]),
-            "market": len([e for e in recent_errors if "market" in str(e).lower()]),
-            "warning": len([e for e in recent_errors if "warning" in str(e).lower()])
-        }
-
         # Get collector metrics
         collectors = {}
         for name, collector in service._collectors.items():
@@ -218,11 +210,6 @@ async def get_metrics():
                 "uptime_seconds": uptime,
                 "last_error": str(service._last_error) if service._last_error else None,
                 "active_tokens": len(service._active_tokens)
-            },
-            # Error metrics
-            "errors": {
-                "total": len(recent_errors),
-                "by_type": error_types
             },
             # Collector metrics
             "collectors": collectors

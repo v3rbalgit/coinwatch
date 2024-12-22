@@ -334,18 +334,10 @@ async def get_metrics():
         if service._start_time is not None:
             uptime = (get_current_timestamp() - service._start_time) / 1000
 
-        # Get error metrics
-        recent_errors = service._error_tracker.get_recent_errors(60)
-        error_types = {
-            "collection": len([e for e in recent_errors if "collection" in str(e).lower()]),
-            "streaming": len([e for e in recent_errors if "streaming" in str(e).lower()]),
-            "warning": len([e for e in recent_errors if "warning" in str(e).lower()])
-        }
-
         # Get collection progress for active collections
         collection_progress = {}
-        for symbol in service.data_collector._collection_symbols:
-            if progress := service.data_collector._collection_progress.get(symbol):
+        for symbol in service.kline_collector._collection_symbols:
+            if progress := service.kline_collector._collection_progress.get(symbol):
                 collection_progress[symbol.name] = {
                     "processed_candles": progress.processed_candles,
                     "total_candles": progress.total_candles,
@@ -360,16 +352,11 @@ async def get_metrics():
                 "last_error": str(service._last_error) if service._last_error else None,
                 "batch_size": service._batch_size
             },
-            # Error metrics
-            "errors": {
-                "total": len(recent_errors),
-                "by_type": error_types
-            },
             # Collection metrics
             "collection": {
                 "active_symbols": len(service._active_symbols),
-                "active_collections": len(service.data_collector._collection_symbols),
-                "streaming_symbols": len(service.data_collector._streaming_symbols),
+                "active_collections": len(service.kline_collector._collection_symbols),
+                "streaming_symbols": len(service.kline_collector._streaming_symbols),
                 "progress": collection_progress
             }
         }

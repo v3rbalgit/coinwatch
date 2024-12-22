@@ -21,11 +21,12 @@ class MetricsCollector:
     """
 
     def __init__(self):
+        # Initialize metrics with error counts for each service
         self._metrics: dict[str, dict] = {
-            'system': {},
-            'market_data': {},
-            'fundamental_data': {},
-            'database': {}
+            'system': {'error_count': 0},
+            'market_data': {'error_count': 0},
+            'fundamental_data': {'error_count': 0},
+            'database': {'error_count': 0}
         }
         self._collection_lock = asyncio.Lock()
         self._session: aiohttp.ClientSession | None = None
@@ -82,6 +83,8 @@ class MetricsCollector:
             }
         except Exception as e:
             self.logger.error(f"Error collecting system metrics: {e}")
+            # Increment error count and return error state
+            self._metrics['system']['error_count'] += 1
             return {
                 'status': ServiceStatus.ERROR,
                 'timestamp': get_current_timestamp(),
@@ -94,7 +97,7 @@ class MetricsCollector:
                 'network_rx_mb': 0,
                 'network_tx_mb': 0,
                 'process_count': 0,
-                'error_count': 1
+                'error_count': self._metrics['system']['error_count']
             }
 
 
@@ -108,7 +111,6 @@ class MetricsCollector:
 
                     # Extract service metrics
                     service_metrics = metrics.get('service', {})
-                    error_metrics = metrics.get('errors', {})
                     collection_metrics = metrics.get('collection', {})
 
                     self._metrics['market_data'].update({
@@ -117,26 +119,33 @@ class MetricsCollector:
                         'uptime_seconds': service_metrics.get('uptime_seconds', 0),
                         'last_error': service_metrics.get('last_error'),
                         'batch_size': service_metrics.get('batch_size', 0),
-                        'errors': {
-                            'total': error_metrics.get('total', 0),
-                            'by_type': error_metrics.get('by_type', {})
-                        },
                         'collection': {
                             'active_symbols': collection_metrics.get('active_symbols', 0),
                             'active_collections': collection_metrics.get('active_collections', 0),
                             'streaming_symbols': collection_metrics.get('streaming_symbols', 0),
                             'progress': collection_metrics.get('progress', {})
-                        }
+                        },
+                        'error_count': 0  # Reset error count on successful collection
                     })
                 else:
                     self.logger.error(f"Market data metrics collection failed: {response.status}")
+                    self._metrics['market_data']['error_count'] += 1
+                    self._metrics['market_data'].update({
+                        'status': ServiceStatus.ERROR,
+                        'timestamp': get_current_timestamp(),
+                        'error': f"HTTP {response.status}",
+                        'error_count': self._metrics['market_data']['error_count']
+                    })
 
         except Exception as e:
             self.logger.error(f"Error collecting market data metrics: {e}")
+            # Increment error count and update metrics
+            self._metrics['market_data']['error_count'] += 1
             self._metrics['market_data'].update({
                 'status': ServiceStatus.ERROR,
                 'timestamp': get_current_timestamp(),
-                'error': str(e)
+                'error': str(e),
+                'error_count': self._metrics['market_data']['error_count']
             })
 
 
@@ -150,7 +159,6 @@ class MetricsCollector:
 
                     # Extract service metrics
                     service_metrics = metrics.get('service', {})
-                    error_metrics = metrics.get('errors', {})
                     collector_metrics = metrics.get('collectors', {})
 
                     self._metrics['fundamental_data'].update({
@@ -159,10 +167,6 @@ class MetricsCollector:
                         'uptime_seconds': service_metrics.get('uptime_seconds', 0),
                         'last_error': service_metrics.get('last_error'),
                         'active_tokens': service_metrics.get('active_tokens', 0),
-                        'errors': {
-                            'total': error_metrics.get('total', 0),
-                            'by_type': error_metrics.get('by_type', {})
-                        },
                         'collectors': {
                             name: {
                                 'running': data.get('running', False),
@@ -172,17 +176,28 @@ class MetricsCollector:
                                 'current_progress': data.get('current_progress')
                             }
                             for name, data in collector_metrics.items()
-                        }
+                        },
+                        'error_count': 0  # Reset error count on successful collection
                     })
                 else:
                     self.logger.error(f"Fundamental data metrics collection failed: {response.status}")
+                    self._metrics['fundamental_data']['error_count'] += 1
+                    self._metrics['fundamental_data'].update({
+                        'status': ServiceStatus.ERROR,
+                        'timestamp': get_current_timestamp(),
+                        'error': f"HTTP {response.status}",
+                        'error_count': self._metrics['fundamental_data']['error_count']
+                    })
 
         except Exception as e:
             self.logger.error(f"Error collecting fundamental data metrics: {e}")
+            # Increment error count and update metrics
+            self._metrics['fundamental_data']['error_count'] += 1
             self._metrics['fundamental_data'].update({
                 'status': ServiceStatus.ERROR,
                 'timestamp': get_current_timestamp(),
-                'error': str(e)
+                'error': str(e),
+                'error_count': self._metrics['fundamental_data']['error_count']
             })
 
 
@@ -228,17 +243,28 @@ class MetricsCollector:
                         'deadlocks': deadlocks,
                         'long_running_transactions': max_tx_duration,
                         'conflicts': conflicts,
-                        'temp_files': temp_files
+                        'temp_files': temp_files,
+                        'error_count': 0  # Reset error count on successful collection
                     })
                 else:
                     self.logger.error(f"Database metrics collection failed: {response.status}")
+                    self._metrics['database']['error_count'] += 1
+                    self._metrics['database'].update({
+                        'status': ServiceStatus.ERROR,
+                        'timestamp': get_current_timestamp(),
+                        'error': f"HTTP {response.status}",
+                        'error_count': self._metrics['database']['error_count']
+                    })
 
         except Exception as e:
             self.logger.error(f"Error collecting database metrics: {e}")
+            # Increment error count and update metrics
+            self._metrics['database']['error_count'] += 1
             self._metrics['database'].update({
                 'status': ServiceStatus.ERROR,
                 'timestamp': get_current_timestamp(),
-                'error': str(e)
+                'error': str(e),
+                'error_count': self._metrics['database']['error_count']
             })
 
 
