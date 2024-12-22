@@ -114,12 +114,23 @@ class FundamentalDataProgress:
     last_update: datetime | None = None
     last_processed_token: str | None = None
 
+    def update(self, symbol: str):
+        """Update progress"""
+        self.processed_tokens += 1
+        self.last_processed_token = symbol
+
+    def get_percentage(self) -> float:
+        """Calculate percentage of processed vs total tokens"""
+        return (self.processed_tokens / self.total_tokens) * 100 if self.total_tokens > 0 else 0
+
     def get_completion_summary(self) -> str:
         """Generate detailed completion summary"""
         elapsed = (get_current_datetime() - self.start_time).total_seconds()
+        percentage = self.get_percentage()
 
         summary = [
             f"Collection completed",
+            f"{percentage:.1f}%",
             f"Type: {self.collector_type}",
             f"Duration: {elapsed:.1f}s",
             f"Progress: {self.processed_tokens}/{self.total_tokens} tokens"
@@ -129,9 +140,9 @@ class FundamentalDataProgress:
 
     def __str__(self) -> str:
         """Human-readable progress representation"""
-        percentage = (self.processed_tokens / self.total_tokens) * 100 if self.total_tokens > 0 else 0
+        percentage = self.get_percentage()
         status = [
-            f"{self.collector_type} Progress: {percentage:.1f}%",
+            f"{self.collector_type} progress: {percentage:.1f}%",
             f"{self.processed_tokens}/{self.total_tokens} tokens"
         ]
         if self.last_processed_token:

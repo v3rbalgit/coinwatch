@@ -167,13 +167,13 @@ class MarketDataService(Service):
                         # Process new symbols in batches with limited concurrency
                         new_symbols = [s for s in symbols if s not in self._active_symbols]
                         if new_symbols:
-                            self.logger.info(f"New symbols: {new_symbols}")
+                            self.logger.info(f"New symbols: {len(new_symbols)}")
                             await self._process_symbols(new_symbols)
 
                         # Handle delisted symbols
                         delisted = self._active_symbols - set(symbols)
                         for symbol in delisted:
-                            self.logger.info(f"Delisted symbols: {delisted}")
+                            self.logger.info(f"Delisted symbols: {len(delisted)}")
                             self._active_symbols.remove(symbol)
                             await self.data_collector.delist(symbol)
 

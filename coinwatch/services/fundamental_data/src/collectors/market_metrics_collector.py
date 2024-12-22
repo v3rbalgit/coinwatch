@@ -50,25 +50,17 @@ class MarketMetricsCollector(FundamentalCollector):
         return "market_metrics"
 
 
-    async def fetch_token_data(self, tokens: set[str]) -> AsyncGenerator[MarketMetricsModel, None]:
+    async def fetch_token_data(self, tokens: set[str]) -> AsyncGenerator[MarketMetricsModel | None, None]:
         """Fetch market metrics from Coingecko API for multiple tokens"""
         # Get CoinGecko IDs for all tokens (using cached values)
         coin_ids = []
-        failed_tokens = set()
 
         for token in tokens:
-            try:
-                if coin_id := await self.coingecko.get_coin_id(token):
-                    coin_ids.append(coin_id)
-                else:
-                    failed_tokens.add(token)
-                    self.logger.warning(f"Could not find CoinGecko ID for token: {token}")
-            except Exception as e:
-                failed_tokens.add(token)
-                self.logger.warning(f"Error getting CoinGecko ID for token {token}: {str(e)}")
-
-        if failed_tokens:
-            self.logger.warning(f"Skipping tokens without CoinGecko IDs: {failed_tokens}")
+            if coin_id := await self.coingecko.get_coin_id(token):
+                coin_ids.append(coin_id)
+            else:
+                self.logger.warning(f"Could not find CoinGecko ID for token: {token}")
+                yield None
 
         try:
             # Process each market data item yielded by the adapter

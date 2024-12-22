@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import aioredis
+from redis.asyncio import Redis
 
 from shared.utils.logger import LoggerSetup
 from .middleware.rate_limit import rate_limit_middleware
@@ -13,7 +13,7 @@ logger = LoggerSetup.setup(__name__)
 
 # Shared instances
 registry = ServiceRegistry()
-redis: aioredis.Redis | None = None
+redis: Redis | None = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -22,9 +22,8 @@ async def lifespan(app: FastAPI):
 
     try:
         # Initialize Redis connection
-        redis = aioredis.from_url(
+        redis = Redis.from_url(
             "redis://redis:6379",
-            encoding="utf-8",
             decode_responses=True
         )
 

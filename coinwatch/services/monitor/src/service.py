@@ -63,6 +63,9 @@ class MonitoringService(Service):
             self._status = ServiceStatus.STOPPING
             self.logger.info("Stopping monitoring service")
 
+            # Clean up collector
+            await self.metrics_collector.cleanup()
+
             # Stop metrics collection
             self._running = False
             if self._collection_task:

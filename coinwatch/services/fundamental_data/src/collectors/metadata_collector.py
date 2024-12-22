@@ -51,13 +51,15 @@ class MetadataCollector(FundamentalCollector):
         return "metadata"
 
 
-    async def fetch_token_data(self, tokens: set[str]) -> AsyncGenerator[MetadataModel, None]:
+    async def fetch_token_data(self, tokens: set[str]) -> AsyncGenerator[MetadataModel | None, None]:
         """Fetch metadata from Coingecko API for multiple tokens"""
         try:
             for token in tokens:
                 # Get coin info (using cached coin_id)
                 coin_id = await self.coingecko.get_coin_id(token)
                 if not coin_id:
+                    self.logger.warning(f"Could not find CoinGecko ID for token: {token}")
+                    yield None
                     continue
 
                 coin_data = await self.coingecko.get_metadata(coin_id)
@@ -91,7 +93,7 @@ class MetadataCollector(FundamentalCollector):
                     launch_time=launch_time,
                     categories=coin_data.get("categories", []),
                     platforms=platforms,
-                    hashing_algorithm=coin_data.get("contract_address"),
+                    hashing_algorithm=coin_data.get("hashing_algorithm"),
                     website=coin_data.get("links", {}).get("homepage", [None])[0] if coin_data.get("links", {}).get("homepage") else None,
                     whitepaper=coin_data.get("links", {}).get("whitepaper"),
                     reddit=coin_data.get("links", {}).get("subreddit_url"),
