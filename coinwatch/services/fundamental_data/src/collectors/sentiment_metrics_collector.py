@@ -86,7 +86,7 @@ class SentimentMetricsCollector(FundamentalCollector):
         return Decimal(str(sum(sentiment_scores) / len(sentiment_scores)))
 
 
-    async def fetch_token_data(self, tokens: set[str]) -> AsyncGenerator[SentimentMetricsModel, None]:
+    async def fetch_token_data(self, tokens: set[str]) -> AsyncGenerator[SentimentMetricsModel | None, None]:
         """
         Collect sentiment metrics for multiple tokens across social media platforms.
 

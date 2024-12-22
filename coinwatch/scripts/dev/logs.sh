@@ -20,10 +20,6 @@ case $SERVICE in
         echo "Showing API Gateway logs..."
         docker-compose logs -f api
         ;;
-    "rabbit" | "rabbitmq")
-        echo "Showing RabbitMQ logs..."
-        docker-compose logs -f rabbitmq
-        ;;
     "db" | "postgres")
         echo "Showing PostgreSQL logs..."
         docker-compose logs -f postgres
@@ -39,7 +35,6 @@ case $SERVICE in
         echo "  - fundamental (Fundamental Data Service)"
         echo "  - monitor     (Monitor Service)"
         echo "  - api         (API Gateway)"
-        echo "  - rabbit      (RabbitMQ)"
         echo "  - db          (PostgreSQL)"
         echo "  - all         (All Services)"
         exit 1

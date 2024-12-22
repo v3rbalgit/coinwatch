@@ -186,22 +186,49 @@ class MetricsCollector:
             })
 
 
+    def _parse_prometheus_metrics(self, text: str) -> dict[str, float]:
+        """Parse Prometheus metrics format into a dictionary"""
+        metrics = {}
+        for line in text.split('\n'):
+            if line and not line.startswith('#'):
+                # Split on whitespace, handling potential labels
+                parts = line.split()
+                if len(parts) >= 2:
+                    # Extract metric name (removing labels if present)
+                    name = parts[0].split('{')[0]
+                    try:
+                        value = float(parts[-1])
+                        metrics[name] = value
+                    except ValueError:
+                        continue
+        return metrics
+
     async def _collect_database_metrics(self) -> None:
-        """Collect database metrics"""
+        """Collect database metrics from postgres-exporter"""
         try:
             session = await self._get_session()
-            async with session.get('http://timescaledb:9187/metrics') as response:
+            async with session.get('http://postgres-exporter:9187/metrics') as response:
                 if response.status == 200:
-                    metrics = await response.json()
+                    text = await response.text()
+                    metrics = self._parse_prometheus_metrics(text)
+
+                    # Extract relevant metrics with proper fallbacks
+                    active_connections = metrics.get('pg_stat_database_numbackends', 0)
+                    max_connections = metrics.get('pg_settings_max_connections', 100)
+                    deadlocks = metrics.get('pg_stat_database_deadlocks', 0)
+                    max_tx_duration = metrics.get('pg_stat_activity_max_tx_duration_seconds', 0)
+                    conflicts = metrics.get('pg_stat_database_conflicts', 0)
+                    temp_files = metrics.get('pg_stat_database_temp_files', 0)
 
                     self._metrics['database'].update({
                         'status': ServiceStatus.RUNNING,
                         'timestamp': get_current_timestamp(),
-                        'active_connections': metrics.get('pg_stat_activity_count', 0),
-                        'pool_usage': metrics.get('pg_stat_activity_count', 0) / 100,  # Convert to percentage
-                        'deadlocks': metrics.get('pg_stat_database_deadlocks', 0),
-                        'long_queries': metrics.get('pg_stat_activity_max_tx_duration', 0),
-                        'replication_lag': metrics.get('pg_stat_replication_lag', 0)
+                        'active_connections': active_connections,
+                        'connection_utilization': (active_connections / max_connections) if max_connections > 0 else 0,
+                        'deadlocks': deadlocks,
+                        'long_running_transactions': max_tx_duration,
+                        'conflicts': conflicts,
+                        'temp_files': temp_files
                     })
                 else:
                     self.logger.error(f"Database metrics collection failed: {response.status}")

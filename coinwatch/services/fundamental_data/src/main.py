@@ -95,7 +95,7 @@ app.add_middleware(
 )
 
 # Business endpoints
-@app.get("/tokens/metadata", response_model=list[MetadataModel])
+@app.get("/metadata", response_model=list[MetadataModel])
 async def get_tokens_metadata(
     symbols: list[str] = Query(..., description="List of token symbols to fetch metadata for")
 ):
@@ -111,7 +111,7 @@ async def get_tokens_metadata(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch metadata: {str(e)}")
 
-@app.get("/tokens/market", response_model=list[MarketMetricsModel])
+@app.get("/market", response_model=list[MarketMetricsModel])
 async def get_tokens_market_metrics(
     symbols: list[str] = Query(..., description="List of token symbols to fetch metadata for")
 ):
@@ -127,7 +127,7 @@ async def get_tokens_market_metrics(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch market metrics : {str(e)}")
 
-@app.get("/tokens/{symbol}/metadata", response_model=MetadataModel)
+@app.get("/{symbol}/metadata", response_model=MetadataModel)
 async def get_token_metadata(symbol: str):
     """Get metadata for a specific token"""
     if not service:
@@ -141,7 +141,7 @@ async def get_token_metadata(symbol: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch metadata: {str(e)}")
 
-@app.get("/tokens/{symbol}/market", response_model=MarketMetricsModel)
+@app.get("/{symbol}/market", response_model=MarketMetricsModel)
 async def get_token_market_metrics(symbol: str):
     """Get market metrics for a specific token"""
     if not service:
@@ -155,22 +155,6 @@ async def get_token_market_metrics(symbol: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch market metrics: {str(e)}")
 
-@app.exception_handler(Exception)
-async def global_exception_handler(request, exc):
-    """Global exception handler"""
-    return JSONResponse(
-        status_code=500,
-        content={"detail": f"Internal server error: {str(exc)}"}
-    )
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8002,
-        reload=bool(os.getenv("DEBUG", False))
-    )
 
 # Service endpoints
 @app.get("/health")
@@ -259,3 +243,22 @@ async def get_status():
             for name, collector in service._collectors.items()
         }
     }
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    """Global exception handler"""
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal server error: {str(exc)}"}
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8002,
+        reload=bool(os.getenv("DEBUG", False))
+    )
+
+

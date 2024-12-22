@@ -4,11 +4,7 @@ echo "Starting Coinwatch development environment..."
 
 # Start infrastructure services
 echo "Starting infrastructure services..."
-docker-compose up -d rabbitmq postgres
-
-# Wait for infrastructure
-echo "Waiting for RabbitMQ..."
-timeout 60s bash -c 'until nc -z localhost 5672; do sleep 1; done'
+docker-compose up -d postgres
 
 echo "Waiting for PostgreSQL..."
 timeout 60s bash -c 'until nc -z localhost 5432; do sleep 1; done'
@@ -45,4 +41,3 @@ echo "  - Market Data:      http://localhost:8001"
 echo "  - Fundamental Data: http://localhost:8002"
 echo "  - Monitor:         http://localhost:8003"
 echo "  - API Gateway:     http://localhost:8000"
-echo "  - RabbitMQ UI:     http://localhost:15672"

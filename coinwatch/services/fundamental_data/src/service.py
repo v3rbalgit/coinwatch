@@ -166,6 +166,9 @@ class FundamentalDataService(Service):
             for collector in self._collectors.values():
                 await collector.cleanup()
 
+            # Cleanup Coingecko adapter
+            await self.coingecko_adapter.cleanup()
+
             # Cancel collector tasks
             for name, task in self._collector_tasks.items():
                 task.cancel()

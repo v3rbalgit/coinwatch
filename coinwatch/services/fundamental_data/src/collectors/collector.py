@@ -45,7 +45,7 @@ class FundamentalCollector[T: (MarketMetricsModel, MetadataModel, SentimentMetri
         pass
 
     @abstractmethod
-    def fetch_token_data(self, tokens: set[str]) -> AsyncGenerator[T, None]:
+    def fetch_token_data(self, tokens: set[str]) -> AsyncGenerator[T | None, None]:
         """
         Fetch fundamental data for specific tokens from an API.
 
@@ -193,24 +193,21 @@ class FundamentalCollector[T: (MarketMetricsModel, MetadataModel, SentimentMetri
 
                 try:
                     async for data in self.fetch_token_data(tokens_to_collect):
-                        try:
-                            self._current_progress.processed_tokens += 1
-                            self._current_progress.last_processed_token = data.symbol
-                            self.logger.info(str(self._current_progress))
-                            self._last_collection[data.symbol] = current_time
-                            collected_data.append(data)
-                        except Exception as e:
-                            failed_tokens.add(data.symbol)
-                            self.logger.error(f"Error processing token {data.symbol}: {e}")
-                            continue
+                        if data:
+                            try:
+                                self._current_progress.update(data.symbol)
+                                self.logger.info(str(self._current_progress))
+                                collected_data.append(data)
+                                self._last_collection[data.symbol] = current_time
+                                await self.store_token_data([data])
+                            except Exception as e:
+                                failed_tokens.add(data.symbol)
+                                self.logger.error(f"Error processing token {data.symbol}: {e}")
+                                continue
+                        else:
+                            self.logger.info(f"Coin ID not found, skipping token...")
+                            self._current_progress.total_tokens -= 1
 
-                    # Store all successfully collected data in one batch
-                    if collected_data:
-                        try:
-                            await self.store_token_data(collected_data)
-                        except Exception as e:
-                            self.logger.error(f"Error storing collected data: {e}")
-                            # Don't raise here to allow cleanup to proceed
 
                 except Exception as e:
                     self.logger.error(f"Error during data collection: {e}")

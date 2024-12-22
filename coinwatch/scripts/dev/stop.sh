@@ -8,7 +8,7 @@ docker-compose stop api monitor fundamental_data market_data
 
 # Stop infrastructure services
 echo "Stopping infrastructure services..."
-docker-compose stop rabbitmq postgres
+docker-compose stop postgres
 
 # Optional cleanup (uncomment if needed)
 # echo "Cleaning up containers..."

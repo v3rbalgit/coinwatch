@@ -18,6 +18,9 @@ RUN grep -v "../../shared" requirements.txt > requirements_clean.txt && \
 # Runtime stage
 FROM python:3.12.8-slim
 
+# Install curl for health checks
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
 # Copy virtual environment from builder
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"

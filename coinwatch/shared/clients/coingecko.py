@@ -98,7 +98,7 @@ class CoinGeckoAdapter(APIAdapter):
             except aiohttp.ClientResponseError as e:
                 if e.status == 429:  # Rate limit exceeded
                     retry_after = int(response.headers.get('retry-after', 60))
-                    self.logger.warning(f"Rate limit exceeded, waiting {retry_after}s")
+                    self.logger.warning(f"CoinGecko API Rate limit exceeded, waiting {retry_after}s")
                     await asyncio.sleep(retry_after)
                     # Retry the request after waiting
                     return await self._request(method, endpoint, **kwargs)
@@ -122,27 +122,81 @@ class CoinGeckoAdapter(APIAdapter):
             return []
 
 
+    def _find_canonical_token(self, coins: list[dict], symbol: str) -> dict | None:
+        """
+        Find the canonical/official token from a list of coins with potentially matching symbols.
+
+        Args:
+            coins: List of coin dictionaries from CoinGecko API
+            symbol: Token symbol to match (e.g. 'btc', 'eth')
+
+        Returns:
+            The best matching coin dictionary or None if no matches found
+        """
+        # Find all coins matching the symbol
+        matching_coins = [
+            coin for coin in coins
+            if coin['symbol'].lower() == symbol.lower()
+        ]
+
+        if not matching_coins:
+            return None
+
+        if len(matching_coins) == 1:
+            return matching_coins[0]
+
+        # Multiple matches - score each token based on characteristics of official tokens
+        def score_token(coin: dict) -> tuple[int, int, int]:
+            # 1. ID complexity score (fewer special chars = higher score)
+            special_chars = sum(1 for c in coin['id'] if not c.isalnum())
+            id_score = 100 - special_chars - len(coin['id'])
+
+            # 2. Name match score (name matching symbol = higher score)
+            # e.g. for BTC, prefer "Bitcoin" over "Bitcoin Wrapped"
+            name_words = coin['name'].lower().split()
+            symbol_in_name = symbol.lower() in name_words
+            name_score = 100 if symbol_in_name else 50
+            name_score -= len(name_words)  # Prefer shorter names
+
+            # 3. ID match score (id matching symbol = higher score)
+            # e.g. for BTC, prefer "bitcoin" over "wrapped-bitcoin"
+            id_words = coin['id'].lower().split('-')
+            symbol_in_id = symbol.lower() in id_words
+            id_match_score = 100 if symbol_in_id else 50
+            id_match_score -= len(id_words)  # Prefer shorter IDs
+
+            return (id_match_score, name_score, id_score)
+
+        # Return the highest scoring coin
+        return max(matching_coins, key=score_token)
+
+
     async def get_coin_id(self, token: str) -> str | None:
-        """Get CoinGecko coin ID for a token"""
+        """
+        Get CoinGecko coin ID for a token, handling cases where multiple tokens
+        share the same symbol by identifying the canonical/official token.
+
+        Args:
+            token: Token symbol to look up (e.g. 'btc', 'eth')
+
+        Returns:
+            The canonical CoinGecko coin ID for the token, or None if not found
+        """
         try:
             coins = await self.get_coin_ids()
 
-            # Create a dictionary with lowercase tokens and their corresponding IDs
-            coin_map = {coin['symbol']: coin['id'] for coin in coins}
+            # Try to find canonical token with original symbol
+            best_match = self._find_canonical_token(coins, token)
+            if best_match:
+                return best_match['id']
 
-            # First try with original token
-            coin_id = coin_map.get(token)
-            if coin_id:
-                return coin_id
-
-            # If not found and token starts with numbers, try without the numeric prefix
-            if any(c.isdigit() for c in token):
-                # Strip leading numbers
-                stripped_token = ''.join(c for c in token if not c.isdigit())
-                coin_id = coin_map.get(stripped_token)
-                if coin_id:
-                    self.logger.info(f"Found coin ID for {token} by stripping numeric prefix -> {stripped_token}")
-                    return coin_id
+            # If not found and token starts with numbers, try without numeric prefix
+            if token[0].isdigit():
+                stripped_token = token.lstrip('0123456789')
+                best_match = self._find_canonical_token(coins, stripped_token)
+                if best_match:
+                    self.logger.info(f"Found coin ID for {token} by stripping leading numbers -> {stripped_token}")
+                    return best_match['id']
 
             return None
 

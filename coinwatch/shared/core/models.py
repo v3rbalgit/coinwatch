@@ -809,34 +809,57 @@ class MarketMetricsModel(BaseModel):
                 if abs(decimal_val) < Decimal('1e-10'):
                     return Decimal('0')
 
-                # Handle large numbers by rounding to millions if needed
-                if abs(decimal_val) > Decimal('1e12'):
-                    decimal_val = (decimal_val / Decimal('1000000')).quantize(Decimal('1')) * Decimal('1000000')
+                # Handle large numbers by checking max_digits
+                max_val = Decimal('9' * max_digits)
+                if abs(decimal_val) > max_val:
+                    decimal_val = max_val if decimal_val > 0 else -max_val
 
-                # Apply precision
+                # Apply precision while respecting max_digits
                 scale = Decimal('0.' + '0' * (precision - 1) + '1')
-                return decimal_val.quantize(scale, rounding=ROUND_HALF_UP)
+                decimal_val = decimal_val.quantize(scale, rounding=ROUND_HALF_UP)
+
+                # Ensure total digits don't exceed max_digits
+                str_val = str(abs(decimal_val))
+                whole_digits = str_val.find('.')
+                if whole_digits == -1:
+                    whole_digits = len(str_val)
+                if whole_digits > (max_digits - precision):
+                    # Adjust scale to fit within max_digits
+                    new_precision = max(0, max_digits - whole_digits)
+                    scale = Decimal('0.' + '0' * (new_precision - 1) + '1') if new_precision > 0 else Decimal('1')
+                    decimal_val = decimal_val.quantize(scale, rounding=ROUND_HALF_UP)
+
+                return decimal_val
 
             except (ValueError, InvalidOperation, TypeError, OverflowError) as e:
                 print(f"Warning: Could not convert value '{value}' ({type(value)}) to Decimal: {str(e)}")
                 return Decimal(default)
 
         def round_pct(value: Any, default: str = '0') -> Decimal:
-            """Round percentage values to 4 decimal places"""
-            return normalize_decimal(value, precision=4, max_digits=16, default=default)
+                """Round percentage values to 4 decimal places with maximum cap"""
+                # Cap percentage changes at ±999999.9999 (12 digits total)
+                MAX_PCT = Decimal('999999.9999')
+                result = normalize_decimal(value, precision=4, max_digits=16, default=default)
+                if result > MAX_PCT:
+                    return MAX_PCT
+                elif result < -MAX_PCT:
+                    return -MAX_PCT
+                return result
 
-        # Process price fields with appropriate constraints
+        # Process price fields (max_digits=20, decimal_places=10)
         def process_price(value: Any) -> Decimal:
             result = normalize_decimal(value, precision=10, max_digits=20, default='0.0000000001')
             return max(result, Decimal('0.0000000001'))  # Ensure minimum price
 
-        # Process supply fields with appropriate constraints
+        # Process supply fields (max_digits=30, decimal_places=8)
         def process_supply(value: Any) -> Decimal:
-            return normalize_decimal(value, precision=8, max_digits=20, default='0')
+            return normalize_decimal(value, precision=8, max_digits=30, default='0')
 
-        # Process market cap and volume fields
+        # Process market cap and volume fields (max_digits=30, decimal_places=2)
         def process_market_value(value: Any) -> Decimal:
             return normalize_decimal(value, precision=2, max_digits=30, default='0')
+
+        # Process percentage fields (max_digits=16, decimal_places=4)
 
         return cls(
             id=data.get('id', ''),

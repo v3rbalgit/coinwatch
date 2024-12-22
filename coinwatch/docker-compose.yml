@@ -6,10 +6,15 @@ services:
       POSTGRES_USER: coinwatch
       POSTGRES_PASSWORD: coinwatch
       POSTGRES_DB: coinwatch
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+      POSTGRES_SHARED_PRELOAD_LIBRARIES: "pg_stat_statements"
+      POSTGRES_MAX_CONNECTIONS: "100"
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./postgresql.conf:/etc/postgresql/postgresql.conf
+    command: postgres -c 'config_file=/etc/postgresql/postgresql.conf'
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U coinwatch"]
       interval: 10s
@@ -40,15 +45,49 @@ services:
       retries: 3
 
   # Monitoring services
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter
+    environment:
+      DATA_SOURCE_NAME: "postgresql://coinwatch:coinwatch@postgres:5432/coinwatch?sslmode=disable"
+    ports:
+      - "9187:9187"
+    volumes:
+      - type: bind
+        source: ./queries.yaml
+        target: /etc/postgres_exporter/queries.yaml
+        read_only: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   prometheus:
     image: prom/prometheus:latest
     ports:
       - "9090:9090"
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_config:/etc/prometheus
     depends_on:
       monitor:
         condition: service_started
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+
+  prometheus-config-init:
+    image: busybox
+    volumes:
+      - prometheus_config:/etc/prometheus
+    command: >
+      sh -c "echo 'global:
+        scrape_interval: 15s
+        evaluation_interval: 15s
+
+      scrape_configs:
+        - job_name: \"monitor\"
+          static_configs:
+            - targets: [\"monitor:8003\"]' > /etc/prometheus/prometheus.yml"
 
   grafana:
     image: grafana/grafana:latest
@@ -74,6 +113,11 @@ services:
       - "8001:8001"
     volumes:
       - ./logs/market_data:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   fundamental_data:
     build:
@@ -89,6 +133,11 @@ services:
       - "8002:8002"
     volumes:
       - ./logs/fundamental_data:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   monitor:
     build:
@@ -100,10 +149,19 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      market_data:
+        condition: service_started
+      fundamental_data:
+        condition: service_started
     ports:
       - "8003:8003"
     volumes:
       - ./logs/monitor:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   api:
     build:
@@ -123,7 +181,13 @@ services:
         condition: service_started
     ports:
       - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
 volumes:
   postgres_data:
   redis_data:
+  prometheus_config:

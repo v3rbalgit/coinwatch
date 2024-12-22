@@ -1,7 +1,7 @@
 import time
 from typing import Dict, Tuple
 from fastapi import Request, HTTPException
-import aioredis
+from redis.asyncio import Redis
 from shared.utils.logger import LoggerSetup
 
 
@@ -17,7 +17,7 @@ class RateLimiter:
     """
 
     def __init__(self, redis_url: str = "redis://redis:6379"):
-        self.redis = aioredis.from_url(redis_url)
+        self.redis = Redis.from_url(redis_url, decode_responses=True)
 
         # Default rate limits (requests per minute)
         self._rate_limits: Dict[str, int] = {
