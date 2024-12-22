@@ -128,12 +128,21 @@ class MarketDataService(Service):
             if not await self.symbol_repository.get_symbol(symbol):
                 await self.symbol_repository.create_symbol(symbol)
 
+            # Get timestamps of oldest and newest kline records of a symbol
             timestamp_range = await self.kline_repository.get_timestamp_range(symbol)
+
+            # Backfill if launch time is older than current time range
+            if timestamp_range:
+                start_time = symbol.launch_time if symbol.launch_time < timestamp_range[0] else timestamp_range[1]
+                end_time = timestamp_range[0] if symbol.launch_time < timestamp_range[0] else get_current_timestamp()
+            else:
+                start_time = symbol.launch_time
+                end_time = get_current_timestamp()
 
             await self.kline_collector.collect(
                 symbol=symbol,
-                start_time=timestamp_range[1] if timestamp_range else symbol.launch_time,
-                end_time=get_current_timestamp()
+                start_time=start_time,
+                end_time=end_time
             )
 
 
@@ -143,7 +152,6 @@ class MarketDataService(Service):
             batch = symbols[i:i + self._batch_size]
             tasks = [self._process_symbol(symbol) for symbol in batch]
 
-            # Process batch concurrently
             await asyncio.gather(*tasks, return_exceptions=True)
 
             # Add small delay between batches to prevent overwhelming
