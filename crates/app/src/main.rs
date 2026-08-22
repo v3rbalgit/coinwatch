@@ -211,7 +211,7 @@ fn analyze() -> Result<()> {
     // honest number — expect it to be far less flattering than the in-sample runs.
     let costs = CostModel {
         fee_frac: Decimal::new(5, 4),
-        slippage_coeff: Decimal::new(10, 4),
+        slippage_coeff: Decimal::new(5, 1),
         gas_usd: Decimal::new(50, 2),
     };
     let candidates = vec![
@@ -264,7 +264,7 @@ fn run_backtest(label: &str, rank_feature: &str, dataset: &[(Instrument, Vec<Bar
     };
     let costs = CostModel {
         fee_frac: Decimal::new(5, 4),        // 5 bps swap fee
-        slippage_coeff: Decimal::new(10, 4), // 10 bps slippage haircut
+        slippage_coeff: Decimal::new(5, 1), // linear price-impact coefficient
         gas_usd: Decimal::new(50, 2),        // $0.50 per position change
     };
     let backtester = Backtester::new(costs, WalkForward { train_bars: 60, test_bars: 30, embargo_bars: 3 });

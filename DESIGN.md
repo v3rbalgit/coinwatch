@@ -198,3 +198,9 @@ are retired.
   can't give: e.g. ETH/USDC on Arbitrum ~275 trades/buyer (bot-churned) vs VELVET ~6.5 (organic).
   `analyze` combines all three modules and surfaces on-chain columns in the leaderboard; on-chain
   backtests await accumulated history (currently ~5 days).
+- *Depth-aware slippage*: the backtester's slippage is now linear price impact scaled by trade
+  notional vs. the pool's daily volume (`coeff × notional × min(notional/volume, 0.5)`), replacing the
+  flat turnover haircut — small trades in deep pools cost ~nothing, large trades in thin pools cost
+  more. Unit-tested (a thinner pool provably ends poorer). Survivorship bias remains the outstanding
+  realism gap: the store only ever holds currently-liquid pools, so dead/rugged tokens are absent —
+  a true fix needs historical universe membership (paid backfill or forward-accumulated snapshots).

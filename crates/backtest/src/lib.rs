@@ -4,14 +4,15 @@
 //! 1. **No lookahead** — weights at bar `t` are decided from the feature
 //!    cross-section at `t` (which uses data through `t`), and earn the return
 //!    from `close[t]` to `close[t+1]`.
-//! 2. **Honest costs** — every rebalance pays proportional fees, a slippage
-//!    haircut, and flat per-trade gas. A cost-free backtest is a lie.
+//! 2. **Honest costs** — every rebalance pays proportional fees, **depth-aware
+//!    slippage** (linear price impact scaled by trade size vs. the pool's daily
+//!    volume), and flat per-trade gas. A cost-free backtest is a lie.
 //!
 //! Phase-1 scope: a single-pass daily backtest with equal-spacing rebalances at
 //! every feature timestamp. `WalkForward` is carried in config for the CV that
-//! activates once strategies gain fittable parameters. The slippage term is a
-//! linear haircut on turnover; modeling slippage against per-block pool liquidity
-//! is deferred (documented as a known simplification).
+//! activates once strategies gain fittable parameters. Slippage uses the daily bar
+//! `volume` as the liquidity proxy; per-block pool depth would be finer but needs
+//! richer data.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -31,7 +32,9 @@ pub struct CostModel {
     pub fee_frac: Decimal,
     /// Flat gas cost per changed position, in quote currency (USD).
     pub gas_usd: Decimal,
-    /// Linear slippage haircut applied per unit of turnover.
+    /// Linear price-impact coefficient. Per-trade slippage = `coeff × notional ×
+    /// participation`, where `participation = min(notional / pool_daily_volume, 0.5)`.
+    /// So small trades in deep pools cost ~nothing; large trades in thin pools cost more.
     pub slippage_coeff: Decimal,
 }
 
@@ -85,12 +88,16 @@ impl Backtester {
         bars: &[(Instrument, Vec<Bar>)],
         features: &FeatureFrame,
     ) -> Result<BacktestResult> {
-        // close lookup: pool -> (ts_millis -> close)
+        // per-pool lookups: close (for returns) and volume (for slippage depth)
         let mut closes: HashMap<String, HashMap<i64, Decimal>> = HashMap::new();
+        let mut volumes: HashMap<String, HashMap<i64, Decimal>> = HashMap::new();
         for (inst, series) in bars {
-            let m = closes.entry(inst.pool.0.clone()).or_default();
+            let c = closes.entry(inst.pool.0.clone()).or_default();
+            let v = volumes.entry(inst.pool.0.clone()).or_default();
             for b in series {
-                m.insert(b.ts.timestamp_millis(), b.close);
+                let ms = b.ts.timestamp_millis();
+                c.insert(ms, b.close);
+                v.insert(ms, b.volume);
             }
         }
 
@@ -139,36 +146,100 @@ impl Backtester {
                 }
             }
 
-            // turnover, gas, and per-trade ledger over the union of positions
-            let mut turnover = Decimal::ZERO;
-            let mut changed = 0i64;
+            // depth-aware costs + per-trade ledger over the union of positions
+            let max_participation = Decimal::new(5, 1); // cap notional/volume at 0.5
+            let mut total_cost = Decimal::ZERO;
             let pools: HashSet<&String> = new_weights.keys().chain(prev_weights.keys()).collect();
             for pool in pools {
                 let wn = new_weights.get(pool).copied().unwrap_or(Decimal::ZERO);
                 let wp = prev_weights.get(pool).copied().unwrap_or(Decimal::ZERO);
                 let delta = (wn - wp).abs();
-                if delta > Decimal::ZERO {
-                    turnover += delta;
-                    changed += 1;
-                    result.trades.push(Trade {
-                        ts: ms_to_dt(t0)?,
-                        instrument_name: name_by_pool.get(pool).cloned().unwrap_or_else(|| pool.clone()),
-                        qty_usd: (wn - wp) * equity,
-                        cost_usd: delta * (fee + slip) * equity + gas,
-                    });
+                if delta <= Decimal::ZERO {
+                    continue;
                 }
+                let notional = delta * equity;
+                // Price impact scales with participation in the pool's daily volume.
+                let volume = volumes.get(pool).and_then(|m| m.get(&t0)).copied().unwrap_or(Decimal::ZERO);
+                let participation = if volume > Decimal::ZERO {
+                    (notional / volume).min(max_participation)
+                } else {
+                    max_participation
+                };
+                let cost = fee * notional + slip * notional * participation + gas;
+                total_cost += cost;
+                result.trades.push(Trade {
+                    ts: ms_to_dt(t0)?,
+                    instrument_name: name_by_pool.get(pool).cloned().unwrap_or_else(|| pool.clone()),
+                    qty_usd: (wn - wp) * equity,
+                    cost_usd: cost,
+                });
             }
 
-            let gas_drag = if equity > Decimal::ZERO {
-                (Decimal::from(changed) * gas) / equity
-            } else {
-                Decimal::ZERO
-            };
-            let net = gross - ((fee + slip) * turnover + gas_drag);
+            let cost_drag = if equity > Decimal::ZERO { total_cost / equity } else { Decimal::ZERO };
+            let net = gross - cost_drag;
             equity += equity * net;
             result.equity_curve.push((ms_to_dt(t1)?, equity));
             prev_weights = new_weights;
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use cw_core::{Instrument, Network, PoolId};
+    use cw_features::FeatureRow;
+    use cw_strategy::CrossSectional;
+    use std::collections::BTreeMap;
+
+    fn inst(name: &str) -> Instrument {
+        Instrument { network: Network::Base, pool: PoolId(name.into()), name: name.into(), token: None }
+    }
+
+    // Flat prices (gross return = 0) so final equity reflects *costs only*. Momentum
+    // flips each day, so the strategy rotates A<->B and trades every step.
+    fn scenario(volume: i64) -> (Vec<(Instrument, Vec<Bar>)>, FeatureFrame) {
+        let (a, b) = (inst("A"), inst("B"));
+        let day = |d: i64| Utc.timestamp_opt(1_700_000_000 + d * 86_400, 0).unwrap();
+        let bar = |d: i64| Bar {
+            ts: day(d),
+            open: Decimal::from(100),
+            high: Decimal::from(100),
+            low: Decimal::from(100),
+            close: Decimal::from(100),
+            volume: Decimal::from(volume),
+        };
+        let bars = vec![
+            (a.clone(), (0..4).map(bar).collect()),
+            (b.clone(), (0..4).map(bar).collect()),
+        ];
+        let mut rows = Vec::new();
+        for d in 0..4 {
+            let (ma, mb) = if d % 2 == 0 { (1, 0) } else { (0, 1) };
+            rows.push(FeatureRow { instrument: a.clone(), ts: day(d), values: BTreeMap::from([("mom".to_string(), Decimal::from(ma))]) });
+            rows.push(FeatureRow { instrument: b.clone(), ts: day(d), values: BTreeMap::from([("mom".to_string(), Decimal::from(mb))]) });
+        }
+        (bars, FeatureFrame { rows })
+    }
+
+    fn final_equity(volume: i64) -> Decimal {
+        let (bars, frame) = scenario(volume);
+        let strat = CrossSectional { rank_feature: "mom".to_string(), top_quantile: 0.5, allow_short: false };
+        let bt = Backtester::new(
+            CostModel { fee_frac: Decimal::new(5, 4), slippage_coeff: Decimal::new(5, 1), gas_usd: Decimal::ZERO },
+            WalkForward { train_bars: 1, test_bars: 1, embargo_bars: 0 },
+        );
+        bt.run(&strat, &bars, &frame).unwrap().equity_curve.last().unwrap().1
+    }
+
+    #[test]
+    fn thinner_pool_incurs_more_slippage() {
+        // Identical scenario except pool volume: the thin pool must end poorer.
+        let deep = final_equity(1_000_000);
+        let thin = final_equity(1_000);
+        assert!(thin < deep, "thin {thin} should trail deep {deep}");
+        assert!(deep < Decimal::from(INITIAL_CAPITAL_USD), "costs must reduce equity");
     }
 }
