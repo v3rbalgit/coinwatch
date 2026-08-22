@@ -211,3 +211,15 @@ are retired.
   `mom` (our default) is weak (IC 0.044, t≈0.8, matching its low DSR), `rsi`/`illiq`/`vol` are ~zero,
   and `oc_tpb` looks promising (IC 0.12) but has too few periods yet. Nothing clears t>2 — the tool
   measures the absence of edge instead of hiding it.
+- *Order-flow imbalance*: extended the on-chain path with buy/sell USD split (verified Bitquery
+  conditional aggregation) — `OnchainDaily` gains buy/sell volumes, storage migrates in two columns,
+  and `OnchainFeatures` adds **`oc_netflow`** = (buy − sell)/(buy + sell) ∈ [−1, 1]. On the demo
+  VELVET shows +0.89 (strongly net-bought, also top momentum), USDC/Base −0.16 (net sold). Still
+  ~4 days of history so its IC isn't yet meaningful; densifies via forward-accumulation.
+- *Strategy sweep*: `cw-harness::sweep` evaluates many configs each independently out-of-sample
+  (its own walk-forward) and deflates every result by the full trial-Sharpe set → a ranked strategy
+  leaderboard by DSR, shown in `analyze`. It surfaces two honest lessons on the demo: (1) `illiq@50%`
+  tops the board (DSR 80%) despite ~zero IC — a top-quantile strategy can win by luck when the
+  feature has no linear signal (overfitting red flag); (2) every config shows DSR 65–80% because
+  *everything* works in a 4-month bull window — **DSR deflates for multiple-testing selection, not
+  for single-regime/sample bias.** Reinforces that more data across regimes is the binding need.

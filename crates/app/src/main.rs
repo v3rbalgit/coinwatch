@@ -17,7 +17,7 @@ use chrono::{Duration, Utc};
 use cw_backtest::{Backtester, CostModel, WalkForward};
 use cw_core::{Bar, CoreError, Decimal, Instrument, Interval, Network, OnchainDaily, Result};
 use cw_features::{combine, FeatureContext, FeatureFrame, FeatureModule, FeatureRow, LiquidityFeatures, OnchainFeatures, TechnicalFeatures};
-use cw_harness::{feature_ic, walk_forward, WfConfig};
+use cw_harness::{feature_ic, sweep, WfConfig};
 use cw_providers::{BarRequest, Bitquery, DataSource, GeckoTerminal, OnchainSource, UniverseRequest, UniverseSource};
 use cw_storage::{DuckStore, Store, TimeRange};
 use cw_strategy::CrossSectional;
@@ -191,14 +191,14 @@ fn analyze() -> Result<()> {
     println!("\nleaderboard (latest bar) top 10 by momentum  [oc_* present only for accumulated days]:");
     for (rank, row) in board.iter().take(10).enumerate() {
         println!(
-            "  {:>2}. {:<9} {:<22} mom={:>7.3}  dvol_mom={:>7.3}  oc_buyers={:>6}  oc_tpb={:>6.1}",
+            "  {:>2}. {:<9} {:<22} mom={:>7.3}  oc_buyers={:>6}  oc_tpb={:>6.1}  oc_net={:>6.2}",
             rank + 1,
             row.instrument.network.slug(),
             row.instrument.name,
             feat(row, "mom"),
-            feat(row, "dvol_mom"),
             feat(row, "oc_buyers"),
             feat(row, "oc_tpb"),
+            feat(row, "oc_netflow"),
         );
     }
 
@@ -219,42 +219,33 @@ fn analyze() -> Result<()> {
     run_backtest("in-sample: technical momentum", "mom", &dataset, &frame)?;
     run_backtest("in-sample: liquidity dvol-momentum", "dvol_mom", &dataset, &frame)?;
 
-    // Walk-forward CV: sweep configs on each train window, evaluate the winner
-    // out-of-sample, and deflate the result for the number of trials. This is the
-    // honest number — expect it to be far less flattering than the in-sample runs.
+    // Strategy sweep: evaluate MANY configs out-of-sample (each its own
+    // walk-forward), deflated for the number of trials → an honest strategy
+    // leaderboard. Contrast the DSR here with the flattering in-sample runs above.
     let costs = CostModel {
         fee_frac: Decimal::new(5, 4),
         slippage_coeff: Decimal::new(5, 1),
         gas_usd: Decimal::new(50, 2),
     };
-    let candidates = vec![
-        ("mom @40%".to_string(), cross("mom", 0.4)),
-        ("mom @60%".to_string(), cross("mom", 0.6)),
-        ("dvol_mom @40%".to_string(), cross("dvol_mom", 0.4)),
-        ("dvol_mom @60%".to_string(), cross("dvol_mom", 0.6)),
-    ];
-    let wf = walk_forward(&candidates, &dataset, &frame, WfConfig { train: 40, test: 12, embargo: 2 }, &costs)?;
-    if wf.folds.is_empty() {
-        println!("\nwalk-forward: not enough history for the chosen windows");
+    let mut candidates: Vec<(String, CrossSectional)> = Vec::new();
+    for feature in ["mom", "dvol_mom", "dvol_z", "rsi", "illiq"] {
+        for q in [0.3, 0.5] {
+            candidates.push((format!("{feature}@{:.0}%", q * 100.0), cross(feature, q)));
+        }
+    }
+    let rows = sweep(&candidates, &dataset, &frame, WfConfig { train: 40, test: 12, embargo: 2 }, &costs)?;
+    if rows.iter().all(|r| r.n_folds == 0) {
+        println!("\nstrategy sweep: not enough history for the chosen windows");
         return Ok(());
     }
-    println!("\nwalk-forward ({} folds, {} candidates each):", wf.folds.len(), candidates.len());
-    for f in &wf.folds {
+    println!("\nstrategy sweep ({} configs, walk-forward OOS, ranked by Deflated Sharpe):", candidates.len());
+    println!("  {:<14} {:>8} {:>9} {:>8} {:>7} {:>6}", "config", "OOS-Shp", "OOS-ret%", "maxDD%", "DSR%", "folds");
+    for r in &rows {
         println!(
-            "  test {}..{}  chose {:<16} (train SR/step {:+.3})",
-            f.test_from.date_naive(), f.test_to.date_naive(), f.chosen, f.train_sharpe
+            "  {:<14} {:>8.2} {:>9.1} {:>8.1} {:>7.1} {:>6}",
+            r.label, r.oos_sharpe, r.oos_return_pct, r.max_drawdown * 100.0, r.dsr * 100.0, r.n_folds
         );
     }
-    let oos = cw_eval::evaluate(&wf.oos)?;
-    let dsr = cw_eval::deflated_sharpe(&cw_eval::returns(&wf.oos), &wf.trial_sharpes);
-    if let (Some((_, s)), Some((_, e))) = (wf.oos.equity_curve.first(), wf.oos.equity_curve.last()) {
-        let total = ((e / s - Decimal::ONE) * Decimal::from(100)).round_dp(2);
-        println!("  OOS equity: ${} -> ${}  ({}% total)", s.round_dp(2), e.round_dp(2), total);
-    }
-    println!(
-        "  OOS: sharpe={:.2}  maxDD={:.1}%  hit={:.1}%  PSR={:.1}%  DSR={:.1}%  ({} trials)",
-        oos.sharpe, oos.max_drawdown * 100.0, oos.hit_rate * 100.0, oos.psr * 100.0, dsr * 100.0, wf.trial_sharpes.len()
-    );
     Ok(())
 }
 

@@ -284,6 +284,60 @@ pub fn feature_ic(bars: &[(Instrument, Vec<Bar>)], features: &FeatureFrame) -> V
     out
 }
 
+/// One row of a strategy sweep: a config's out-of-sample performance, deflated
+/// for the number of configs tried.
+#[derive(Debug, Clone)]
+pub struct SweepRow {
+    pub label: String,
+    pub oos_sharpe: f64,
+    pub oos_return_pct: f64,
+    pub max_drawdown: f64,
+    pub dsr: f64,
+    pub n_folds: usize,
+}
+
+/// Evaluate each candidate independently out-of-sample (its own walk-forward),
+/// then deflate every result by the full set of trial Sharpes. This is the honest
+/// "strategy leaderboard": ranked by Deflated Sharpe Ratio, strongest first.
+pub fn sweep<S: Strategy>(
+    candidates: &[(String, S)],
+    bars: &[(Instrument, Vec<Bar>)],
+    features: &FeatureFrame,
+    cfg: WfConfig,
+    costs: &CostModel,
+) -> Result<Vec<SweepRow>> {
+    let mut runs = Vec::with_capacity(candidates.len());
+    let mut trial_sharpes = Vec::with_capacity(candidates.len());
+    for cand in candidates {
+        let wf = walk_forward(std::slice::from_ref(cand), bars, features, cfg, costs)?;
+        let rets = cw_eval::returns(&wf.oos);
+        trial_sharpes.push(cw_eval::per_period_sharpe(&rets));
+        runs.push((cand.0.clone(), wf, rets));
+    }
+
+    let mut rows = Vec::with_capacity(runs.len());
+    for (label, wf, rets) in &runs {
+        let m = cw_eval::evaluate(&wf.oos)?;
+        let ret_pct = match (wf.oos.equity_curve.first(), wf.oos.equity_curve.last()) {
+            (Some((_, e0)), Some((_, e1))) => {
+                let (a, b) = (e0.to_f64().unwrap_or(0.0), e1.to_f64().unwrap_or(0.0));
+                if a > 0.0 { (b / a - 1.0) * 100.0 } else { 0.0 }
+            }
+            _ => 0.0,
+        };
+        rows.push(SweepRow {
+            label: label.clone(),
+            oos_sharpe: m.sharpe,
+            oos_return_pct: ret_pct,
+            max_drawdown: m.max_drawdown,
+            dsr: cw_eval::deflated_sharpe(rets, &trial_sharpes),
+            n_folds: wf.folds.len(),
+        });
+    }
+    rows.sort_by(|a, b| b.dsr.partial_cmp(&a.dsr).unwrap_or(Ordering::Equal));
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,5 +437,17 @@ mod tests {
         let g = ics.iter().find(|f| f.feature == "g").expect("feature g present");
         assert!(g.mean_ic > 0.99, "expected near-perfect IC, got {}", g.mean_ic);
         assert!(g.n_periods >= 3);
+    }
+
+    #[test]
+    fn sweep_returns_a_row_per_candidate() {
+        let (bars, frame) = synthetic(40);
+        let candidates = vec![
+            ("mom@50".to_string(), CrossSectional { rank_feature: "mom".to_string(), top_quantile: 0.5, allow_short: false }),
+            ("mom@30".to_string(), CrossSectional { rank_feature: "mom".to_string(), top_quantile: 0.3, allow_short: false }),
+        ];
+        let costs = CostModel { fee_frac: Decimal::new(5, 4), slippage_coeff: Decimal::new(5, 1), gas_usd: Decimal::ZERO };
+        let rows = sweep(&candidates, &bars, &frame, WfConfig { train: 15, test: 5, embargo: 1 }, &costs).unwrap();
+        assert_eq!(rows.len(), 2);
     }
 }
