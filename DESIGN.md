@@ -231,3 +231,10 @@ are retired.
   plausible *real* lead — `vol` at **t=−2.5 over 89 periods** (the low-volatility anomaly). The
   platform killed a fake edge and pointed at a real one: exactly its job. Breadth was the single
   highest-leverage change.
+- *PIVOT to Hyperliquid perps*: verified (spike) the free `info` API gives 232 perps, ~3y of clean
+  daily candles, and hourly funding — solving the breadth/depth/regime constraints at zero cost, and
+  enabling shorting (fixes the spot-only bull-market limitation). Added `providers/hyperliquid`
+  (paced + retried; universe via `metaAndAssetCtxs`, candles via `candleSnapshot` as canonical
+  `Bar`s) and an `hl-ingest` command (resumable, store-first). Landed **40 perps × 37,148 daily bars,
+  2023-05 → today (3.3y), 24 coins with ≥3y each, 0 OHLC violations.** Next: funding store + perps-
+  aware backtester (shorts + funding P&L) + long/short research on this universe.

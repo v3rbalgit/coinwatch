@@ -18,7 +18,7 @@ use cw_backtest::{Backtester, CostModel, WalkForward};
 use cw_core::{Bar, CoreError, Decimal, Instrument, Interval, Network, OnchainDaily, Result};
 use cw_features::{combine, FeatureContext, FeatureFrame, FeatureModule, FeatureRow, LiquidityFeatures, OnchainFeatures, TechnicalFeatures};
 use cw_harness::{feature_ic, sweep, WfConfig};
-use cw_providers::{BarRequest, Bitquery, DataSource, GeckoTerminal, OnchainSource, UniverseRequest, UniverseSource};
+use cw_providers::{BarRequest, Bitquery, DataSource, GeckoTerminal, Hyperliquid, OnchainSource, UniverseRequest, UniverseSource};
 use cw_storage::{DuckStore, Store, TimeRange};
 use cw_strategy::CrossSectional;
 
@@ -32,9 +32,10 @@ async fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_default();
     let result = match cmd.as_str() {
         "ingest" => ingest().await,
+        "hl-ingest" => hl_ingest().await,
         "" | "analyze" => analyze(),
         other => {
-            eprintln!("unknown command '{other}'. usage: coinwatch [ingest|analyze]");
+            eprintln!("unknown command '{other}'. usage: coinwatch [ingest|hl-ingest|analyze]");
             std::process::exit(2);
         }
     };
@@ -126,6 +127,41 @@ async fn ingest() -> Result<()> {
         }
     }
     println!("ingest complete: {fetched} fetched, {fresh} up-to-date, {onchain_rows} on-chain rows; db: {DB_PATH}");
+    Ok(())
+}
+
+/// Ingest the Hyperliquid perp universe: ~3y of daily candles into the bars store.
+async fn hl_ingest() -> Result<()> {
+    let hl = Hyperliquid::new();
+    let store = open_store()?;
+    let perps = hl.top_perps(40, Decimal::from(1_000_000u64)).await?;
+    println!("hyperliquid: {} perps (min 24h vol $1M)", perps.len());
+
+    let mut total = 0usize;
+    for (inst, day_vol) in &perps {
+        store.register_instrument(inst)?;
+        // Resumable: skip coins already backfilled and current.
+        let stored = store.load_bars(inst, Interval::Day, wide_range()).unwrap_or_default();
+        if stored.len() >= 300 && stored.last().is_some_and(|b| b.ts > Utc::now() - Duration::days(2)) {
+            println!("  {:<12} up-to-date", inst.name);
+            continue;
+        }
+        let req = BarRequest {
+            instrument: inst.clone(),
+            interval: Interval::Day,
+            limit: 1200, // ~3.3y of daily candles
+        };
+        match hl.fetch_bars(&req).await {
+            Ok(bars) if !bars.is_empty() => {
+                let n = store.upsert_bars(inst, Interval::Day, &bars)?;
+                total += n;
+                println!("  {:<12} {:>5} bars  24h_vol=${:>14.0}", inst.name, n, day_vol);
+            }
+            Ok(_) => println!("  {:<12} no bars", inst.name),
+            Err(e) => eprintln!("  {:<12} fetch failed: {e}", inst.name),
+        }
+    }
+    println!("hl-ingest complete: {total} bars across {} perps; db: {DB_PATH}", perps.len());
     Ok(())
 }
 

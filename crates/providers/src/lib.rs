@@ -13,6 +13,7 @@
 
 pub mod bitquery;
 pub mod geckoterminal;
+pub mod hyperliquid;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -77,3 +78,4 @@ pub trait OnchainSource: Send + Sync {
 
 pub use bitquery::Bitquery;
 pub use geckoterminal::GeckoTerminal;
+pub use hyperliquid::Hyperliquid;
