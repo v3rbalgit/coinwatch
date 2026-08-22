@@ -298,6 +298,19 @@ are retired.
   more alpha. **Caveat: in-sample, full-period.** The honest next step is walk-forward (OOS) + DSR
   validation of the illiquidity alpha — does the +15%/yr survive out-of-sample and multiple-testing
   deflation?
+- *OOS validation (chunk 6)*: threaded `rebalance_every` through `walk_forward`/`sweep` and reworked
+  `analyze` into an out-of-sample validation — a long-only family (illiq/low-vol/mom/dvol_mom) run
+  through walk-forward at biweekly cadence + DSR, plus an **OOS alpha** regression against an
+  equal-weight-market walk-forward on the same folds. **The illiquidity premium survives OOS:**
+  `illiq@30%` d14 shows OOS Sharpe **0.95**, OOS **+232%** (≈ its in-sample +270% → not overfit), and
+  **OOS alpha +36.6%/yr** beyond market beta (≈1.04, R² 0.90) — top of the deflated board; `dvol_mom@30%`
+  is a second liquidity-family lead (OOS Sharpe 0.93). **Low-vol is confirmed dead OOS** (negative
+  alpha, DSR 0%). **Honest caveat:** the top DSR is only **17.6%** — after deflating for the 8 configs
+  tried, this is a *strong lead* consistent with the documented academic illiquidity premium, **not a
+  statistically overwhelming proven edge**; walk-forward re-enters positions per fold so the absolute
+  alpha magnitude carries uncertainty, though the relative OOS outperformance is robust. Verdict: a
+  genuine, literature-backed edge candidate worth **paper trading + further validation**, not yet a
+  proven money-printer.
 
 ## 8. Direction & signal roadmap
 

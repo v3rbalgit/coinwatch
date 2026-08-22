@@ -21,12 +21,17 @@ use rust_decimal::prelude::ToPrimitive;
 /// Notional starting capital for the stitched OOS curve.
 const OOS_START: f64 = 10_000.0;
 
-/// Walk-forward CV configuration, in units of feature timestamps (bars).
+/// Walk-forward CV + per-fold execution configuration. Train/test/embargo are in
+/// feature timestamps (bars); the two knobs are applied to every fold's backtest.
 #[derive(Debug, Clone, Copy)]
 pub struct WfConfig {
     pub train: usize,
     pub test: usize,
     pub embargo: usize,
+    /// Portfolio vol target for each fold's backtest (None = off).
+    pub vol_target: Option<Decimal>,
+    /// Rebalance cadence (bars) for each fold's backtest (1 = every bar).
+    pub rebalance_every: usize,
 }
 
 /// What one fold decided and how the chosen config scored in-sample.
@@ -96,7 +101,6 @@ pub fn walk_forward<S: Strategy>(
     cfg: WfConfig,
     costs: &CostModel,
     funding: &[(Instrument, Vec<FundingPoint>)],
-    vol_target: Option<Decimal>,
 ) -> Result<WalkForwardResult> {
     let mut times: Vec<i64> = features.rows.iter().map(|r| r.ts.timestamp_millis()).collect();
     times.sort_unstable();
@@ -115,7 +119,8 @@ pub fn walk_forward<S: Strategy>(
         costs.clone(),
         WalkForward { train_bars: cfg.train, test_bars: cfg.test, embargo_bars: cfg.embargo },
     )
-    .with_vol_target(vol_target);
+    .with_vol_target(cfg.vol_target)
+    .with_rebalance_every(cfg.rebalance_every);
     let window = cfg.train + cfg.embargo + cfg.test;
     let ms = |ms: i64| DateTime::<Utc>::from_timestamp_millis(ms).unwrap_or_default();
 
@@ -309,12 +314,11 @@ pub fn sweep<S: Strategy>(
     cfg: WfConfig,
     costs: &CostModel,
     funding: &[(Instrument, Vec<FundingPoint>)],
-    vol_target: Option<Decimal>,
 ) -> Result<Vec<SweepRow>> {
     let mut runs = Vec::with_capacity(candidates.len());
     let mut trial_sharpes = Vec::with_capacity(candidates.len());
     for cand in candidates {
-        let wf = walk_forward(std::slice::from_ref(cand), bars, features, cfg, costs, funding, vol_target)?;
+        let wf = walk_forward(std::slice::from_ref(cand), bars, features, cfg, costs, funding)?;
         let rets = cw_eval::returns(&wf.oos);
         trial_sharpes.push(cw_eval::per_period_sharpe(&rets));
         runs.push((cand.0.clone(), wf, rets));
@@ -408,7 +412,7 @@ mod tests {
             slippage_coeff: Decimal::new(10, 4),
             gas_usd: Decimal::ZERO,
         };
-        let wf = walk_forward(&candidates, &bars, &frame, WfConfig { train: 15, test: 5, embargo: 1 }, &costs, &[], None).unwrap();
+        let wf = walk_forward(&candidates, &bars, &frame, WfConfig { train: 15, test: 5, embargo: 1, vol_target: None, rebalance_every: 1 }, &costs, &[]).unwrap();
         assert!(!wf.folds.is_empty());
         assert!(!wf.oos.equity_curve.is_empty());
         assert_eq!(wf.trial_sharpes.len(), wf.folds.len()); // 1 candidate per fold
@@ -452,7 +456,7 @@ mod tests {
             ("mom@30".to_string(), CrossSectional { rank_feature: "mom".to_string(), top_quantile: 0.3, allow_short: false, invert: false, weight_feature: None }),
         ];
         let costs = CostModel { fee_frac: Decimal::new(5, 4), slippage_coeff: Decimal::new(5, 1), gas_usd: Decimal::ZERO };
-        let rows = sweep(&candidates, &bars, &frame, WfConfig { train: 15, test: 5, embargo: 1 }, &costs, &[], None).unwrap();
+        let rows = sweep(&candidates, &bars, &frame, WfConfig { train: 15, test: 5, embargo: 1, vol_target: None, rebalance_every: 1 }, &costs, &[]).unwrap();
         assert_eq!(rows.len(), 2);
     }
 }

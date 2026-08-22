@@ -15,7 +15,7 @@ use chrono::{Duration, Utc};
 use cw_backtest::{BacktestResult, Backtester, CostModel, WalkForward};
 use cw_core::{Bar, CoreError, Decimal, FundingPoint, Instrument, Interval, Result};
 use cw_features::{combine, FeatureContext, FeatureFrame, FeatureModule, FeatureRow, LiquidityFeatures, TechnicalFeatures};
-use cw_harness::{feature_ic, sweep, WfConfig};
+use cw_harness::{feature_ic, sweep, walk_forward, WalkForwardResult, WfConfig};
 use cw_providers::{BarRequest, DataSource, Hyperliquid};
 use cw_storage::{DuckStore, Store, TimeRange};
 use cw_strategy::CrossSectional;
@@ -210,54 +210,75 @@ fn analyze() -> Result<()> {
     run_backtest("in-sample: technical momentum", "mom", &dataset, &frame, &funding_dataset, None)?;
     run_backtest("in-sample: liquidity dvol-momentum", "dvol_mom", &dataset, &frame, &funding_dataset, None)?;
 
-    // Strategy sweep: evaluate MANY configs out-of-sample (each its own
-    // walk-forward), deflated for the number of trials → an honest strategy
-    // leaderboard. Contrast the DSR here with the flattering in-sample runs above.
+    // ===== OOS validation of the long-only signals (walk-forward + DSR) =====
+    // The decisive test: does the in-sample illiquidity alpha survive out-of-sample
+    // and multiple-testing deflation? Long-only, biweekly rebalance (turnover
+    // control), no vol targeting.
     let costs = CostModel {
         fee_frac: Decimal::new(5, 4),
         slippage_coeff: Decimal::new(5, 1),
         gas_usd: Decimal::new(50, 2),
     };
-    // Market-neutral (long/short) tests of the significant signals + baselines.
-    // (label, feature, top_quantile, invert); all allow_short = true.
-    // (label, rank feature, quantile, invert, vol-weight?) — equal-weight vs
-    // inverse-vol sizing on the significant signals, all market-neutral L/S.
-    let specs: &[(&str, &str, f64, bool, bool)] = &[
-        ("vol L/S eq", "vol", 0.20, true, false),
-        ("vol L/S vw", "vol", 0.20, true, true),
-        ("vol L/S 33% vw", "vol", 0.33, true, true),
-        ("illiq L/S eq", "illiq", 0.20, false, false),
-        ("illiq L/S vw", "illiq", 0.20, false, true),
-        ("illiq L/S 33% vw", "illiq", 0.33, false, true),
-        ("mom L/S vw", "mom", 0.20, false, true),
+    let cadence = 14usize;
+    let wf_cfg = WfConfig { train: 90, test: 30, embargo: 3, vol_target: None, rebalance_every: cadence };
+    let val_specs: &[(&str, &str, f64, bool)] = &[
+        ("illiq 20%", "illiq", 0.20, false),
+        ("illiq 30%", "illiq", 0.30, false),
+        ("illiq 40%", "illiq", 0.40, false),
+        ("low-vol 20%", "vol", 0.20, true),
+        ("low-vol 30%", "vol", 0.30, true),
+        ("low-vol 40%", "vol", 0.40, true),
+        ("mom 30%", "mom", 0.30, false),
+        ("dvol_mom 30%", "dvol_mom", 0.30, false),
     ];
-    let candidates: Vec<(String, CrossSectional)> = specs
+    let mk = |feature: &str, q: f64, invert: bool| CrossSectional {
+        rank_feature: feature.to_string(),
+        top_quantile: q,
+        allow_short: false,
+        invert,
+        weight_feature: None,
+    };
+    let candidates: Vec<(String, CrossSectional)> = val_specs
         .iter()
-        .map(|(label, feature, q, invert, vw)| {
-            (
-                label.to_string(),
-                CrossSectional {
-                    rank_feature: feature.to_string(),
-                    top_quantile: *q,
-                    allow_short: true,
-                    invert: *invert,
-                    weight_feature: if *vw { Some("vol".to_string()) } else { None },
-                },
-            )
-        })
+        .map(|(label, feature, q, invert)| (label.to_string(), mk(feature, *q, *invert)))
         .collect();
-    let vol_target = Some(Decimal::new(15, 3)); // 1.5%/day ≈ 24%/yr target
-    let rows = sweep(&candidates, &dataset, &frame, WfConfig { train: 90, test: 30, embargo: 3 }, &costs, &funding_dataset, vol_target)?;
+    let rows = sweep(&candidates, &dataset, &frame, wf_cfg, &costs, &funding_dataset)?;
     if rows.iter().all(|r| r.n_folds == 0) {
-        println!("\nstrategy sweep: not enough history for the chosen windows");
+        println!("\nOOS validation: not enough history for the chosen windows");
         return Ok(());
     }
-    println!("\nstrategy sweep ({} configs, vol-targeted 1.5%/day, walk-forward OOS, ranked by DSR):", candidates.len());
+    println!("\nOOS validation ({} long-only configs, walk-forward d{cadence}, ranked by Deflated Sharpe):", candidates.len());
     println!("  {:<14} {:>8} {:>9} {:>8} {:>7} {:>6}", "config", "OOS-Shp", "OOS-ret%", "maxDD%", "DSR%", "folds");
     for r in &rows {
         println!(
             "  {:<14} {:>8.2} {:>9.1} {:>8.1} {:>7.1} {:>6}",
             r.label, r.oos_sharpe, r.oos_return_pct, r.max_drawdown * 100.0, r.dsr * 100.0, r.n_folds
+        );
+    }
+
+    // A long-only OOS Sharpe is mostly market beta. Walk-forward the equal-weight
+    // market and each signal on the same folds, then regress OOS returns → the OOS
+    // ALPHA (edge beyond beta) — the number that actually matters.
+    let oos_ret_pct = |wf: &WalkForwardResult| -> Decimal {
+        match (wf.oos.equity_curve.first(), wf.oos.equity_curve.last()) {
+            (Some((_, e0)), Some((_, e1))) if *e0 > Decimal::ZERO => {
+                ((e1 / e0 - Decimal::ONE) * Decimal::from(100)).round_dp(1)
+            }
+            _ => Decimal::ZERO,
+        }
+    };
+    let market_cand = [("market".to_string(), mk("vol", 1.0, false))];
+    let market_wf = walk_forward(&market_cand, &dataset, &frame, wf_cfg, &costs, &funding_dataset)?;
+    let market_oos = cw_eval::returns(&market_wf.oos);
+    println!("\nOOS alpha vs market (walk-forward d{cadence}; market OOS {}%):", oos_ret_pct(&market_wf));
+    println!("  {:<14} {:>9} {:>6} {:>10} {:>6}", "config", "OOS-ret%", "beta", "alpha%/yr", "R2");
+    for (label, feature, q, invert) in val_specs.iter().filter(|s| s.1 == "illiq" || s.1 == "vol") {
+        let cand = [(label.to_string(), mk(feature, *q, *invert))];
+        let wf = walk_forward(&cand, &dataset, &frame, wf_cfg, &costs, &funding_dataset)?;
+        let ab = cw_eval::alpha_beta(&cw_eval::returns(&wf.oos), &market_oos);
+        println!(
+            "  {:<14} {:>9} {:>6.2} {:>10.1} {:>6.2}",
+            label, oos_ret_pct(&wf), ab.beta, ab.alpha_annual * 100.0, ab.r2
         );
     }
 
