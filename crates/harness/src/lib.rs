@@ -125,6 +125,8 @@ pub fn walk_forward<S: Strategy>(
     let ms = |ms: i64| DateTime::<Utc>::from_timestamp_millis(ms).unwrap_or_default();
 
     let mut oos_points: Vec<(DateTime<Utc>, f64)> = Vec::new();
+    // Positions carried across folds so the OOS is a continuously-held path.
+    let mut carry: HashMap<String, Decimal> = HashMap::new();
     let mut i = 0;
     while i + window <= times.len() {
         let train_set: HashSet<i64> = times[i..i + cfg.train].iter().copied().collect();
@@ -145,12 +147,17 @@ pub fn walk_forward<S: Strategy>(
         let (best_idx, best_sharpe) = best.expect("candidates non-empty");
         let (chosen_label, chosen_strat) = &candidates[best_idx];
 
-        // Evaluate the winner out-of-sample and collect its step returns.
+        // Evaluate the winner out-of-sample, carrying positions across folds so the
+        // OOS is a continuously-held path: each fold seeds from the prior fold's
+        // ending positions instead of re-entering from cash (only the delta when the
+        // chosen strategy changes is traded). Without this, 35 full cash re-entries
+        // wildly deflate OOS returns — especially in HL's thin early-2023 market.
         let test_frame = subframe(features, &test_set);
-        let test_res = backtester.run(chosen_strat, bars, &test_frame, funding)?;
+        let (test_res, end_held) = backtester.run_stateful(chosen_strat, bars, &test_frame, funding, &carry)?;
         for w in test_res.equity_curve.windows(2) {
             oos_points.push((w[1].0, step_return(&w[0].1, &w[1].1)));
         }
+        carry = end_held;
 
         result.folds.push(FoldSummary {
             test_from: ms(times[test_start]),

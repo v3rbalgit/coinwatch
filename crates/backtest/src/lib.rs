@@ -121,10 +121,11 @@ impl Backtester {
         self
     }
 
-    /// Run `strategy` over `bars`, `features`, and per-instrument `funding`.
-    /// Rebalances at each feature timestamp; each step nets the price return,
-    /// funding P&L (longs pay positive funding, shorts receive), and costs.
-    /// `funding` may be empty (spot-like: no funding P&L).
+    /// Run `strategy` over `bars`, `features`, and per-instrument `funding` from an
+    /// all-cash start. Rebalances at each feature timestamp; each step nets the price
+    /// return, funding P&L (longs pay positive funding, shorts receive), and costs.
+    /// `funding` may be empty (spot-like: no funding P&L). See [`Backtester::run_stateful`]
+    /// for the carried-position variant used by walk-forward.
     pub fn run<S: Strategy>(
         &self,
         strategy: &S,
@@ -132,6 +133,20 @@ impl Backtester {
         features: &FeatureFrame,
         funding: &[(Instrument, Vec<FundingPoint>)],
     ) -> Result<BacktestResult> {
+        Ok(self.run_stateful(strategy, bars, features, funding, &HashMap::new())?.0)
+    }
+
+    /// Like [`Backtester::run`] but seeds starting positions with `initial_held` and
+    /// returns the ending positions, so a caller (walk-forward) can carry a portfolio
+    /// across segment boundaries instead of re-entering from cash every segment.
+    pub fn run_stateful<S: Strategy>(
+        &self,
+        strategy: &S,
+        bars: &[(Instrument, Vec<Bar>)],
+        features: &FeatureFrame,
+        funding: &[(Instrument, Vec<FundingPoint>)],
+        initial_held: &HashMap<String, Decimal>,
+    ) -> Result<(BacktestResult, HashMap<String, Decimal>)> {
         // per-pool lookups: close (for returns) and volume (for slippage depth)
         let mut closes: HashMap<String, HashMap<i64, Decimal>> = HashMap::new();
         let mut volumes: HashMap<String, HashMap<i64, Decimal>> = HashMap::new();
@@ -162,13 +177,13 @@ impl Backtester {
         }
         let times: Vec<i64> = sections.keys().copied().collect();
         if times.len() < 2 {
-            return Ok(BacktestResult::default());
+            return Ok((BacktestResult::default(), initial_held.clone()));
         }
 
         let (fee, slip, gas) = (self.costs.fee_frac, self.costs.slippage_coeff, self.costs.gas_usd);
 
         let mut equity = Decimal::from(INITIAL_CAPITAL_USD);
-        let mut held: HashMap<String, Decimal> = HashMap::new();
+        let mut held: HashMap<String, Decimal> = initial_held.clone();
         let mut net_returns: Vec<f64> = Vec::new();
         let mut result = BacktestResult {
             equity_curve: vec![(ms_to_dt(times[0])?, equity)],
@@ -254,7 +269,7 @@ impl Backtester {
             net_returns.push(net.to_f64().unwrap_or(0.0));
             result.equity_curve.push((ms_to_dt(t1)?, equity));
         }
-        Ok(result)
+        Ok((result, held))
     }
 }
 
@@ -330,5 +345,24 @@ mod tests {
         // Flat prices => equity reflects costs only; fewer trades ends richer.
         let (de, re) = (daily.equity_curve.last().unwrap().1, rare.equity_curve.last().unwrap().1);
         assert!(re > de, "rare {re} should beat daily {de} on cost savings");
+    }
+
+    #[test]
+    fn carried_positions_avoid_reentry_cost() {
+        use std::collections::HashMap;
+        // Seeding a segment with its own opening positions skips the cash-entry cost
+        // (the walk-forward carry that keeps OOS returns from being deflated).
+        let (bars, frame) = scenario(1_000);
+        let strat = CrossSectional { rank_feature: "mom".to_string(), top_quantile: 0.5, allow_short: false, invert: false, weight_feature: None };
+        let costs = CostModel { fee_frac: Decimal::new(5, 4), slippage_coeff: Decimal::new(5, 1), gas_usd: Decimal::ZERO };
+        let bt = Backtester::new(costs, WalkForward { train_bars: 1, test_bars: 1, embargo_bars: 0 });
+        let t0 = frame.rows.iter().map(|r| r.ts).min().unwrap();
+        let cs: Vec<FeatureRow> = frame.rows.iter().filter(|r| r.ts == t0).cloned().collect();
+        let opening: HashMap<String, Decimal> =
+            strat.target_weights(&cs).unwrap().into_iter().map(|tw| (tw.instrument.pool.0, tw.weight)).collect();
+        let cash = bt.run(&strat, &bars, &frame, &[]).unwrap();
+        let (seeded, _end) = bt.run_stateful(&strat, &bars, &frame, &[], &opening).unwrap();
+        let (c, s) = (cash.equity_curve.last().unwrap().1, seeded.equity_curve.last().unwrap().1);
+        assert!(s > c, "seeded {s} should beat cash-start {c} by the saved entry cost");
     }
 }

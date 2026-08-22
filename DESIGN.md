@@ -326,6 +326,19 @@ are retired.
   *underperform* risk-adjusted). (3) **Funding LEVEL fails, funding ANOMALY works** — raw-rate carry
   is −56%; the edge is the z-score. Next: complete the funding backfill and re-validate `fundz carry`
   over the full 3y before trusting it.
+- *Walk-forward OOS re-entry fix (chunk 8)*: with 22/27 coins deep, re-validation showed the OOS
+  market benchmark at an impossible **+3.6%** vs **+86%** for the *same* strategy run continuously
+  over the *same* days. Root cause (traced step-by-step): each walk-forward fold's backtest
+  **re-entered from cash**, paying a full entry cost *every* fold (35×) that a continuously-held OOS
+  never pays — catastrophic in HL's **thin early-2023 market** (measured fold entry ≈ **6%**). Fix:
+  `Backtester::run_stateful` seeds each fold from the prior fold's ending positions and returns its
+  own ending positions, so walk-forward stitches a **continuously-held** OOS path (only the delta is
+  traded when the chosen strategy changes). Market OOS → **+115%** (residual vs +86% is the skipped
+  inter-fold boundary day, consistent across strategies). **The artifact had been understating the
+  market-neutral strategies most** (they eat re-entry hardest). Corrected verdict: **illiquidity L/S
+  (market-neutral) is a legitimate edge — OOS Sharpe 0.91, DSR 35.7%, maxDD 26%** (was 0.63/18%);
+  `fundz carry` holds at DSR 24%; long-only illiq alpha is a more sober **+25.7%/yr** (the broken
+  benchmark had inflated it). Pre-existing `dvol_z` epsilon bug (liquidity.rs) still flagged, unfixed.
 
 ## 8. Direction & signal roadmap
 
