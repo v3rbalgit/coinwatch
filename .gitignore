@@ -184,6 +184,10 @@ project_structure.txt
 research/**/out/
 *.duckdb
 *.parquet
+# Rust
+/target/
+
+.codegraph/
 logs/
 *.log
 *.log.*

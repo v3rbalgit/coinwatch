@@ -1,0 +1,10 @@
+[package]
+name = "cw-strategy"
+description = "Strategy trait: features -> target weights. Same impl runs in backtest and live."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cw-core.workspace = true
+cw-features.workspace = true

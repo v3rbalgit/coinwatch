@@ -1,0 +1,10 @@
+[package]
+name = "cw-features"
+description = "FeatureModule trait + edge-hypothesis modules (technical now; tokenomics/on-chain later)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cw-core.workspace = true
+chrono.workspace = true

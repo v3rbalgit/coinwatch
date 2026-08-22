@@ -1,0 +1,29 @@
+# Coinwatch quant platform — Rust workspace (Phase 1 skeleton).
+# See DESIGN.md for the architecture and trait-seam rationale.
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/v3rbalgit/coinwatch"
+
+[workspace.dependencies]
+# Internal crates
+cw-core = { path = "crates/core" }
+cw-storage = { path = "crates/storage" }
+cw-providers = { path = "crates/providers" }
+cw-features = { path = "crates/features" }
+cw-strategy = { path = "crates/strategy" }
+cw-backtest = { path = "crates/backtest" }
+cw-eval = { path = "crates/eval" }
+
+# Shared third-party
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+rust_decimal = { version = "1", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

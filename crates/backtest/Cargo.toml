@@ -1,0 +1,12 @@
+[package]
+name = "cw-backtest"
+description = "Point-in-time backtester with cost/slippage models and walk-forward CV."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cw-core.workspace = true
+cw-features.workspace = true
+cw-strategy.workspace = true
+chrono.workspace = true

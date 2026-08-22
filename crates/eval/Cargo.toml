@@ -1,0 +1,10 @@
+[package]
+name = "cw-eval"
+description = "Performance + overfitting metrics (Sharpe/Sortino/maxDD/turnover, deflated Sharpe/PBO)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cw-core.workspace = true
+cw-backtest.workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "cw-app"
+description = "Orchestration / CLI: wires the ingest -> features -> strategy -> backtest -> eval pipeline."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "coinwatch"
+path = "src/main.rs"
+
+[dependencies]
+cw-core.workspace = true
+cw-storage.workspace = true
+cw-providers.workspace = true
+cw-features.workspace = true
+cw-strategy.workspace = true
+cw-backtest.workspace = true
+cw-eval.workspace = true
+rust_decimal.workspace = true
+tokio.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "cw-storage"
+description = "Canonical bar store with point-in-time reads (DuckDB/Parquet, Postgres later)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cw-core.workspace = true
+chrono.workspace = true

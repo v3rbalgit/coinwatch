@@ -1,0 +1,10 @@
+[package]
+name = "cw-providers"
+description = "DataSource trait + provider adapters (GeckoTerminal now, Bitquery/RPC later)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cw-core.workspace = true
+async-trait.workspace = true
