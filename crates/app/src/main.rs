@@ -8,10 +8,13 @@
 use std::collections::HashMap;
 use std::fs;
 
+use chrono::{Duration, Utc};
+use cw_backtest::{Backtester, CostModel, WalkForward};
 use cw_core::{CoreError, Decimal, Instrument, Interval, Network, Result};
 use cw_features::{FeatureContext, FeatureModule, TechnicalFeatures};
 use cw_providers::{BarRequest, DataSource, GeckoTerminal, UniverseRequest, UniverseSource};
 use cw_storage::{DuckStore, Store, TimeRange};
+use cw_strategy::CrossSectional;
 
 const DB_PATH: &str = "research/data/coinwatch.duckdb";
 
@@ -48,40 +51,50 @@ async fn run() -> Result<()> {
         .map_err(|e| CoreError::Storage(format!("mkdir research/data: {e}")))?;
     let store = DuckStore::open(DB_PATH)?;
 
-    // Backfill each pool's daily bars into the store, then read back.
+    // Ingest each pool: load from the store when we already have history,
+    // otherwise fetch from the provider and persist. Reruns are offline + instant.
+    let wide = TimeRange {
+        from: Utc::now() - Duration::days(400),
+        to: Utc::now() + Duration::days(1),
+    };
     let mut dataset: Vec<(Instrument, Vec<cw_core::Bar>)> = Vec::new();
-    let mut total_rows = 0usize;
     for pool in &pools {
-        let req = BarRequest {
-            instrument: pool.instrument.clone(),
-            interval: Interval::Day,
-            limit: 120,
-        };
-        // Resilient backfill: a throttled/failed pool is skipped, not fatal.
-        let bars = match provider.fetch_bars(&req).await {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("  {:<28} fetch failed: {e}", pool.instrument.name);
-                continue;
+        let stored = store.load_bars(&pool.instrument, Interval::Day, wide).unwrap_or_default();
+        let (bars, src) = if stored.len() >= 60 {
+            (stored, "store")
+        } else {
+            let req = BarRequest {
+                instrument: pool.instrument.clone(),
+                interval: Interval::Day,
+                limit: 120,
+            };
+            match provider.fetch_bars(&req).await {
+                Ok(fetched) if !fetched.is_empty() => {
+                    store.upsert_bars(&pool.instrument, Interval::Day, &fetched)?;
+                    (fetched, "fetch")
+                }
+                Ok(_) => {
+                    println!("  {:<28} no bars", pool.instrument.name);
+                    continue;
+                }
+                Err(e) if !stored.is_empty() => {
+                    eprintln!("  {:<28} fetch failed ({e}); using stored", pool.instrument.name);
+                    (stored, "store")
+                }
+                Err(e) => {
+                    eprintln!("  {:<28} fetch failed: {e}", pool.instrument.name);
+                    continue;
+                }
             }
         };
-        let (Some(first), Some(last)) = (bars.first(), bars.last()) else {
-            println!("  {:<28} no bars", pool.instrument.name);
-            continue;
-        };
-        total_rows += store.upsert_bars(&pool.instrument, Interval::Day, &bars)?;
-        let loaded = store.load_bars(
-            &pool.instrument,
-            Interval::Day,
-            TimeRange { from: first.ts, to: last.ts },
-        )?;
         println!(
-            "  {:<28} reserve=${:>12.0}  bars={}",
-            pool.instrument.name, pool.reserve_usd, loaded.len()
+            "  {:<28} reserve=${:>12.0}  bars={:>3} [{}]",
+            pool.instrument.name, pool.reserve_usd, bars.len(), src
         );
-        dataset.push((pool.instrument.clone(), loaded));
+        dataset.push((pool.instrument.clone(), bars));
     }
-    println!("store: {} pools, {} bars total; db: {DB_PATH}", dataset.len(), total_rows);
+    let total_bars: usize = dataset.iter().map(|(_, b)| b.len()).sum();
+    println!("dataset: {} pools, {} bars; db: {DB_PATH}", dataset.len(), total_bars);
 
     // Cross-sectional momentum leaderboard from the latest feature bar per pool.
     let module = TechnicalFeatures::default();
@@ -105,6 +118,45 @@ async fn run() -> Result<()> {
             row.values["mom"],
             row.values["rsi"],
             row.values["vol"],
+        );
+    }
+
+    // --- Backtest the cross-sectional momentum strategy over the universe. ---
+    let strategy = CrossSectional {
+        rank_feature: "mom".to_string(),
+        top_quantile: 0.4,
+        allow_short: false,
+    };
+    let costs = CostModel {
+        fee_frac: Decimal::new(5, 4),        // 5 bps swap fee
+        slippage_coeff: Decimal::new(10, 4), // 10 bps slippage haircut
+        gas_usd: Decimal::new(50, 2),        // $0.50 per position change
+    };
+    let backtester = Backtester::new(
+        costs,
+        WalkForward { train_bars: 60, test_bars: 30, embargo_bars: 3 },
+    );
+    let result = backtester.run(&strategy, &dataset, &frame)?;
+    let metrics = cw_eval::evaluate(&result)?;
+
+    if let (Some((_, e0)), Some((_, e1))) = (result.equity_curve.first(), result.equity_curve.last()) {
+        let total = ((e1 / e0 - Decimal::ONE) * Decimal::from(100)).round_dp(2);
+        println!(
+            "\nbacktest (long-only top {:.0}% by {}, {} rebalances):",
+            strategy.top_quantile * 100.0,
+            strategy.rank_feature,
+            result.equity_curve.len().saturating_sub(1),
+        );
+        println!("  equity: ${} -> ${}  ({}% total)", e0.round_dp(2), e1.round_dp(2), total);
+        println!(
+            "  sharpe={:.2}  sortino={:.2}  maxDD={:.1}%  hit={:.1}%  turnover={:.2}  PSR={:.1}%  trades={}",
+            metrics.sharpe,
+            metrics.sortino,
+            metrics.max_drawdown * 100.0,
+            metrics.hit_rate * 100.0,
+            metrics.turnover,
+            metrics.psr * 100.0,
+            result.trades.len(),
         );
     }
     Ok(())

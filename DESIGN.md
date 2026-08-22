@@ -119,9 +119,15 @@ scaffolding. The Bybit/CEX clients and the HTTP microservice mesh are retired.
    violations across 2,274 daily bars); **binding constraint is history depth ≈ 6 months on the
    keyless tier** — enough to build/validate the harness, too shallow for robust CV of an edge.
    Full findings: `research/spikes/gecko_ohlcv/README.md`.
-2. **Phase 1 — Harness MVP**: `core` + `storage` + `providers/geckoterminal` +
-   `features/technical` + one `strategy` + `backtest` (real cost model) + `eval`.
-   End-to-end walk-forward backtest with honest metrics on a liquid EVM token universe.
+2. **Phase 1 — Harness MVP** ✅ *(done)*: `core` + `storage` (DuckDB) +
+   `providers/geckoterminal` (+ `UniverseSource`) + `features/technical` (mom/vol/rsi) +
+   `strategy` (`CrossSectional`) + `backtest` (cost-aware, point-in-time) + `eval`
+   (Sharpe/Sortino/maxDD/turnover/hit-rate + PSR). The `coinwatch` binary runs the full
+   pipeline end-to-end on a live Base universe. **The demo backtest numbers are NOT an
+   edge** — tiny universe, ~4 months, in-sample, bull-market window, 78% drawdown; their
+   only purpose is to confirm the architecture (same `Strategy` will run live). Walk-forward
+   train/test CV is deferred until a strategy carries fittable parameters; the single-pass
+   run is the whole out-of-sample for a non-parametric rule.
 3. **Phase 2 — Confirm modularity**: add a second `FeatureModule` (simple tokenomics or an
    on-chain liquidity feature via Bitquery) into the **unchanged** engine. Clean slot-in =
    architecture confirmed.
@@ -144,3 +150,7 @@ scaffolding. The Bybit/CEX clients and the HTTP microservice mesh are retired.
 
 - *Phase 0*: Design captured; scope decisions locked; data spike run — GeckoTerminal free OHLCV
   validated (pristine quality; ~6-month keyless history is the binding constraint).
+- *Phase 1*: Harness MVP complete — 8 `cw-*` crates wired as a DAG; live GeckoTerminal ingestion
+  - DuckDB store + technical features + cross-sectional strategy + cost-aware backtest + metrics;
+  store-first ingestion makes reruns offline/instant. Demo results are architecture confirmation,
+  not alpha.

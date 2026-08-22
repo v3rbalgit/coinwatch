@@ -521,10 +521,13 @@ name = "cw-app"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "cw-backtest",
  "cw-core",
+ "cw-eval",
  "cw-features",
  "cw-providers",
  "cw-storage",
+ "cw-strategy",
  "tokio",
 ]
 
@@ -552,8 +555,10 @@ dependencies = [
 name = "cw-eval"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "cw-backtest",
  "cw-core",
+ "rust_decimal",
 ]
 
 [[package]]
@@ -592,6 +597,7 @@ dependencies = [
 name = "cw-strategy"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "cw-core",
  "cw-features",
 ]
