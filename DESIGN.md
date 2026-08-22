@@ -161,3 +161,8 @@ scaffolding. The Bybit/CEX clients and the HTTP microservice mesh are retired.
 - *Phase 2*: Modularity confirmed — second `FeatureModule` (`LiquidityFeatures`) + `combine()`
   added at the feature layer only; engine crates untouched; same strategy ranks by either
   module's feature via config. New edge hypotheses now slot in without engine changes.
+- *Post-Phase 2*: Split the binary into `ingest` (networked, incremental, registers instruments;
+  Base + Arbitrum) and `analyze` (offline; reconstructs the universe from the store). DuckStore
+  gains an instrument registry (`register_instrument`/`list_instruments`). The wider cross-section
+  already cut the demo momentum strategy's max drawdown ~79% → ~47% — concrete evidence that
+  breadth, not cleverness, is the first lever against the in-sample problem.

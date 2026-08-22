@@ -13,7 +13,7 @@ use std::str::FromStr;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
-use cw_core::{Bar, CoreError, Decimal, Instrument, Interval, Result};
+use cw_core::{Bar, CoreError, Decimal, Instrument, Interval, Network, PoolId, Result};
 use duckdb::{params, Connection};
 
 /// A time window `[from, to]` (inclusive) used for point-in-time reads.
@@ -31,6 +31,13 @@ pub trait Store {
 
     /// Load bars for `(instrument, interval)` within `range` (point-in-time).
     fn load_bars(&self, instrument: &Instrument, interval: Interval, range: TimeRange) -> Result<Vec<Bar>>;
+
+    /// Record an instrument in the registry (idempotent) so the analysis side
+    /// can reconstruct the universe from the store alone (offline research).
+    fn register_instrument(&self, instrument: &Instrument) -> Result<()>;
+
+    /// All registered instruments (the persisted universe).
+    fn list_instruments(&self) -> Result<Vec<Instrument>>;
 }
 
 /// Stable string tag for an interval (matches the on-disk primary key).
@@ -73,6 +80,12 @@ impl DuckStore {
                 close    VARCHAR NOT NULL,
                 volume   VARCHAR NOT NULL,
                 PRIMARY KEY (network, pool, interval, ts)
+            );
+            CREATE TABLE IF NOT EXISTS instruments (
+                network VARCHAR NOT NULL,
+                pool    VARCHAR NOT NULL,
+                name    VARCHAR NOT NULL,
+                PRIMARY KEY (network, pool)
             );",
         )
         .map_err(|e| CoreError::Storage(format!("schema: {e}")))?;
@@ -169,6 +182,46 @@ impl Store for DuckStore {
                 low: dec(&low)?,
                 close: dec(&close)?,
                 volume: dec(&volume)?,
+            });
+        }
+        Ok(out)
+    }
+
+    fn register_instrument(&self, instrument: &Instrument) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| CoreError::Storage(format!("lock: {e}")))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO instruments VALUES (?,?,?)",
+            params![
+                instrument.network.slug(),
+                instrument.pool.0.as_str(),
+                instrument.name.as_str()
+            ],
+        )
+        .map_err(|e| CoreError::Storage(format!("register: {e}")))?;
+        Ok(())
+    }
+
+    fn list_instruments(&self) -> Result<Vec<Instrument>> {
+        let conn = self.conn.lock().map_err(|e| CoreError::Storage(format!("lock: {e}")))?;
+        let mut stmt = conn
+            .prepare("SELECT network, pool, name FROM instruments ORDER BY network, name")
+            .map_err(|e| CoreError::Storage(format!("prepare list: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| CoreError::Storage(format!("query: {e}")))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (network, pool, name) = r.map_err(|e| CoreError::Storage(format!("row: {e}")))?;
+            out.push(Instrument {
+                network: Network::from_slug(&network),
+                pool: PoolId(pool),
+                name,
             });
         }
         Ok(out)

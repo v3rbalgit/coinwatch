@@ -27,6 +27,16 @@ impl Network {
             Network::Other(s) => s.as_str(),
         }
     }
+
+    /// Inverse of [`Network::slug`]; unknown slugs round-trip through `Other`.
+    pub fn from_slug(slug: &str) -> Network {
+        match slug {
+            "base" => Network::Base,
+            "arbitrum" => Network::Arbitrum,
+            "eth" => Network::Ethereum,
+            other => Network::Other(other.to_string()),
+        }
+    }
 }
 
 /// A DEX pool address on a given network — the atomic unit of a price series.

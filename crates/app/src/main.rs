@@ -1,10 +1,14 @@
 //! `coinwatch` — orchestration entry point.
 //!
-//! Phase-2: modularity confirmation. Two independent feature modules
-//! ([`TechnicalFeatures`] + [`LiquidityFeatures`]) are combined into one frame and
-//! fed to the *unchanged* engine (`strategy` + `backtest` + `eval`). The same
-//! [`CrossSectional`] strategy is then ranked by either module's feature via
-//! config only — proving new edge hypotheses slot in without engine changes.
+//! Two subcommands cleanly separate the slow, networked ingest from fast, offline
+//! research (the shape a scheduled deployment needs):
+//!
+//! - `coinwatch ingest`  — discover the universe on Base + Arbitrum, register
+//!   instruments, and incrementally backfill daily bars into the DuckDB store
+//!   (skips pools that are already up to date).
+//! - `coinwatch analyze` — reconstruct the universe from the store (no network),
+//!   compute combined technical + liquidity features, and backtest the same
+//!   `CrossSectional` strategy ranked by either module's feature.
 
 use std::collections::HashMap;
 use std::fs;
@@ -12,122 +16,147 @@ use std::fs;
 use chrono::{Duration, Utc};
 use cw_backtest::{Backtester, CostModel, WalkForward};
 use cw_core::{Bar, CoreError, Decimal, Instrument, Interval, Network, Result};
-use cw_features::{combine, FeatureContext, FeatureFrame, FeatureModule, LiquidityFeatures, TechnicalFeatures};
+use cw_features::{combine, FeatureContext, FeatureFrame, FeatureModule, FeatureRow, LiquidityFeatures, TechnicalFeatures};
 use cw_providers::{BarRequest, DataSource, GeckoTerminal, UniverseRequest, UniverseSource};
 use cw_storage::{DuckStore, Store, TimeRange};
 use cw_strategy::CrossSectional;
 
 const DB_PATH: &str = "research/data/coinwatch.duckdb";
+/// Minimum bars an instrument needs before it can carry features / be analyzed.
+const MIN_BARS: usize = 60;
 
 #[tokio::main]
 async fn main() {
-    if let Err(e) = run().await {
+    let cmd = std::env::args().nth(1).unwrap_or_default();
+    let result = match cmd.as_str() {
+        "ingest" => ingest().await,
+        "" | "analyze" => analyze(),
+        other => {
+            eprintln!("unknown command '{other}'. usage: coinwatch [ingest|analyze]");
+            std::process::exit(2);
+        }
+    };
+    if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
 }
 
-async fn run() -> Result<()> {
-    let provider = GeckoTerminal::default();
-    let network = Network::Base;
+fn open_store() -> Result<DuckStore> {
+    fs::create_dir_all("research/data").map_err(|e| CoreError::Storage(format!("mkdir: {e}")))?;
+    DuckStore::open(DB_PATH)
+}
 
-    let uni_req = UniverseRequest {
-        min_reserve_usd: Decimal::from(1_000_000u64),
-        limit: 6,
-        pages: 1,
-    };
-    println!(
-        "universe: top {} pools on {} (reserve >= ${})",
-        uni_req.limit,
-        network.slug(),
-        uni_req.min_reserve_usd
-    );
-    let pools = provider.top_pools(&network, &uni_req).await?;
-    if pools.is_empty() {
-        println!("no pools matched; nothing to do");
-        return Ok(());
-    }
-
-    fs::create_dir_all("research/data")
-        .map_err(|e| CoreError::Storage(format!("mkdir research/data: {e}")))?;
-    let store = DuckStore::open(DB_PATH)?;
-
-    // Ingest each pool: load from the store when we already have history,
-    // otherwise fetch from the provider and persist. Reruns are offline + instant.
-    let wide = TimeRange {
+/// A generous read window covering all retained history.
+fn wide_range() -> TimeRange {
+    TimeRange {
         from: Utc::now() - Duration::days(400),
         to: Utc::now() + Duration::days(1),
+    }
+}
+
+fn feat(row: &FeatureRow, key: &str) -> Decimal {
+    row.values.get(key).copied().unwrap_or_default()
+}
+
+/// Discover + incrementally backfill the universe. Networked and resilient.
+async fn ingest() -> Result<()> {
+    let provider = GeckoTerminal::default();
+    let store = open_store()?;
+    let networks = [Network::Base, Network::Arbitrum];
+    let uni_req = UniverseRequest {
+        min_reserve_usd: Decimal::from(1_000_000u64),
+        limit: 12,
+        pages: 1,
     };
-    let mut dataset: Vec<(Instrument, Vec<Bar>)> = Vec::new();
-    for pool in &pools {
-        let stored = store.load_bars(&pool.instrument, Interval::Day, wide).unwrap_or_default();
-        let (bars, src) = if stored.len() >= 60 {
-            (stored, "store")
-        } else {
+
+    let (mut fetched, mut fresh) = (0usize, 0usize);
+    for network in &networks {
+        let pools = provider.top_pools(network, &uni_req).await?;
+        println!("network {}: {} pools (reserve >= ${})", network.slug(), pools.len(), uni_req.min_reserve_usd);
+        for pool in &pools {
+            store.register_instrument(&pool.instrument)?;
+            let stored = store.load_bars(&pool.instrument, Interval::Day, wide_range()).unwrap_or_default();
+            let up_to_date = stored.len() >= MIN_BARS
+                && stored.last().is_some_and(|b| b.ts > Utc::now() - Duration::days(2));
+            if up_to_date {
+                fresh += 1;
+                println!("  {:<28} up-to-date ({} bars)", pool.instrument.name, stored.len());
+                continue;
+            }
             let req = BarRequest {
                 instrument: pool.instrument.clone(),
                 interval: Interval::Day,
                 limit: 120,
             };
             match provider.fetch_bars(&req).await {
-                Ok(fetched) if !fetched.is_empty() => {
-                    store.upsert_bars(&pool.instrument, Interval::Day, &fetched)?;
-                    (fetched, "fetch")
+                Ok(bars) if !bars.is_empty() => {
+                    let n = store.upsert_bars(&pool.instrument, Interval::Day, &bars)?;
+                    fetched += 1;
+                    println!("  {:<28} +{} bars", pool.instrument.name, n);
                 }
-                Ok(_) => {
-                    println!("  {:<28} no bars", pool.instrument.name);
-                    continue;
-                }
-                Err(e) if !stored.is_empty() => {
-                    eprintln!("  {:<28} fetch failed ({e}); using stored", pool.instrument.name);
-                    (stored, "store")
-                }
-                Err(e) => {
-                    eprintln!("  {:<28} fetch failed: {e}", pool.instrument.name);
-                    continue;
-                }
+                Ok(_) => println!("  {:<28} no bars", pool.instrument.name),
+                Err(e) => eprintln!("  {:<28} fetch failed: {e}", pool.instrument.name),
             }
-        };
-        println!(
-            "  {:<28} reserve=${:>12.0}  bars={:>3} [{}]",
-            pool.instrument.name, pool.reserve_usd, bars.len(), src
-        );
-        dataset.push((pool.instrument.clone(), bars));
+        }
+    }
+    println!("ingest complete: {fetched} fetched, {fresh} up-to-date; db: {DB_PATH}");
+    Ok(())
+}
+
+/// Reconstruct the universe from the store and run the research pipeline offline.
+fn analyze() -> Result<()> {
+    let store = open_store()?;
+    let instruments = store.list_instruments()?;
+    if instruments.is_empty() {
+        println!("store empty — run `coinwatch ingest` first");
+        return Ok(());
+    }
+
+    let mut dataset: Vec<(Instrument, Vec<Bar>)> = Vec::new();
+    for inst in &instruments {
+        let bars = store.load_bars(inst, Interval::Day, wide_range()).unwrap_or_default();
+        if bars.len() >= MIN_BARS {
+            dataset.push((inst.clone(), bars));
+        }
     }
     let total_bars: usize = dataset.iter().map(|(_, b)| b.len()).sum();
-    println!("dataset: {} pools, {} bars; db: {DB_PATH}", dataset.len(), total_bars);
+    println!(
+        "analyze: {}/{} instruments with >={} bars, {} bars total",
+        dataset.len(), instruments.len(), MIN_BARS, total_bars
+    );
+    if dataset.len() < 2 {
+        println!("need >=2 instruments for a cross-sectional backtest — ingest more");
+        return Ok(());
+    }
 
     // Two independent feature modules → one combined frame for the same engine.
     let technical = TechnicalFeatures::default();
     let liquidity = LiquidityFeatures::default();
     let ctx = FeatureContext { bars: &dataset };
     let frame = combine(&[technical.compute(&ctx)?, liquidity.compute(&ctx)?]);
-    println!(
-        "features: modules [{}, {}] combined -> {} rows",
-        technical.name(),
-        liquidity.name(),
-        frame.rows.len()
-    );
+    println!("features: modules [{}, {}] -> {} rows", technical.name(), liquidity.name(), frame.rows.len());
 
-    // Cross-sectional momentum leaderboard from the latest feature bar per pool.
-    let mut latest: HashMap<&str, &cw_features::FeatureRow> = HashMap::new();
+    // Cross-sectional leaderboard from the latest feature bar per instrument.
+    let mut latest: HashMap<&str, &FeatureRow> = HashMap::new();
     for row in &frame.rows {
         let key = row.instrument.pool.0.as_str();
         if latest.get(key).is_none_or(|cur| row.ts > cur.ts) {
             latest.insert(key, row);
         }
     }
-    let mut board: Vec<&cw_features::FeatureRow> = latest.into_values().collect();
-    board.sort_by(|a, b| b.values["mom"].cmp(&a.values["mom"]));
-    println!("\nleaderboard (latest bar): momentum | dollar-vol momentum | illiquidity");
-    for (rank, row) in board.iter().enumerate() {
+    let mut board: Vec<&FeatureRow> = latest.into_values().collect();
+    board.sort_by_key(|b| std::cmp::Reverse(feat(b, "mom")));
+    println!("\nleaderboard (latest bar) top 10 by momentum:");
+    for (rank, row) in board.iter().take(10).enumerate() {
         println!(
-            "  {:>2}. {:<28} mom={:>8.4}  dvol_mom={:>8.4}  illiq={:>8.4}",
+            "  {:>2}. {:<9} {:<24} mom={:>8.4}  dvol_mom={:>8.4}  illiq={:>8.4}",
             rank + 1,
+            row.instrument.network.slug(),
             row.instrument.name,
-            row.values["mom"],
-            row.values["dvol_mom"],
-            row.values["illiq"],
+            feat(row, "mom"),
+            feat(row, "dvol_mom"),
+            feat(row, "illiq"),
         );
     }
 
