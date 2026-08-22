@@ -13,7 +13,7 @@ use std::str::FromStr;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
-use cw_core::{Bar, CoreError, Decimal, FundingPoint, Instrument, Interval, Network, OnchainDaily, PoolId, Result};
+use cw_core::{Bar, CoreError, Decimal, FundingPoint, Instrument, Interval, Network, PoolId, Result};
 use duckdb::{params, Connection};
 
 /// A time window `[from, to]` (inclusive) used for point-in-time reads.
@@ -38,12 +38,6 @@ pub trait Store {
 
     /// All registered instruments (the persisted universe).
     fn list_instruments(&self) -> Result<Vec<Instrument>>;
-
-    /// Insert-or-replace daily on-chain aggregates for a token (idempotent).
-    fn upsert_onchain(&self, network: &Network, token: &str, records: &[OnchainDaily]) -> Result<usize>;
-
-    /// Load daily on-chain aggregates for a token within `range` (point-in-time).
-    fn load_onchain(&self, network: &Network, token: &str, range: TimeRange) -> Result<Vec<OnchainDaily>>;
 
     /// Insert-or-replace perp funding points for a coin (idempotent).
     fn upsert_funding(&self, network: &Network, coin: &str, points: &[FundingPoint]) -> Result<usize>;
@@ -100,17 +94,6 @@ impl DuckStore {
                 token   VARCHAR,
                 PRIMARY KEY (network, pool)
             );
-            CREATE TABLE IF NOT EXISTS onchain_daily (
-                network         VARCHAR NOT NULL,
-                token           VARCHAR NOT NULL,
-                date            BIGINT  NOT NULL,
-                trades          BIGINT  NOT NULL,
-                volume_usd      VARCHAR NOT NULL,
-                unique_buyers   BIGINT  NOT NULL,
-                buy_volume_usd  VARCHAR,
-                sell_volume_usd VARCHAR,
-                PRIMARY KEY (network, token, date)
-            );
             CREATE TABLE IF NOT EXISTS funding (
                 network      VARCHAR NOT NULL,
                 coin         VARCHAR NOT NULL,
@@ -123,8 +106,6 @@ impl DuckStore {
         .map_err(|e| CoreError::Storage(format!("schema: {e}")))?;
         // Best-effort migrations for stores created before these columns existed.
         let _ = conn.execute("ALTER TABLE instruments ADD COLUMN token VARCHAR", []);
-        let _ = conn.execute("ALTER TABLE onchain_daily ADD COLUMN buy_volume_usd VARCHAR", []);
-        let _ = conn.execute("ALTER TABLE onchain_daily ADD COLUMN sell_volume_usd VARCHAR", []);
 
         Ok(Self {
             path,
@@ -261,74 +242,6 @@ impl Store for DuckStore {
                 pool: PoolId(pool),
                 name,
                 token,
-            });
-        }
-        Ok(out)
-    }
-
-    fn upsert_onchain(&self, network: &Network, token: &str, records: &[OnchainDaily]) -> Result<usize> {
-        let conn = self.conn.lock().map_err(|e| CoreError::Storage(format!("lock: {e}")))?;
-        let mut stmt = conn
-            .prepare("INSERT OR REPLACE INTO onchain_daily VALUES (?,?,?,?,?,?,?,?)")
-            .map_err(|e| CoreError::Storage(format!("prepare onchain upsert: {e}")))?;
-        let mut written = 0usize;
-        for r in records {
-            stmt.execute(params![
-                network.slug(),
-                token,
-                r.date.timestamp_millis(),
-                r.trades,
-                r.volume_usd.to_string(),
-                r.unique_buyers,
-                r.buy_volume_usd.to_string(),
-                r.sell_volume_usd.to_string(),
-            ])
-            .map_err(|e| CoreError::Storage(format!("onchain upsert: {e}")))?;
-            written += 1;
-        }
-        Ok(written)
-    }
-
-    fn load_onchain(&self, network: &Network, token: &str, range: TimeRange) -> Result<Vec<OnchainDaily>> {
-        let conn = self.conn.lock().map_err(|e| CoreError::Storage(format!("lock: {e}")))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT date, trades, volume_usd, unique_buyers, buy_volume_usd, sell_volume_usd
-                 FROM onchain_daily
-                 WHERE network = ? AND token = ? AND date BETWEEN ? AND ?
-                 ORDER BY date",
-            )
-            .map_err(|e| CoreError::Storage(format!("prepare onchain load: {e}")))?;
-        let rows = stmt
-            .query_map(
-                params![network.slug(), token, range.from.timestamp_millis(), range.to.timestamp_millis()],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                    ))
-                },
-            )
-            .map_err(|e| CoreError::Storage(format!("onchain query: {e}")))?;
-        let dec0 = |s: Option<String>| Decimal::from_str(&s.unwrap_or_else(|| "0".to_string())).unwrap_or_default();
-        let mut out = Vec::new();
-        for r in rows {
-            let (date_ms, trades, vol, buyers, buy, sell) =
-                r.map_err(|e| CoreError::Storage(format!("row: {e}")))?;
-            let date = DateTime::<Utc>::from_timestamp_millis(date_ms)
-                .ok_or_else(|| CoreError::InvalidData(format!("date out of range: {date_ms}")))?;
-            out.push(OnchainDaily {
-                date,
-                trades,
-                volume_usd: Decimal::from_str(&vol)
-                    .map_err(|e| CoreError::InvalidData(format!("decimal '{vol}': {e}")))?,
-                unique_buyers: buyers,
-                buy_volume_usd: dec0(buy),
-                sell_volume_usd: dec0(sell),
             });
         }
         Ok(out)

@@ -6,21 +6,18 @@
 //! This is the seam Phase 2 uses to *confirm* the architecture.
 
 pub mod liquidity;
-pub mod onchain;
 pub mod technical;
 
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
-use cw_core::{Bar, Decimal, Instrument, OnchainDaily, Result};
+use cw_core::{Bar, Decimal, Instrument, Result};
 
-/// Inputs available to a feature computation. Modules read only the channels they
-/// need: price/OHLCV modules use `bars`; on-chain modules use `onchain`. Both are
-/// per-instrument and oldest-first. Widening this is a feature-layer concern only
-/// — the engine (`strategy`/`backtest`/`eval`) never sees it.
+/// Inputs available to a feature computation: per-instrument bars, oldest-first.
+/// New signal channels (funding, alt-data) are added here as needed; the engine
+/// (`strategy`/`backtest`/`eval`) never sees this — it's a feature-layer concern.
 pub struct FeatureContext<'a> {
     pub bars: &'a [(Instrument, Vec<Bar>)],
-    pub onchain: &'a [(Instrument, Vec<OnchainDaily>)],
 }
 
 /// One row of computed features for one instrument at one timestamp.
@@ -70,5 +67,4 @@ pub fn combine(frames: &[FeatureFrame]) -> FeatureFrame {
 }
 
 pub use liquidity::LiquidityFeatures;
-pub use onchain::OnchainFeatures;
 pub use technical::TechnicalFeatures;

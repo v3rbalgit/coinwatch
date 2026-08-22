@@ -1,43 +1,39 @@
-//! `coinwatch` — orchestration entry point.
+//! `coinwatch` — orchestration entry point (Hyperliquid perps).
 //!
-//! Two subcommands cleanly separate the slow, networked ingest from fast, offline
-//! research (the shape a scheduled deployment needs):
+//! Two subcommands separate the slow, networked ingest from fast, offline research:
 //!
-//! - `coinwatch ingest`  — discover the universe on Base + Arbitrum, register
-//!   instruments, and incrementally backfill daily bars into the DuckDB store
-//!   (skips pools that are already up to date).
+//! - `coinwatch ingest`  — pull the Hyperliquid perp universe: ~3y of daily candles
+//!   and hourly funding into the DuckDB store (resumable, store-first).
 //! - `coinwatch analyze` — reconstruct the universe from the store (no network),
-//!   compute combined technical + liquidity features, and backtest the same
-//!   `CrossSectional` strategy ranked by either module's feature.
+//!   compute features, screen them by IC, and run cost-aware walk-forward backtests
+//!   + a deflated strategy sweep.
 
 use std::collections::HashMap;
 use std::fs;
 
 use chrono::{Duration, Utc};
 use cw_backtest::{Backtester, CostModel, WalkForward};
-use cw_core::{Bar, CoreError, Decimal, Instrument, Interval, Network, OnchainDaily, Result};
-use cw_features::{combine, FeatureContext, FeatureFrame, FeatureModule, FeatureRow, LiquidityFeatures, OnchainFeatures, TechnicalFeatures};
+use cw_core::{Bar, CoreError, Decimal, Instrument, Interval, Result};
+use cw_features::{combine, FeatureContext, FeatureFrame, FeatureModule, FeatureRow, LiquidityFeatures, TechnicalFeatures};
 use cw_harness::{feature_ic, sweep, WfConfig};
-use cw_providers::{BarRequest, Bitquery, DataSource, GeckoTerminal, Hyperliquid, OnchainSource, UniverseRequest, UniverseSource};
+use cw_providers::{BarRequest, DataSource, Hyperliquid};
 use cw_storage::{DuckStore, Store, TimeRange};
 use cw_strategy::CrossSectional;
 
 const DB_PATH: &str = "research/data/coinwatch.duckdb";
 /// Minimum bars an instrument needs before it can carry features / be analyzed.
 const MIN_BARS: usize = 60;
-/// Funding-history window pulled per perp on hl-ingest (paginated, resumable).
-const HL_FUNDING_DAYS: i64 = 120;
+/// Funding-history window pulled per perp on ingest (paginated, resumable).
+const FUNDING_DAYS: i64 = 120;
 
 #[tokio::main]
 async fn main() {
-    dotenvy::dotenv().ok(); // load .env (BITQUERY_ACCESS_TOKEN, …) if present
     let cmd = std::env::args().nth(1).unwrap_or_default();
     let result = match cmd.as_str() {
         "ingest" => ingest().await,
-        "hl-ingest" => hl_ingest().await,
         "" | "analyze" => analyze(),
         other => {
-            eprintln!("unknown command '{other}'. usage: coinwatch [ingest|hl-ingest|analyze]");
+            eprintln!("unknown command '{other}'. usage: coinwatch [ingest|analyze]");
             std::process::exit(2);
         }
     };
@@ -55,7 +51,7 @@ fn open_store() -> Result<DuckStore> {
 /// A generous read window covering all retained history.
 fn wide_range() -> TimeRange {
     TimeRange {
-        from: Utc::now() - Duration::days(400),
+        from: Utc::now() - Duration::days(1500),
         to: Utc::now() + Duration::days(1),
     }
 }
@@ -64,76 +60,9 @@ fn feat(row: &FeatureRow, key: &str) -> Decimal {
     row.values.get(key).copied().unwrap_or_default()
 }
 
-/// Discover + incrementally backfill the universe. Networked and resilient.
+/// Ingest the Hyperliquid perp universe: ~3y daily candles + hourly funding.
+/// Resumable/store-first, so re-runs skip current coins and fill the rest.
 async fn ingest() -> Result<()> {
-    let provider = GeckoTerminal::default();
-    let store = open_store()?;
-    let networks = [Network::Base, Network::Arbitrum, Network::Ethereum];
-    let uni_req = UniverseRequest {
-        min_reserve_usd: Decimal::from(300_000u64),
-        limit: 30,
-        pages: 2,
-    };
-
-    // On-chain flow is optional: only runs when a Bitquery token is configured.
-    let bitquery = std::env::var("BITQUERY_ACCESS_TOKEN")
-        .ok()
-        .filter(|t| !t.trim().is_empty())
-        .map(Bitquery::new);
-    if bitquery.is_none() {
-        println!("(no BITQUERY_ACCESS_TOKEN set — skipping on-chain flow)");
-    }
-
-    let (mut fetched, mut fresh, mut onchain_rows) = (0usize, 0usize, 0usize);
-    for network in &networks {
-        let pools = provider.top_pools(network, &uni_req).await?;
-        println!("network {}: {} pools (reserve >= ${})", network.slug(), pools.len(), uni_req.min_reserve_usd);
-        for pool in &pools {
-            store.register_instrument(&pool.instrument)?;
-
-            // On-chain daily flow — always run (forward-accumulate the ~4 recent
-            // days the free realtime tier exposes; idempotent upsert).
-            if let (Some(bq), Some(token)) = (bitquery.as_ref(), pool.instrument.token.as_deref()) {
-                let since = Utc::now() - Duration::days(5);
-                match bq.daily_flow(&pool.instrument.network, token, since).await {
-                    Ok(flow) if !flow.is_empty() => {
-                        onchain_rows += store.upsert_onchain(&pool.instrument.network, token, &flow)?;
-                    }
-                    Ok(_) => {}
-                    Err(e) => eprintln!("  {:<28} on-chain: {e}", pool.instrument.name),
-                }
-            }
-
-            let stored = store.load_bars(&pool.instrument, Interval::Day, wide_range()).unwrap_or_default();
-            let up_to_date = stored.len() >= MIN_BARS
-                && stored.last().is_some_and(|b| b.ts > Utc::now() - Duration::days(2));
-            if up_to_date {
-                fresh += 1;
-                println!("  {:<28} up-to-date ({} bars)", pool.instrument.name, stored.len());
-                continue;
-            }
-            let req = BarRequest {
-                instrument: pool.instrument.clone(),
-                interval: Interval::Day,
-                limit: 120,
-            };
-            match provider.fetch_bars(&req).await {
-                Ok(bars) if !bars.is_empty() => {
-                    let n = store.upsert_bars(&pool.instrument, Interval::Day, &bars)?;
-                    fetched += 1;
-                    println!("  {:<28} +{} bars", pool.instrument.name, n);
-                }
-                Ok(_) => println!("  {:<28} no bars", pool.instrument.name),
-                Err(e) => eprintln!("  {:<28} fetch failed: {e}", pool.instrument.name),
-            }
-        }
-    }
-    println!("ingest complete: {fetched} fetched, {fresh} up-to-date, {onchain_rows} on-chain rows; db: {DB_PATH}");
-    Ok(())
-}
-
-/// Ingest the Hyperliquid perp universe: ~3y of daily candles into the bars store.
-async fn hl_ingest() -> Result<()> {
     let hl = Hyperliquid::new();
     let store = open_store()?;
     let perps = hl.top_perps(40, Decimal::from(1_000_000u64)).await?;
@@ -150,7 +79,7 @@ async fn hl_ingest() -> Result<()> {
             .last()
             .is_some_and(|p| p.time > Utc::now() - Duration::days(2));
         if !funding_current {
-            match hl.fetch_funding(&inst.pool.0, Utc::now() - Duration::days(HL_FUNDING_DAYS)).await {
+            match hl.fetch_funding(&inst.pool.0, Utc::now() - Duration::days(FUNDING_DAYS)).await {
                 Ok(f) if !f.is_empty() => {
                     funding_rows += store.upsert_funding(&inst.network, &inst.pool.0, &f)?;
                 }
@@ -180,7 +109,7 @@ async fn hl_ingest() -> Result<()> {
             Err(e) => eprintln!("  {:<12} fetch failed: {e}", inst.name),
         }
     }
-    println!("hl-ingest complete: {total} bars, {funding_rows} funding rows across {} perps; db: {DB_PATH}", perps.len());
+    println!("ingest complete: {total} bars, {funding_rows} funding rows across {} perps; db: {DB_PATH}", perps.len());
     Ok(())
 }
 
@@ -210,28 +139,12 @@ fn analyze() -> Result<()> {
         return Ok(());
     }
 
-    // On-chain daily aggregates for the same universe (sparse until history grows).
-    let mut onchain_dataset: Vec<(Instrument, Vec<OnchainDaily>)> = Vec::new();
-    for (inst, _) in &dataset {
-        if let Some(token) = inst.token.as_deref() {
-            let oc = store.load_onchain(&inst.network, token, wide_range()).unwrap_or_default();
-            if !oc.is_empty() {
-                onchain_dataset.push((inst.clone(), oc));
-            }
-        }
-    }
-
-    // Three independent feature modules → one combined frame for the same engine.
+    // Feature modules → one combined frame for the same engine.
     let technical = TechnicalFeatures::default();
     let liquidity = LiquidityFeatures::default();
-    let onchain = OnchainFeatures;
-    let ctx = FeatureContext { bars: &dataset, onchain: &onchain_dataset };
-    let frame = combine(&[technical.compute(&ctx)?, liquidity.compute(&ctx)?, onchain.compute(&ctx)?]);
-    let oc_days: usize = onchain_dataset.iter().map(|(_, v)| v.len()).sum();
-    println!(
-        "features: modules [{}, {}, {}] -> {} rows ({} on-chain days / {} tokens)",
-        technical.name(), liquidity.name(), onchain.name(), frame.rows.len(), oc_days, onchain_dataset.len()
-    );
+    let ctx = FeatureContext { bars: &dataset };
+    let frame = combine(&[technical.compute(&ctx)?, liquidity.compute(&ctx)?]);
+    println!("features: modules [{}, {}] -> {} rows", technical.name(), liquidity.name(), frame.rows.len());
 
     // Cross-sectional leaderboard from the latest feature bar per instrument.
     let mut latest: HashMap<&str, &FeatureRow> = HashMap::new();
@@ -243,17 +156,16 @@ fn analyze() -> Result<()> {
     }
     let mut board: Vec<&FeatureRow> = latest.into_values().collect();
     board.sort_by_key(|b| std::cmp::Reverse(feat(b, "mom")));
-    println!("\nleaderboard (latest bar) top 10 by momentum  [oc_* present only for accumulated days]:");
-    for (rank, row) in board.iter().take(10).enumerate() {
+    println!("\nleaderboard (latest bar) top 12 by momentum:");
+    for (rank, row) in board.iter().take(12).enumerate() {
         println!(
-            "  {:>2}. {:<9} {:<22} mom={:>7.3}  oc_buyers={:>6}  oc_tpb={:>6.1}  oc_net={:>6.2}",
+            "  {:>2}. {:<10} mom={:>7.3}  vol={:>7.4}  rsi={:>6.2}  dvol_mom={:>7.3}",
             rank + 1,
-            row.instrument.network.slug(),
             row.instrument.name,
             feat(row, "mom"),
-            feat(row, "oc_buyers"),
-            feat(row, "oc_tpb"),
-            feat(row, "oc_netflow"),
+            feat(row, "vol"),
+            feat(row, "rsi"),
+            feat(row, "dvol_mom"),
         );
     }
 
@@ -288,7 +200,7 @@ fn analyze() -> Result<()> {
             candidates.push((format!("{feature}@{:.0}%", q * 100.0), cross(feature, q)));
         }
     }
-    let rows = sweep(&candidates, &dataset, &frame, WfConfig { train: 40, test: 12, embargo: 2 }, &costs)?;
+    let rows = sweep(&candidates, &dataset, &frame, WfConfig { train: 90, test: 30, embargo: 3 }, &costs)?;
     if rows.iter().all(|r| r.n_folds == 0) {
         println!("\nstrategy sweep: not enough history for the chosen windows");
         return Ok(());
@@ -323,10 +235,10 @@ fn run_backtest(label: &str, rank_feature: &str, dataset: &[(Instrument, Vec<Bar
     };
     let costs = CostModel {
         fee_frac: Decimal::new(5, 4),        // 5 bps swap fee
-        slippage_coeff: Decimal::new(5, 1), // linear price-impact coefficient
+        slippage_coeff: Decimal::new(5, 1),  // linear price-impact coefficient
         gas_usd: Decimal::new(50, 2),        // $0.50 per position change
     };
-    let backtester = Backtester::new(costs, WalkForward { train_bars: 60, test_bars: 30, embargo_bars: 3 });
+    let backtester = Backtester::new(costs, WalkForward { train_bars: 90, test_bars: 30, embargo_bars: 3 });
     let result = backtester.run(&strategy, dataset, frame)?;
     let m = cw_eval::evaluate(&result)?;
 

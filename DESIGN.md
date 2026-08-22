@@ -243,3 +243,34 @@ are retired.
   window). Landed 75k+ hourly funding rows across 27/40 perps (rest fills on further runs). Bumped HL
   pacing to ~1.1s to stay under the info-API weight limit (500ms triggered 429 storms). Deep (3y)
   funding backfill deferred; 120d suffices to build the carry signal + verify the pipeline.
+- *Consolidation on Hyperliquid*: the spot exploration built/validated the reusable engine, then we
+  pivoted — so the spot-specific code was retired. **Archived on branch `v2-spot`**; removed from
+  `main`: GeckoTerminal/Bitquery adapters, `OnchainFeatures`/`oc_*`, `onchain_daily` table, the
+  `FeatureContext.onchain` channel, `UniverseSource`/`OnchainSource` traits, and dotenvy. Renamed
+  `hl-ingest`→`ingest`; store cleaned to HL-only. Kept the asset-agnostic spine (features/strategy/
+  backtest/eval/harness/storage) + `providers/hyperliquid`. On the now-clean **3+ year / 1,170-
+  rebalance** HL cross-section two signals are **robustly significant**: `vol` IC **t=−5.45**
+  (low-volatility anomaly) and `illiq` **t=+4.70** (illiquidity premium); `mom` is ~zero. Long-only
+  strategies still blow up (they buy the high-vol pumped coins) — harvesting these needs **long/short**,
+  which perps enable and `CrossSectional.allow_short` supports. This is exactly what the perps
+  backtester (next) unlocks.
+
+## 8. Direction & signal roadmap
+
+**Direction A (active): Hyperliquid perps.** Find durable long/short + funding-carry edges on 3y of
+clean data, validate (walk-forward + DSR + realistic costs), then paper-trade and execute on HL.
+
+**Signal sourcing (how a quant sequences it):**
+- *Tier 1 (now — free, deep, directly about the traded instrument):* price signals (cross-sectional
+  momentum, mean-reversion, **low-volatility**, illiquidity) + perp-native signals (**funding carry**,
+  open interest / positioning, liquidation cascades). Start here; it's plenty to hunt a first edge.
+- *Tier 2 (later — added one at a time, each IC-screened before trust):* orthogonal/alt-data — the
+  *right* on-chain signals for large caps (exchange netflows, stablecoin flows, L1 activity/fees),
+  CEX order-flow, social sentiment. **Signal source ≠ execution venue:** an alt-data signal can drive
+  an HL trade. Don't hoard data — add a source only with a hypothesis, then IC-test it.
+
+**Direction B (parked): new-token discovery.** Gaming newly-listed tokens is a *different* tool with
+*different* signals (new-pool/launch detection, holder concentration, rug/LP-lock filters, first-hour
+wallet intelligence — mostly new work, not what the retired spot code did). The idea and the old spot
+adapters live on `v2-spot`; revive on the shared engine spine **if/when Direction A is working** and
+there's bandwidth. One direction at a time.

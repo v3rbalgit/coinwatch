@@ -18,7 +18,7 @@ pub enum Network {
 }
 
 impl Network {
-    /// URL/path slug used by data providers (GeckoTerminal-style: Ethereum = "eth").
+    /// URL/path slug used by data providers (e.g. Ethereum = "eth").
     pub fn slug(&self) -> &str {
         match self {
             Network::Base => "base",
@@ -91,19 +91,6 @@ impl Bar {
 pub struct TargetWeight {
     pub instrument: Instrument,
     pub weight: Decimal,
-}
-
-/// Per-day on-chain DEX activity for one token (from decoded swaps). Distinct
-/// from OHLCV: this is microstructure — trade counts, USD flow, unique traders.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct OnchainDaily {
-    pub date: DateTime<Utc>,
-    pub trades: i64,
-    pub volume_usd: Decimal,
-    pub unique_buyers: i64,
-    /// USD volume of buy-side vs sell-side swaps (order-flow imbalance driver).
-    pub buy_volume_usd: Decimal,
-    pub sell_volume_usd: Decimal,
 }
 
 /// One perpetual-futures funding observation (Hyperliquid): the hourly funding

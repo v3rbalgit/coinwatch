@@ -1,23 +1,14 @@
-//! `cw-providers` — the ingestion seams and their adapters.
+//! `cw-providers` — the ingestion seam and its adapters.
 //!
-//! Two capabilities, deliberately split so a feed that only serves OHLCV need not
-//! implement pool discovery:
-//! - [`DataSource`] — fetch canonical bars for one instrument.
-//! - [`UniverseSource`] — discover the tradable universe (top liquid pools).
-//!
-//! Every external feed (GeckoTerminal, Bitquery, a self-hosted RPC node) is an
-//! adapter behind these traits. Swapping keyless → keyed → paid, or one provider
-//! for another, is a wiring change — never a change to the rest of the system,
-//! which only ever sees canonical [`cw_core`] types. Adapters own their
-//! rate-limiting/backoff.
+//! [`DataSource`] fetches canonical bars for one instrument; adapters normalize
+//! provider payloads into canonical [`cw_core`] types and own their own
+//! rate-limiting/backoff. The active adapter is [`Hyperliquid`] (perps); its
+//! non-bar capabilities (perp universe, funding) are inherent methods on it.
 
-pub mod bitquery;
-pub mod geckoterminal;
 pub mod hyperliquid;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
-use cw_core::{Bar, Decimal, Instrument, Interval, Network, OnchainDaily, Result};
+use cw_core::{Bar, Instrument, Interval, Result};
 
 /// A request for a contiguous run of bars for one instrument.
 #[derive(Debug, Clone)]
@@ -32,50 +23,11 @@ pub struct BarRequest {
 /// [`Bar`]s.
 #[async_trait]
 pub trait DataSource: Send + Sync {
-    /// Stable adapter name for logging/metrics (e.g. `"geckoterminal"`).
+    /// Stable adapter name for logging/metrics.
     fn name(&self) -> &str;
 
     /// Fetch bars for `req`, oldest-first, OHLC-consistent.
     async fn fetch_bars(&self, req: &BarRequest) -> Result<Vec<Bar>>;
 }
 
-/// Parameters for universe discovery.
-#[derive(Debug, Clone)]
-pub struct UniverseRequest {
-    /// Minimum pool reserve (USD) to be considered tradable.
-    pub min_reserve_usd: Decimal,
-    /// Max pools to return (after filtering/dedupe).
-    pub limit: usize,
-    /// How many listing pages to scan.
-    pub pages: usize,
-}
-
-/// A discovered pool with the liquidity/volume that qualified it.
-#[derive(Debug, Clone)]
-pub struct PoolInfo {
-    pub instrument: Instrument,
-    pub reserve_usd: Decimal,
-    pub volume_24h_usd: Decimal,
-}
-
-/// The universe-discovery seam: rank/list the top liquid pools on a network.
-#[async_trait]
-pub trait UniverseSource: Send + Sync {
-    /// Top pools on `network` satisfying `req`, deduped by base token,
-    /// highest-liquidity first.
-    async fn top_pools(&self, network: &Network, req: &UniverseRequest) -> Result<Vec<PoolInfo>>;
-}
-
-/// The on-chain-microstructure seam: per-day DEX activity for a token, from
-/// decoded swaps. Distinct from bars (price) — this is flow (counts, USD, traders).
-#[async_trait]
-pub trait OnchainSource: Send + Sync {
-    fn name(&self) -> &str;
-
-    /// Daily aggregates for `token` on `network` since `since` (oldest-first).
-    async fn daily_flow(&self, network: &Network, token: &str, since: DateTime<Utc>) -> Result<Vec<OnchainDaily>>;
-}
-
-pub use bitquery::Bitquery;
-pub use geckoterminal::GeckoTerminal;
 pub use hyperliquid::Hyperliquid;
