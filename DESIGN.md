@@ -67,12 +67,12 @@ algorithm.
 
 ## 3. Data sources (verified 2026)
 
-| Source                         | What it gives                                                        | Cost / limits | Used for |
-|--------------------------------|----------------------------------------------------------------------|---------------|----------|
+| Source | What it gives | Cost / limits | Used for |
+| -------------------------------- | ---------------------------------------------------------------------- | --------------- | ---------- |
 | **GeckoTerminal / CoinGecko onchain** | DEX pool OHLCV to 1s granularity back to 2021; 250+ networks, 1900+ DEXes | Free keyless (~30 req/min, ~6 months history); paid deeper | Phase 1 OHLCV backtesting |
 | **Bitquery** ⭐ (chosen next) | Full DEX trade history from first swap; per-wallet trade history/PnL; holders; liquidity; multi-chain (ETH/Base/Arbitrum/OP/Polygon/BSC); GraphQL + Kafka/WS | Free key → $39/$79/mo | **On-chain feature modules (next)** — swap-level, holders, wallet flow |
-| **Dune (SQL) / The Graph**     | SQL / subgraph access to decoded events (Dune *Sim* API retired Aug 2026) | Free tiers + paid | Exploratory hypothesis validation |
-| **DexScreener**                | Live snapshots only — **no history**                                 | Free | Live scanner only; **not** backtesting |
+| **Dune (SQL) / The Graph** | SQL / subgraph access to decoded events (Dune *Sim* API retired Aug 2026) | Free tiers + paid | Exploratory hypothesis validation |
+| **DexScreener** | Live snapshots only — **no history** | Free | Live scanner only; **not** backtesting |
 | **Managed RPC (Alchemy / QuickNode / Helius)** | Real-time state, event logs, mempool, contract calls | Free tiers + paid | **Live loop + execution (later)** |
 
 Data-source adapters sit behind a single `DataSource` trait so providers are swappable.
@@ -186,3 +186,9 @@ are retired.
   dropped (managed RPC for live, analytical APIs for research); **Bitquery** chosen as the next
   on-chain data provider (free tier first) to build a swap-level/holder/wallet-flow feature module;
   eventual UI is a **TUI** introduced with paper trading. Direction: find → verify → execute.
+- *On-chain ingestion*: verified Bitquery v2 (spike) — **free tier is realtime-only, ~4-day
+  lookback**; historical needs a paid per-chain archive add-on (same query). Added `OnchainDaily`
+  type, `onchain_daily` store table + registry `token` column, an `OnchainSource` seam +
+  `Bitquery` adapter (Bearer auth, server-side `DEXTradeByTokens` aggregation), and wired `ingest`
+  to forward-accumulate daily on-chain flow (trades / USD volume / unique buyers). First run
+  stored 48 rows across 10 tokens. Feature module consuming it is next.

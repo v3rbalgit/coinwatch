@@ -49,6 +49,9 @@ pub struct Instrument {
     pub network: Network,
     pub pool: PoolId,
     pub name: String,
+    /// Base-token contract address, for joining on-chain data. `None` when unknown
+    /// (e.g. reconstructed from an older store row).
+    pub token: Option<String>,
 }
 
 /// Bar aggregation interval.
@@ -88,4 +91,14 @@ impl Bar {
 pub struct TargetWeight {
     pub instrument: Instrument,
     pub weight: Decimal,
+}
+
+/// Per-day on-chain DEX activity for one token (from decoded swaps). Distinct
+/// from OHLCV: this is microstructure — trade counts, USD flow, unique traders.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OnchainDaily {
+    pub date: DateTime<Utc>,
+    pub trades: i64,
+    pub volume_usd: Decimal,
+    pub unique_buyers: i64,
 }

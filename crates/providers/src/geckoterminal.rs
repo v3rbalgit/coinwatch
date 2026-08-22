@@ -285,21 +285,24 @@ impl UniverseSource for GeckoTerminal {
                 if reserve < req.min_reserve_usd {
                     continue;
                 }
+                let base_id = entry.relationships.base_token.and_then(|t| t.data).map(|d| d.id);
                 // Dedupe by base token so we don't collect five WETH/x pools.
-                let base_id = entry
-                    .relationships
-                    .base_token
-                    .and_then(|t| t.data)
-                    .map(|d| d.id)
-                    .unwrap_or_else(|| entry.attributes.address.clone());
-                if !seen.insert(base_id) {
+                let dedupe_key = base_id.clone().unwrap_or_else(|| entry.attributes.address.clone());
+                if !seen.insert(dedupe_key) {
                     continue;
                 }
+                // GeckoTerminal token ids are "{network}_{address}"; keep the address
+                // for on-chain (Bitquery) joins.
+                let token = base_id
+                    .as_deref()
+                    .and_then(|id| id.split_once('_'))
+                    .map(|(_, addr)| addr.to_string());
                 out.push(PoolInfo {
                     instrument: Instrument {
                         network: network.clone(),
                         pool: PoolId(entry.attributes.address),
                         name: entry.attributes.name,
+                        token,
                     },
                     reserve_usd: reserve,
                     volume_24h_usd: opt_decimal(&entry.attributes.volume_usd.h24).unwrap_or_default(),

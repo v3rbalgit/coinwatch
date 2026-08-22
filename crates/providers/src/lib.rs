@@ -11,10 +11,12 @@
 //! which only ever sees canonical [`cw_core`] types. Adapters own their
 //! rate-limiting/backoff.
 
+pub mod bitquery;
 pub mod geckoterminal;
 
 use async_trait::async_trait;
-use cw_core::{Bar, Decimal, Instrument, Interval, Network, Result};
+use chrono::{DateTime, Utc};
+use cw_core::{Bar, Decimal, Instrument, Interval, Network, OnchainDaily, Result};
 
 /// A request for a contiguous run of bars for one instrument.
 #[derive(Debug, Clone)]
@@ -63,4 +65,15 @@ pub trait UniverseSource: Send + Sync {
     async fn top_pools(&self, network: &Network, req: &UniverseRequest) -> Result<Vec<PoolInfo>>;
 }
 
+/// The on-chain-microstructure seam: per-day DEX activity for a token, from
+/// decoded swaps. Distinct from bars (price) — this is flow (counts, USD, traders).
+#[async_trait]
+pub trait OnchainSource: Send + Sync {
+    fn name(&self) -> &str;
+
+    /// Daily aggregates for `token` on `network` since `since` (oldest-first).
+    async fn daily_flow(&self, network: &Network, token: &str, since: DateTime<Utc>) -> Result<Vec<OnchainDaily>>;
+}
+
+pub use bitquery::Bitquery;
 pub use geckoterminal::GeckoTerminal;

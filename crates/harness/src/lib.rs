@@ -172,6 +172,7 @@ mod tests {
             network: Network::Base,
             pool: PoolId(name.to_string()),
             name: name.to_string(),
+            token: None,
         }
     }
 

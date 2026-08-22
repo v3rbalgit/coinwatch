@@ -18,7 +18,7 @@ use cw_backtest::{Backtester, CostModel, WalkForward};
 use cw_core::{Bar, CoreError, Decimal, Instrument, Interval, Network, Result};
 use cw_features::{combine, FeatureContext, FeatureFrame, FeatureModule, FeatureRow, LiquidityFeatures, TechnicalFeatures};
 use cw_harness::{walk_forward, WfConfig};
-use cw_providers::{BarRequest, DataSource, GeckoTerminal, UniverseRequest, UniverseSource};
+use cw_providers::{BarRequest, Bitquery, DataSource, GeckoTerminal, OnchainSource, UniverseRequest, UniverseSource};
 use cw_storage::{DuckStore, Store, TimeRange};
 use cw_strategy::CrossSectional;
 
@@ -28,6 +28,7 @@ const MIN_BARS: usize = 60;
 
 #[tokio::main]
 async fn main() {
+    dotenvy::dotenv().ok(); // load .env (BITQUERY_ACCESS_TOKEN, …) if present
     let cmd = std::env::args().nth(1).unwrap_or_default();
     let result = match cmd.as_str() {
         "ingest" => ingest().await,
@@ -71,12 +72,35 @@ async fn ingest() -> Result<()> {
         pages: 1,
     };
 
-    let (mut fetched, mut fresh) = (0usize, 0usize);
+    // On-chain flow is optional: only runs when a Bitquery token is configured.
+    let bitquery = std::env::var("BITQUERY_ACCESS_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+        .map(Bitquery::new);
+    if bitquery.is_none() {
+        println!("(no BITQUERY_ACCESS_TOKEN set — skipping on-chain flow)");
+    }
+
+    let (mut fetched, mut fresh, mut onchain_rows) = (0usize, 0usize, 0usize);
     for network in &networks {
         let pools = provider.top_pools(network, &uni_req).await?;
         println!("network {}: {} pools (reserve >= ${})", network.slug(), pools.len(), uni_req.min_reserve_usd);
         for pool in &pools {
             store.register_instrument(&pool.instrument)?;
+
+            // On-chain daily flow — always run (forward-accumulate the ~4 recent
+            // days the free realtime tier exposes; idempotent upsert).
+            if let (Some(bq), Some(token)) = (bitquery.as_ref(), pool.instrument.token.as_deref()) {
+                let since = Utc::now() - Duration::days(5);
+                match bq.daily_flow(&pool.instrument.network, token, since).await {
+                    Ok(flow) if !flow.is_empty() => {
+                        onchain_rows += store.upsert_onchain(&pool.instrument.network, token, &flow)?;
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("  {:<28} on-chain: {e}", pool.instrument.name),
+                }
+            }
+
             let stored = store.load_bars(&pool.instrument, Interval::Day, wide_range()).unwrap_or_default();
             let up_to_date = stored.len() >= MIN_BARS
                 && stored.last().is_some_and(|b| b.ts > Utc::now() - Duration::days(2));
@@ -101,7 +125,7 @@ async fn ingest() -> Result<()> {
             }
         }
     }
-    println!("ingest complete: {fetched} fetched, {fresh} up-to-date; db: {DB_PATH}");
+    println!("ingest complete: {fetched} fetched, {fresh} up-to-date, {onchain_rows} on-chain rows; db: {DB_PATH}");
     Ok(())
 }
 

@@ -92,6 +92,7 @@ mod tests {
                 network: Network::Base,
                 pool: PoolId(name.to_string()),
                 name: name.to_string(),
+                token: None,
             },
             ts: Utc::now(),
             values: BTreeMap::from([("mom".to_string(), Decimal::from(mom))]),
