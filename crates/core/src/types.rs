@@ -101,4 +101,7 @@ pub struct OnchainDaily {
     pub trades: i64,
     pub volume_usd: Decimal,
     pub unique_buyers: i64,
+    /// USD volume of buy-side vs sell-side swaps (order-flow imbalance driver).
+    pub buy_volume_usd: Decimal,
+    pub sell_volume_usd: Decimal,
 }

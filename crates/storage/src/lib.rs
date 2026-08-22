@@ -95,18 +95,22 @@ impl DuckStore {
                 PRIMARY KEY (network, pool)
             );
             CREATE TABLE IF NOT EXISTS onchain_daily (
-                network       VARCHAR NOT NULL,
-                token         VARCHAR NOT NULL,
-                date          BIGINT  NOT NULL,
-                trades        BIGINT  NOT NULL,
-                volume_usd    VARCHAR NOT NULL,
-                unique_buyers BIGINT  NOT NULL,
+                network         VARCHAR NOT NULL,
+                token           VARCHAR NOT NULL,
+                date            BIGINT  NOT NULL,
+                trades          BIGINT  NOT NULL,
+                volume_usd      VARCHAR NOT NULL,
+                unique_buyers   BIGINT  NOT NULL,
+                buy_volume_usd  VARCHAR,
+                sell_volume_usd VARCHAR,
                 PRIMARY KEY (network, token, date)
             );",
         )
         .map_err(|e| CoreError::Storage(format!("schema: {e}")))?;
-        // Best-effort migration for stores created before the token column existed.
+        // Best-effort migrations for stores created before these columns existed.
         let _ = conn.execute("ALTER TABLE instruments ADD COLUMN token VARCHAR", []);
+        let _ = conn.execute("ALTER TABLE onchain_daily ADD COLUMN buy_volume_usd VARCHAR", []);
+        let _ = conn.execute("ALTER TABLE onchain_daily ADD COLUMN sell_volume_usd VARCHAR", []);
 
         Ok(Self {
             path,
@@ -251,7 +255,7 @@ impl Store for DuckStore {
     fn upsert_onchain(&self, network: &Network, token: &str, records: &[OnchainDaily]) -> Result<usize> {
         let conn = self.conn.lock().map_err(|e| CoreError::Storage(format!("lock: {e}")))?;
         let mut stmt = conn
-            .prepare("INSERT OR REPLACE INTO onchain_daily VALUES (?,?,?,?,?,?)")
+            .prepare("INSERT OR REPLACE INTO onchain_daily VALUES (?,?,?,?,?,?,?,?)")
             .map_err(|e| CoreError::Storage(format!("prepare onchain upsert: {e}")))?;
         let mut written = 0usize;
         for r in records {
@@ -262,6 +266,8 @@ impl Store for DuckStore {
                 r.trades,
                 r.volume_usd.to_string(),
                 r.unique_buyers,
+                r.buy_volume_usd.to_string(),
+                r.sell_volume_usd.to_string(),
             ])
             .map_err(|e| CoreError::Storage(format!("onchain upsert: {e}")))?;
             written += 1;
@@ -273,7 +279,8 @@ impl Store for DuckStore {
         let conn = self.conn.lock().map_err(|e| CoreError::Storage(format!("lock: {e}")))?;
         let mut stmt = conn
             .prepare(
-                "SELECT date, trades, volume_usd, unique_buyers FROM onchain_daily
+                "SELECT date, trades, volume_usd, unique_buyers, buy_volume_usd, sell_volume_usd
+                 FROM onchain_daily
                  WHERE network = ? AND token = ? AND date BETWEEN ? AND ?
                  ORDER BY date",
             )
@@ -287,13 +294,17 @@ impl Store for DuckStore {
                         row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
                     ))
                 },
             )
             .map_err(|e| CoreError::Storage(format!("onchain query: {e}")))?;
+        let dec0 = |s: Option<String>| Decimal::from_str(&s.unwrap_or_else(|| "0".to_string())).unwrap_or_default();
         let mut out = Vec::new();
         for r in rows {
-            let (date_ms, trades, vol, buyers) = r.map_err(|e| CoreError::Storage(format!("row: {e}")))?;
+            let (date_ms, trades, vol, buyers, buy, sell) =
+                r.map_err(|e| CoreError::Storage(format!("row: {e}")))?;
             let date = DateTime::<Utc>::from_timestamp_millis(date_ms)
                 .ok_or_else(|| CoreError::InvalidData(format!("date out of range: {date_ms}")))?;
             out.push(OnchainDaily {
@@ -302,6 +313,8 @@ impl Store for DuckStore {
                 volume_usd: Decimal::from_str(&vol)
                     .map_err(|e| CoreError::InvalidData(format!("decimal '{vol}': {e}")))?,
                 unique_buyers: buyers,
+                buy_volume_usd: dec0(buy),
+                sell_volume_usd: dec0(sell),
             });
         }
         Ok(out)

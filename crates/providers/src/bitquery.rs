@@ -72,6 +72,10 @@ struct FlowRow {
     trades: serde_json::Value,
     #[serde(rename = "volumeUsd")]
     volume_usd: serde_json::Value,
+    #[serde(rename = "buyVol", default)]
+    buy_vol: serde_json::Value,
+    #[serde(rename = "sellVol", default)]
+    sell_vol: serde_json::Value,
     buyers: serde_json::Value,
 }
 #[derive(Deserialize)]
@@ -124,6 +128,8 @@ impl OnchainSource for Bitquery {
       day: Block {{ Date }}
       trades: count
       volumeUsd: sum(of: Trade_AmountInUSD)
+      buyVol: sum(of: Trade_AmountInUSD, if: {{Trade: {{Side: {{Type: {{is: buy}}}}}}}})
+      sellVol: sum(of: Trade_AmountInUSD, if: {{Trade: {{Side: {{Type: {{is: sell}}}}}}}})
       buyers: uniq(of: Trade_Buyer)
     }}
   }}
@@ -163,6 +169,8 @@ impl OnchainSource for Bitquery {
                 trades: val_i64(&r.trades),
                 volume_usd: val_decimal(&r.volume_usd),
                 unique_buyers: val_i64(&r.buyers),
+                buy_volume_usd: val_decimal(&r.buy_vol),
+                sell_volume_usd: val_decimal(&r.sell_vol),
             });
         }
         Ok(out)
