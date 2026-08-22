@@ -90,7 +90,9 @@ fn dvol_zscore(dvol: &[f64], i: usize, w: usize) -> Option<f64> {
     let m = mean(window);
     let var = window.iter().map(|v| (v - m).powi(2)).sum::<f64>() / window.len() as f64;
     let sd = var.sqrt();
-    if sd <= 0.0 {
+    // Epsilon (not <= 0.0): a constant-volume window has sd ~ fp-noise, which would
+    // otherwise yield a spurious z ≈ 1/√n instead of "no dispersion".
+    if sd <= 1e-12 {
         return None;
     }
     Some((dvol[i] - m) / sd)

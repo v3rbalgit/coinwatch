@@ -65,7 +65,9 @@ pub fn alpha_beta(strategy: &[f64], market: &[f64]) -> AlphaBeta {
         cov += (m[i] - mean_m) * (s[i] - mean_s);
         var_m += (m[i] - mean_m).powi(2);
     }
-    let beta = if var_m > 0.0 { cov / var_m } else { 0.0 };
+    // Epsilon guards: a (near-)constant market factor has var_m ~ fp-noise, which
+    // would otherwise produce a spurious beta from noise/noise.
+    let beta = if var_m > 1e-12 { cov / var_m } else { 0.0 };
     let alpha = mean_s - beta * mean_m;
     let (mut ss_res, mut ss_tot) = (0.0, 0.0);
     for i in 0..n {
@@ -73,7 +75,7 @@ pub fn alpha_beta(strategy: &[f64], market: &[f64]) -> AlphaBeta {
         ss_res += (s[i] - pred).powi(2);
         ss_tot += (s[i] - mean_s).powi(2);
     }
-    let r2 = if ss_tot > 0.0 { 1.0 - ss_res / ss_tot } else { 0.0 };
+    let r2 = if ss_tot > 1e-12 { 1.0 - ss_res / ss_tot } else { 0.0 };
     AlphaBeta { alpha, alpha_annual: alpha * PERIODS_PER_YEAR, beta, r2 }
 }
 
@@ -85,7 +87,9 @@ pub fn per_period_sharpe(rets: &[f64]) -> f64 {
     let n = rets.len() as f64;
     let mean = rets.iter().sum::<f64>() / n;
     let sd = (rets.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n).sqrt();
-    if sd > 0.0 {
+    // Epsilon (not > 0.0): a near-constant series has sd ~ fp-noise, which would
+    // otherwise yield an astronomical mean/sd; treat it as no measurable Sharpe.
+    if sd > 1e-12 {
         mean / sd
     } else {
         0.0
@@ -154,7 +158,9 @@ fn moments(rets: &[f64]) -> (f64, f64, f64, f64) {
     let n = rets.len() as f64;
     let mean = rets.iter().sum::<f64>() / n;
     let sd = (rets.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n).sqrt();
-    if sd <= 0.0 {
+    // Epsilon (not <= 0.0): near-constant returns have sd ~ fp-noise; computing skew/
+    // kurtosis by dividing through it yields nonsense, so treat it as degenerate.
+    if sd <= 1e-12 {
         return (mean, 0.0, 0.0, 3.0);
     }
     let skew = rets.iter().map(|r| ((r - mean) / sd).powi(3)).sum::<f64>() / n;
@@ -211,7 +217,9 @@ pub fn evaluate(result: &BacktestResult) -> Result<Metrics> {
     let sharpe = if sd > 0.0 { mean / sd * ann } else { 0.0 };
 
     let dsd = (rets.iter().map(|r| if *r < 0.0 { r * r } else { 0.0 }).sum::<f64>() / n).sqrt();
-    let sortino = if dsd > 0.0 { mean / dsd * ann } else { 0.0 };
+    // Epsilon (not > 0.0): a series with only fp-noise downside would otherwise
+    // yield an astronomical Sortino.
+    let sortino = if dsd > 1e-12 { mean / dsd * ann } else { 0.0 };
 
     let eq: Vec<f64> = result.equity_curve.iter().map(|(_, e)| e.to_f64().unwrap_or(0.0)).collect();
     let mut peak = eq.first().copied().unwrap_or(0.0);
@@ -258,7 +266,16 @@ mod tests {
 
     #[test]
     fn steady_growth_has_positive_sharpe_and_no_drawdown() {
-        let eq: Vec<f64> = (0..40).map(|i| 10_000.0 * 1.01_f64.powi(i)).collect();
+        // Steadily-rising equity with mild positive variation: positive Sharpe, no
+        // drawdown, 100% hit rate. (A *perfectly* constant return has zero volatility
+        // and thus an undefined Sharpe, which we now report as 0 rather than an
+        // fp-noise-driven number.)
+        let mut equity = 10_000.0;
+        let mut eq = vec![equity];
+        for i in 0..40 {
+            equity *= 1.0 + 0.008 + 0.004 * ((i as f64 * 0.9).sin() * 0.5 + 0.5);
+            eq.push(equity);
+        }
         let m = evaluate(&result_from(&eq)).unwrap();
         assert!(m.sharpe > 0.0);
         assert!(m.max_drawdown < 1e-9);
@@ -291,6 +308,17 @@ mod tests {
         assert!((ab.beta - 1.5).abs() < 1e-6);
         assert!((ab.alpha - 0.001).abs() < 1e-6);
         assert!(ab.r2 > 0.999);
+    }
+
+    #[test]
+    fn constant_series_do_not_produce_spurious_stats() {
+        // Near-constant inputs must not yield an astronomical Sharpe, and regressing
+        // on a constant market factor must give beta 0 (not fp-noise / fp-noise).
+        let flat = vec![0.001_f64; 40];
+        assert_eq!(per_period_sharpe(&flat), 0.0);
+        let ab = alpha_beta(&flat, &vec![0.002_f64; 40]);
+        assert_eq!(ab.beta, 0.0);
+        assert_eq!(ab.r2, 0.0);
     }
 
     #[test]
