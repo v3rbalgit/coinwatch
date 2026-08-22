@@ -105,3 +105,13 @@ pub struct OnchainDaily {
     pub buy_volume_usd: Decimal,
     pub sell_volume_usd: Decimal,
 }
+
+/// One perpetual-futures funding observation (Hyperliquid): the hourly funding
+/// rate longs pay shorts (negative = shorts pay longs) and the mark-vs-oracle
+/// premium. Funding is both a holding cost and a carry-edge signal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FundingPoint {
+    pub time: DateTime<Utc>,
+    pub funding_rate: Decimal,
+    pub premium: Decimal,
+}

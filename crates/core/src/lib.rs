@@ -9,7 +9,7 @@ pub mod error;
 pub mod types;
 
 pub use error::{CoreError, Result};
-pub use types::{Bar, Instrument, Interval, Network, OnchainDaily, PoolId, TargetWeight};
+pub use types::{Bar, FundingPoint, Instrument, Interval, Network, OnchainDaily, PoolId, TargetWeight};
 
 /// Re-export so downstream crates share one `Decimal` type.
 pub use rust_decimal::Decimal;

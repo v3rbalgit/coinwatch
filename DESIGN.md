@@ -238,3 +238,8 @@ are retired.
   `Bar`s) and an `hl-ingest` command (resumable, store-first). Landed **40 perps × 37,148 daily bars,
   2023-05 → today (3.3y), 24 coins with ≥3y each, 0 OHLC violations.** Next: funding store + perps-
   aware backtester (shorts + funding P&L) + long/short research on this universe.
+- *HL funding (chunk 1b)*: added `FundingPoint` type, a `funding` store table + `upsert/load_funding`,
+  and `Hyperliquid::fetch_funding` (paginated, deduped) wired into `hl-ingest` (resumable, 120-day
+  window). Landed 75k+ hourly funding rows across 27/40 perps (rest fills on further runs). Bumped HL
+  pacing to ~1.1s to stay under the info-API weight limit (500ms triggered 429 storms). Deep (3y)
+  funding backfill deferred; 120d suffices to build the carry signal + verify the pipeline.

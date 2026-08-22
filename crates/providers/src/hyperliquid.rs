@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cw_core::{Bar, CoreError, Decimal, Instrument, Interval, Network, PoolId, Result};
+use cw_core::{Bar, CoreError, Decimal, FundingPoint, Instrument, Interval, Network, PoolId, Result};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::json;
@@ -21,7 +21,9 @@ use serde_json::json;
 use crate::{BarRequest, DataSource};
 
 const ENDPOINT: &str = "https://api.hyperliquid.xyz/info";
-const DEFAULT_MIN_INTERVAL: Duration = Duration::from_millis(500);
+// HL info API is weight-rate-limited (~1200/min); ~1.1s spacing stays under it and
+// avoids the 429-retry storms that make paginated funding backfills crawl.
+const DEFAULT_MIN_INTERVAL: Duration = Duration::from_millis(1100);
 const MAX_RETRIES: u32 = 4;
 
 /// Hyperliquid info-API adapter. Market data needs no auth.
@@ -130,6 +132,39 @@ impl Hyperliquid {
         out.truncate(limit);
         Ok(out)
     }
+
+    /// Hourly funding history for `coin` since `since`, paginated (the API caps
+    /// at ~500 points per call), deduped and oldest-first.
+    pub async fn fetch_funding(&self, coin: &str, since: DateTime<Utc>) -> Result<Vec<FundingPoint>> {
+        let now = Utc::now().timestamp_millis();
+        let mut start = since.timestamp_millis();
+        let mut out: Vec<FundingPoint> = Vec::new();
+        loop {
+            let body = json!({ "type": "fundingHistory", "coin": coin, "startTime": start, "endTime": now });
+            let rows: Vec<FundingRow> = self.post_json(&body).await?;
+            if rows.is_empty() {
+                break;
+            }
+            let page = rows.len();
+            let last_time = rows.iter().map(|r| r.time).max().unwrap_or(start);
+            for r in rows {
+                let time = DateTime::<Utc>::from_timestamp_millis(r.time)
+                    .ok_or_else(|| CoreError::InvalidData(format!("funding ts out of range: {}", r.time)))?;
+                out.push(FundingPoint {
+                    time,
+                    funding_rate: Decimal::from_str(&r.funding_rate).unwrap_or_default(),
+                    premium: Decimal::from_str(&r.premium).unwrap_or_default(),
+                });
+            }
+            if page < 500 || last_time >= now {
+                break; // last page
+            }
+            start = last_time + 1;
+        }
+        out.sort_by_key(|p| p.time);
+        out.dedup_by_key(|p| p.time);
+        Ok(out)
+    }
 }
 
 /// Hyperliquid candle interval + its millis-per-bar (for the start-time window).
@@ -173,6 +208,15 @@ struct Candle {
     c: serde_json::Value,
     #[serde(default)]
     v: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct FundingRow {
+    #[serde(rename = "fundingRate")]
+    funding_rate: String,
+    #[serde(default)]
+    premium: String,
+    time: i64,
 }
 
 #[async_trait]

@@ -25,6 +25,8 @@ use cw_strategy::CrossSectional;
 const DB_PATH: &str = "research/data/coinwatch.duckdb";
 /// Minimum bars an instrument needs before it can carry features / be analyzed.
 const MIN_BARS: usize = 60;
+/// Funding-history window pulled per perp on hl-ingest (paginated, resumable).
+const HL_FUNDING_DAYS: i64 = 120;
 
 #[tokio::main]
 async fn main() {
@@ -137,9 +139,26 @@ async fn hl_ingest() -> Result<()> {
     let perps = hl.top_perps(40, Decimal::from(1_000_000u64)).await?;
     println!("hyperliquid: {} perps (min 24h vol $1M)", perps.len());
 
-    let mut total = 0usize;
+    let (mut total, mut funding_rows) = (0usize, 0usize);
     for (inst, day_vol) in &perps {
         store.register_instrument(inst)?;
+
+        // Funding (perp carry signal) — resumable: pull a bounded window unless current.
+        let funding_current = store
+            .load_funding(&inst.network, &inst.pool.0, wide_range())
+            .unwrap_or_default()
+            .last()
+            .is_some_and(|p| p.time > Utc::now() - Duration::days(2));
+        if !funding_current {
+            match hl.fetch_funding(&inst.pool.0, Utc::now() - Duration::days(HL_FUNDING_DAYS)).await {
+                Ok(f) if !f.is_empty() => {
+                    funding_rows += store.upsert_funding(&inst.network, &inst.pool.0, &f)?;
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("  {:<12} funding: {e}", inst.name),
+            }
+        }
+
         // Resumable: skip coins already backfilled and current.
         let stored = store.load_bars(inst, Interval::Day, wide_range()).unwrap_or_default();
         if stored.len() >= 300 && stored.last().is_some_and(|b| b.ts > Utc::now() - Duration::days(2)) {
@@ -161,7 +180,7 @@ async fn hl_ingest() -> Result<()> {
             Err(e) => eprintln!("  {:<12} fetch failed: {e}", inst.name),
         }
     }
-    println!("hl-ingest complete: {total} bars across {} perps; db: {DB_PATH}", perps.len());
+    println!("hl-ingest complete: {total} bars, {funding_rows} funding rows across {} perps; db: {DB_PATH}", perps.len());
     Ok(())
 }
 

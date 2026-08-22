@@ -13,7 +13,7 @@ use std::str::FromStr;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
-use cw_core::{Bar, CoreError, Decimal, Instrument, Interval, Network, OnchainDaily, PoolId, Result};
+use cw_core::{Bar, CoreError, Decimal, FundingPoint, Instrument, Interval, Network, OnchainDaily, PoolId, Result};
 use duckdb::{params, Connection};
 
 /// A time window `[from, to]` (inclusive) used for point-in-time reads.
@@ -44,6 +44,12 @@ pub trait Store {
 
     /// Load daily on-chain aggregates for a token within `range` (point-in-time).
     fn load_onchain(&self, network: &Network, token: &str, range: TimeRange) -> Result<Vec<OnchainDaily>>;
+
+    /// Insert-or-replace perp funding points for a coin (idempotent).
+    fn upsert_funding(&self, network: &Network, coin: &str, points: &[FundingPoint]) -> Result<usize>;
+
+    /// Load perp funding points for a coin within `range` (point-in-time).
+    fn load_funding(&self, network: &Network, coin: &str, range: TimeRange) -> Result<Vec<FundingPoint>>;
 }
 
 /// Stable string tag for an interval (matches the on-disk primary key).
@@ -104,6 +110,14 @@ impl DuckStore {
                 buy_volume_usd  VARCHAR,
                 sell_volume_usd VARCHAR,
                 PRIMARY KEY (network, token, date)
+            );
+            CREATE TABLE IF NOT EXISTS funding (
+                network      VARCHAR NOT NULL,
+                coin         VARCHAR NOT NULL,
+                time         BIGINT  NOT NULL,
+                funding_rate VARCHAR NOT NULL,
+                premium      VARCHAR NOT NULL,
+                PRIMARY KEY (network, coin, time)
             );",
         )
         .map_err(|e| CoreError::Storage(format!("schema: {e}")))?;
@@ -316,6 +330,52 @@ impl Store for DuckStore {
                 buy_volume_usd: dec0(buy),
                 sell_volume_usd: dec0(sell),
             });
+        }
+        Ok(out)
+    }
+
+    fn upsert_funding(&self, network: &Network, coin: &str, points: &[FundingPoint]) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| CoreError::Storage(format!("lock: {e}")))?;
+        let mut stmt = conn
+            .prepare("INSERT OR REPLACE INTO funding VALUES (?,?,?,?,?)")
+            .map_err(|e| CoreError::Storage(format!("prepare funding upsert: {e}")))?;
+        let mut written = 0usize;
+        for p in points {
+            stmt.execute(params![
+                network.slug(),
+                coin,
+                p.time.timestamp_millis(),
+                p.funding_rate.to_string(),
+                p.premium.to_string(),
+            ])
+            .map_err(|e| CoreError::Storage(format!("funding upsert: {e}")))?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    fn load_funding(&self, network: &Network, coin: &str, range: TimeRange) -> Result<Vec<FundingPoint>> {
+        let conn = self.conn.lock().map_err(|e| CoreError::Storage(format!("lock: {e}")))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT time, funding_rate, premium FROM funding
+                 WHERE network = ? AND coin = ? AND time BETWEEN ? AND ?
+                 ORDER BY time",
+            )
+            .map_err(|e| CoreError::Storage(format!("prepare funding load: {e}")))?;
+        let rows = stmt
+            .query_map(
+                params![network.slug(), coin, range.from.timestamp_millis(), range.to.timestamp_millis()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+            )
+            .map_err(|e| CoreError::Storage(format!("funding query: {e}")))?;
+        let dec = |s: &str| Decimal::from_str(s).unwrap_or_default();
+        let mut out = Vec::new();
+        for r in rows {
+            let (time_ms, rate, prem) = r.map_err(|e| CoreError::Storage(format!("row: {e}")))?;
+            let time = DateTime::<Utc>::from_timestamp_millis(time_ms)
+                .ok_or_else(|| CoreError::InvalidData(format!("time out of range: {time_ms}")))?;
+            out.push(FundingPoint { time, funding_rate: dec(&rate), premium: dec(&prem) });
         }
         Ok(out)
     }
