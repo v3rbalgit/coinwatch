@@ -1,17 +1,18 @@
 //! `coinwatch` — orchestration entry point.
 //!
-//! Phase-1 (in progress): the live seams end-to-end across a *universe* —
-//! discover top liquid pools ([`UniverseSource`]), backfill each into the DuckDB
-//! [`DuckStore`] (paced + idempotent), compute the [`TechnicalFeatures`] matrix,
-//! and rank instruments cross-sectionally by momentum. Strategy/backtest/eval land next.
+//! Phase-2: modularity confirmation. Two independent feature modules
+//! ([`TechnicalFeatures`] + [`LiquidityFeatures`]) are combined into one frame and
+//! fed to the *unchanged* engine (`strategy` + `backtest` + `eval`). The same
+//! [`CrossSectional`] strategy is then ranked by either module's feature via
+//! config only — proving new edge hypotheses slot in without engine changes.
 
 use std::collections::HashMap;
 use std::fs;
 
 use chrono::{Duration, Utc};
 use cw_backtest::{Backtester, CostModel, WalkForward};
-use cw_core::{CoreError, Decimal, Instrument, Interval, Network, Result};
-use cw_features::{FeatureContext, FeatureModule, TechnicalFeatures};
+use cw_core::{Bar, CoreError, Decimal, Instrument, Interval, Network, Result};
+use cw_features::{combine, FeatureContext, FeatureFrame, FeatureModule, LiquidityFeatures, TechnicalFeatures};
 use cw_providers::{BarRequest, DataSource, GeckoTerminal, UniverseRequest, UniverseSource};
 use cw_storage::{DuckStore, Store, TimeRange};
 use cw_strategy::CrossSectional;
@@ -57,7 +58,7 @@ async fn run() -> Result<()> {
         from: Utc::now() - Duration::days(400),
         to: Utc::now() + Duration::days(1),
     };
-    let mut dataset: Vec<(Instrument, Vec<cw_core::Bar>)> = Vec::new();
+    let mut dataset: Vec<(Instrument, Vec<Bar>)> = Vec::new();
     for pool in &pools {
         let stored = store.load_bars(&pool.instrument, Interval::Day, wide).unwrap_or_default();
         let (bars, src) = if stored.len() >= 60 {
@@ -96,9 +97,19 @@ async fn run() -> Result<()> {
     let total_bars: usize = dataset.iter().map(|(_, b)| b.len()).sum();
     println!("dataset: {} pools, {} bars; db: {DB_PATH}", dataset.len(), total_bars);
 
+    // Two independent feature modules → one combined frame for the same engine.
+    let technical = TechnicalFeatures::default();
+    let liquidity = LiquidityFeatures::default();
+    let ctx = FeatureContext { bars: &dataset };
+    let frame = combine(&[technical.compute(&ctx)?, liquidity.compute(&ctx)?]);
+    println!(
+        "features: modules [{}, {}] combined -> {} rows",
+        technical.name(),
+        liquidity.name(),
+        frame.rows.len()
+    );
+
     // Cross-sectional momentum leaderboard from the latest feature bar per pool.
-    let module = TechnicalFeatures::default();
-    let frame = module.compute(&FeatureContext { bars: &dataset })?;
     let mut latest: HashMap<&str, &cw_features::FeatureRow> = HashMap::new();
     for row in &frame.rows {
         let key = row.instrument.pool.0.as_str();
@@ -108,22 +119,29 @@ async fn run() -> Result<()> {
     }
     let mut board: Vec<&cw_features::FeatureRow> = latest.into_values().collect();
     board.sort_by(|a, b| b.values["mom"].cmp(&a.values["mom"]));
-
-    println!("\nmomentum leaderboard (latest bar, {} lookback):", module.momentum_lookback);
+    println!("\nleaderboard (latest bar): momentum | dollar-vol momentum | illiquidity");
     for (rank, row) in board.iter().enumerate() {
         println!(
-            "  {:>2}. {:<28} mom={:>8.4} rsi={:>6.2} vol={:>7.4}",
+            "  {:>2}. {:<28} mom={:>8.4}  dvol_mom={:>8.4}  illiq={:>8.4}",
             rank + 1,
             row.instrument.name,
             row.values["mom"],
-            row.values["rsi"],
-            row.values["vol"],
+            row.values["dvol_mom"],
+            row.values["illiq"],
         );
     }
 
-    // --- Backtest the cross-sectional momentum strategy over the universe. ---
+    // Same engine, two edge hypotheses — selected by config (rank feature) only.
+    run_backtest("technical momentum", "mom", &dataset, &frame)?;
+    run_backtest("liquidity: dollar-vol momentum", "dvol_mom", &dataset, &frame)?;
+    Ok(())
+}
+
+/// Backtest [`CrossSectional`] ranked by `rank_feature` and print metrics.
+/// Nothing here is feature-module-specific — the same engine consumes any column.
+fn run_backtest(label: &str, rank_feature: &str, dataset: &[(Instrument, Vec<Bar>)], frame: &FeatureFrame) -> Result<()> {
     let strategy = CrossSectional {
-        rank_feature: "mom".to_string(),
+        rank_feature: rank_feature.to_string(),
         top_quantile: 0.4,
         allow_short: false,
     };
@@ -132,30 +150,25 @@ async fn run() -> Result<()> {
         slippage_coeff: Decimal::new(10, 4), // 10 bps slippage haircut
         gas_usd: Decimal::new(50, 2),        // $0.50 per position change
     };
-    let backtester = Backtester::new(
-        costs,
-        WalkForward { train_bars: 60, test_bars: 30, embargo_bars: 3 },
-    );
-    let result = backtester.run(&strategy, &dataset, &frame)?;
-    let metrics = cw_eval::evaluate(&result)?;
+    let backtester = Backtester::new(costs, WalkForward { train_bars: 60, test_bars: 30, embargo_bars: 3 });
+    let result = backtester.run(&strategy, dataset, frame)?;
+    let m = cw_eval::evaluate(&result)?;
 
     if let (Some((_, e0)), Some((_, e1))) = (result.equity_curve.first(), result.equity_curve.last()) {
         let total = ((e1 / e0 - Decimal::ONE) * Decimal::from(100)).round_dp(2);
         println!(
-            "\nbacktest (long-only top {:.0}% by {}, {} rebalances):",
-            strategy.top_quantile * 100.0,
-            strategy.rank_feature,
-            result.equity_curve.len().saturating_sub(1),
+            "\nbacktest [{label}] (long-only top 40% by {rank_feature}, {} rebalances):",
+            result.equity_curve.len().saturating_sub(1)
         );
         println!("  equity: ${} -> ${}  ({}% total)", e0.round_dp(2), e1.round_dp(2), total);
         println!(
             "  sharpe={:.2}  sortino={:.2}  maxDD={:.1}%  hit={:.1}%  turnover={:.2}  PSR={:.1}%  trades={}",
-            metrics.sharpe,
-            metrics.sortino,
-            metrics.max_drawdown * 100.0,
-            metrics.hit_rate * 100.0,
-            metrics.turnover,
-            metrics.psr * 100.0,
+            m.sharpe,
+            m.sortino,
+            m.max_drawdown * 100.0,
+            m.hit_rate * 100.0,
+            m.turnover,
+            m.psr * 100.0,
             result.trades.len(),
         );
     }

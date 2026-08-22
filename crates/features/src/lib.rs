@@ -5,6 +5,7 @@
 //! adding a `tokenomics` or `onchain_activity` module must not touch the engine.
 //! This is the seam Phase 2 uses to *confirm* the architecture.
 
+pub mod liquidity;
 pub mod technical;
 
 use std::collections::BTreeMap;
@@ -40,4 +41,28 @@ pub trait FeatureModule {
     fn compute(&self, ctx: &FeatureContext<'_>) -> Result<FeatureFrame>;
 }
 
+/// Merge several modules' frames into one, unioning feature columns per
+/// `(instrument, timestamp)`. This is how independent modules become combinable
+/// inputs to a single strategy — without the engine knowing how many modules ran.
+pub fn combine(frames: &[FeatureFrame]) -> FeatureFrame {
+    let mut merged: BTreeMap<(String, i64), FeatureRow> = BTreeMap::new();
+    for frame in frames {
+        for row in &frame.rows {
+            let key = (row.instrument.pool.0.clone(), row.ts.timestamp_millis());
+            merged
+                .entry(key)
+                .and_modify(|existing| {
+                    for (k, v) in &row.values {
+                        existing.values.insert(k.clone(), *v);
+                    }
+                })
+                .or_insert_with(|| row.clone());
+        }
+    }
+    FeatureFrame {
+        rows: merged.into_values().collect(),
+    }
+}
+
+pub use liquidity::LiquidityFeatures;
 pub use technical::TechnicalFeatures;

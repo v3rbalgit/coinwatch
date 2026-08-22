@@ -128,9 +128,13 @@ scaffolding. The Bybit/CEX clients and the HTTP microservice mesh are retired.
    only purpose is to confirm the architecture (same `Strategy` will run live). Walk-forward
    train/test CV is deferred until a strategy carries fittable parameters; the single-pass
    run is the whole out-of-sample for a non-parametric rule.
-3. **Phase 2 — Confirm modularity**: add a second `FeatureModule` (simple tokenomics or an
-   on-chain liquidity feature via Bitquery) into the **unchanged** engine. Clean slot-in =
-   architecture confirmed.
+3. **Phase 2 — Confirm modularity** ✅ *(done)*: added a second `FeatureModule`
+   (`LiquidityFeatures` — dollar-volume momentum, Amihud illiquidity, volume z-score, derived
+   from the `volume` already on each bar) plus a `combine()` frame-merge helper. **The engine
+   crates (`core`/`storage`/`strategy`/`backtest`/`eval`) were not touched** — the same
+   `CrossSectional` strategy now ranks by either module's feature via config only, and the two
+   signals produce genuinely different backtests. Architecture confirmed: new edge hypotheses
+   slot in at the feature layer alone.
 4. **Phase 3 — Research loop + paper trading**: hypothesis iteration in Polars/DuckDB; wire
    the winning strategy to a live paper-trade runner; then decide on real execution.
 
@@ -154,3 +158,6 @@ scaffolding. The Bybit/CEX clients and the HTTP microservice mesh are retired.
   - DuckDB store + technical features + cross-sectional strategy + cost-aware backtest + metrics;
   store-first ingestion makes reruns offline/instant. Demo results are architecture confirmation,
   not alpha.
+- *Phase 2*: Modularity confirmed — second `FeatureModule` (`LiquidityFeatures`) + `combine()`
+  added at the feature layer only; engine crates untouched; same strategy ranks by either
+  module's feature via config. New edge hypotheses now slot in without engine changes.
