@@ -15,8 +15,8 @@ use std::fs;
 
 use chrono::{Duration, Utc};
 use cw_backtest::{Backtester, CostModel, WalkForward};
-use cw_core::{Bar, CoreError, Decimal, Instrument, Interval, Network, Result};
-use cw_features::{combine, FeatureContext, FeatureFrame, FeatureModule, FeatureRow, LiquidityFeatures, TechnicalFeatures};
+use cw_core::{Bar, CoreError, Decimal, Instrument, Interval, Network, OnchainDaily, Result};
+use cw_features::{combine, FeatureContext, FeatureFrame, FeatureModule, FeatureRow, LiquidityFeatures, OnchainFeatures, TechnicalFeatures};
 use cw_harness::{walk_forward, WfConfig};
 use cw_providers::{BarRequest, Bitquery, DataSource, GeckoTerminal, OnchainSource, UniverseRequest, UniverseSource};
 use cw_storage::{DuckStore, Store, TimeRange};
@@ -155,12 +155,28 @@ fn analyze() -> Result<()> {
         return Ok(());
     }
 
-    // Two independent feature modules → one combined frame for the same engine.
+    // On-chain daily aggregates for the same universe (sparse until history grows).
+    let mut onchain_dataset: Vec<(Instrument, Vec<OnchainDaily>)> = Vec::new();
+    for (inst, _) in &dataset {
+        if let Some(token) = inst.token.as_deref() {
+            let oc = store.load_onchain(&inst.network, token, wide_range()).unwrap_or_default();
+            if !oc.is_empty() {
+                onchain_dataset.push((inst.clone(), oc));
+            }
+        }
+    }
+
+    // Three independent feature modules → one combined frame for the same engine.
     let technical = TechnicalFeatures::default();
     let liquidity = LiquidityFeatures::default();
-    let ctx = FeatureContext { bars: &dataset };
-    let frame = combine(&[technical.compute(&ctx)?, liquidity.compute(&ctx)?]);
-    println!("features: modules [{}, {}] -> {} rows", technical.name(), liquidity.name(), frame.rows.len());
+    let onchain = OnchainFeatures;
+    let ctx = FeatureContext { bars: &dataset, onchain: &onchain_dataset };
+    let frame = combine(&[technical.compute(&ctx)?, liquidity.compute(&ctx)?, onchain.compute(&ctx)?]);
+    let oc_days: usize = onchain_dataset.iter().map(|(_, v)| v.len()).sum();
+    println!(
+        "features: modules [{}, {}, {}] -> {} rows ({} on-chain days / {} tokens)",
+        technical.name(), liquidity.name(), onchain.name(), frame.rows.len(), oc_days, onchain_dataset.len()
+    );
 
     // Cross-sectional leaderboard from the latest feature bar per instrument.
     let mut latest: HashMap<&str, &FeatureRow> = HashMap::new();
@@ -172,16 +188,17 @@ fn analyze() -> Result<()> {
     }
     let mut board: Vec<&FeatureRow> = latest.into_values().collect();
     board.sort_by_key(|b| std::cmp::Reverse(feat(b, "mom")));
-    println!("\nleaderboard (latest bar) top 10 by momentum:");
+    println!("\nleaderboard (latest bar) top 10 by momentum  [oc_* present only for accumulated days]:");
     for (rank, row) in board.iter().take(10).enumerate() {
         println!(
-            "  {:>2}. {:<9} {:<24} mom={:>8.4}  dvol_mom={:>8.4}  illiq={:>8.4}",
+            "  {:>2}. {:<9} {:<22} mom={:>7.3}  dvol_mom={:>7.3}  oc_buyers={:>6}  oc_tpb={:>6.1}",
             rank + 1,
             row.instrument.network.slug(),
             row.instrument.name,
             feat(row, "mom"),
             feat(row, "dvol_mom"),
-            feat(row, "illiq"),
+            feat(row, "oc_buyers"),
+            feat(row, "oc_tpb"),
         );
     }
 

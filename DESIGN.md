@@ -192,3 +192,9 @@ are retired.
   `Bitquery` adapter (Bearer auth, server-side `DEXTradeByTokens` aggregation), and wired `ingest`
   to forward-accumulate daily on-chain flow (trades / USD volume / unique buyers). First run
   stored 48 rows across 10 tokens. Feature module consuming it is next.
+- *On-chain feature module*: widened `FeatureContext` with an `onchain` channel (feature layer
+  only — engine untouched) and added `OnchainFeatures` — `oc_flow` (real DEX USD volume),
+  `oc_buyers` (unique buyers), `oc_tpb` (trades/buyer). `oc_tpb` is genuinely new signal OHLCV
+  can't give: e.g. ETH/USDC on Arbitrum ~275 trades/buyer (bot-churned) vs VELVET ~6.5 (organic).
+  `analyze` combines all three modules and surfaces on-chain columns in the leaderboard; on-chain
+  backtests await accumulated history (currently ~5 days).
