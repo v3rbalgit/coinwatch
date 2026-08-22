@@ -141,24 +141,43 @@ impl OnchainSource for Bitquery {
             "variables": { "token": token, "since": since.to_rfc3339() },
         });
 
-        let resp = self
-            .client
-            .post(&self.endpoint)
-            .header("Authorization", format!("Bearer {}", self.token))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| CoreError::DataSource(format!("bitquery request: {e}")))?;
-        let status = resp.status();
-        let payload: GqlResponse = resp
-            .json()
-            .await
-            .map_err(|e| CoreError::DataSource(format!("bitquery decode ({status}): {e}")))?;
+        // Retry throttled/transient responses (many tokens per ingest => many calls).
+        let mut attempt: u64 = 0;
+        let payload: GqlResponse = loop {
+            let resp = match self
+                .client
+                .post(&self.endpoint)
+                .header("Authorization", format!("Bearer {}", self.token))
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    if attempt >= 3 {
+                        return Err(CoreError::DataSource(format!("bitquery request: {e}")));
+                    }
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_secs(2 * attempt)).await;
+                    continue;
+                }
+            };
+            let status = resp.status();
+            if (status.as_u16() == 429 || status.is_server_error()) && attempt < 3 {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_secs(3 * attempt)).await;
+                continue;
+            }
+            break resp
+                .json()
+                .await
+                .map_err(|e| CoreError::DataSource(format!("bitquery decode ({status}): {e}")))?;
+        };
 
         if let Some(errors) = payload.errors.filter(|e| !e.is_empty()) {
             let msg = errors.into_iter().map(|e| e.message).collect::<Vec<_>>().join("; ");
-            return Err(CoreError::DataSource(format!("bitquery graphql ({status}): {msg}")));
+            return Err(CoreError::DataSource(format!("bitquery graphql: {msg}")));
         }
 
         let rows = payload.data.and_then(|d| d.evm).map(|e| e.rows).unwrap_or_default();

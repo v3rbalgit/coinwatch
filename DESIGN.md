@@ -223,3 +223,11 @@ are retired.
   feature has no linear signal (overfitting red flag); (2) every config shows DSR 65–80% because
   *everything* works in a 4-month bull window — **DSR deflates for multiple-testing selection, not
   for single-regime/sample bias.** Reinforces that more data across regimes is the binding need.
+- *Universe widened (Base + Arbitrum + Ethereum, ~44 pools, $300k floor)* + Bitquery retry/backoff.
+  **The headline finding of the whole build:** on the wider 34-instrument cross-section the momentum
+  "edge" *evaporates* — the strategy that showed +273% on 9 major-heavy pools now shows −25%
+  (Sharpe −0.74), and **every** sweep config is negative-Sharpe (DSR ≤ 7%). The earlier numbers were
+  a survivorship/selection artifact of a tiny majors-only universe. The IC screen now flags a
+  plausible *real* lead — `vol` at **t=−2.5 over 89 periods** (the low-volatility anomaly). The
+  platform killed a fake edge and pointed at a real one: exactly its job. Breadth was the single
+  highest-leverage change.

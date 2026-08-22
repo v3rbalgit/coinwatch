@@ -65,11 +65,11 @@ fn feat(row: &FeatureRow, key: &str) -> Decimal {
 async fn ingest() -> Result<()> {
     let provider = GeckoTerminal::default();
     let store = open_store()?;
-    let networks = [Network::Base, Network::Arbitrum];
+    let networks = [Network::Base, Network::Arbitrum, Network::Ethereum];
     let uni_req = UniverseRequest {
-        min_reserve_usd: Decimal::from(1_000_000u64),
-        limit: 12,
-        pages: 1,
+        min_reserve_usd: Decimal::from(300_000u64),
+        limit: 30,
+        pages: 2,
     };
 
     // On-chain flow is optional: only runs when a Bitquery token is configured.
