@@ -45,10 +45,16 @@ truth is what lets a backtested edge be trusted in deployment.
 | Chain focus         | **EVM L2s first (Base / Arbitrum)**                           | Standardized ERC-20/Uniswap-style events → ~90% code reuse across EVM chains; gentler infra; cleanly backtestable. |
 | First focus module  | **Cross-sectional systematic strategy on liquid EVM tokens** | Most cleanly backtestable with the cheapest data; exercises the hardest parts of the harness (point-in-time, costs, portfolio construction, survivorship). Not a latency race. |
 | Stack               | **Rust core + Polars/DuckDB research layer**                 | Correctness/performance in the pipeline; fast iteration in research. Both share one Parquet/DuckDB data contract. |
-| Deployment target   | Small always-on VPS (e.g. DigitalOcean), observable in real time | Cheap, controllable; no self-hosted node required initially. |
+| Deployment target   | Small always-on VPS (e.g. DigitalOcean), monitored via a TUI | Cheap, controllable; no self-hosted node — managed RPC/data providers instead. |
 
-**Explicitly deferred:** new-launch sniping (adversarial latency race), self-hosted RPC
-node (HDD unsuitable; revisit only after an edge justifies it), real execution.
+**Direction (locked):** find edge → verify (realistic backtest + paper-trading sim) →
+execute on-chain, built step by step. The eventual UI is a **TUI** (ratatui) introduced
+*with* the paper-trading loop — not before; no GUI, and no static reports as an end goal.
+
+**Explicitly deferred:** new-launch sniping (adversarial latency race); real execution
+(only after paper trading validates an edge). **Self-hosted node dropped** — use managed
+RPC (Alchemy/QuickNode/Helius) for the live path and analytical APIs (Bitquery/Dune) for
+research.
 
 ### Honest expectation setting
 
@@ -64,10 +70,10 @@ algorithm.
 | Source                         | What it gives                                                        | Cost / limits | Used for |
 |--------------------------------|----------------------------------------------------------------------|---------------|----------|
 | **GeckoTerminal / CoinGecko onchain** | DEX pool OHLCV to 1s granularity back to 2021; 250+ networks, 1900+ DEXes | Free keyless (~30 req/min, ~6 months history); paid deeper | Phase 1 OHLCV backtesting |
-| **Bitquery**                   | Full DEX trade history from first swap; per-wallet trade history/PnL; liquidity; multi-chain (ETH/Base/Arbitrum/OP/Polygon/BSC) | Free tier limited; paid | On-chain feature modules (swap-level, holder, wallet flow) |
-| **Dune / The Graph**           | SQL / subgraph access to decoded events                              | Free tiers + paid | Ad-hoc research, holder snapshots |
+| **Bitquery** ⭐ (chosen next) | Full DEX trade history from first swap; per-wallet trade history/PnL; holders; liquidity; multi-chain (ETH/Base/Arbitrum/OP/Polygon/BSC); GraphQL + Kafka/WS | Free key → $39/$79/mo | **On-chain feature modules (next)** — swap-level, holders, wallet flow |
+| **Dune (SQL) / The Graph**     | SQL / subgraph access to decoded events (Dune *Sim* API retired Aug 2026) | Free tiers + paid | Exploratory hypothesis validation |
 | **DexScreener**                | Live snapshots only — **no history**                                 | Free | Live scanner only; **not** backtesting |
-| Self-hosted RPC / archive node | Full raw data, low latency                                           | Heavy infra (needs NVMe) | Deferred |
+| **Managed RPC (Alchemy / QuickNode / Helius)** | Real-time state, event logs, mempool, contract calls | Free tiers + paid | **Live loop + execution (later)** |
 
 Data-source adapters sit behind a single `DataSource` trait so providers are swappable.
 
@@ -106,11 +112,13 @@ Python/Polars/DuckDB notebooks read the **same** Parquet/DuckDB artifacts the Ru
 pipeline writes. One shared data contract → fast iteration with no language friction. Rust
 is the system of record; Python is scratch space.
 
-### Reuse from legacy `coinwatch/`
+### The Python original (archived)
 
-Conceptual, not code: domain-modeling rigor, TimescaleDB/partitioning patterns,
-collector→repository→service separation, and the Prometheus/Grafana observability
-scaffolding. The Bybit/CEX clients and the HTTP microservice mesh are retired.
+The original Python CEX system is archived on the `v1-python` branch (tag `v1.0-python`);
+`main` is Rust-only. It is a *reference*, not a dependency: its social-sentiment collectors
+(Reddit/Twitter/Telegram) and CoinGecko fundamentals client are a spec to mine if we later
+add a social/fundamental feature module. The Bybit/CEX clients and HTTP microservice mesh
+are retired.
 
 ## 5. Phased plan
 
@@ -173,3 +181,8 @@ scaffolding. The Bybit/CEX clients and the HTTP microservice mesh are retired.
   plus probit/returns/per-period-Sharpe helpers. The demo makes the point vividly: in-sample
   Sharpe 3.84 / PSR 98.6% collapses to a walk-forward **DSR of ~16%** once 16 trials are deflated —
   the overfitting guard is now a workflow, not a footnote.
+- *Rust-only pivot*: `main` restructured to Rust-only; Python original archived on `v1-python`
+  (tag `v1.0-python`), README rewritten, `.gitignore` slimmed. Decisions locked: self-hosted node
+  dropped (managed RPC for live, analytical APIs for research); **Bitquery** chosen as the next
+  on-chain data provider (free tier first) to build a swap-level/holder/wallet-flow feature module;
+  eventual UI is a **TUI** introduced with paper trading. Direction: find → verify → execute.
