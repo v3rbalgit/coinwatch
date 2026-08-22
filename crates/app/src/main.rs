@@ -197,8 +197,8 @@ fn analyze() -> Result<()> {
     }
 
     // In-sample, full-period backtests (the flattering, overfit-prone view).
-    run_backtest("in-sample: technical momentum", "mom", &dataset, &frame, &funding_dataset)?;
-    run_backtest("in-sample: liquidity dvol-momentum", "dvol_mom", &dataset, &frame, &funding_dataset)?;
+    run_backtest("in-sample: technical momentum", "mom", &dataset, &frame, &funding_dataset, None)?;
+    run_backtest("in-sample: liquidity dvol-momentum", "dvol_mom", &dataset, &frame, &funding_dataset, None)?;
 
     // Strategy sweep: evaluate MANY configs out-of-sample (each its own
     // walk-forward), deflated for the number of trials → an honest strategy
@@ -210,18 +210,20 @@ fn analyze() -> Result<()> {
     };
     // Market-neutral (long/short) tests of the significant signals + baselines.
     // (label, feature, top_quantile, invert); all allow_short = true.
-    let specs: &[(&str, &str, f64, bool)] = &[
-        ("vol L/S (long low-vol)", "vol", 0.20, true),
-        ("vol L/S 33%", "vol", 0.33, true),
-        ("illiq L/S", "illiq", 0.20, false),
-        ("illiq L/S 33%", "illiq", 0.33, false),
-        ("mom L/S", "mom", 0.20, false),
-        ("dvol_mom L/S", "dvol_mom", 0.20, false),
-        ("rsi L/S", "rsi", 0.20, false),
+    // (label, rank feature, quantile, invert, vol-weight?) — equal-weight vs
+    // inverse-vol sizing on the significant signals, all market-neutral L/S.
+    let specs: &[(&str, &str, f64, bool, bool)] = &[
+        ("vol L/S eq", "vol", 0.20, true, false),
+        ("vol L/S vw", "vol", 0.20, true, true),
+        ("vol L/S 33% vw", "vol", 0.33, true, true),
+        ("illiq L/S eq", "illiq", 0.20, false, false),
+        ("illiq L/S vw", "illiq", 0.20, false, true),
+        ("illiq L/S 33% vw", "illiq", 0.33, false, true),
+        ("mom L/S vw", "mom", 0.20, false, true),
     ];
     let candidates: Vec<(String, CrossSectional)> = specs
         .iter()
-        .map(|(label, feature, q, invert)| {
+        .map(|(label, feature, q, invert, vw)| {
             (
                 label.to_string(),
                 CrossSectional {
@@ -229,16 +231,18 @@ fn analyze() -> Result<()> {
                     top_quantile: *q,
                     allow_short: true,
                     invert: *invert,
+                    weight_feature: if *vw { Some("vol".to_string()) } else { None },
                 },
             )
         })
         .collect();
-    let rows = sweep(&candidates, &dataset, &frame, WfConfig { train: 90, test: 30, embargo: 3 }, &costs, &funding_dataset)?;
+    let vol_target = Some(Decimal::new(15, 3)); // 1.5%/day ≈ 24%/yr target
+    let rows = sweep(&candidates, &dataset, &frame, WfConfig { train: 90, test: 30, embargo: 3 }, &costs, &funding_dataset, vol_target)?;
     if rows.iter().all(|r| r.n_folds == 0) {
         println!("\nstrategy sweep: not enough history for the chosen windows");
         return Ok(());
     }
-    println!("\nstrategy sweep ({} configs, walk-forward OOS, ranked by Deflated Sharpe):", candidates.len());
+    println!("\nstrategy sweep ({} configs, vol-targeted 1.5%/day, walk-forward OOS, ranked by DSR):", candidates.len());
     println!("  {:<14} {:>8} {:>9} {:>8} {:>7} {:>6}", "config", "OOS-Shp", "OOS-ret%", "maxDD%", "DSR%", "folds");
     for r in &rows {
         println!(
@@ -257,19 +261,22 @@ fn run_backtest(
     dataset: &[(Instrument, Vec<Bar>)],
     frame: &FeatureFrame,
     funding: &[(Instrument, Vec<FundingPoint>)],
+    vol_target: Option<Decimal>,
 ) -> Result<()> {
     let strategy = CrossSectional {
         rank_feature: rank_feature.to_string(),
         top_quantile: 0.4,
         allow_short: false,
         invert: false,
+        weight_feature: None,
     };
     let costs = CostModel {
         fee_frac: Decimal::new(5, 4),        // 5 bps swap fee
         slippage_coeff: Decimal::new(5, 1),  // linear price-impact coefficient
         gas_usd: Decimal::new(50, 2),        // $0.50 per position change
     };
-    let backtester = Backtester::new(costs, WalkForward { train_bars: 90, test_bars: 30, embargo_bars: 3 });
+    let backtester = Backtester::new(costs, WalkForward { train_bars: 90, test_bars: 30, embargo_bars: 3 })
+        .with_vol_target(vol_target);
     let result = backtester.run(&strategy, dataset, frame, funding)?;
     let m = cw_eval::evaluate(&result)?;
 

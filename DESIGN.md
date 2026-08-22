@@ -265,6 +265,18 @@ are retired.
   refuses to bless a naive blowup: **a significant signal ≠ a profitable naive strategy.** Next
   research lever is *portfolio construction* — risk/vol-weighting, more diversification, lower
   turnover — not another signal.
+- *Risk-aware sizing + a critical bug fix (chunk 3)*: added inverse-volatility position weighting
+  (`CrossSectional.weight_feature`) and **portfolio vol-targeting** (`Backtester.with_vol_target`:
+  scale gross exposure by target/trailing-vol, capped). **Neither rescued the L/S plays — which
+  exposed the real problem:** HL candle volume `v` is in **base-coin units**, but the depth-aware
+  slippage compared it to a USD notional → nonsensical slippage (≈25%/trade on BTC, ≈0 on DOGE),
+  which had been corrupting *every* backtest. Fixed the adapter to store USD volume (`v × close`);
+  dvol-momentum long-only went **−85% → +270%** on the fix alone. (The IC screen never used the
+  backtester, so those signal readings stayed valid throughout.) **Post-fix finding:** market-neutral
+  L/S on the low-vol/illiquidity signals *still* struggles — dominated by **crypto short-side tail
+  risk** (shorting high-vol coins → short squeezes) while long-only is dominated by market beta. The
+  signals are real; naive top/bottom-quantile L/S — especially the short leg — is the wrong vehicle.
+  Next: long-only low-vol (no short) and/or hard short-risk controls.
 
 ## 8. Direction & signal roadmap
 

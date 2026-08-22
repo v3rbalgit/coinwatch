@@ -239,13 +239,16 @@ impl DataSource for Hyperliquid {
         for c in &candles {
             let ts = DateTime::<Utc>::from_timestamp_millis(c.t)
                 .ok_or_else(|| CoreError::InvalidData(format!("hyperliquid ts out of range: {}", c.t)))?;
+            // HL candle volume `v` is in base-coin units; store USD volume
+            // (v * close) so the backtester's depth/liquidity math is unit-correct.
+            let close = to_decimal(&c.c);
             let bar = Bar {
                 ts,
                 open: to_decimal(&c.o),
                 high: to_decimal(&c.h),
                 low: to_decimal(&c.l),
-                close: to_decimal(&c.c),
-                volume: to_decimal(&c.v),
+                close,
+                volume: to_decimal(&c.v) * close,
             };
             if bar.ohlc_consistent() {
                 bars.push(bar);

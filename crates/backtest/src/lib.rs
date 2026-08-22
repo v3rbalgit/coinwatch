@@ -20,10 +20,15 @@ use chrono::{DateTime, Utc};
 use cw_core::{Bar, CoreError, Decimal, FundingPoint, Instrument, Result};
 use cw_features::{FeatureFrame, FeatureRow};
 use cw_strategy::Strategy;
+use rust_decimal::prelude::ToPrimitive;
 
 /// Notional starting capital (USD). Gas is converted to a return drag against
 /// current equity, so this sets the scale at which flat costs bite.
 const INITIAL_CAPITAL_USD: i64 = 10_000;
+/// Trailing window (bars) for realized-vol estimation in vol targeting.
+const VOL_WINDOW: usize = 20;
+/// Cap on the vol-target leverage multiplier.
+const MAX_LEVERAGE: f64 = 3.0;
 
 /// Transaction-cost parameters applied to every simulated fill.
 #[derive(Debug, Clone)]
@@ -68,6 +73,10 @@ pub struct BacktestResult {
 pub struct Backtester {
     pub costs: CostModel,
     pub walk_forward: WalkForward,
+    /// Optional target daily volatility; when set, gross exposure is scaled each
+    /// step by target / trailing-realized-vol (capped) to control the geometric
+    /// volatility drag that ruins high-variance crypto strategies.
+    pub vol_target: Option<Decimal>,
 }
 
 fn ms_to_dt(ms: i64) -> Result<DateTime<Utc>> {
@@ -75,9 +84,32 @@ fn ms_to_dt(ms: i64) -> Result<DateTime<Utc>> {
         .ok_or_else(|| CoreError::InvalidData(format!("timestamp out of range: {ms}")))
 }
 
+/// Exposure scale for vol targeting from trailing realized daily vol (past
+/// returns only — no lookahead). Returns 1.0 when targeting is off or too few
+/// observations exist.
+fn vol_target_scale(target: Option<Decimal>, past: &[f64]) -> Decimal {
+    let Some(t) = target else { return Decimal::ONE };
+    let tf = t.to_f64().unwrap_or(0.0);
+    if past.len() < 5 || tf <= 0.0 {
+        return Decimal::ONE;
+    }
+    let w = &past[past.len().saturating_sub(VOL_WINDOW)..];
+    let mean = w.iter().sum::<f64>() / w.len() as f64;
+    let var = w.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / w.len() as f64;
+    let vol = var.sqrt();
+    let s = if vol > 1e-9 { (tf / vol).min(MAX_LEVERAGE) } else { MAX_LEVERAGE };
+    Decimal::from_f64_retain(s.max(0.0)).unwrap_or(Decimal::ONE)
+}
+
 impl Backtester {
     pub fn new(costs: CostModel, walk_forward: WalkForward) -> Self {
-        Self { costs, walk_forward }
+        Self { costs, walk_forward, vol_target: None }
+    }
+
+    /// Enable portfolio volatility targeting at `target` daily vol.
+    pub fn with_vol_target(mut self, target: Option<Decimal>) -> Self {
+        self.vol_target = target;
+        self
     }
 
     /// Run `strategy` over `bars`, `features`, and per-instrument `funding`.
@@ -128,6 +160,7 @@ impl Backtester {
 
         let mut equity = Decimal::from(INITIAL_CAPITAL_USD);
         let mut prev_weights: HashMap<String, Decimal> = HashMap::new();
+        let mut net_returns: Vec<f64> = Vec::new();
         let mut result = BacktestResult {
             equity_curve: vec![(ms_to_dt(times[0])?, equity)],
             trades: Vec::new(),
@@ -136,11 +169,13 @@ impl Backtester {
         for pair in times.windows(2) {
             let (t0, t1) = (pair[0], pair[1]);
             let targets = strategy.target_weights(&sections[&t0])?;
+            // Vol targeting scales gross exposure from trailing realized vol.
+            let scale = vol_target_scale(self.vol_target, &net_returns);
 
             let mut new_weights: HashMap<String, Decimal> = HashMap::new();
             let mut name_by_pool: HashMap<String, String> = HashMap::new();
             for tw in &targets {
-                new_weights.insert(tw.instrument.pool.0.clone(), tw.weight);
+                new_weights.insert(tw.instrument.pool.0.clone(), tw.weight * scale);
                 name_by_pool.insert(tw.instrument.pool.0.clone(), tw.instrument.name.clone());
             }
 
@@ -201,6 +236,7 @@ impl Backtester {
             let net = gross + funding_pnl - cost_drag;
             // A real account can't go below zero — ruin floors equity at 0.
             equity = (equity + equity * net).max(Decimal::ZERO);
+            net_returns.push(net.to_f64().unwrap_or(0.0));
             result.equity_curve.push((ms_to_dt(t1)?, equity));
             prev_weights = new_weights;
         }
@@ -249,7 +285,7 @@ mod tests {
 
     fn final_equity(volume: i64) -> Decimal {
         let (bars, frame) = scenario(volume);
-        let strat = CrossSectional { rank_feature: "mom".to_string(), top_quantile: 0.5, allow_short: false, invert: false };
+        let strat = CrossSectional { rank_feature: "mom".to_string(), top_quantile: 0.5, allow_short: false, invert: false, weight_feature: None };
         let bt = Backtester::new(
             CostModel { fee_frac: Decimal::new(5, 4), slippage_coeff: Decimal::new(5, 1), gas_usd: Decimal::ZERO },
             WalkForward { train_bars: 1, test_bars: 1, embargo_bars: 0 },

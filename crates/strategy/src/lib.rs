@@ -34,6 +34,10 @@ pub struct CrossSectional {
     /// If true, rank ascending — long the LOW end — for signals whose edge is
     /// negative (e.g. the low-volatility anomaly: long low vol, short high vol).
     pub invert: bool,
+    /// Optional risk feature to inverse-weight positions within each leg (e.g.
+    /// `"vol"`): weight ∝ 1/risk, normalized to the leg's gross. `None` = equal
+    /// weight. Inverse-vol sizing caps the fat-tail blowup from volatile names.
+    pub weight_feature: Option<String>,
 }
 
 impl Strategy for CrossSectional {
@@ -64,26 +68,39 @@ impl Strategy for CrossSectional {
         let short = self.allow_short && n > leg;
         // Long-only → gross 1.0 on the top leg; long-short → +0.5 / -0.5.
         let long_total = if short { Decimal::new(5, 1) } else { Decimal::ONE };
-        let long_w = long_total / Decimal::from(leg as u64);
+        let wf = self.weight_feature.as_deref();
 
-        let mut weights = Vec::with_capacity(if short { leg * 2 } else { leg });
-        for (row, _) in ranked.iter().take(leg) {
-            weights.push(TargetWeight {
-                instrument: row.instrument.clone(),
-                weight: long_w,
-            });
-        }
+        let long_rows: Vec<&FeatureRow> = ranked.iter().take(leg).map(|(r, _)| *r).collect();
+        let mut weights = allocate(&long_rows, long_total, wf);
         if short {
-            let short_w = -(Decimal::new(5, 1) / Decimal::from(leg as u64));
-            for (row, _) in ranked.iter().rev().take(leg) {
-                weights.push(TargetWeight {
-                    instrument: row.instrument.clone(),
-                    weight: short_w,
-                });
-            }
+            let short_rows: Vec<&FeatureRow> = ranked.iter().rev().take(leg).map(|(r, _)| *r).collect();
+            weights.extend(allocate(&short_rows, -Decimal::new(5, 1), wf));
         }
         Ok(weights)
     }
+}
+
+/// Distribute `gross` exposure across `rows`: equal-weight, or (when
+/// `weight_feature` is set) inversely to that risk feature (∝ 1/risk), so
+/// volatile names get smaller positions. The leg always sums to `gross`.
+fn allocate(rows: &[&FeatureRow], gross: Decimal, weight_feature: Option<&str>) -> Vec<TargetWeight> {
+    let eps = Decimal::new(1, 9);
+    let raws: Vec<Decimal> = rows
+        .iter()
+        .map(|r| match weight_feature.and_then(|wf| r.values.get(wf)) {
+            Some(risk) if risk.abs() > eps => Decimal::ONE / risk.abs(),
+            _ => Decimal::ONE,
+        })
+        .collect();
+    let total: Decimal = raws.iter().copied().sum();
+    let n = Decimal::from(rows.len().max(1) as u64);
+    rows.iter()
+        .zip(&raws)
+        .map(|(r, raw)| {
+            let frac = if total > Decimal::ZERO { *raw / total } else { Decimal::ONE / n };
+            TargetWeight { instrument: r.instrument.clone(), weight: gross * frac }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -113,6 +130,7 @@ mod tests {
             top_quantile: 0.5,
             allow_short: false,
             invert: false,
+            weight_feature: None,
         };
         let cross = vec![row("a", 5), row("b", 1), row("c", 9), row("d", -3)];
         let w = s.target_weights(&cross).unwrap();
@@ -131,6 +149,7 @@ mod tests {
             top_quantile: 0.25,
             allow_short: true,
             invert: false,
+            weight_feature: None,
         };
         let cross = vec![row("a", 5), row("b", 1), row("c", 9), row("d", -3)];
         let w = s.target_weights(&cross).unwrap();
@@ -147,7 +166,29 @@ mod tests {
             top_quantile: 0.5,
             allow_short: false,
             invert: false,
+            weight_feature: None,
         };
         assert!(s.target_weights(&[row("a", 1)]).is_err());
+    }
+
+    #[test]
+    fn inverse_vol_weighting_sizes_down_volatile_names() {
+        let mut a = row("a", 2);
+        a.values.insert("vol".to_string(), Decimal::new(2, 2)); // 0.02
+        let mut b = row("b", 1);
+        b.values.insert("vol".to_string(), Decimal::new(8, 2)); // 0.08
+        let s = CrossSectional {
+            rank_feature: "mom".to_string(),
+            top_quantile: 1.0,
+            allow_short: false,
+            invert: false,
+            weight_feature: Some("vol".to_string()),
+        };
+        let w = s.target_weights(&[a, b]).unwrap();
+        let wa = w.iter().find(|t| t.instrument.name == "a").unwrap().weight;
+        let wb = w.iter().find(|t| t.instrument.name == "b").unwrap().weight;
+        assert!(wa > wb, "low-vol name should get more weight");
+        assert_eq!((wa / wb).round_dp(0), Decimal::from(4)); // 1/0.02 : 1/0.08 = 4:1
+        assert_eq!(wa + wb, Decimal::ONE); // long-only sums to gross 1
     }
 }

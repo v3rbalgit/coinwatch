@@ -10,3 +10,4 @@ cw-core.workspace = true
 cw-features.workspace = true
 cw-strategy.workspace = true
 chrono.workspace = true
+rust_decimal.workspace = true

@@ -540,6 +540,7 @@ dependencies = [
  "cw-core",
  "cw-features",
  "cw-strategy",
+ "rust_decimal",
 ]
 
 [[package]]
