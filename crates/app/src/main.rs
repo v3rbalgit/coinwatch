@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::fs;
 
 use chrono::{Duration, Utc};
-use cw_backtest::{Backtester, CostModel, WalkForward};
+use cw_backtest::{BacktestResult, Backtester, CostModel, WalkForward};
 use cw_core::{Bar, CoreError, Decimal, FundingPoint, Instrument, Interval, Result};
 use cw_features::{combine, FeatureContext, FeatureFrame, FeatureModule, FeatureRow, LiquidityFeatures, TechnicalFeatures};
 use cw_harness::{feature_ic, sweep, WfConfig};
@@ -58,6 +58,16 @@ fn wide_range() -> TimeRange {
 
 fn feat(row: &FeatureRow, key: &str) -> Decimal {
     row.values.get(key).copied().unwrap_or_default()
+}
+
+/// Total return of a backtest as a percentage (1 dp).
+fn pct(r: &BacktestResult) -> Decimal {
+    match (r.equity_curve.first(), r.equity_curve.last()) {
+        (Some((_, e0)), Some((_, e1))) if *e0 > Decimal::ZERO => {
+            ((e1 / e0 - Decimal::ONE) * Decimal::from(100)).round_dp(1)
+        }
+        _ => Decimal::from(-100),
+    }
 }
 
 /// Ingest the Hyperliquid perp universe: ~3y daily candles + hourly funding.
@@ -248,6 +258,50 @@ fn analyze() -> Result<()> {
         println!(
             "  {:<14} {:>8.2} {:>9.1} {:>8.1} {:>7.1} {:>6}",
             r.label, r.oos_sharpe, r.oos_return_pct, r.max_drawdown * 100.0, r.dsr * 100.0, r.n_folds
+        );
+    }
+
+    // Long-only signal harvesting + market-beta decomposition. The L/S sweep dies
+    // on short-side tail risk; here we ask whether low-vol / illiquidity add ALPHA
+    // long-only, or merely ride crypto's beta. In-sample, full-period, no vol
+    // targeting — beta is structural, and near-zero in-sample alpha means no edge.
+    let bt = |strat: &CrossSectional| -> Result<BacktestResult> {
+        Backtester::new(costs.clone(), WalkForward { train_bars: 90, test_bars: 30, embargo_bars: 3 })
+            .run(strat, &dataset, &frame, &funding_dataset)
+    };
+    let market = CrossSectional {
+        rank_feature: "vol".to_string(),
+        top_quantile: 1.0,
+        allow_short: false,
+        invert: false,
+        weight_feature: None,
+    };
+    let market_bt = bt(&market)?;
+    let market_rets = cw_eval::returns(&market_bt);
+    let market_m = cw_eval::evaluate(&market_bt)?;
+    println!("\nlong-only alpha vs beta (in-sample; benchmark = equal-weight universe):");
+    println!("  {:<16} {:>8} {:>7} {:>6} {:>6} {:>9} {:>6}", "strategy", "ret%", "sharpe", "turn", "beta", "alpha%/yr", "R2");
+    println!("  {:<16} {:>8} {:>7.2} {:>6.2} {:>6.2} {:>9} {:>6}", "market (EW)", pct(&market_bt), market_m.sharpe, market_m.turnover, 1.0, "-", "-");
+    let longs: &[(&str, &str, f64, bool)] = &[
+        ("low-vol 30%", "vol", 0.30, true),
+        ("low-vol 20%", "vol", 0.20, true),
+        ("illiq 30%", "illiq", 0.30, false),
+        ("illiq 20%", "illiq", 0.20, false),
+    ];
+    for (label, feature, q, invert) in longs {
+        let strat = CrossSectional {
+            rank_feature: feature.to_string(),
+            top_quantile: *q,
+            allow_short: false,
+            invert: *invert,
+            weight_feature: None,
+        };
+        let r = bt(&strat)?;
+        let m = cw_eval::evaluate(&r)?;
+        let ab = cw_eval::alpha_beta(&cw_eval::returns(&r), &market_rets);
+        println!(
+            "  {:<16} {:>8} {:>7.2} {:>6.2} {:>6.2} {:>9.1} {:>6.2}",
+            label, pct(&r), m.sharpe, m.turnover, ab.beta, ab.alpha_annual * 100.0, ab.r2
         );
     }
     Ok(())

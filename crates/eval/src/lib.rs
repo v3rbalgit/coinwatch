@@ -37,6 +37,46 @@ pub fn returns(result: &BacktestResult) -> Vec<f64> {
         .collect()
 }
 
+/// Single-factor regression of a strategy's per-period returns on a benchmark's:
+/// `strategy_t = alpha + beta·market_t + ε`. `alpha` is the average per-period
+/// return NOT explained by market exposure — the honest "edge beyond beta";
+/// `alpha_annual` scales it by the periods/year, `r2` is the market's explained
+/// variance fraction.
+#[derive(Debug, Default, Clone)]
+pub struct AlphaBeta {
+    pub alpha: f64,
+    pub alpha_annual: f64,
+    pub beta: f64,
+    pub r2: f64,
+}
+
+/// OLS of `strategy` on `market` (per-period returns, aligned by position).
+pub fn alpha_beta(strategy: &[f64], market: &[f64]) -> AlphaBeta {
+    let n = strategy.len().min(market.len());
+    if n < 3 {
+        return AlphaBeta::default();
+    }
+    let (s, m) = (&strategy[..n], &market[..n]);
+    let nf = n as f64;
+    let mean_s = s.iter().sum::<f64>() / nf;
+    let mean_m = m.iter().sum::<f64>() / nf;
+    let (mut cov, mut var_m) = (0.0, 0.0);
+    for i in 0..n {
+        cov += (m[i] - mean_m) * (s[i] - mean_s);
+        var_m += (m[i] - mean_m).powi(2);
+    }
+    let beta = if var_m > 0.0 { cov / var_m } else { 0.0 };
+    let alpha = mean_s - beta * mean_m;
+    let (mut ss_res, mut ss_tot) = (0.0, 0.0);
+    for i in 0..n {
+        let pred = alpha + beta * m[i];
+        ss_res += (s[i] - pred).powi(2);
+        ss_tot += (s[i] - mean_s).powi(2);
+    }
+    let r2 = if ss_tot > 0.0 { 1.0 - ss_res / ss_tot } else { 0.0 };
+    AlphaBeta { alpha, alpha_annual: alpha * PERIODS_PER_YEAR, beta, r2 }
+}
+
 /// Non-annualized (per-period) Sharpe of a return series.
 pub fn per_period_sharpe(rets: &[f64]) -> f64 {
     if rets.len() < 2 {
@@ -240,6 +280,17 @@ mod tests {
         let few = deflated_sharpe(&rets, &[0.05, 0.06]);
         let many = deflated_sharpe(&rets, &[0.02, 0.05, 0.1, 0.2, 0.3, 0.4]);
         assert!(many <= few);
+    }
+
+    #[test]
+    fn alpha_beta_recovers_a_known_line() {
+        // strategy = 0.001 + 1.5*market exactly => alpha 0.001, beta 1.5, R2 1.
+        let market: Vec<f64> = (0..50).map(|i| ((i as f64) * 0.7).sin() * 0.02).collect();
+        let strat: Vec<f64> = market.iter().map(|m| 0.001 + 1.5 * m).collect();
+        let ab = alpha_beta(&strat, &market);
+        assert!((ab.beta - 1.5).abs() < 1e-6);
+        assert!((ab.alpha - 0.001).abs() < 1e-6);
+        assert!(ab.r2 > 0.999);
     }
 
     #[test]

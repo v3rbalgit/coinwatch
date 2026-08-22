@@ -277,6 +277,17 @@ are retired.
   risk** (shorting high-vol coins → short squeezes) while long-only is dominated by market beta. The
   signals are real; naive top/bottom-quantile L/S — especially the short leg — is the wrong vehicle.
   Next: long-only low-vol (no short) and/or hard short-risk controls.
+- *Long-only + market-beta decomposition (chunk 4)*: added `eval::alpha_beta` (single-factor OLS of a
+  strategy's returns on a benchmark → alpha, beta, R²) and a long-only section in `analyze` that
+  decomposes each strategy vs an **equal-weight-universe benchmark** (+153%, Sharpe 0.77 — most
+  long-only return is just **beta**), showing turnover too. **Two findings.** (1) **illiquidity is the
+  first genuine edge candidate:** long-only `illiq@30%` returns **+195%** (beats the market), turnover
+  a low **0.08**, and carries **+8.3%/yr alpha net of realistic costs** — it survives because illiquidity
+  rankings are persistent. (2) **long-only low-vol ruins (−100%) purely from TURNOVER:** the low-vol
+  majors have near-identical 14-day vol, so the ranking reshuffles daily → turnover **0.66** → cost
+  bleed to ruin. Proven by a zero-cost run where the ruin vanishes (low-vol +165%, +3.6%/yr alpha).
+  The signal is fine; the daily rebalance isn't. Next lever: **turnover control** (rebalance cadence /
+  no-trade band / weight smoothing) — which would also lift every cost-sensitive strategy.
 
 ## 8. Direction & signal roadmap
 
