@@ -180,6 +180,10 @@ cython_debug/
 
 # Custom ignores
 project_structure.txt
+# Research spike outputs (regenerable data artifacts)
+research/**/out/
+*.duckdb
+*.parquet
 logs/
 *.log
 *.log.*
