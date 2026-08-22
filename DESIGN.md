@@ -204,3 +204,10 @@ are retired.
   more. Unit-tested (a thinner pool provably ends poorer). Survivorship bias remains the outstanding
   realism gap: the store only ever holds currently-liquid pools, so dead/rugged tokens are absent —
   a true fix needs historical universe membership (paid backfill or forward-accumulated snapshots).
+- *IC screen (experiment layer)*: `cw-harness::feature_ic` computes each feature's time-averaged
+  cross-sectional **rank Information Coefficient** vs. next-bar returns, with IC-IR and t-stat — the
+  first-pass "which features actually predict?" screen, shown in `analyze` before any backtest. On
+  the demo it's honest and useful: `dvol_z` is the strongest technical signal (IC 0.066, t≈1.6),
+  `mom` (our default) is weak (IC 0.044, t≈0.8, matching its low DSR), `rsi`/`illiq`/`vol` are ~zero,
+  and `oc_tpb` looks promising (IC 0.12) but has too few periods yet. Nothing clears t>2 — the tool
+  measures the absence of edge instead of hiding it.

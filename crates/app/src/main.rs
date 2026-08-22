@@ -17,7 +17,7 @@ use chrono::{Duration, Utc};
 use cw_backtest::{Backtester, CostModel, WalkForward};
 use cw_core::{Bar, CoreError, Decimal, Instrument, Interval, Network, OnchainDaily, Result};
 use cw_features::{combine, FeatureContext, FeatureFrame, FeatureModule, FeatureRow, LiquidityFeatures, OnchainFeatures, TechnicalFeatures};
-use cw_harness::{walk_forward, WfConfig};
+use cw_harness::{feature_ic, walk_forward, WfConfig};
 use cw_providers::{BarRequest, Bitquery, DataSource, GeckoTerminal, OnchainSource, UniverseRequest, UniverseSource};
 use cw_storage::{DuckStore, Store, TimeRange};
 use cw_strategy::CrossSectional;
@@ -200,6 +200,19 @@ fn analyze() -> Result<()> {
             feat(row, "oc_buyers"),
             feat(row, "oc_tpb"),
         );
+    }
+
+    // Which features actually predict next-bar returns? (rank-IC screen — the
+    // first thing to look at: run this before trusting any backtest.)
+    let ics = feature_ic(&dataset, &frame);
+    if !ics.is_empty() {
+        println!("\nfeature IC (cross-sectional rank corr vs next-bar return; |IC-IR| desc):");
+        for f in &ics {
+            println!(
+                "  {:<10} IC={:>7.4}  IC-IR={:>6.2}  t={:>6.2}  hit={:>5.1}%  n={}",
+                f.feature, f.mean_ic, f.icir, f.t_stat, f.hit_rate * 100.0, f.n_periods
+            );
+        }
     }
 
     // In-sample, full-period backtests (the flattering, overfit-prone view).

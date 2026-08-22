@@ -8,7 +8,8 @@
 //! full-sample backtest. The stitched OOS returns plus the full set of trial
 //! Sharpes feed the Deflated Sharpe Ratio.
 
-use std::collections::HashSet;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use cw_backtest::{BacktestResult, Backtester, CostModel, WalkForward};
@@ -157,6 +158,132 @@ pub fn walk_forward<S: Strategy>(
     Ok(result)
 }
 
+/// Minimum instruments in a cross-section to compute a rank IC for that bar.
+const MIN_XS: usize = 4;
+
+/// Predictive-power summary for one feature column: the cross-sectional rank
+/// correlation (Spearman IC) between the feature and next-bar returns, averaged
+/// over time. The IC-IR (`mean_ic / ic_std`) and its `t_stat` say whether that
+/// signal is stable enough to bother backtesting.
+#[derive(Debug, Clone)]
+pub struct FeatureIC {
+    pub feature: String,
+    pub mean_ic: f64,
+    pub icir: f64,
+    pub t_stat: f64,
+    /// Fraction of periods with positive IC.
+    pub hit_rate: f64,
+    pub n_periods: usize,
+}
+
+/// Average ranks (1-based, ties share the mean rank).
+fn ranks(v: &[f64]) -> Vec<f64> {
+    let n = v.len();
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&a, &b| v[a].partial_cmp(&v[b]).unwrap_or(Ordering::Equal));
+    let mut r = vec![0.0; n];
+    let mut i = 0;
+    while i < n {
+        let mut j = i;
+        while j + 1 < n && v[idx[j + 1]] == v[idx[i]] {
+            j += 1;
+        }
+        let avg = (i + j) as f64 / 2.0 + 1.0;
+        for &k in &idx[i..=j] {
+            r[k] = avg;
+        }
+        i = j + 1;
+    }
+    r
+}
+
+fn pearson(x: &[f64], y: &[f64]) -> Option<f64> {
+    let n = x.len() as f64;
+    if n < 2.0 {
+        return None;
+    }
+    let (mx, my) = (x.iter().sum::<f64>() / n, y.iter().sum::<f64>() / n);
+    let (mut cov, mut vx, mut vy) = (0.0, 0.0, 0.0);
+    for (a, b) in x.iter().zip(y) {
+        let (dx, dy) = (a - mx, b - my);
+        cov += dx * dy;
+        vx += dx * dx;
+        vy += dy * dy;
+    }
+    if vx <= 0.0 || vy <= 0.0 {
+        return None;
+    }
+    Some(cov / (vx.sqrt() * vy.sqrt()))
+}
+
+fn spearman(x: &[f64], y: &[f64]) -> Option<f64> {
+    pearson(&ranks(x), &ranks(y))
+}
+
+/// Information Coefficient per feature: the time-averaged cross-sectional rank
+/// correlation between each feature and next-bar returns. The first-pass screen
+/// for "which features actually predict?" — sorted by |IC-IR|, strongest first.
+pub fn feature_ic(bars: &[(Instrument, Vec<Bar>)], features: &FeatureFrame) -> Vec<FeatureIC> {
+    // next-bar return per (pool, ts)
+    let mut fwd: HashMap<(String, i64), f64> = HashMap::new();
+    for (inst, series) in bars {
+        let mut s: Vec<&Bar> = series.iter().collect();
+        s.sort_by_key(|b| b.ts);
+        for w in s.windows(2) {
+            let c0 = w[0].close.to_f64().unwrap_or(0.0);
+            let c1 = w[1].close.to_f64().unwrap_or(0.0);
+            if c0 > 0.0 {
+                fwd.insert((inst.pool.0.clone(), w[0].ts.timestamp_millis()), c1 / c0 - 1.0);
+            }
+        }
+    }
+
+    let mut by_ts: BTreeMap<i64, Vec<&FeatureRow>> = BTreeMap::new();
+    let mut cols: BTreeSet<String> = BTreeSet::new();
+    for row in &features.rows {
+        by_ts.entry(row.ts.timestamp_millis()).or_default().push(row);
+        cols.extend(row.values.keys().cloned());
+    }
+
+    let mut out = Vec::new();
+    for col in &cols {
+        let mut ics: Vec<f64> = Vec::new();
+        for (ts, rows) in &by_ts {
+            let (mut fv, mut rv) = (Vec::new(), Vec::new());
+            for row in rows {
+                if let (Some(v), Some(r)) =
+                    (row.values.get(col), fwd.get(&(row.instrument.pool.0.clone(), *ts)))
+                {
+                    fv.push(v.to_f64().unwrap_or(0.0));
+                    rv.push(*r);
+                }
+            }
+            if fv.len() >= MIN_XS {
+                if let Some(ic) = spearman(&fv, &rv).filter(|x| x.is_finite()) {
+                    ics.push(ic);
+                }
+            }
+        }
+        if ics.is_empty() {
+            continue;
+        }
+        let n = ics.len() as f64;
+        let mean = ics.iter().sum::<f64>() / n;
+        let std = (ics.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n).sqrt();
+        let icir = if std > 0.0 { mean / std } else { 0.0 };
+        out.push(FeatureIC {
+            feature: col.clone(),
+            mean_ic: mean,
+            icir,
+            t_stat: icir * n.sqrt(),
+            hit_rate: ics.iter().filter(|x| **x > 0.0).count() as f64 / n,
+            n_periods: ics.len(),
+        });
+    }
+    out.sort_by(|a, b| b.icir.abs().partial_cmp(&a.icir.abs()).unwrap_or(Ordering::Equal));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +353,35 @@ mod tests {
         assert!(!wf.folds.is_empty());
         assert!(!wf.oos.equity_curve.is_empty());
         assert_eq!(wf.trial_sharpes.len(), wf.folds.len()); // 1 candidate per fold
+    }
+
+    #[test]
+    fn feature_ic_detects_a_predictive_feature() {
+        // 5 instruments, each growing at a fixed daily rate; a feature equal to that
+        // rate perfectly ranks next-bar returns → cross-sectional IC ≈ 1.
+        let rates: [f64; 5] = [0.01, 0.02, 0.03, 0.04, 0.05];
+        let day = |d: i64| Utc.timestamp_opt(1_700_000_000 + d * 86_400, 0).unwrap();
+        let (mut bars, mut rows) = (Vec::new(), Vec::new());
+        for (i, &rate) in rates.iter().enumerate() {
+            let instrument = inst(&format!("T{i}"));
+            let series: Vec<Bar> = (0..6)
+                .map(|d| {
+                    let c = Decimal::from_f64_retain(100.0 * (1.0 + rate).powi(d as i32)).unwrap();
+                    Bar { ts: day(d), open: c, high: c, low: c, close: c, volume: Decimal::from(1000) }
+                })
+                .collect();
+            for bar in &series {
+                rows.push(FeatureRow {
+                    instrument: instrument.clone(),
+                    ts: bar.ts,
+                    values: BTreeMap::from([("g".to_string(), Decimal::from_f64_retain(rate).unwrap())]),
+                });
+            }
+            bars.push((instrument, series));
+        }
+        let ics = feature_ic(&bars, &FeatureFrame { rows });
+        let g = ics.iter().find(|f| f.feature == "g").expect("feature g present");
+        assert!(g.mean_ic > 0.99, "expected near-perfect IC, got {}", g.mean_ic);
+        assert!(g.n_periods >= 3);
     }
 }
