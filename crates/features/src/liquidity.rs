@@ -184,7 +184,7 @@ mod tests {
             mom_long: 10,
         };
         let dataset = vec![(instrument(), bars)];
-        let frame = module.compute(&FeatureContext { bars: &dataset }).unwrap();
+        let frame = module.compute(&FeatureContext { bars: &dataset, funding: &[] }).unwrap();
         assert!(!frame.rows.is_empty());
         assert!(frame.rows.last().unwrap().values["dvol_mom"] > Decimal::ZERO);
     }
@@ -199,7 +199,7 @@ mod tests {
             mom_long: 10,
         };
         let dataset = vec![(instrument(), bars)];
-        let frame = module.compute(&FeatureContext { bars: &dataset }).unwrap();
+        let frame = module.compute(&FeatureContext { bars: &dataset, funding: &[] }).unwrap();
         let row = frame.rows.last().unwrap();
         for name in FEATURES {
             assert!(row.values.contains_key(name), "missing feature {name}");

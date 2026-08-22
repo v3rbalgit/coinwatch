@@ -5,19 +5,22 @@
 //! adding a `tokenomics` or `onchain_activity` module must not touch the engine.
 //! This is the seam Phase 2 uses to *confirm* the architecture.
 
+pub mod funding;
 pub mod liquidity;
 pub mod technical;
 
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
-use cw_core::{Bar, Decimal, Instrument, Result};
+use cw_core::{Bar, Decimal, FundingPoint, Instrument, Result};
 
-/// Inputs available to a feature computation: per-instrument bars, oldest-first.
-/// New signal channels (funding, alt-data) are added here as needed; the engine
-/// (`strategy`/`backtest`/`eval`) never sees this — it's a feature-layer concern.
+/// Inputs available to a feature computation: per-instrument bars, oldest-first,
+/// plus per-instrument hourly funding. Modules read only the channels they need;
+/// the engine (`strategy`/`backtest`/`eval`) never sees this — it's a feature-layer
+/// concern. New signal channels (alt-data) are added here as needed.
 pub struct FeatureContext<'a> {
     pub bars: &'a [(Instrument, Vec<Bar>)],
+    pub funding: &'a [(Instrument, Vec<FundingPoint>)],
 }
 
 /// One row of computed features for one instrument at one timestamp.
@@ -66,5 +69,6 @@ pub fn combine(frames: &[FeatureFrame]) -> FeatureFrame {
     }
 }
 
+pub use funding::FundingFeatures;
 pub use liquidity::LiquidityFeatures;
 pub use technical::TechnicalFeatures;

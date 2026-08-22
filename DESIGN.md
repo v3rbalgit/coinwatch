@@ -311,6 +311,21 @@ are retired.
   alpha magnitude carries uncertainty, though the relative OOS outperformance is robust. Verdict: a
   genuine, literature-backed edge candidate worth **paper trading + further validation**, not yet a
   proven money-printer.
+- *Funding signals + bidirectional/carry (chunk 7)*: added a `FundingFeatures` module (`fund_rate`,
+  `fund_z`) on a new funding channel of `FeatureContext` (z-score uses an epsilon guard so a constant
+  series gives z=0, not the fp-noise 1/√n); made `CrossSectional` hold cash (not error) when the rank
+  feature is absent so sparse signals backtest cleanly; deep-funding backfill (~3y, resumable by
+  depth); and added market-neutral illiquidity L/S + funding-carry candidates to the OOS validation.
+  **Three findings (preliminary — funding only partially backfilled, 12/27 coins deep):** (1) **funding
+  *anomaly* carry is the best edge yet** — `fundz carry` (market-neutral: short unusually-high funding
+  vs the coin's own history, long unusually-low) posts **OOS Sharpe 1.37, DSR 56.8%, maxDD 24%**,
+  ~2× the DSR of anything prior, and uses *both* shorting and funding. (2) **The illiquidity "edge"
+  was mostly BETA** — market-neutral `illiq L/S` returns only +35.7% (Sharpe 0.66) vs +227% long-only,
+  and even that residual is likely small-cap beta; the chunk-6 "+36%/yr alpha" was over-optimistic
+  (an honest correction — the volume-units fix also flipped `illiq`'s IC negative: illiquid small-caps
+  *underperform* risk-adjusted). (3) **Funding LEVEL fails, funding ANOMALY works** — raw-rate carry
+  is −56%; the edge is the z-score. Next: complete the funding backfill and re-validate `fundz carry`
+  over the full 3y before trusting it.
 
 ## 8. Direction & signal roadmap
 

@@ -14,7 +14,7 @@ use std::fs;
 use chrono::{Duration, Utc};
 use cw_backtest::{BacktestResult, Backtester, CostModel, WalkForward};
 use cw_core::{Bar, CoreError, Decimal, FundingPoint, Instrument, Interval, Result};
-use cw_features::{combine, FeatureContext, FeatureFrame, FeatureModule, FeatureRow, LiquidityFeatures, TechnicalFeatures};
+use cw_features::{combine, FeatureContext, FeatureFrame, FeatureModule, FeatureRow, FundingFeatures, LiquidityFeatures, TechnicalFeatures};
 use cw_harness::{feature_ic, sweep, walk_forward, WalkForwardResult, WfConfig};
 use cw_providers::{BarRequest, DataSource, Hyperliquid};
 use cw_storage::{DuckStore, Store, TimeRange};
@@ -24,7 +24,8 @@ const DB_PATH: &str = "research/data/coinwatch.duckdb";
 /// Minimum bars an instrument needs before it can carry features / be analyzed.
 const MIN_BARS: usize = 60;
 /// Funding-history window pulled per perp on ingest (paginated, resumable).
-const FUNDING_DAYS: i64 = 120;
+/// ~3.3y so the funding-carry signal can be backtested over the full bar history.
+const FUNDING_DAYS: i64 = 1200;
 
 #[tokio::main]
 async fn main() {
@@ -82,13 +83,19 @@ async fn ingest() -> Result<()> {
     for (inst, day_vol) in &perps {
         store.register_instrument(inst)?;
 
-        // Funding (perp carry signal) — resumable: pull a bounded window unless current.
-        let funding_current = store
-            .load_funding(&inst.network, &inst.pool.0, wide_range())
-            .unwrap_or_default()
-            .last()
-            .is_some_and(|p| p.time > Utc::now() - Duration::days(2));
-        if !funding_current {
+        let stored = store.load_bars(inst, Interval::Day, wide_range()).unwrap_or_default();
+
+        // Funding (perp carry signal): deep-backfill ~3y, resumable by depth. A coin
+        // is done once its funding reaches the target window — or as far back as its
+        // own price history goes, for coins listed <3y ago — and is current.
+        let existing = store.load_funding(&inst.network, &inst.pool.0, wide_range()).unwrap_or_default();
+        let target = Utc::now() - Duration::days(FUNDING_DAYS - 45);
+        let earliest_bar = stored.first().map(|b| b.ts);
+        let deep = existing.first().is_some_and(|p| {
+            p.time < target || earliest_bar.is_some_and(|eb| p.time < eb + Duration::days(35))
+        });
+        let current = existing.last().is_some_and(|p| p.time > Utc::now() - Duration::days(3));
+        if !(deep && current) {
             match hl.fetch_funding(&inst.pool.0, Utc::now() - Duration::days(FUNDING_DAYS)).await {
                 Ok(f) if !f.is_empty() => {
                     funding_rows += store.upsert_funding(&inst.network, &inst.pool.0, &f)?;
@@ -98,8 +105,7 @@ async fn ingest() -> Result<()> {
             }
         }
 
-        // Resumable: skip coins already backfilled and current.
-        let stored = store.load_bars(inst, Interval::Day, wide_range()).unwrap_or_default();
+        // Bars: resumable — skip coins already backfilled and current.
         if stored.len() >= 300 && stored.last().is_some_and(|b| b.ts > Utc::now() - Duration::days(2)) {
             println!("  {:<12} up-to-date", inst.name);
             continue;
@@ -166,9 +172,13 @@ fn analyze() -> Result<()> {
     // Feature modules → one combined frame for the same engine.
     let technical = TechnicalFeatures::default();
     let liquidity = LiquidityFeatures::default();
-    let ctx = FeatureContext { bars: &dataset };
-    let frame = combine(&[technical.compute(&ctx)?, liquidity.compute(&ctx)?]);
-    println!("features: modules [{}, {}] -> {} rows", technical.name(), liquidity.name(), frame.rows.len());
+    let funding_feat = FundingFeatures::default();
+    let ctx = FeatureContext { bars: &dataset, funding: &funding_dataset };
+    let frame = combine(&[technical.compute(&ctx)?, liquidity.compute(&ctx)?, funding_feat.compute(&ctx)?]);
+    println!(
+        "features: modules [{}, {}, {}] -> {} rows",
+        technical.name(), liquidity.name(), funding_feat.name(), frame.rows.len()
+    );
 
     // Cross-sectional leaderboard from the latest feature bar per instrument.
     let mut latest: HashMap<&str, &FeatureRow> = HashMap::new();
@@ -221,26 +231,29 @@ fn analyze() -> Result<()> {
     };
     let cadence = 14usize;
     let wf_cfg = WfConfig { train: 90, test: 30, embargo: 3, vol_target: None, rebalance_every: cadence };
-    let val_specs: &[(&str, &str, f64, bool)] = &[
-        ("illiq 20%", "illiq", 0.20, false),
-        ("illiq 30%", "illiq", 0.30, false),
-        ("illiq 40%", "illiq", 0.40, false),
-        ("low-vol 20%", "vol", 0.20, true),
-        ("low-vol 30%", "vol", 0.30, true),
-        ("low-vol 40%", "vol", 0.40, true),
-        ("mom 30%", "mom", 0.30, false),
-        ("dvol_mom 30%", "dvol_mom", 0.30, false),
+    // (label, feature, quantile, allow_short, invert). Long-only harvests + the two
+    // bidirectional/perp-native additions: illiquidity L/S (long illiquid, short
+    // liquid majors = safe short) and funding carry (long low-funding, short high).
+    let val_specs: &[(&str, &str, f64, bool, bool)] = &[
+        ("illiq LO 30%", "illiq", 0.30, false, false),
+        ("illiq LO 40%", "illiq", 0.40, false, false),
+        ("low-vol LO 30%", "vol", 0.30, false, true),
+        ("illiq L/S 30%", "illiq", 0.30, true, false),
+        ("illiq L/S 20%", "illiq", 0.20, true, false),
+        ("fund carry 30%", "fund_rate", 0.30, true, true),
+        ("fund carry 20%", "fund_rate", 0.20, true, true),
+        ("fundz carry 30%", "fund_z", 0.30, true, true),
     ];
-    let mk = |feature: &str, q: f64, invert: bool| CrossSectional {
+    let mk = |feature: &str, q: f64, short: bool, invert: bool| CrossSectional {
         rank_feature: feature.to_string(),
         top_quantile: q,
-        allow_short: false,
+        allow_short: short,
         invert,
         weight_feature: None,
     };
     let candidates: Vec<(String, CrossSectional)> = val_specs
         .iter()
-        .map(|(label, feature, q, invert)| (label.to_string(), mk(feature, *q, *invert)))
+        .map(|(label, feature, q, short, invert)| (label.to_string(), mk(feature, *q, *short, *invert)))
         .collect();
     let rows = sweep(&candidates, &dataset, &frame, wf_cfg, &costs, &funding_dataset)?;
     if rows.iter().all(|r| r.n_folds == 0) {
@@ -267,13 +280,13 @@ fn analyze() -> Result<()> {
             _ => Decimal::ZERO,
         }
     };
-    let market_cand = [("market".to_string(), mk("vol", 1.0, false))];
+    let market_cand = [("market".to_string(), mk("vol", 1.0, false, false))];
     let market_wf = walk_forward(&market_cand, &dataset, &frame, wf_cfg, &costs, &funding_dataset)?;
     let market_oos = cw_eval::returns(&market_wf.oos);
     println!("\nOOS alpha vs market (walk-forward d{cadence}; market OOS {}%):", oos_ret_pct(&market_wf));
     println!("  {:<14} {:>9} {:>6} {:>10} {:>6}", "config", "OOS-ret%", "beta", "alpha%/yr", "R2");
-    for (label, feature, q, invert) in val_specs.iter().filter(|s| s.1 == "illiq" || s.1 == "vol") {
-        let cand = [(label.to_string(), mk(feature, *q, *invert))];
+    for (label, feature, q, short, invert) in val_specs.iter().filter(|s| !s.3) {
+        let cand = [(label.to_string(), mk(feature, *q, *short, *invert))];
         let wf = walk_forward(&cand, &dataset, &frame, wf_cfg, &costs, &funding_dataset)?;
         let ab = cw_eval::alpha_beta(&cw_eval::returns(&wf.oos), &market_oos);
         println!(

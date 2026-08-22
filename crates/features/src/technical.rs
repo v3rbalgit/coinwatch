@@ -185,7 +185,7 @@ mod tests {
             rsi_lookback: 5,
         };
         let dataset = vec![(instrument(), bars)];
-        let frame = module.compute(&FeatureContext { bars: &dataset }).unwrap();
+        let frame = module.compute(&FeatureContext { bars: &dataset, funding: &[] }).unwrap();
 
         assert!(!frame.rows.is_empty());
         let last = frame.rows.last().unwrap();
@@ -204,7 +204,7 @@ mod tests {
             rsi_lookback: 10,
         };
         let dataset = vec![(instrument(), bars)];
-        let frame = module.compute(&FeatureContext { bars: &dataset }).unwrap();
+        let frame = module.compute(&FeatureContext { bars: &dataset, funding: &[] }).unwrap();
         assert!(frame.rows.is_empty());
     }
 
@@ -218,7 +218,7 @@ mod tests {
             rsi_lookback: 5,
         };
         let dataset = vec![(instrument(), bars)];
-        let frame = module.compute(&FeatureContext { bars: &dataset }).unwrap();
+        let frame = module.compute(&FeatureContext { bars: &dataset, funding: &[] }).unwrap();
         let last = frame.rows.last().unwrap();
         assert!(last.values["mom"] < Decimal::ZERO);
         assert_eq!(last.values["rsi"], dec(0.0));

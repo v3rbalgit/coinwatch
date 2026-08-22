@@ -5,7 +5,7 @@
 //! implementation is driven by the backtester and (later) the live runner — that
 //! single source of truth is what lets a backtested edge be trusted in deployment.
 
-use cw_core::{CoreError, Decimal, Result, TargetWeight};
+use cw_core::{Decimal, Result, TargetWeight};
 use cw_features::FeatureRow;
 
 /// Maps a rebalance-point cross-section to desired positions.
@@ -51,11 +51,10 @@ impl Strategy for CrossSectional {
             .iter()
             .filter_map(|r| r.values.get(&self.rank_feature).map(|v| (r, *v)))
             .collect();
+        // No instrument carries the rank feature this period (e.g. a sparse signal
+        // like funding before its history exists) → hold cash rather than error.
         if ranked.is_empty() {
-            return Err(CoreError::Config(format!(
-                "rank feature '{}' absent from cross-section",
-                self.rank_feature
-            )));
+            return Ok(Vec::new());
         }
         if self.invert {
             ranked.sort_by(|a, b| a.1.cmp(&b.1)); // ascending: long the low end
@@ -160,7 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_feature_errors() {
+    fn missing_feature_yields_no_positions() {
         let s = CrossSectional {
             rank_feature: "nope".to_string(),
             top_quantile: 0.5,
@@ -168,7 +167,7 @@ mod tests {
             invert: false,
             weight_feature: None,
         };
-        assert!(s.target_weights(&[row("a", 1)]).is_err());
+        assert!(s.target_weights(&[row("a", 1)]).unwrap().is_empty());
     }
 
     #[test]
