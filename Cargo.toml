@@ -19,6 +19,7 @@ cw-features = { path = "crates/features" }
 cw-strategy = { path = "crates/strategy" }
 cw-backtest = { path = "crates/backtest" }
 cw-eval = { path = "crates/eval" }
+cw-harness = { path = "crates/harness" }
 
 # Shared third-party
 thiserror = "2"

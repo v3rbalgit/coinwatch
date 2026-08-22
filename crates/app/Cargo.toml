@@ -17,5 +17,6 @@ cw-features.workspace = true
 cw-strategy.workspace = true
 cw-backtest.workspace = true
 cw-eval.workspace = true
+cw-harness.workspace = true
 tokio.workspace = true
 chrono.workspace = true

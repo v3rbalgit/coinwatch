@@ -1,0 +1,15 @@
+[package]
+name = "cw-harness"
+description = "Research workflows composing the engine: walk-forward CV with config sweep + OOS deflation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cw-core.workspace = true
+cw-features.workspace = true
+cw-strategy.workspace = true
+cw-backtest.workspace = true
+cw-eval.workspace = true
+chrono.workspace = true
+rust_decimal.workspace = true

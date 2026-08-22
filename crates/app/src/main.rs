@@ -17,6 +17,7 @@ use chrono::{Duration, Utc};
 use cw_backtest::{Backtester, CostModel, WalkForward};
 use cw_core::{Bar, CoreError, Decimal, Instrument, Interval, Network, Result};
 use cw_features::{combine, FeatureContext, FeatureFrame, FeatureModule, FeatureRow, LiquidityFeatures, TechnicalFeatures};
+use cw_harness::{walk_forward, WfConfig};
 use cw_providers::{BarRequest, DataSource, GeckoTerminal, UniverseRequest, UniverseSource};
 use cw_storage::{DuckStore, Store, TimeRange};
 use cw_strategy::CrossSectional;
@@ -160,10 +161,56 @@ fn analyze() -> Result<()> {
         );
     }
 
-    // Same engine, two edge hypotheses — selected by config (rank feature) only.
-    run_backtest("technical momentum", "mom", &dataset, &frame)?;
-    run_backtest("liquidity: dollar-vol momentum", "dvol_mom", &dataset, &frame)?;
+    // In-sample, full-period backtests (the flattering, overfit-prone view).
+    run_backtest("in-sample: technical momentum", "mom", &dataset, &frame)?;
+    run_backtest("in-sample: liquidity dvol-momentum", "dvol_mom", &dataset, &frame)?;
+
+    // Walk-forward CV: sweep configs on each train window, evaluate the winner
+    // out-of-sample, and deflate the result for the number of trials. This is the
+    // honest number — expect it to be far less flattering than the in-sample runs.
+    let costs = CostModel {
+        fee_frac: Decimal::new(5, 4),
+        slippage_coeff: Decimal::new(10, 4),
+        gas_usd: Decimal::new(50, 2),
+    };
+    let candidates = vec![
+        ("mom @40%".to_string(), cross("mom", 0.4)),
+        ("mom @60%".to_string(), cross("mom", 0.6)),
+        ("dvol_mom @40%".to_string(), cross("dvol_mom", 0.4)),
+        ("dvol_mom @60%".to_string(), cross("dvol_mom", 0.6)),
+    ];
+    let wf = walk_forward(&candidates, &dataset, &frame, WfConfig { train: 40, test: 12, embargo: 2 }, &costs)?;
+    if wf.folds.is_empty() {
+        println!("\nwalk-forward: not enough history for the chosen windows");
+        return Ok(());
+    }
+    println!("\nwalk-forward ({} folds, {} candidates each):", wf.folds.len(), candidates.len());
+    for f in &wf.folds {
+        println!(
+            "  test {}..{}  chose {:<16} (train SR/step {:+.3})",
+            f.test_from.date_naive(), f.test_to.date_naive(), f.chosen, f.train_sharpe
+        );
+    }
+    let oos = cw_eval::evaluate(&wf.oos)?;
+    let dsr = cw_eval::deflated_sharpe(&cw_eval::returns(&wf.oos), &wf.trial_sharpes);
+    if let (Some((_, s)), Some((_, e))) = (wf.oos.equity_curve.first(), wf.oos.equity_curve.last()) {
+        let total = ((e / s - Decimal::ONE) * Decimal::from(100)).round_dp(2);
+        println!("  OOS equity: ${} -> ${}  ({}% total)", s.round_dp(2), e.round_dp(2), total);
+    }
+    println!(
+        "  OOS: sharpe={:.2}  maxDD={:.1}%  hit={:.1}%  PSR={:.1}%  DSR={:.1}%  ({} trials)",
+        oos.sharpe, oos.max_drawdown * 100.0, oos.hit_rate * 100.0, oos.psr * 100.0, dsr * 100.0, wf.trial_sharpes.len()
+    );
     Ok(())
+}
+
+/// Shorthand for a long-only cross-sectional candidate.
+fn cross(rank_feature: &str, top_quantile: f64) -> CrossSectional {
+    CrossSectional {
+        rank_feature: rank_feature.to_string(),
+        top_quantile,
+        allow_short: false,
+    }
 }
 
 /// Backtest [`CrossSectional`] ranked by `rank_feature` and print metrics.

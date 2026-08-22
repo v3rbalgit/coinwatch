@@ -525,6 +525,7 @@ dependencies = [
  "cw-core",
  "cw-eval",
  "cw-features",
+ "cw-harness",
  "cw-providers",
  "cw-storage",
  "cw-strategy",
@@ -567,6 +568,19 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "cw-core",
+ "rust_decimal",
+]
+
+[[package]]
+name = "cw-harness"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "cw-backtest",
+ "cw-core",
+ "cw-eval",
+ "cw-features",
+ "cw-strategy",
  "rust_decimal",
 ]
 

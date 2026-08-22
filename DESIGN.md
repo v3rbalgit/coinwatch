@@ -166,3 +166,10 @@ scaffolding. The Bybit/CEX clients and the HTTP microservice mesh are retired.
   gains an instrument registry (`register_instrument`/`list_instruments`). The wider cross-section
   already cut the demo momentum strategy's max drawdown ~79% → ~47% — concrete evidence that
   breadth, not cleverness, is the first lever against the in-sample problem.
+- *Walk-forward CV*: new `cw-harness` crate (composes `backtest` + `eval`, which can't depend on
+  each other) provides `walk_forward` — rolls train/test folds, sweeps candidate configs per train
+  window, evaluates the in-train winner out-of-sample, and stitches a continuous OOS curve. `eval`
+  gains the **Deflated Sharpe Ratio** (multiple-testing-aware, using the trial-Sharpe distribution)
+  plus probit/returns/per-period-Sharpe helpers. The demo makes the point vividly: in-sample
+  Sharpe 3.84 / PSR 98.6% collapses to a walk-forward **DSR of ~16%** once 16 trials are deflated —
+  the overfitting guard is now a workflow, not a footnote.
