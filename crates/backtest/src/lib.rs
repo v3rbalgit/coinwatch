@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
-use cw_core::{Bar, CoreError, Decimal, Instrument, Result};
+use cw_core::{Bar, CoreError, Decimal, FundingPoint, Instrument, Result};
 use cw_features::{FeatureFrame, FeatureRow};
 use cw_strategy::Strategy;
 
@@ -80,13 +80,16 @@ impl Backtester {
         Self { costs, walk_forward }
     }
 
-    /// Run `strategy` over `bars` (per-instrument close series) and `features`
-    /// (the rebalance cross-sections). Rebalances at each feature timestamp.
+    /// Run `strategy` over `bars`, `features`, and per-instrument `funding`.
+    /// Rebalances at each feature timestamp; each step nets the price return,
+    /// funding P&L (longs pay positive funding, shorts receive), and costs.
+    /// `funding` may be empty (spot-like: no funding P&L).
     pub fn run<S: Strategy>(
         &self,
         strategy: &S,
         bars: &[(Instrument, Vec<Bar>)],
         features: &FeatureFrame,
+        funding: &[(Instrument, Vec<FundingPoint>)],
     ) -> Result<BacktestResult> {
         // per-pool lookups: close (for returns) and volume (for slippage depth)
         let mut closes: HashMap<String, HashMap<i64, Decimal>> = HashMap::new();
@@ -98,6 +101,16 @@ impl Backtester {
                 let ms = b.ts.timestamp_millis();
                 c.insert(ms, b.close);
                 v.insert(ms, b.volume);
+            }
+        }
+
+        // per-pool daily funding: sum of hourly rates within each UTC day
+        let mut funding_daily: HashMap<String, HashMap<i64, Decimal>> = HashMap::new();
+        for (inst, points) in funding {
+            let m = funding_daily.entry(inst.pool.0.clone()).or_default();
+            for p in points {
+                let day = (p.time.timestamp_millis() / 86_400_000) * 86_400_000;
+                *m.entry(day).or_insert(Decimal::ZERO) += p.funding_rate;
             }
         }
 
@@ -175,9 +188,19 @@ impl Backtester {
                 });
             }
 
+            // funding P&L over [t0, t1]: a long pays positive funding, a short receives.
+            let mut funding_pnl = Decimal::ZERO;
+            for (pool, w) in &new_weights {
+                if *w != Decimal::ZERO {
+                    let f = funding_daily.get(pool).and_then(|m| m.get(&t0)).copied().unwrap_or(Decimal::ZERO);
+                    funding_pnl -= *w * f;
+                }
+            }
+
             let cost_drag = if equity > Decimal::ZERO { total_cost / equity } else { Decimal::ZERO };
-            let net = gross - cost_drag;
-            equity += equity * net;
+            let net = gross + funding_pnl - cost_drag;
+            // A real account can't go below zero — ruin floors equity at 0.
+            equity = (equity + equity * net).max(Decimal::ZERO);
             result.equity_curve.push((ms_to_dt(t1)?, equity));
             prev_weights = new_weights;
         }
@@ -226,12 +249,12 @@ mod tests {
 
     fn final_equity(volume: i64) -> Decimal {
         let (bars, frame) = scenario(volume);
-        let strat = CrossSectional { rank_feature: "mom".to_string(), top_quantile: 0.5, allow_short: false };
+        let strat = CrossSectional { rank_feature: "mom".to_string(), top_quantile: 0.5, allow_short: false, invert: false };
         let bt = Backtester::new(
             CostModel { fee_frac: Decimal::new(5, 4), slippage_coeff: Decimal::new(5, 1), gas_usd: Decimal::ZERO },
             WalkForward { train_bars: 1, test_bars: 1, embargo_bars: 0 },
         );
-        bt.run(&strat, &bars, &frame).unwrap().equity_curve.last().unwrap().1
+        bt.run(&strat, &bars, &frame, &[]).unwrap().equity_curve.last().unwrap().1
     }
 
     #[test]

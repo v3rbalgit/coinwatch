@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use cw_backtest::{BacktestResult, Backtester, CostModel, WalkForward};
-use cw_core::{Bar, Decimal, Instrument, Result};
+use cw_core::{Bar, Decimal, FundingPoint, Instrument, Result};
 use cw_features::{FeatureFrame, FeatureRow};
 use cw_strategy::Strategy;
 use rust_decimal::prelude::ToPrimitive;
@@ -95,6 +95,7 @@ pub fn walk_forward<S: Strategy>(
     features: &FeatureFrame,
     cfg: WfConfig,
     costs: &CostModel,
+    funding: &[(Instrument, Vec<FundingPoint>)],
 ) -> Result<WalkForwardResult> {
     let mut times: Vec<i64> = features.rows.iter().map(|r| r.ts.timestamp_millis()).collect();
     times.sort_unstable();
@@ -127,7 +128,7 @@ pub fn walk_forward<S: Strategy>(
         let train_frame = subframe(features, &train_set);
         let mut best: Option<(usize, f64)> = None;
         for (idx, (_, strat)) in candidates.iter().enumerate() {
-            let train_res = backtester.run(strat, bars, &train_frame)?;
+            let train_res = backtester.run(strat, bars, &train_frame, funding)?;
             let sharpe = cw_eval::per_period_sharpe(&cw_eval::returns(&train_res));
             result.trial_sharpes.push(sharpe);
             if best.is_none_or(|(_, bs)| sharpe > bs) {
@@ -139,7 +140,7 @@ pub fn walk_forward<S: Strategy>(
 
         // Evaluate the winner out-of-sample and collect its step returns.
         let test_frame = subframe(features, &test_set);
-        let test_res = backtester.run(chosen_strat, bars, &test_frame)?;
+        let test_res = backtester.run(chosen_strat, bars, &test_frame, funding)?;
         for w in test_res.equity_curve.windows(2) {
             oos_points.push((w[1].0, step_return(&w[0].1, &w[1].1)));
         }
@@ -305,11 +306,12 @@ pub fn sweep<S: Strategy>(
     features: &FeatureFrame,
     cfg: WfConfig,
     costs: &CostModel,
+    funding: &[(Instrument, Vec<FundingPoint>)],
 ) -> Result<Vec<SweepRow>> {
     let mut runs = Vec::with_capacity(candidates.len());
     let mut trial_sharpes = Vec::with_capacity(candidates.len());
     for cand in candidates {
-        let wf = walk_forward(std::slice::from_ref(cand), bars, features, cfg, costs)?;
+        let wf = walk_forward(std::slice::from_ref(cand), bars, features, cfg, costs, funding)?;
         let rets = cw_eval::returns(&wf.oos);
         trial_sharpes.push(cw_eval::per_period_sharpe(&rets));
         runs.push((cand.0.clone(), wf, rets));
@@ -396,14 +398,14 @@ mod tests {
         let (bars, frame) = synthetic(40);
         let candidates = vec![(
             "mom@50".to_string(),
-            CrossSectional { rank_feature: "mom".to_string(), top_quantile: 0.5, allow_short: false },
+            CrossSectional { rank_feature: "mom".to_string(), top_quantile: 0.5, allow_short: false, invert: false },
         )];
         let costs = CostModel {
             fee_frac: Decimal::new(5, 4),
             slippage_coeff: Decimal::new(10, 4),
             gas_usd: Decimal::ZERO,
         };
-        let wf = walk_forward(&candidates, &bars, &frame, WfConfig { train: 15, test: 5, embargo: 1 }, &costs).unwrap();
+        let wf = walk_forward(&candidates, &bars, &frame, WfConfig { train: 15, test: 5, embargo: 1 }, &costs, &[]).unwrap();
         assert!(!wf.folds.is_empty());
         assert!(!wf.oos.equity_curve.is_empty());
         assert_eq!(wf.trial_sharpes.len(), wf.folds.len()); // 1 candidate per fold
@@ -443,11 +445,11 @@ mod tests {
     fn sweep_returns_a_row_per_candidate() {
         let (bars, frame) = synthetic(40);
         let candidates = vec![
-            ("mom@50".to_string(), CrossSectional { rank_feature: "mom".to_string(), top_quantile: 0.5, allow_short: false }),
-            ("mom@30".to_string(), CrossSectional { rank_feature: "mom".to_string(), top_quantile: 0.3, allow_short: false }),
+            ("mom@50".to_string(), CrossSectional { rank_feature: "mom".to_string(), top_quantile: 0.5, allow_short: false, invert: false }),
+            ("mom@30".to_string(), CrossSectional { rank_feature: "mom".to_string(), top_quantile: 0.3, allow_short: false, invert: false }),
         ];
         let costs = CostModel { fee_frac: Decimal::new(5, 4), slippage_coeff: Decimal::new(5, 1), gas_usd: Decimal::ZERO };
-        let rows = sweep(&candidates, &bars, &frame, WfConfig { train: 15, test: 5, embargo: 1 }, &costs).unwrap();
+        let rows = sweep(&candidates, &bars, &frame, WfConfig { train: 15, test: 5, embargo: 1 }, &costs, &[]).unwrap();
         assert_eq!(rows.len(), 2);
     }
 }

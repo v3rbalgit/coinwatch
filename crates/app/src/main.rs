@@ -13,7 +13,7 @@ use std::fs;
 
 use chrono::{Duration, Utc};
 use cw_backtest::{Backtester, CostModel, WalkForward};
-use cw_core::{Bar, CoreError, Decimal, Instrument, Interval, Result};
+use cw_core::{Bar, CoreError, Decimal, FundingPoint, Instrument, Interval, Result};
 use cw_features::{combine, FeatureContext, FeatureFrame, FeatureModule, FeatureRow, LiquidityFeatures, TechnicalFeatures};
 use cw_harness::{feature_ic, sweep, WfConfig};
 use cw_providers::{BarRequest, DataSource, Hyperliquid};
@@ -139,6 +139,20 @@ fn analyze() -> Result<()> {
         return Ok(());
     }
 
+    // Funding series per instrument (perp funding P&L in the backtest).
+    let mut funding_dataset: Vec<(Instrument, Vec<FundingPoint>)> = Vec::new();
+    for (inst, _) in &dataset {
+        let f = store.load_funding(&inst.network, &inst.pool.0, wide_range()).unwrap_or_default();
+        if !f.is_empty() {
+            funding_dataset.push((inst.clone(), f));
+        }
+    }
+    println!(
+        "funding: {} points across {} perps",
+        funding_dataset.iter().map(|(_, f)| f.len()).sum::<usize>(),
+        funding_dataset.len()
+    );
+
     // Feature modules → one combined frame for the same engine.
     let technical = TechnicalFeatures::default();
     let liquidity = LiquidityFeatures::default();
@@ -183,8 +197,8 @@ fn analyze() -> Result<()> {
     }
 
     // In-sample, full-period backtests (the flattering, overfit-prone view).
-    run_backtest("in-sample: technical momentum", "mom", &dataset, &frame)?;
-    run_backtest("in-sample: liquidity dvol-momentum", "dvol_mom", &dataset, &frame)?;
+    run_backtest("in-sample: technical momentum", "mom", &dataset, &frame, &funding_dataset)?;
+    run_backtest("in-sample: liquidity dvol-momentum", "dvol_mom", &dataset, &frame, &funding_dataset)?;
 
     // Strategy sweep: evaluate MANY configs out-of-sample (each its own
     // walk-forward), deflated for the number of trials → an honest strategy
@@ -194,13 +208,32 @@ fn analyze() -> Result<()> {
         slippage_coeff: Decimal::new(5, 1),
         gas_usd: Decimal::new(50, 2),
     };
-    let mut candidates: Vec<(String, CrossSectional)> = Vec::new();
-    for feature in ["mom", "dvol_mom", "dvol_z", "rsi", "illiq"] {
-        for q in [0.3, 0.5] {
-            candidates.push((format!("{feature}@{:.0}%", q * 100.0), cross(feature, q)));
-        }
-    }
-    let rows = sweep(&candidates, &dataset, &frame, WfConfig { train: 90, test: 30, embargo: 3 }, &costs)?;
+    // Market-neutral (long/short) tests of the significant signals + baselines.
+    // (label, feature, top_quantile, invert); all allow_short = true.
+    let specs: &[(&str, &str, f64, bool)] = &[
+        ("vol L/S (long low-vol)", "vol", 0.20, true),
+        ("vol L/S 33%", "vol", 0.33, true),
+        ("illiq L/S", "illiq", 0.20, false),
+        ("illiq L/S 33%", "illiq", 0.33, false),
+        ("mom L/S", "mom", 0.20, false),
+        ("dvol_mom L/S", "dvol_mom", 0.20, false),
+        ("rsi L/S", "rsi", 0.20, false),
+    ];
+    let candidates: Vec<(String, CrossSectional)> = specs
+        .iter()
+        .map(|(label, feature, q, invert)| {
+            (
+                label.to_string(),
+                CrossSectional {
+                    rank_feature: feature.to_string(),
+                    top_quantile: *q,
+                    allow_short: true,
+                    invert: *invert,
+                },
+            )
+        })
+        .collect();
+    let rows = sweep(&candidates, &dataset, &frame, WfConfig { train: 90, test: 30, embargo: 3 }, &costs, &funding_dataset)?;
     if rows.iter().all(|r| r.n_folds == 0) {
         println!("\nstrategy sweep: not enough history for the chosen windows");
         return Ok(());
@@ -216,22 +249,20 @@ fn analyze() -> Result<()> {
     Ok(())
 }
 
-/// Shorthand for a long-only cross-sectional candidate.
-fn cross(rank_feature: &str, top_quantile: f64) -> CrossSectional {
-    CrossSectional {
-        rank_feature: rank_feature.to_string(),
-        top_quantile,
-        allow_short: false,
-    }
-}
-
 /// Backtest [`CrossSectional`] ranked by `rank_feature` and print metrics.
 /// Nothing here is feature-module-specific — the same engine consumes any column.
-fn run_backtest(label: &str, rank_feature: &str, dataset: &[(Instrument, Vec<Bar>)], frame: &FeatureFrame) -> Result<()> {
+fn run_backtest(
+    label: &str,
+    rank_feature: &str,
+    dataset: &[(Instrument, Vec<Bar>)],
+    frame: &FeatureFrame,
+    funding: &[(Instrument, Vec<FundingPoint>)],
+) -> Result<()> {
     let strategy = CrossSectional {
         rank_feature: rank_feature.to_string(),
         top_quantile: 0.4,
         allow_short: false,
+        invert: false,
     };
     let costs = CostModel {
         fee_frac: Decimal::new(5, 4),        // 5 bps swap fee
@@ -239,7 +270,7 @@ fn run_backtest(label: &str, rank_feature: &str, dataset: &[(Instrument, Vec<Bar
         gas_usd: Decimal::new(50, 2),        // $0.50 per position change
     };
     let backtester = Backtester::new(costs, WalkForward { train_bars: 90, test_bars: 30, embargo_bars: 3 });
-    let result = backtester.run(&strategy, dataset, frame)?;
+    let result = backtester.run(&strategy, dataset, frame, funding)?;
     let m = cw_eval::evaluate(&result)?;
 
     if let (Some((_, e0)), Some((_, e1))) = (result.equity_curve.first(), result.equity_curve.last()) {

@@ -254,6 +254,17 @@ are retired.
   strategies still blow up (they buy the high-vol pumped coins) — harvesting these needs **long/short**,
   which perps enable and `CrossSectional.allow_short` supports. This is exactly what the perps
   backtester (next) unlocks.
+- *Perps backtester (chunk 2)*: the engine now models **funding P&L** (longs pay positive funding,
+  shorts receive; daily-summed from the funding table) and **ruin** (equity floored at 0); shorts
+  were already correct via signed weights. `CrossSectional` gains an **`invert`** flag (long the low
+  end — e.g. long low-vol). `run`/`walk_forward`/`sweep` thread funding; the sweep now tests
+  market-neutral long/short. **Honest finding:** even the L/S plays on the *significant* signals blow
+  up (−99 to −100%) — including long-low-vol/short-high-vol. The IC (vol t=−5.4) is real but **small
+  (~5%)**, and a naive equal-weight top-quantile L/S is swamped by crypto's fat tails
+  (crashes/short-squeezes) and bled by high turnover with no risk management. The platform correctly
+  refuses to bless a naive blowup: **a significant signal ≠ a profitable naive strategy.** Next
+  research lever is *portfolio construction* — risk/vol-weighting, more diversification, lower
+  turnover — not another signal.
 
 ## 8. Direction & signal roadmap
 
@@ -261,6 +272,7 @@ are retired.
 clean data, validate (walk-forward + DSR + realistic costs), then paper-trade and execute on HL.
 
 **Signal sourcing (how a quant sequences it):**
+
 - *Tier 1 (now — free, deep, directly about the traded instrument):* price signals (cross-sectional
   momentum, mean-reversion, **low-volatility**, illiquidity) + perp-native signals (**funding carry**,
   open interest / positioning, liquidation cascades). Start here; it's plenty to hunt a first edge.

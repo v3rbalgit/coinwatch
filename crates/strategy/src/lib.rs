@@ -31,6 +31,9 @@ pub struct CrossSectional {
     pub top_quantile: f64,
     /// If false, the bottom leg is held flat instead of shorted.
     pub allow_short: bool,
+    /// If true, rank ascending — long the LOW end — for signals whose edge is
+    /// negative (e.g. the low-volatility anomaly: long low vol, short high vol).
+    pub invert: bool,
 }
 
 impl Strategy for CrossSectional {
@@ -50,7 +53,11 @@ impl Strategy for CrossSectional {
                 self.rank_feature
             )));
         }
-        ranked.sort_by(|a, b| b.1.cmp(&a.1)); // descending
+        if self.invert {
+            ranked.sort_by(|a, b| a.1.cmp(&b.1)); // ascending: long the low end
+        } else {
+            ranked.sort_by(|a, b| b.1.cmp(&a.1)); // descending: long the high end
+        }
 
         let n = ranked.len();
         let leg = (((n as f64) * self.top_quantile).floor() as usize).clamp(1, n);
@@ -105,6 +112,7 @@ mod tests {
             rank_feature: "mom".to_string(),
             top_quantile: 0.5,
             allow_short: false,
+            invert: false,
         };
         let cross = vec![row("a", 5), row("b", 1), row("c", 9), row("d", -3)];
         let w = s.target_weights(&cross).unwrap();
@@ -122,6 +130,7 @@ mod tests {
             rank_feature: "mom".to_string(),
             top_quantile: 0.25,
             allow_short: true,
+            invert: false,
         };
         let cross = vec![row("a", 5), row("b", 1), row("c", 9), row("d", -3)];
         let w = s.target_weights(&cross).unwrap();
@@ -137,6 +146,7 @@ mod tests {
             rank_feature: "nope".to_string(),
             top_quantile: 0.5,
             allow_short: false,
+            invert: false,
         };
         assert!(s.target_weights(&[row("a", 1)]).is_err());
     }
