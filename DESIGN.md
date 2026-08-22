@@ -288,6 +288,16 @@ are retired.
   bleed to ruin. Proven by a zero-cost run where the ruin vanishes (low-vol +165%, +3.6%/yr alpha).
   The signal is fine; the daily rebalance isn't. Next lever: **turnover control** (rebalance cadence /
   no-trade band / weight smoothing) — which would also lift every cost-sensitive strategy.
+- *Turnover control (chunk 5)*: added a **rebalance cadence** to the backtester
+  (`Backtester.with_rebalance_every(N)`): rebalance every N bars, holding weights between and paying
+  no costs (unit-tested). Sweeping cadence d1/d7/d14 **cleanly separates two conclusions.** (1)
+  **Low-vol long-only is NOT a real edge:** cadence cuts its turnover 0.66→0.05, but it stays negative
+  net of costs (d14: −70%, alpha −58%/yr) — the signal doesn't survive as a long-only book. (2)
+  **Illiquidity is the genuine edge, and it *improves* with less trading:** `illiq@30%` biweekly hits
+  **+270%, Sharpe 0.92, +15.4%/yr alpha** net of realistic costs (turnover 0.03, R² 0.87). Less churn →
+  more alpha. **Caveat: in-sample, full-period.** The honest next step is walk-forward (OOS) + DSR
+  validation of the illiquidity alpha — does the +15%/yr survive out-of-sample and multiple-testing
+  deflation?
 
 ## 8. Direction & signal roadmap
 

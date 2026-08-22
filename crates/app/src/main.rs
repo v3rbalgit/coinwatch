@@ -265,8 +265,9 @@ fn analyze() -> Result<()> {
     // on short-side tail risk; here we ask whether low-vol / illiquidity add ALPHA
     // long-only, or merely ride crypto's beta. In-sample, full-period, no vol
     // targeting — beta is structural, and near-zero in-sample alpha means no edge.
-    let bt = |strat: &CrossSectional| -> Result<BacktestResult> {
+    let bt = |strat: &CrossSectional, every: usize| -> Result<BacktestResult> {
         Backtester::new(costs.clone(), WalkForward { train_bars: 90, test_bars: 30, embargo_bars: 3 })
+            .with_rebalance_every(every)
             .run(strat, &dataset, &frame, &funding_dataset)
     };
     let market = CrossSectional {
@@ -276,17 +277,15 @@ fn analyze() -> Result<()> {
         invert: false,
         weight_feature: None,
     };
-    let market_bt = bt(&market)?;
+    let market_bt = bt(&market, 1)?;
     let market_rets = cw_eval::returns(&market_bt);
     let market_m = cw_eval::evaluate(&market_bt)?;
-    println!("\nlong-only alpha vs beta (in-sample; benchmark = equal-weight universe):");
-    println!("  {:<16} {:>8} {:>7} {:>6} {:>6} {:>9} {:>6}", "strategy", "ret%", "sharpe", "turn", "beta", "alpha%/yr", "R2");
-    println!("  {:<16} {:>8} {:>7.2} {:>6.2} {:>6.2} {:>9} {:>6}", "market (EW)", pct(&market_bt), market_m.sharpe, market_m.turnover, 1.0, "-", "-");
+    println!("\nlong-only alpha vs beta + rebalance cadence (in-sample; benchmark = equal-weight universe):");
+    println!("  {:<18} {:>8} {:>7} {:>6} {:>6} {:>9} {:>6}", "strategy", "ret%", "sharpe", "turn", "beta", "alpha%/yr", "R2");
+    println!("  {:<18} {:>8} {:>7.2} {:>6.2} {:>6.2} {:>9} {:>6}", "market (EW)", pct(&market_bt), market_m.sharpe, market_m.turnover, 1.0, "-", "-");
     let longs: &[(&str, &str, f64, bool)] = &[
         ("low-vol 30%", "vol", 0.30, true),
-        ("low-vol 20%", "vol", 0.20, true),
         ("illiq 30%", "illiq", 0.30, false),
-        ("illiq 20%", "illiq", 0.20, false),
     ];
     for (label, feature, q, invert) in longs {
         let strat = CrossSectional {
@@ -296,13 +295,15 @@ fn analyze() -> Result<()> {
             invert: *invert,
             weight_feature: None,
         };
-        let r = bt(&strat)?;
-        let m = cw_eval::evaluate(&r)?;
-        let ab = cw_eval::alpha_beta(&cw_eval::returns(&r), &market_rets);
-        println!(
-            "  {:<16} {:>8} {:>7.2} {:>6.2} {:>6.2} {:>9.1} {:>6.2}",
-            label, pct(&r), m.sharpe, m.turnover, ab.beta, ab.alpha_annual * 100.0, ab.r2
-        );
+        for every in [1usize, 7, 14] {
+            let r = bt(&strat, every)?;
+            let m = cw_eval::evaluate(&r)?;
+            let ab = cw_eval::alpha_beta(&cw_eval::returns(&r), &market_rets);
+            println!(
+                "  {:<18} {:>8} {:>7.2} {:>6.2} {:>6.2} {:>9.1} {:>6.2}",
+                format!("{label} d{every}"), pct(&r), m.sharpe, m.turnover, ab.beta, ab.alpha_annual * 100.0, ab.r2
+            );
+        }
     }
     Ok(())
 }

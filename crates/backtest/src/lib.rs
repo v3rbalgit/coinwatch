@@ -77,6 +77,9 @@ pub struct Backtester {
     /// step by target / trailing-realized-vol (capped) to control the geometric
     /// volatility drag that ruins high-variance crypto strategies.
     pub vol_target: Option<Decimal>,
+    /// Rebalance the portfolio every N bars (default 1 = every bar). Higher values
+    /// cut turnover: between rebalances weights are held and no costs are paid.
+    pub rebalance_every: usize,
 }
 
 fn ms_to_dt(ms: i64) -> Result<DateTime<Utc>> {
@@ -103,12 +106,18 @@ fn vol_target_scale(target: Option<Decimal>, past: &[f64]) -> Decimal {
 
 impl Backtester {
     pub fn new(costs: CostModel, walk_forward: WalkForward) -> Self {
-        Self { costs, walk_forward, vol_target: None }
+        Self { costs, walk_forward, vol_target: None, rebalance_every: 1 }
     }
 
     /// Enable portfolio volatility targeting at `target` daily vol.
     pub fn with_vol_target(mut self, target: Option<Decimal>) -> Self {
         self.vol_target = target;
+        self
+    }
+
+    /// Rebalance every `every` bars (turnover control); `every` < 1 is treated as 1.
+    pub fn with_rebalance_every(mut self, every: usize) -> Self {
+        self.rebalance_every = every.max(1);
         self
     }
 
@@ -159,29 +168,64 @@ impl Backtester {
         let (fee, slip, gas) = (self.costs.fee_frac, self.costs.slippage_coeff, self.costs.gas_usd);
 
         let mut equity = Decimal::from(INITIAL_CAPITAL_USD);
-        let mut prev_weights: HashMap<String, Decimal> = HashMap::new();
+        let mut held: HashMap<String, Decimal> = HashMap::new();
         let mut net_returns: Vec<f64> = Vec::new();
         let mut result = BacktestResult {
             equity_curve: vec![(ms_to_dt(times[0])?, equity)],
             trades: Vec::new(),
         };
+        let cadence = self.rebalance_every.max(1);
 
-        for pair in times.windows(2) {
+        for (step, pair) in times.windows(2).enumerate() {
             let (t0, t1) = (pair[0], pair[1]);
-            let targets = strategy.target_weights(&sections[&t0])?;
-            // Vol targeting scales gross exposure from trailing realized vol.
-            let scale = vol_target_scale(self.vol_target, &net_returns);
 
-            let mut new_weights: HashMap<String, Decimal> = HashMap::new();
-            let mut name_by_pool: HashMap<String, String> = HashMap::new();
-            for tw in &targets {
-                new_weights.insert(tw.instrument.pool.0.clone(), tw.weight * scale);
-                name_by_pool.insert(tw.instrument.pool.0.clone(), tw.instrument.name.clone());
+            // Rebalance only every `cadence` bars; between, hold weights and pay no
+            // costs — the turnover-control lever.
+            let mut total_cost = Decimal::ZERO;
+            if step % cadence == 0 {
+                let targets = strategy.target_weights(&sections[&t0])?;
+                // Vol targeting scales gross exposure from trailing realized vol.
+                let scale = vol_target_scale(self.vol_target, &net_returns);
+                let mut target: HashMap<String, Decimal> = HashMap::new();
+                let mut name_by_pool: HashMap<String, String> = HashMap::new();
+                for tw in &targets {
+                    target.insert(tw.instrument.pool.0.clone(), tw.weight * scale);
+                    name_by_pool.insert(tw.instrument.pool.0.clone(), tw.instrument.name.clone());
+                }
+
+                // depth-aware costs + per-trade ledger over the union of positions
+                let max_participation = Decimal::new(5, 1); // cap notional/volume at 0.5
+                let pools: HashSet<&String> = target.keys().chain(held.keys()).collect();
+                for pool in pools {
+                    let wn = target.get(pool).copied().unwrap_or(Decimal::ZERO);
+                    let wp = held.get(pool).copied().unwrap_or(Decimal::ZERO);
+                    let delta = (wn - wp).abs();
+                    if delta <= Decimal::ZERO {
+                        continue;
+                    }
+                    let notional = delta * equity;
+                    // Price impact scales with participation in the pool's daily volume.
+                    let volume = volumes.get(pool).and_then(|m| m.get(&t0)).copied().unwrap_or(Decimal::ZERO);
+                    let participation = if volume > Decimal::ZERO {
+                        (notional / volume).min(max_participation)
+                    } else {
+                        max_participation
+                    };
+                    let cost = fee * notional + slip * notional * participation + gas;
+                    total_cost += cost;
+                    result.trades.push(Trade {
+                        ts: ms_to_dt(t0)?,
+                        instrument_name: name_by_pool.get(pool).cloned().unwrap_or_else(|| pool.clone()),
+                        qty_usd: (wn - wp) * equity,
+                        cost_usd: cost,
+                    });
+                }
+                held = target;
             }
 
-            // gross return over [t0, t1]
+            // gross return over [t0, t1] on the currently-held weights
             let mut gross = Decimal::ZERO;
-            for (pool, w) in &new_weights {
+            for (pool, w) in &held {
                 if *w == Decimal::ZERO {
                     continue;
                 }
@@ -194,38 +238,9 @@ impl Backtester {
                 }
             }
 
-            // depth-aware costs + per-trade ledger over the union of positions
-            let max_participation = Decimal::new(5, 1); // cap notional/volume at 0.5
-            let mut total_cost = Decimal::ZERO;
-            let pools: HashSet<&String> = new_weights.keys().chain(prev_weights.keys()).collect();
-            for pool in pools {
-                let wn = new_weights.get(pool).copied().unwrap_or(Decimal::ZERO);
-                let wp = prev_weights.get(pool).copied().unwrap_or(Decimal::ZERO);
-                let delta = (wn - wp).abs();
-                if delta <= Decimal::ZERO {
-                    continue;
-                }
-                let notional = delta * equity;
-                // Price impact scales with participation in the pool's daily volume.
-                let volume = volumes.get(pool).and_then(|m| m.get(&t0)).copied().unwrap_or(Decimal::ZERO);
-                let participation = if volume > Decimal::ZERO {
-                    (notional / volume).min(max_participation)
-                } else {
-                    max_participation
-                };
-                let cost = fee * notional + slip * notional * participation + gas;
-                total_cost += cost;
-                result.trades.push(Trade {
-                    ts: ms_to_dt(t0)?,
-                    instrument_name: name_by_pool.get(pool).cloned().unwrap_or_else(|| pool.clone()),
-                    qty_usd: (wn - wp) * equity,
-                    cost_usd: cost,
-                });
-            }
-
             // funding P&L over [t0, t1]: a long pays positive funding, a short receives.
             let mut funding_pnl = Decimal::ZERO;
-            for (pool, w) in &new_weights {
+            for (pool, w) in &held {
                 if *w != Decimal::ZERO {
                     let f = funding_daily.get(pool).and_then(|m| m.get(&t0)).copied().unwrap_or(Decimal::ZERO);
                     funding_pnl -= *w * f;
@@ -238,7 +253,6 @@ impl Backtester {
             equity = (equity + equity * net).max(Decimal::ZERO);
             net_returns.push(net.to_f64().unwrap_or(0.0));
             result.equity_curve.push((ms_to_dt(t1)?, equity));
-            prev_weights = new_weights;
         }
         Ok(result)
     }
@@ -300,5 +314,21 @@ mod tests {
         let thin = final_equity(1_000);
         assert!(thin < deep, "thin {thin} should trail deep {deep}");
         assert!(deep < Decimal::from(INITIAL_CAPITAL_USD), "costs must reduce equity");
+    }
+
+    #[test]
+    fn higher_cadence_cuts_trades_and_cost() {
+        // Momentum flips daily, so daily rebalancing rotates A<->B every step; a
+        // long cadence rebalances once and holds, trading (and paying) far less.
+        let (bars, frame) = scenario(1_000_000);
+        let strat = CrossSectional { rank_feature: "mom".to_string(), top_quantile: 0.5, allow_short: false, invert: false, weight_feature: None };
+        let costs = CostModel { fee_frac: Decimal::new(5, 4), slippage_coeff: Decimal::new(5, 1), gas_usd: Decimal::ZERO };
+        let wf = WalkForward { train_bars: 1, test_bars: 1, embargo_bars: 0 };
+        let daily = Backtester::new(costs.clone(), wf).run(&strat, &bars, &frame, &[]).unwrap();
+        let rare = Backtester::new(costs, wf).with_rebalance_every(10).run(&strat, &bars, &frame, &[]).unwrap();
+        assert!(rare.trades.len() < daily.trades.len(), "rare {} < daily {}", rare.trades.len(), daily.trades.len());
+        // Flat prices => equity reflects costs only; fewer trades ends richer.
+        let (de, re) = (daily.equity_curve.last().unwrap().1, rare.equity_curve.last().unwrap().1);
+        assert!(re > de, "rare {re} should beat daily {de} on cost savings");
     }
 }
