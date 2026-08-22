@@ -17,6 +17,18 @@ pub enum Network {
     Other(String),
 }
 
+impl Network {
+    /// URL/path slug used by data providers (GeckoTerminal-style: Ethereum = "eth").
+    pub fn slug(&self) -> &str {
+        match self {
+            Network::Base => "base",
+            Network::Arbitrum => "arbitrum",
+            Network::Ethereum => "eth",
+            Network::Other(s) => s.as_str(),
+        }
+    }
+}
+
 /// A DEX pool address on a given network — the atomic unit of a price series.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PoolId(pub String);

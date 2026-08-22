@@ -1,48 +1,81 @@
 //! `coinwatch` — orchestration entry point.
 //!
-//! Phase-1 skeleton: this wires one instance of every seam into the intended
-//! pipeline and prints the plan. It intentionally does **not** run a backtest
-//! yet — the seam implementations return `Unimplemented`. Its job is to prove
-//! the whole workspace compiles and links as one coherent DAG.
+//! Phase-1 (in progress): exercises the first two real seams end-to-end — fetch
+//! live bars from the [`GeckoTerminal`] provider, upsert them into the DuckDB
+//! [`DuckStore`] (idempotently), then read a point-in-time window back out.
+//! Features, strategy, backtest and eval get wired in as their seams land.
 
-use rust_decimal::Decimal;
+use std::fs;
 
-use cw_backtest::{Backtester, CostModel, WalkForward};
-use cw_features::{FeatureModule, TechnicalFeatures};
-use cw_providers::{DataSource, GeckoTerminal};
-use cw_storage::DuckStore;
-use cw_strategy::{CrossSectional, Strategy};
+use chrono::Duration;
+use cw_core::{CoreError, Instrument, Interval, Network, PoolId, Result};
+use cw_providers::{BarRequest, DataSource, GeckoTerminal};
+use cw_storage::{DuckStore, Store, TimeRange};
+
+const DB_PATH: &str = "research/data/coinwatch.duckdb";
 
 #[tokio::main]
 async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<()> {
     let provider = GeckoTerminal::default();
-    let _store = DuckStore::new("research/data/coinwatch.duckdb");
-    let features = TechnicalFeatures::default();
-    let strategy = CrossSectional {
-        rank_feature: "mom".to_string(),
-        top_quantile: 0.2,
-        allow_short: false,
+
+    // Known-liquid pool validated in the Phase-0 spike (WETH/USDC 0.01% on Base).
+    let instrument = Instrument {
+        network: Network::Base,
+        pool: PoolId("0x72ab388e2e2f6facef59e3c3fa2c4e29011c2d38".to_string()),
+        name: "WETH / USDC 0.01%".to_string(),
     };
-    let backtester = Backtester::new(
-        CostModel {
-            fee_frac: Decimal::new(5, 4),   // 0.0005 = 5 bps
-            gas_usd: Decimal::new(20, 2),   // $0.20
-            slippage_coeff: Decimal::new(1, 1),
-        },
-        WalkForward { train_bars: 90, test_bars: 30, embargo_bars: 3 },
+    let req = BarRequest {
+        instrument: instrument.clone(),
+        interval: Interval::Day,
+        limit: 30,
+    };
+
+    println!(
+        "fetch: {} daily bars for {} via {}",
+        req.limit,
+        instrument.name,
+        provider.name()
+    );
+    let bars = provider.fetch_bars(&req).await?;
+    let (Some(first), Some(last)) = (bars.first(), bars.last()) else {
+        println!("no bars returned; nothing to store");
+        return Ok(());
+    };
+    println!(
+        "  -> {} bars ({} .. {})",
+        bars.len(),
+        first.ts.date_naive(),
+        last.ts.date_naive()
     );
 
-    println!("coinwatch quant platform — Phase 1 skeleton");
-    println!("pipeline: {provider} -> store -> {feat} -> {strat} -> backtest -> eval",
-        provider = provider.name(),
-        feat = features.name(),
-        strat = strategy.name(),
-    );
+    fs::create_dir_all("research/data")
+        .map_err(|e| CoreError::Storage(format!("mkdir research/data: {e}")))?;
+    let store = DuckStore::open(DB_PATH)?;
+
+    let n1 = store.upsert_bars(&instrument, Interval::Day, &bars)?;
+    let n2 = store.upsert_bars(&instrument, Interval::Day, &bars)?;
+    println!("store: upserted {n1}, re-upserted {n2} (idempotent -> no duplicates)");
+
+    // Point-in-time read: only the last 7 days, proving range-bounded loads.
+    let to = last.ts;
+    let from = to - Duration::days(6);
+    let window = store.load_bars(&instrument, Interval::Day, TimeRange { from, to })?;
     println!(
-        "backtest: walk-forward train={} test={} embargo={} bars",
-        backtester.walk_forward.train_bars,
-        backtester.walk_forward.test_bars,
-        backtester.walk_forward.embargo_bars,
+        "load [{} .. {}]: {} bars",
+        from.date_naive(),
+        to.date_naive(),
+        window.len()
     );
-    println!("status: seams wired; implementations pending (see DESIGN.md Phase 1).");
+    for b in &window {
+        println!("  {}  C={} V={}", b.ts.date_naive(), b.close, b.volume);
+    }
+    println!("db: {DB_PATH}");
+    Ok(())
 }
