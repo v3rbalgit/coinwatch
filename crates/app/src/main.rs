@@ -1,14 +1,14 @@
 //! `coinwatch` — orchestration entry point.
 //!
-//! Phase-1 (in progress): exercises the first two real seams end-to-end — fetch
-//! live bars from the [`GeckoTerminal`] provider, upsert them into the DuckDB
-//! [`DuckStore`] (idempotently), then read a point-in-time window back out.
-//! Features, strategy, backtest and eval get wired in as their seams land.
+//! Phase-1 (in progress): exercises the live seams end-to-end — fetch bars from
+//! [`GeckoTerminal`], upsert them idempotently into the DuckDB [`DuckStore`],
+//! read them back point-in-time, and compute the [`TechnicalFeatures`] matrix.
+//! Strategy, backtest and eval get wired in as their seams land.
 
 use std::fs;
 
-use chrono::Duration;
 use cw_core::{CoreError, Instrument, Interval, Network, PoolId, Result};
+use cw_features::{FeatureContext, FeatureModule, TechnicalFeatures};
 use cw_providers::{BarRequest, DataSource, GeckoTerminal};
 use cw_storage::{DuckStore, Store, TimeRange};
 
@@ -34,48 +34,47 @@ async fn run() -> Result<()> {
     let req = BarRequest {
         instrument: instrument.clone(),
         interval: Interval::Day,
-        limit: 30,
+        limit: 120,
     };
 
-    println!(
-        "fetch: {} daily bars for {} via {}",
-        req.limit,
-        instrument.name,
-        provider.name()
-    );
+    println!("fetch: {} daily bars for {} via {}", req.limit, instrument.name, provider.name());
     let bars = provider.fetch_bars(&req).await?;
     let (Some(first), Some(last)) = (bars.first(), bars.last()) else {
         println!("no bars returned; nothing to store");
         return Ok(());
     };
-    println!(
-        "  -> {} bars ({} .. {})",
-        bars.len(),
-        first.ts.date_naive(),
-        last.ts.date_naive()
-    );
+    let (from, to) = (first.ts, last.ts);
+    println!("  -> {} bars ({} .. {})", bars.len(), from.date_naive(), to.date_naive());
 
     fs::create_dir_all("research/data")
         .map_err(|e| CoreError::Storage(format!("mkdir research/data: {e}")))?;
     let store = DuckStore::open(DB_PATH)?;
+    let n = store.upsert_bars(&instrument, Interval::Day, &bars)?;
+    store.upsert_bars(&instrument, Interval::Day, &bars)?; // re-run: idempotent
+    println!("store: upserted {n} (idempotent re-run -> no duplicates); db: {DB_PATH}");
 
-    let n1 = store.upsert_bars(&instrument, Interval::Day, &bars)?;
-    let n2 = store.upsert_bars(&instrument, Interval::Day, &bars)?;
-    println!("store: upserted {n1}, re-upserted {n2} (idempotent -> no duplicates)");
+    // Read back point-in-time, then compute the technical feature matrix.
+    let loaded = store.load_bars(&instrument, Interval::Day, TimeRange { from, to })?;
+    let module = TechnicalFeatures::default();
+    let dataset = vec![(instrument.clone(), loaded)];
+    let frame = module.compute(&FeatureContext { bars: &dataset })?;
 
-    // Point-in-time read: only the last 7 days, proving range-bounded loads.
-    let to = last.ts;
-    let from = to - Duration::days(6);
-    let window = store.load_bars(&instrument, Interval::Day, TimeRange { from, to })?;
     println!(
-        "load [{} .. {}]: {} bars",
-        from.date_naive(),
-        to.date_naive(),
-        window.len()
+        "features[{}]: {} rows (lookbacks mom={} vol={} rsi={})",
+        module.name(),
+        frame.rows.len(),
+        module.momentum_lookback,
+        module.vol_lookback,
+        module.rsi_lookback,
     );
-    for b in &window {
-        println!("  {}  C={} V={}", b.ts.date_naive(), b.close, b.volume);
+    for row in frame.rows.iter().rev().take(5).rev() {
+        println!(
+            "  {}  mom={:>8.4} vol={:>7.4} rsi={:>6.2}",
+            row.ts.date_naive(),
+            row.values["mom"],
+            row.values["vol"],
+            row.values["rsi"],
+        );
     }
-    println!("db: {DB_PATH}");
     Ok(())
 }

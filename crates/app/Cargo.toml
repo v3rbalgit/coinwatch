@@ -13,5 +13,6 @@ path = "src/main.rs"
 cw-core.workspace = true
 cw-storage.workspace = true
 cw-providers.workspace = true
+cw-features.workspace = true
 tokio.workspace = true
 chrono.workspace = true

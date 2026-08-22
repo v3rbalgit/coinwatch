@@ -8,3 +8,4 @@ license.workspace = true
 [dependencies]
 cw-core.workspace = true
 chrono.workspace = true
+rust_decimal.workspace = true
