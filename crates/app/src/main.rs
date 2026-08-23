@@ -21,7 +21,7 @@ use cw_features::{
 use cw_harness::{WalkForwardResult, WfConfig, feature_ic, sweep, walk_forward_prepared};
 use cw_providers::{BarRequest, DataSource, Hyperliquid};
 use cw_storage::{DuckStore, Store, TimeRange};
-use cw_strategy::CrossSectional;
+use cw_strategy::{Blend, CrossSectional};
 
 const DB_PATH: &str = "research/data/coinwatch.duckdb";
 /// Minimum bars an instrument needs before it can carry features / be analyzed.
@@ -356,6 +356,54 @@ fn analyze() -> Result<()> {
             ab.beta,
             ab.alpha_annual * 100.0,
             ab.r2
+        );
+    }
+
+    // ===== Multi-signal blend: diversify the two market-neutral survivors =====
+    // Illiquidity L/S and funding carry exploit distinct mechanisms; if their OOS
+    // returns are weakly correlated, a risk-shared blend lifts Sharpe/DSR without a
+    // stronger single signal. Each sleeve and the 50/50 blend are deflated together.
+    let illiq_ls = mk("illiq", 0.30, true, false);
+    let fundz = mk("fund_z", 0.30, true, true);
+    let half = Decimal::new(5, 1);
+    let blend_specs: Vec<(String, Blend)> = vec![
+        (
+            "illiq L/S 30%".to_string(),
+            Blend {
+                sleeves: vec![(Decimal::ONE, illiq_ls.clone())],
+            },
+        ),
+        (
+            "fundz carry 30%".to_string(),
+            Blend {
+                sleeves: vec![(Decimal::ONE, fundz.clone())],
+            },
+        ),
+        (
+            "blend 50/50".to_string(),
+            Blend {
+                sleeves: vec![(half, illiq_ls.clone()), (half, fundz.clone())],
+            },
+        ),
+    ];
+    let illiq_wf = walk_forward_prepared(&[("illiq".to_string(), illiq_ls)], &prep, wf_cfg, &costs)?;
+    let fundz_wf = walk_forward_prepared(&[("fundz".to_string(), fundz)], &prep, wf_cfg, &costs)?;
+    let corr = cw_eval::correlation(&cw_eval::returns(&illiq_wf.oos), &cw_eval::returns(&fundz_wf.oos));
+    let blend_rows = sweep(&blend_specs, &dataset, &frame, wf_cfg, &costs, &funding_dataset)?;
+    println!("\nmulti-signal blend (walk-forward d{cadence}; sleeve OOS-return corr = {corr:.2}):");
+    println!(
+        "  {:<14} {:>8} {:>9} {:>8} {:>7} {:>6}",
+        "config", "OOS-Shp", "OOS-ret%", "maxDD%", "DSR%", "folds"
+    );
+    for r in &blend_rows {
+        println!(
+            "  {:<14} {:>8.2} {:>9.1} {:>8.1} {:>7.1} {:>6}",
+            r.label,
+            r.oos_sharpe,
+            r.oos_return_pct,
+            r.max_drawdown * 100.0,
+            r.dsr * 100.0,
+            r.n_folds
         );
     }
 

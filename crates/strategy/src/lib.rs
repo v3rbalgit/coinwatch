@@ -5,7 +5,9 @@
 //! implementation is driven by the backtester and (later) the live runner — that
 //! single source of truth is what lets a backtested edge be trusted in deployment.
 
-use cw_core::{Decimal, Result, TargetWeight};
+use std::collections::HashMap;
+
+use cw_core::{Decimal, Instrument, Result, TargetWeight};
 use cw_features::FeatureRow;
 
 /// Maps a rebalance-point cross-section to desired positions.
@@ -77,6 +79,48 @@ impl Strategy for CrossSectional {
             weights.extend(allocate(&short_rows, -Decimal::new(5, 1), wf));
         }
         Ok(weights)
+    }
+}
+
+/// Capital-weighted blend of cross-sectional sleeves. Runs each sleeve on the same
+/// cross-section, sums `fraction * sleeve_weight` per instrument, then renormalizes
+/// gross exposure to 1.0. Blending economically-distinct market-neutral sleeves (an
+/// illiquidity L/S and a funding carry) diversifies their idiosyncratic risk: a
+/// net-neutral input stays net-neutral, and constant gross keeps the blend
+/// comparable to a single sleeve regardless of name overlap. Fractions are relative
+/// (only their ratio matters after renormalization).
+#[derive(Debug, Clone)]
+pub struct Blend {
+    /// (capital fraction, sleeve) pairs.
+    pub sleeves: Vec<(Decimal, CrossSectional)>,
+}
+
+impl Strategy for Blend {
+    fn name(&self) -> &'static str {
+        "blend"
+    }
+
+    fn target_weights(&self, cross_section: &[FeatureRow]) -> Result<Vec<TargetWeight>> {
+        let mut acc: HashMap<String, (Instrument, Decimal)> = HashMap::new();
+        for (fraction, sleeve) in &self.sleeves {
+            for tw in sleeve.target_weights(cross_section)? {
+                let slot = acc
+                    .entry(tw.instrument.pool.0.clone())
+                    .or_insert_with(|| (tw.instrument.clone(), Decimal::ZERO));
+                slot.1 += tw.weight * *fraction;
+            }
+        }
+        let gross: Decimal = acc.values().map(|(_, w)| w.abs()).sum();
+        if gross <= Decimal::ZERO {
+            return Ok(Vec::new());
+        }
+        Ok(acc
+            .into_values()
+            .map(|(instrument, w)| TargetWeight {
+                instrument,
+                weight: w / gross,
+            })
+            .collect())
     }
 }
 
@@ -164,6 +208,38 @@ mod tests {
         assert_eq!(net, Decimal::ZERO);
         let gross: Decimal = w.iter().map(|t| t.weight.abs()).sum();
         assert_eq!(gross, Decimal::ONE);
+    }
+
+    #[test]
+    fn blend_of_two_sleeves_is_gross_one_and_net_neutral() {
+        let mk = |name: &str, mom: i64, alt: i64| {
+            let mut r = row(name, mom);
+            r.values.insert("alt".to_string(), Decimal::from(alt));
+            r
+        };
+        let cross = vec![mk("a", 5, 1), mk("b", 1, 9), mk("c", 9, 5), mk("d", -3, -3)];
+        let s1 = CrossSectional {
+            rank_feature: "mom".to_string(),
+            top_quantile: 0.5,
+            allow_short: true,
+            invert: false,
+            weight_feature: None,
+        };
+        let s2 = CrossSectional {
+            rank_feature: "alt".to_string(),
+            top_quantile: 0.5,
+            allow_short: true,
+            invert: false,
+            weight_feature: None,
+        };
+        let blend = Blend {
+            sleeves: vec![(Decimal::new(5, 1), s1), (Decimal::new(5, 1), s2)],
+        };
+        let w = blend.target_weights(&cross).unwrap();
+        let net: Decimal = w.iter().map(|t| t.weight).sum();
+        let gross: Decimal = w.iter().map(|t| t.weight.abs()).sum();
+        assert!(net.abs() < Decimal::new(1, 6), "blend stays net-neutral");
+        assert_eq!(gross.round_dp(6), Decimal::ONE, "blend gross renormalized to 1");
     }
 
     #[test]

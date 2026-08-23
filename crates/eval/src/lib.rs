@@ -97,6 +97,31 @@ pub fn alpha_beta(strategy: &[f64], market: &[f64]) -> AlphaBeta {
     }
 }
 
+/// Pearson correlation of two aligned series (truncated to the shorter length).
+/// Returns 0 when either series has (near-)zero variance or fewer than 3 points.
+/// Used to check whether two strategy return streams actually diversify.
+#[must_use]
+pub fn correlation(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len().min(b.len());
+    let (Some(a), Some(b)) = (a.get(..n), b.get(..n)) else {
+        return 0.0;
+    };
+    if n < 3 {
+        return 0.0;
+    }
+    let nf = n as f64;
+    let ma = a.iter().sum::<f64>() / nf;
+    let mb = b.iter().sum::<f64>() / nf;
+    let (mut cov, mut va, mut vb) = (0.0, 0.0, 0.0);
+    for (x, y) in a.iter().zip(b.iter()) {
+        cov += (x - ma) * (y - mb);
+        va += (x - ma).powi(2);
+        vb += (y - mb).powi(2);
+    }
+    let denom = (va * vb).sqrt();
+    if denom > 1e-12 { cov / denom } else { 0.0 }
+}
+
 /// Non-annualized (per-period) Sharpe of a return series.
 pub fn per_period_sharpe(rets: &[f64]) -> f64 {
     if rets.len() < 2 {
@@ -349,6 +374,17 @@ mod tests {
         assert!((ab.beta - 1.5).abs() < 1e-6);
         assert!((ab.alpha - 0.001).abs() < 1e-6);
         assert!(ab.r2 > 0.999);
+    }
+
+    #[test]
+    fn correlation_recovers_perfect_and_anti_correlation() {
+        let a = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let up = [2.0, 4.0, 6.0, 8.0, 10.0];
+        let down = [5.0, 4.0, 3.0, 2.0, 1.0];
+        assert!((correlation(&a, &up) - 1.0).abs() < 1e-9);
+        assert!((correlation(&a, &down) + 1.0).abs() < 1e-9);
+        // A constant series has no variance -> defined as zero correlation.
+        assert!(correlation(&a, &[3.0; 5]).abs() < 1e-12);
     }
 
     #[test]
