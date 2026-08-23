@@ -351,6 +351,43 @@ fn analyze() -> Result<()> {
     let corr = cw_eval::correlation(&cw_eval::returns(&illiq_wf.oos), &cw_eval::returns(&fundz_wf.oos));
     println!("  (blend 50/50 = illiq L/S 30% + fundz carry 30%; sleeve OOS-return corr = {corr:.2})");
 
+    // ===== Robustness: does the blend hold up in BOTH halves of the sample? =====
+    // A single lucky window can inflate DSR. Split the timeline at its midpoint and
+    // walk-forward the 50/50 blend on each half independently; a real edge is
+    // positive in both, not carried by one regime.
+    let blend_5050 = Blend {
+        sleeves: vec![
+            (Decimal::new(5, 1), mk("illiq", 0.30, true, false)),
+            (Decimal::new(5, 1), mk("fund_z", 0.30, true, true)),
+        ],
+    };
+    let mid = prep.times.get(prep.times.len() / 2).copied().unwrap_or_default();
+    let (first_rows, second_rows): (Vec<_>, Vec<_>) =
+        frame.rows.iter().cloned().partition(|r| r.ts.timestamp_millis() < mid);
+    println!("\nblend robustness (50/50 blend walk-forwarded on each half of the sample):");
+    println!(
+        "  {:<12} {:>8} {:>9} {:>8} {:>6}",
+        "period", "OOS-Shp", "OOS-ret%", "maxDD%", "folds"
+    );
+    for (label, rows) in [("first half", first_rows), ("second half", second_rows)] {
+        let sub = Prepared::new(&dataset, &FeatureFrame { rows }, &funding_dataset);
+        let wf = walk_forward_prepared(&[("blend".to_string(), blend_5050.clone())], &sub, wf_cfg, &costs)?;
+        let m = cw_eval::evaluate(&wf.oos)?;
+        let ret = match (wf.oos.equity_curve.first(), wf.oos.equity_curve.last()) {
+            (Some((_, e0)), Some((_, e1))) if *e0 > Decimal::ZERO => {
+                ((e1 / e0 - Decimal::ONE) * Decimal::from(100)).round_dp(1)
+            }
+            _ => Decimal::ZERO,
+        };
+        println!(
+            "  {label:<12} {:>8.2} {:>9} {:>8.1} {:>6}",
+            m.sharpe,
+            ret,
+            m.max_drawdown * 100.0,
+            wf.folds.len()
+        );
+    }
+
     // A long-only OOS Sharpe is mostly market beta. Walk-forward the equal-weight
     // market and each signal on the same folds, then regress OOS returns → the OOS
     // ALPHA (edge beyond beta) — the number that actually matters.
