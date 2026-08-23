@@ -12,13 +12,13 @@ use std::collections::HashMap;
 use std::fs;
 
 use chrono::{Duration, Utc};
-use cw_backtest::{BacktestResult, Backtester, CostModel, WalkForward};
+use cw_backtest::{BacktestResult, Backtester, CostModel, Prepared, WalkForward};
 use cw_core::{Bar, CoreError, Decimal, FundingPoint, Instrument, Interval, Result};
 use cw_features::{
     FeatureContext, FeatureFrame, FeatureModule, FeatureRow, FundingFeatures, LiquidityFeatures, TechnicalFeatures,
     combine,
 };
-use cw_harness::{WalkForwardResult, WfConfig, feature_ic, sweep, walk_forward};
+use cw_harness::{WalkForwardResult, WfConfig, feature_ic, sweep, walk_forward_prepared};
 use cw_providers::{BarRequest, DataSource, Hyperliquid};
 use cw_storage::{DuckStore, Store, TimeRange};
 use cw_strategy::CrossSectional;
@@ -332,8 +332,10 @@ fn analyze() -> Result<()> {
             _ => Decimal::ZERO,
         }
     };
+    // One shared Prepared for the whole OOS-alpha section (market + each signal).
+    let prep = Prepared::new(&dataset, &frame, &funding_dataset);
     let market_cand = [("market".to_string(), mk("vol", 1.0, false, false))];
-    let market_wf = walk_forward(&market_cand, &dataset, &frame, wf_cfg, &costs, &funding_dataset)?;
+    let market_wf = walk_forward_prepared(&market_cand, &prep, wf_cfg, &costs)?;
     let market_oos = cw_eval::returns(&market_wf.oos);
     println!(
         "\nOOS alpha vs market (walk-forward d{cadence}; market OOS {}%):",
@@ -345,7 +347,7 @@ fn analyze() -> Result<()> {
     );
     for (label, feature, q, short, invert) in val_specs.iter().filter(|s| !s.3) {
         let cand = [(label.to_string(), mk(feature, *q, *short, *invert))];
-        let wf = walk_forward(&cand, &dataset, &frame, wf_cfg, &costs, &funding_dataset)?;
+        let wf = walk_forward_prepared(&cand, &prep, wf_cfg, &costs)?;
         let ab = cw_eval::alpha_beta(&cw_eval::returns(&wf.oos), &market_oos);
         println!(
             "  {:<14} {:>9} {:>6.2} {:>10.1} {:>6.2}",
@@ -371,7 +373,8 @@ fn analyze() -> Result<()> {
             },
         )
         .with_rebalance_every(every)
-        .run(strat, &dataset, &frame, &funding_dataset)
+        .run_prepared(strat, &prep, &prep.times, &HashMap::new(), true)
+        .map(|(r, _)| r)
     };
     let market = CrossSectional {
         rank_feature: "vol".to_string(),

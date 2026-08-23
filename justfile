@@ -29,3 +29,7 @@ quality:
   RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
   cargo deny check
   git diff --check
+
+# Run the criterion benchmarks.
+bench:
+  cargo bench -p cw-harness

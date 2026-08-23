@@ -29,6 +29,8 @@ const INITIAL_CAPITAL_USD: i64 = 10_000;
 const VOL_WINDOW: usize = 20;
 /// Cap on the vol-target leverage multiplier.
 const MAX_LEVERAGE: f64 = 3.0;
+/// Cap on a trade's participation in a pool's daily volume (slippage saturates here).
+const MAX_PARTICIPATION: f64 = 0.5;
 
 /// Transaction-cost parameters applied to every simulated fill.
 #[derive(Debug, Clone)]
@@ -101,24 +103,91 @@ fn ms_to_dt(ms: i64) -> Result<DateTime<Utc>> {
 /// Exposure scale for vol targeting from trailing realized daily vol (past
 /// returns only — no lookahead). Returns 1.0 when targeting is off or too few
 /// observations exist.
-fn vol_target_scale(target: Option<Decimal>, past: &[f64]) -> Decimal {
-    let Some(t) = target else { return Decimal::ONE };
+fn vol_target_scale(target: Option<Decimal>, past: &[f64]) -> f64 {
+    let Some(t) = target else { return 1.0 };
     let tf = t.to_f64().unwrap_or(0.0);
     if past.len() < 5 || tf <= 0.0 {
-        return Decimal::ONE;
+        return 1.0;
     }
     let Some(w) = past.get(past.len().saturating_sub(VOL_WINDOW)..) else {
-        return Decimal::ONE;
+        return 1.0;
     };
     let mean = w.iter().sum::<f64>() / w.len() as f64;
     let var = w.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / w.len() as f64;
     let vol = var.sqrt();
-    let s = if vol > 1e-9 {
-        (tf / vol).min(MAX_LEVERAGE)
+    if vol > 1e-9 {
+        (tf / vol).clamp(0.0, MAX_LEVERAGE)
     } else {
         MAX_LEVERAGE
-    };
-    Decimal::from_f64_retain(s.max(0.0)).unwrap_or(Decimal::ONE)
+    }
+}
+
+/// Price/volume/funding lookups precomputed once and shared across many backtest
+/// runs (e.g. every fold of a walk-forward) so the per-run loop never rebuilds them.
+struct MarketData {
+    closes: HashMap<String, HashMap<i64, f64>>,
+    volumes: HashMap<String, HashMap<i64, f64>>,
+    funding_daily: HashMap<String, HashMap<i64, f64>>,
+}
+
+/// Everything a run needs, computed once: market lookups (as `f64` for the hot
+/// loop), instrument display names, the cross-section per timestamp, and the
+/// ordered rebalance timestamps. Walk-forward slices [`Prepared::times`] per fold
+/// and reuses the rest instead of rebuilding lookups and re-cloning a subframe
+/// every fold.
+pub struct Prepared {
+    market: MarketData,
+    names: HashMap<String, String>,
+    sections: BTreeMap<i64, Vec<FeatureRow>>,
+    /// Ordered rebalance timestamps (ms), ascending and deduplicated.
+    pub times: Vec<i64>,
+}
+
+impl Prepared {
+    /// Precompute market lookups + per-timestamp cross-sections from raw inputs.
+    #[must_use]
+    pub fn new(
+        bars: &[(Instrument, Vec<Bar>)],
+        features: &FeatureFrame,
+        funding: &[(Instrument, Vec<FundingPoint>)],
+    ) -> Self {
+        let mut closes: HashMap<String, HashMap<i64, f64>> = HashMap::new();
+        let mut volumes: HashMap<String, HashMap<i64, f64>> = HashMap::new();
+        let mut names: HashMap<String, String> = HashMap::new();
+        for (inst, series) in bars {
+            names.insert(inst.pool.0.clone(), inst.name.clone());
+            let c = closes.entry(inst.pool.0.clone()).or_default();
+            let v = volumes.entry(inst.pool.0.clone()).or_default();
+            for b in series {
+                let ms = b.ts.timestamp_millis();
+                c.insert(ms, b.close.to_f64().unwrap_or(0.0));
+                v.insert(ms, b.volume.to_f64().unwrap_or(0.0));
+            }
+        }
+        let mut funding_daily: HashMap<String, HashMap<i64, f64>> = HashMap::new();
+        for (inst, points) in funding {
+            let m = funding_daily.entry(inst.pool.0.clone()).or_default();
+            for p in points {
+                let day = (p.time.timestamp_millis() / 86_400_000) * 86_400_000;
+                *m.entry(day).or_insert(0.0) += p.funding_rate.to_f64().unwrap_or(0.0);
+            }
+        }
+        let mut sections: BTreeMap<i64, Vec<FeatureRow>> = BTreeMap::new();
+        for row in &features.rows {
+            sections.entry(row.ts.timestamp_millis()).or_default().push(row.clone());
+        }
+        let times: Vec<i64> = sections.keys().copied().collect();
+        Self {
+            market: MarketData {
+                closes,
+                volumes,
+                funding_daily,
+            },
+            names,
+            sections,
+            times,
+        }
+    }
 }
 
 impl Backtester {
@@ -159,7 +228,8 @@ impl Backtester {
         features: &FeatureFrame,
         funding: &[(Instrument, Vec<FundingPoint>)],
     ) -> Result<BacktestResult> {
-        Ok(self.run_stateful(strategy, bars, features, funding, &HashMap::new())?.0)
+        let prep = Prepared::new(bars, features, funding);
+        Ok(self.run_prepared(strategy, &prep, &prep.times, &HashMap::new(), true)?.0)
     }
 
     /// Like [`Backtester::run`] but seeds starting positions with `initial_held` and
@@ -173,46 +243,40 @@ impl Backtester {
         funding: &[(Instrument, Vec<FundingPoint>)],
         initial_held: &HashMap<String, Decimal>,
     ) -> Result<(BacktestResult, HashMap<String, Decimal>)> {
-        // per-pool lookups: close (for returns) and volume (for slippage depth)
-        let mut closes: HashMap<String, HashMap<i64, Decimal>> = HashMap::new();
-        let mut volumes: HashMap<String, HashMap<i64, Decimal>> = HashMap::new();
-        for (inst, series) in bars {
-            let c = closes.entry(inst.pool.0.clone()).or_default();
-            let v = volumes.entry(inst.pool.0.clone()).or_default();
-            for b in series {
-                let ms = b.ts.timestamp_millis();
-                c.insert(ms, b.close);
-                v.insert(ms, b.volume);
-            }
-        }
+        let prep = Prepared::new(bars, features, funding);
+        self.run_prepared(strategy, &prep, &prep.times, initial_held, true)
+    }
 
-        // per-pool daily funding: sum of hourly rates within each UTC day
-        let mut funding_daily: HashMap<String, HashMap<i64, Decimal>> = HashMap::new();
-        for (inst, points) in funding {
-            let m = funding_daily.entry(inst.pool.0.clone()).or_default();
-            for p in points {
-                let day = (p.time.timestamp_millis() / 86_400_000) * 86_400_000;
-                *m.entry(day).or_insert(Decimal::ZERO) += p.funding_rate;
-            }
-        }
-
-        // rebalance cross-sections, ordered by timestamp
-        let mut sections: BTreeMap<i64, Vec<FeatureRow>> = BTreeMap::new();
-        for row in &features.rows {
-            sections.entry(row.ts.timestamp_millis()).or_default().push(row.clone());
-        }
-        let times: Vec<i64> = sections.keys().copied().collect();
+    /// Shared core: run over precomputed [`Prepared`] data and an explicit `times`
+    /// window (a contiguous slice of [`Prepared::times`]), seeded with `initial_held`.
+    /// Walk-forward slices `times` per fold and reuses `prep` across all folds. When
+    /// `ledger` is false the per-trade ledger is skipped (walk-forward keeps only the
+    /// stitched returns). Arithmetic runs in `f64`; equity/trade amounts are stored
+    /// back as [`Decimal`] at the boundary.
+    pub fn run_prepared<S: Strategy>(
+        &self,
+        strategy: &S,
+        prep: &Prepared,
+        times: &[i64],
+        initial_held: &HashMap<String, Decimal>,
+        ledger: bool,
+    ) -> Result<(BacktestResult, HashMap<String, Decimal>)> {
         if times.len() < 2 {
             return Ok((BacktestResult::default(), initial_held.clone()));
         }
+        let to_dec = |x: f64| Decimal::from_f64_retain(x).unwrap_or_default();
+        let fee = self.costs.fee_frac.to_f64().unwrap_or(0.0);
+        let slip = self.costs.slippage_coeff.to_f64().unwrap_or(0.0);
+        let gas = self.costs.gas_usd.to_f64().unwrap_or(0.0);
 
-        let (fee, slip, gas) = (self.costs.fee_frac, self.costs.slippage_coeff, self.costs.gas_usd);
-
-        let mut equity = Decimal::from(INITIAL_CAPITAL_USD);
-        let mut held: HashMap<String, Decimal> = initial_held.clone();
+        let mut equity = INITIAL_CAPITAL_USD as f64;
+        let mut held: HashMap<String, f64> = initial_held
+            .iter()
+            .map(|(k, v)| (k.clone(), v.to_f64().unwrap_or(0.0)))
+            .collect();
         let mut net_returns: Vec<f64> = Vec::new();
         let mut result = BacktestResult {
-            equity_curve: vec![(ms_to_dt(times.first().copied().unwrap_or_default())?, equity)],
+            equity_curve: vec![(ms_to_dt(times.first().copied().unwrap_or_default())?, to_dec(equity))],
             trades: Vec::new(),
         };
         let cadence = self.rebalance_every.max(1);
@@ -222,87 +286,78 @@ impl Backtester {
 
             // Rebalance only every `cadence` bars; between, hold weights and pay no
             // costs — the turnover-control lever.
-            let mut total_cost = Decimal::ZERO;
+            let mut total_cost = 0.0_f64;
             if step % cadence == 0 {
-                let Some(section) = sections.get(&t0) else { continue };
+                let Some(section) = prep.sections.get(&t0) else {
+                    continue;
+                };
                 let targets = strategy.target_weights(section)?;
                 // Vol targeting scales gross exposure from trailing realized vol.
                 let scale = vol_target_scale(self.vol_target, &net_returns);
-                let mut target: HashMap<String, Decimal> = HashMap::new();
-                let mut name_by_pool: HashMap<String, String> = HashMap::new();
+                let mut target: HashMap<String, f64> = HashMap::with_capacity(targets.len());
                 for tw in &targets {
-                    target.insert(tw.instrument.pool.0.clone(), tw.weight * scale);
-                    name_by_pool.insert(tw.instrument.pool.0.clone(), tw.instrument.name.clone());
+                    target.insert(tw.instrument.pool.0.clone(), tw.weight.to_f64().unwrap_or(0.0) * scale);
                 }
 
-                // depth-aware costs + per-trade ledger over the union of positions
-                let max_participation = Decimal::new(5, 1); // cap notional/volume at 0.5
+                // depth-aware costs + (optional) per-trade ledger over the position union
                 let pools: HashSet<&String> = target.keys().chain(held.keys()).collect();
                 for pool in pools {
-                    let wn = target.get(pool).copied().unwrap_or(Decimal::ZERO);
-                    let wp = held.get(pool).copied().unwrap_or(Decimal::ZERO);
+                    let wn = target.get(pool).copied().unwrap_or(0.0);
+                    let wp = held.get(pool).copied().unwrap_or(0.0);
                     let delta = (wn - wp).abs();
-                    if delta <= Decimal::ZERO {
+                    if delta <= 0.0 {
                         continue;
                     }
                     let notional = delta * equity;
                     // Price impact scales with participation in the pool's daily volume.
-                    let volume = volumes.get(pool).and_then(|m| m.get(&t0)).copied().unwrap_or(Decimal::ZERO);
-                    let participation = if volume > Decimal::ZERO {
-                        (notional / volume).min(max_participation)
+                    let volume = prep.market.volumes.get(pool).and_then(|m| m.get(&t0)).copied().unwrap_or(0.0);
+                    let participation = if volume > 0.0 {
+                        (notional / volume).min(MAX_PARTICIPATION)
                     } else {
-                        max_participation
+                        MAX_PARTICIPATION
                     };
                     let cost = fee * notional + slip * notional * participation + gas;
                     total_cost += cost;
-                    result.trades.push(Trade {
-                        ts: ms_to_dt(t0)?,
-                        instrument_name: name_by_pool.get(pool).cloned().unwrap_or_else(|| pool.clone()),
-                        qty_usd: (wn - wp) * equity,
-                        cost_usd: cost,
-                    });
+                    if ledger {
+                        result.trades.push(Trade {
+                            ts: ms_to_dt(t0)?,
+                            instrument_name: prep.names.get(pool).cloned().unwrap_or_else(|| pool.clone()),
+                            qty_usd: to_dec((wn - wp) * equity),
+                            cost_usd: to_dec(cost),
+                        });
+                    }
                 }
                 held = target;
             }
 
-            // gross return over [t0, t1] on the currently-held weights
-            let mut gross = Decimal::ZERO;
+            // Price return + funding P&L over [t0, t1] on the currently-held weights.
+            let mut gross = 0.0_f64;
+            let mut funding_pnl = 0.0_f64;
             for (pool, w) in &held {
-                if *w == Decimal::ZERO {
-                    continue;
-                }
-                if let Some(cmap) = closes.get(pool)
-                    && let (Some(c0), Some(c1)) = (cmap.get(&t0), cmap.get(&t1))
-                    && *c0 > Decimal::ZERO
+                if let Some(cmap) = prep.market.closes.get(pool)
+                    && let (Some(&c0), Some(&c1)) = (cmap.get(&t0), cmap.get(&t1))
+                    && c0 > 0.0
                 {
-                    gross += *w * (c1 / c0 - Decimal::ONE);
+                    gross += *w * (c1 / c0 - 1.0);
                 }
+                let f = prep
+                    .market
+                    .funding_daily
+                    .get(pool)
+                    .and_then(|m| m.get(&t0))
+                    .copied()
+                    .unwrap_or(0.0);
+                funding_pnl -= *w * f;
             }
 
-            // funding P&L over [t0, t1]: a long pays positive funding, a short receives.
-            let mut funding_pnl = Decimal::ZERO;
-            for (pool, w) in &held {
-                if *w != Decimal::ZERO {
-                    let f = funding_daily
-                        .get(pool)
-                        .and_then(|m| m.get(&t0))
-                        .copied()
-                        .unwrap_or(Decimal::ZERO);
-                    funding_pnl -= *w * f;
-                }
-            }
-
-            let cost_drag = if equity > Decimal::ZERO {
-                total_cost / equity
-            } else {
-                Decimal::ZERO
-            };
+            let cost_drag = if equity > 0.0 { total_cost / equity } else { 0.0 };
             let net = gross + funding_pnl - cost_drag;
             // A real account can't go below zero — ruin floors equity at 0.
-            equity = (equity + equity * net).max(Decimal::ZERO);
-            net_returns.push(net.to_f64().unwrap_or(0.0));
-            result.equity_curve.push((ms_to_dt(t1)?, equity));
+            equity = (equity + equity * net).max(0.0);
+            net_returns.push(net);
+            result.equity_curve.push((ms_to_dt(t1)?, to_dec(equity)));
         }
+        let held = held.into_iter().map(|(k, v)| (k, to_dec(v))).collect();
         Ok((result, held))
     }
 }

@@ -9,10 +9,10 @@
 //! Sharpes feed the Deflated Sharpe Ratio.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, Utc};
-use cw_backtest::{BacktestResult, Backtester, CostModel, WalkForward};
+use cw_backtest::{BacktestResult, Backtester, CostModel, Prepared, WalkForward};
 use cw_core::{Bar, Decimal, FundingPoint, Instrument, Result};
 use cw_features::{FeatureFrame, FeatureRow};
 use cw_strategy::Strategy;
@@ -62,17 +62,6 @@ pub struct WalkForwardResult {
     pub trial_sharpes: Vec<f64>,
 }
 
-fn subframe(frame: &FeatureFrame, ts_set: &HashSet<i64>) -> FeatureFrame {
-    FeatureFrame {
-        rows: frame
-            .rows
-            .iter()
-            .filter(|r: &&FeatureRow| ts_set.contains(&r.ts.timestamp_millis()))
-            .cloned()
-            .collect(),
-    }
-}
-
 fn step_return(e0: &Decimal, e1: &Decimal) -> f64 {
     let (a, b) = (e0.to_f64().unwrap_or(0.0), e1.to_f64().unwrap_or(0.0));
     if a > 0.0 { b / a - 1.0 } else { 0.0 }
@@ -106,9 +95,18 @@ pub fn walk_forward<S: Strategy>(
     costs: &CostModel,
     funding: &[(Instrument, Vec<FundingPoint>)],
 ) -> Result<WalkForwardResult> {
-    let mut times: Vec<i64> = features.rows.iter().map(|r| r.ts.timestamp_millis()).collect();
-    times.sort_unstable();
-    times.dedup();
+    walk_forward_prepared(candidates, &Prepared::new(bars, features, funding), cfg, costs)
+}
+
+/// Like [`walk_forward`] but over a shared, precomputed [`Prepared`] so a sweep can
+/// build it once and reuse it across every candidate.
+pub fn walk_forward_prepared<S: Strategy>(
+    candidates: &[(String, S)],
+    prep: &Prepared,
+    cfg: WfConfig,
+    costs: &CostModel,
+) -> Result<WalkForwardResult> {
+    let times = &prep.times;
 
     let mut result = WalkForwardResult {
         folds: Vec::new(),
@@ -137,21 +135,18 @@ pub fn walk_forward<S: Strategy>(
     let mut carry: HashMap<String, Decimal> = HashMap::new();
     let mut i = 0;
     while i + window <= times.len() {
-        let Some(train_slice) = times.get(i..i + cfg.train) else {
+        let Some(train_times) = times.get(i..i + cfg.train) else {
             break;
         };
-        let train_set: HashSet<i64> = train_slice.iter().copied().collect();
         let test_start = i + cfg.train + cfg.embargo;
-        let Some(test_slice) = times.get(test_start..test_start + cfg.test) else {
+        let Some(test_times) = times.get(test_start..test_start + cfg.test) else {
             break;
         };
-        let test_set: HashSet<i64> = test_slice.iter().copied().collect();
 
         // Sweep candidates on the train window; pick the best in-train Sharpe.
-        let train_frame = subframe(features, &train_set);
         let mut best: Option<(usize, f64)> = None;
         for (idx, (_, strat)) in candidates.iter().enumerate() {
-            let train_res = backtester.run(strat, bars, &train_frame, funding)?;
+            let (train_res, _) = backtester.run_prepared(strat, prep, train_times, &HashMap::new(), false)?;
             let sharpe = cw_eval::per_period_sharpe(&cw_eval::returns(&train_res));
             result.trial_sharpes.push(sharpe);
             if best.is_none_or(|(_, bs)| sharpe > bs) {
@@ -168,8 +163,7 @@ pub fn walk_forward<S: Strategy>(
         // ending positions instead of re-entering from cash (only the delta when the
         // chosen strategy changes is traded). Without this, 35 full cash re-entries
         // wildly deflate OOS returns — especially in HL's thin early-2023 market.
-        let test_frame = subframe(features, &test_set);
-        let (test_res, end_held) = backtester.run_stateful(chosen_strat, bars, &test_frame, funding, &carry)?;
+        let (test_res, end_held) = backtester.run_prepared(chosen_strat, prep, test_times, &carry, false)?;
         for w in test_res.equity_curve.windows(2) {
             let [a, b] = w else { continue };
             oos_points.push((b.0, step_return(&a.1, &b.1)));
@@ -260,16 +254,17 @@ fn spearman(x: &[f64], y: &[f64]) -> Option<f64> {
 /// for "which features actually predict?" — sorted by |IC-IR|, strongest first.
 pub fn feature_ic(bars: &[(Instrument, Vec<Bar>)], features: &FeatureFrame) -> Vec<FeatureIC> {
     // next-bar return per (pool, ts)
-    let mut fwd: HashMap<(String, i64), f64> = HashMap::new();
+    let mut fwd: HashMap<String, HashMap<i64, f64>> = HashMap::new();
     for (inst, series) in bars {
         let mut s: Vec<&Bar> = series.iter().collect();
         s.sort_by_key(|b| b.ts);
+        let m = fwd.entry(inst.pool.0.clone()).or_default();
         for w in s.windows(2) {
             let [b0, b1] = w else { continue };
             let c0 = b0.close.to_f64().unwrap_or(0.0);
             let c1 = b1.close.to_f64().unwrap_or(0.0);
             if c0 > 0.0 {
-                fwd.insert((inst.pool.0.clone(), b0.ts.timestamp_millis()), c1 / c0 - 1.0);
+                m.insert(b0.ts.timestamp_millis(), c1 / c0 - 1.0);
             }
         }
     }
@@ -287,7 +282,10 @@ pub fn feature_ic(bars: &[(Instrument, Vec<Bar>)], features: &FeatureFrame) -> V
         for (ts, rows) in &by_ts {
             let (mut fv, mut rv) = (Vec::new(), Vec::new());
             for row in rows {
-                if let (Some(v), Some(r)) = (row.values.get(col), fwd.get(&(row.instrument.pool.0.clone(), *ts))) {
+                if let (Some(v), Some(r)) = (
+                    row.values.get(col),
+                    fwd.get(row.instrument.pool.0.as_str()).and_then(|m| m.get(ts)),
+                ) {
                     fv.push(v.to_f64().unwrap_or(0.0));
                     rv.push(*r);
                 }
@@ -347,10 +345,11 @@ pub fn sweep<S: Strategy>(
     costs: &CostModel,
     funding: &[(Instrument, Vec<FundingPoint>)],
 ) -> Result<Vec<SweepRow>> {
+    let prep = Prepared::new(bars, features, funding);
     let mut runs = Vec::with_capacity(candidates.len());
     let mut trial_sharpes = Vec::with_capacity(candidates.len());
     for cand in candidates {
-        let wf = walk_forward(std::slice::from_ref(cand), bars, features, cfg, costs, funding)?;
+        let wf = walk_forward_prepared(std::slice::from_ref(cand), &prep, cfg, costs)?;
         let rets = cw_eval::returns(&wf.oos);
         trial_sharpes.push(cw_eval::per_period_sharpe(&rets));
         runs.push((cand.0.clone(), wf, rets));
