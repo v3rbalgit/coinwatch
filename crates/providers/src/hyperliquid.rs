@@ -4,8 +4,10 @@
 //! candles, hourly funding. This adapter provides the perp universe (ranked by
 //! day volume) and candles (as canonical [`Bar`]s). Funding is added separately.
 //!
-//! The info API is weight-rate-limited per IP, so requests are paced with a
-//! minimum interval and 429s are retried with backoff.
+//! The info API is weight-rate-limited per IP — and its fundingHistory endpoint
+//! throttles bursty pagination hard — so requests go through a conservative
+//! `Pacer` that spaces them under that throttle and backs off on 429/5xx, honoring
+//! a `Retry-After` header.
 
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -21,18 +23,80 @@ use serde_json::json;
 use crate::{BarRequest, DataSource};
 
 const ENDPOINT: &str = "https://api.hyperliquid.xyz/info";
-// HL info API is weight-rate-limited (~1200/min); ~1.1s spacing stays under it and
-// avoids the 429-retry storms that make paginated funding backfills crawl.
-const DEFAULT_MIN_INTERVAL: Duration = Duration::from_millis(1100);
 const MAX_RETRIES: u32 = 4;
+
+/// Adaptive request pacer (AIMD). Starts optimistic, additively speeds up on each
+/// success, and multiplicatively backs off on 429/5xx — honoring a `Retry-After`
+/// header when present. This converges near the server's true sustainable rate
+/// instead of a hand-tuned fixed interval: HL's aggregate info limit is generous
+/// (~1200/min), but its fundingHistory endpoint throttles bursty pagination, and the
+/// pacer discovers that per-endpoint ceiling on its own.
+struct Pacer {
+    /// Earliest instant the next request may start (reserved under the lock).
+    next_allowed: Mutex<Instant>,
+}
+
+impl Pacer {
+    /// Fixed spacing that stays under HL's fundingHistory throttle. Probing for more
+    /// throughput there is counterproductive — 429 retries cost far more than the
+    /// spacing saves — so a safe constant plus `Retry-After` is both simpler and
+    /// faster than an adaptive prober for this API.
+    const INTERVAL: Duration = Duration::from_millis(1100);
+    /// Fallback pause on a 429 that carries no `Retry-After` header.
+    const DEFAULT_BACKOFF: Duration = Duration::from_secs(2);
+
+    fn new() -> Self {
+        Self {
+            next_allowed: Mutex::new(Instant::now()),
+        }
+    }
+
+    #[expect(clippy::expect_used, reason = "poisoned pacer mutex is an unrecoverable bug")]
+    fn lock(&self) -> std::sync::MutexGuard<'_, Instant> {
+        self.next_allowed.lock().expect("pacer mutex poisoned")
+    }
+
+    /// Reserve and wait for the next request slot.
+    async fn acquire(&self) {
+        let wait = {
+            let mut na = self.lock();
+            let now = Instant::now();
+            let at = (*na).max(now);
+            *na = at + Self::INTERVAL;
+            at.checked_duration_since(now)
+        };
+        if let Some(w) = wait {
+            tokio::time::sleep(w).await;
+        }
+    }
+
+    /// Throttle (429/5xx): hold new requests for the server's `Retry-After` (or a
+    /// default backoff) before the next attempt.
+    fn on_throttle(&self, retry_after: Option<Duration>) {
+        let backoff = retry_after.unwrap_or(Self::DEFAULT_BACKOFF);
+        let mut na = self.lock();
+        *na = (*na).max(Instant::now() + backoff);
+    }
+}
+
+/// Parse a numeric `Retry-After` header (delta-seconds) into a [`Duration`].
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let secs = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(Duration::from_secs(secs))
+}
 
 /// Hyperliquid info-API adapter. Market data needs no auth.
 #[derive(Clone)]
 pub struct Hyperliquid {
     endpoint: String,
     client: reqwest::Client,
-    min_interval: Duration,
-    last_request: Arc<Mutex<Option<Instant>>>,
+    pacer: Arc<Pacer>,
 }
 
 impl Default for Hyperliquid {
@@ -54,34 +118,17 @@ impl Hyperliquid {
         Self {
             endpoint: ENDPOINT.to_string(),
             client,
-            min_interval: DEFAULT_MIN_INTERVAL,
-            last_request: Arc::new(Mutex::new(None)),
+            pacer: Arc::new(Pacer::new()),
         }
     }
 
-    /// Block until the next request is allowed under the min-interval budget.
-    async fn pace(&self) {
-        let wait = {
-            #[expect(clippy::expect_used, reason = "poisoned pace mutex is an unrecoverable bug")]
-            let mut guard = self.last_request.lock().expect("pace mutex poisoned");
-            let now = Instant::now();
-            let target = match *guard {
-                Some(prev) => (prev + self.min_interval).max(now),
-                None => now,
-            };
-            *guard = Some(target);
-            target.checked_duration_since(now)
-        };
-        if let Some(w) = wait {
-            tokio::time::sleep(w).await;
-        }
-    }
-
-    /// Paced POST of an info request, retrying 429/5xx with backoff.
+    /// Paced POST of an info request. The [`Pacer`] handles inter-request spacing and
+    /// AIMD backoff; on 429/5xx we record the throttle (honoring `Retry-After`) and
+    /// retry until [`MAX_RETRIES`]. Network errors retry with a plain backoff.
     async fn post_json<T: DeserializeOwned>(&self, body: &serde_json::Value) -> Result<T> {
         let mut attempt = 0;
         loop {
-            self.pace().await;
+            self.pacer.acquire().await;
             match self.client.post(&self.endpoint).json(body).send().await {
                 Ok(resp) => {
                     let status = resp.status();
@@ -91,10 +138,12 @@ impl Hyperliquid {
                             .await
                             .map_err(|e| CoreError::DataSource(format!("hyperliquid decode: {e}")));
                     }
-                    if (status.as_u16() == 429 || status.is_server_error()) && attempt < MAX_RETRIES {
-                        attempt += 1;
-                        tokio::time::sleep(Duration::from_secs(2 * attempt as u64)).await;
-                        continue;
+                    if status.as_u16() == 429 || status.is_server_error() {
+                        self.pacer.on_throttle(parse_retry_after(resp.headers()));
+                        if attempt < MAX_RETRIES {
+                            attempt += 1;
+                            continue;
+                        }
                     }
                     return Err(CoreError::DataSource(format!("hyperliquid http {status}")));
                 }
@@ -103,7 +152,7 @@ impl Hyperliquid {
                         return Err(CoreError::DataSource(format!("hyperliquid request: {e}")));
                     }
                     attempt += 1;
-                    tokio::time::sleep(Duration::from_secs(2 * attempt as u64)).await;
+                    tokio::time::sleep(Duration::from_secs(2 * u64::from(attempt))).await;
                 }
             }
         }
