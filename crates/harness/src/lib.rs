@@ -345,11 +345,21 @@ pub fn sweep<S: Strategy>(
     costs: &CostModel,
     funding: &[(Instrument, Vec<FundingPoint>)],
 ) -> Result<Vec<SweepRow>> {
-    let prep = Prepared::new(bars, features, funding);
+    sweep_prepared(candidates, &Prepared::new(bars, features, funding), cfg, costs)
+}
+
+/// Like [`sweep`] but over a shared, precomputed [`Prepared`] so an analysis can
+/// build it once and reuse it across several sweeps and walk-forwards.
+pub fn sweep_prepared<S: Strategy>(
+    candidates: &[(String, S)],
+    prep: &Prepared,
+    cfg: WfConfig,
+    costs: &CostModel,
+) -> Result<Vec<SweepRow>> {
     let mut runs = Vec::with_capacity(candidates.len());
     let mut trial_sharpes = Vec::with_capacity(candidates.len());
     for cand in candidates {
-        let wf = walk_forward_prepared(std::slice::from_ref(cand), &prep, cfg, costs)?;
+        let wf = walk_forward_prepared(std::slice::from_ref(cand), prep, cfg, costs)?;
         let rets = cw_eval::returns(&wf.oos);
         trial_sharpes.push(cw_eval::per_period_sharpe(&rets));
         runs.push((cand.0.clone(), wf, rets));

@@ -18,7 +18,7 @@ use cw_features::{
     FeatureContext, FeatureFrame, FeatureModule, FeatureRow, FundingFeatures, LiquidityFeatures, TechnicalFeatures,
     combine,
 };
-use cw_harness::{WalkForwardResult, WfConfig, feature_ic, sweep, walk_forward_prepared};
+use cw_harness::{WalkForwardResult, WfConfig, feature_ic, sweep_prepared, walk_forward_prepared};
 use cw_providers::{BarRequest, DataSource, Hyperliquid};
 use cw_storage::{DuckStore, Store, TimeRange};
 use cw_strategy::{Blend, CrossSectional};
@@ -292,17 +292,38 @@ fn analyze() -> Result<()> {
         invert,
         weight_feature: None,
     };
-    let candidates: Vec<(String, CrossSectional)> = val_specs
+    // One Prepared shared across every sweep/walk-forward below.
+    let prep = Prepared::new(&dataset, &frame, &funding_dataset);
+    // Each single-signal config is a one-sleeve blend; the diversifying 50/50 blend
+    // of the two market-neutral survivors is folded in so it is deflated by the FULL
+    // trial set (an honest multiple-testing correction), not a favorable sub-sweep.
+    let mut candidates: Vec<(String, Blend)> = val_specs
         .iter()
-        .map(|(label, feature, q, short, invert)| (label.to_string(), mk(feature, *q, *short, *invert)))
+        .map(|(label, feature, q, short, invert)| {
+            (
+                label.to_string(),
+                Blend {
+                    sleeves: vec![(Decimal::ONE, mk(feature, *q, *short, *invert))],
+                },
+            )
+        })
         .collect();
-    let rows = sweep(&candidates, &dataset, &frame, wf_cfg, &costs, &funding_dataset)?;
+    candidates.push((
+        "blend 50/50".to_string(),
+        Blend {
+            sleeves: vec![
+                (Decimal::new(5, 1), mk("illiq", 0.30, true, false)),
+                (Decimal::new(5, 1), mk("fund_z", 0.30, true, true)),
+            ],
+        },
+    ));
+    let rows = sweep_prepared(&candidates, &prep, wf_cfg, &costs)?;
     if rows.iter().all(|r| r.n_folds == 0) {
         println!("\nOOS validation: not enough history for the chosen windows");
         return Ok(());
     }
     println!(
-        "\nOOS validation ({} long-only configs, walk-forward d{cadence}, ranked by Deflated Sharpe):",
+        "\nOOS validation ({} configs, walk-forward d{cadence}, ranked by Deflated Sharpe):",
         candidates.len()
     );
     println!(
@@ -321,6 +342,15 @@ fn analyze() -> Result<()> {
         );
     }
 
+    // Why the blend works: the two market-neutral sleeves are near-uncorrelated, so
+    // combining them raises Sharpe and cuts drawdown vs either alone.
+    let illiq_wf =
+        walk_forward_prepared(&[("illiq".to_string(), mk("illiq", 0.30, true, false))], &prep, wf_cfg, &costs)?;
+    let fundz_wf =
+        walk_forward_prepared(&[("fundz".to_string(), mk("fund_z", 0.30, true, true))], &prep, wf_cfg, &costs)?;
+    let corr = cw_eval::correlation(&cw_eval::returns(&illiq_wf.oos), &cw_eval::returns(&fundz_wf.oos));
+    println!("  (blend 50/50 = illiq L/S 30% + fundz carry 30%; sleeve OOS-return corr = {corr:.2})");
+
     // A long-only OOS Sharpe is mostly market beta. Walk-forward the equal-weight
     // market and each signal on the same folds, then regress OOS returns → the OOS
     // ALPHA (edge beyond beta) — the number that actually matters.
@@ -332,8 +362,6 @@ fn analyze() -> Result<()> {
             _ => Decimal::ZERO,
         }
     };
-    // One shared Prepared for the whole OOS-alpha section (market + each signal).
-    let prep = Prepared::new(&dataset, &frame, &funding_dataset);
     let market_cand = [("market".to_string(), mk("vol", 1.0, false, false))];
     let market_wf = walk_forward_prepared(&market_cand, &prep, wf_cfg, &costs)?;
     let market_oos = cw_eval::returns(&market_wf.oos);
@@ -356,54 +384,6 @@ fn analyze() -> Result<()> {
             ab.beta,
             ab.alpha_annual * 100.0,
             ab.r2
-        );
-    }
-
-    // ===== Multi-signal blend: diversify the two market-neutral survivors =====
-    // Illiquidity L/S and funding carry exploit distinct mechanisms; if their OOS
-    // returns are weakly correlated, a risk-shared blend lifts Sharpe/DSR without a
-    // stronger single signal. Each sleeve and the 50/50 blend are deflated together.
-    let illiq_ls = mk("illiq", 0.30, true, false);
-    let fundz = mk("fund_z", 0.30, true, true);
-    let half = Decimal::new(5, 1);
-    let blend_specs: Vec<(String, Blend)> = vec![
-        (
-            "illiq L/S 30%".to_string(),
-            Blend {
-                sleeves: vec![(Decimal::ONE, illiq_ls.clone())],
-            },
-        ),
-        (
-            "fundz carry 30%".to_string(),
-            Blend {
-                sleeves: vec![(Decimal::ONE, fundz.clone())],
-            },
-        ),
-        (
-            "blend 50/50".to_string(),
-            Blend {
-                sleeves: vec![(half, illiq_ls.clone()), (half, fundz.clone())],
-            },
-        ),
-    ];
-    let illiq_wf = walk_forward_prepared(&[("illiq".to_string(), illiq_ls)], &prep, wf_cfg, &costs)?;
-    let fundz_wf = walk_forward_prepared(&[("fundz".to_string(), fundz)], &prep, wf_cfg, &costs)?;
-    let corr = cw_eval::correlation(&cw_eval::returns(&illiq_wf.oos), &cw_eval::returns(&fundz_wf.oos));
-    let blend_rows = sweep(&blend_specs, &dataset, &frame, wf_cfg, &costs, &funding_dataset)?;
-    println!("\nmulti-signal blend (walk-forward d{cadence}; sleeve OOS-return corr = {corr:.2}):");
-    println!(
-        "  {:<14} {:>8} {:>9} {:>8} {:>7} {:>6}",
-        "config", "OOS-Shp", "OOS-ret%", "maxDD%", "DSR%", "folds"
-    );
-    for r in &blend_rows {
-        println!(
-            "  {:<14} {:>8.2} {:>9.1} {:>8.1} {:>7.1} {:>6}",
-            r.label,
-            r.oos_sharpe,
-            r.oos_return_pct,
-            r.max_drawdown * 100.0,
-            r.dsr * 100.0,
-            r.n_folds
         );
     }
 
