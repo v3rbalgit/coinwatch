@@ -19,11 +19,15 @@ const EULER_MASCHERONI: f64 = 0.577_215_664_901_532_9;
 /// Headline metrics for a single backtest run.
 #[derive(Debug, Default, Clone)]
 pub struct Metrics {
+    /// Annualized Sharpe ratio.
     pub sharpe: f64,
+    /// Annualized Sortino ratio (downside-only risk).
     pub sortino: f64,
+    /// Maximum peak-to-trough drawdown (fraction).
     pub max_drawdown: f64,
     /// Average gross turnover per rebalance (fraction of equity traded).
     pub turnover: f64,
+    /// Fraction of periods with a positive return.
     pub hit_rate: f64,
     /// Probabilistic Sharpe Ratio vs. a zero benchmark (probability true SR > 0).
     pub psr: f64,
@@ -33,7 +37,10 @@ pub struct Metrics {
 pub fn returns(result: &BacktestResult) -> Vec<f64> {
     let eq: Vec<f64> = result.equity_curve.iter().map(|(_, e)| e.to_f64().unwrap_or(0.0)).collect();
     eq.windows(2)
-        .filter_map(|w| if w[0] > 0.0 { Some(w[1] / w[0] - 1.0) } else { None })
+        .filter_map(|w| match *w {
+            [a, b] if a > 0.0 => Some(b / a - 1.0),
+            _ => None,
+        })
         .collect()
 }
 
@@ -44,9 +51,13 @@ pub fn returns(result: &BacktestResult) -> Vec<f64> {
 /// variance fraction.
 #[derive(Debug, Default, Clone)]
 pub struct AlphaBeta {
+    /// Per-period alpha (intercept): return not explained by market exposure.
     pub alpha: f64,
+    /// `alpha` scaled to a yearly figure.
     pub alpha_annual: f64,
+    /// Market beta (regression slope).
     pub beta: f64,
+    /// Fraction of variance the market explains.
     pub r2: f64,
 }
 
@@ -56,27 +67,34 @@ pub fn alpha_beta(strategy: &[f64], market: &[f64]) -> AlphaBeta {
     if n < 3 {
         return AlphaBeta::default();
     }
-    let (s, m) = (&strategy[..n], &market[..n]);
+    let (Some(s), Some(m)) = (strategy.get(..n), market.get(..n)) else {
+        return AlphaBeta::default();
+    };
     let nf = n as f64;
     let mean_s = s.iter().sum::<f64>() / nf;
     let mean_m = m.iter().sum::<f64>() / nf;
     let (mut cov, mut var_m) = (0.0, 0.0);
-    for i in 0..n {
-        cov += (m[i] - mean_m) * (s[i] - mean_s);
-        var_m += (m[i] - mean_m).powi(2);
+    for (mi, si) in m.iter().zip(s.iter()) {
+        cov += (mi - mean_m) * (si - mean_s);
+        var_m += (mi - mean_m).powi(2);
     }
     // Epsilon guards: a (near-)constant market factor has var_m ~ fp-noise, which
     // would otherwise produce a spurious beta from noise/noise.
     let beta = if var_m > 1e-12 { cov / var_m } else { 0.0 };
     let alpha = mean_s - beta * mean_m;
     let (mut ss_res, mut ss_tot) = (0.0, 0.0);
-    for i in 0..n {
-        let pred = alpha + beta * m[i];
-        ss_res += (s[i] - pred).powi(2);
-        ss_tot += (s[i] - mean_s).powi(2);
+    for (mi, si) in m.iter().zip(s.iter()) {
+        let pred = alpha + beta * mi;
+        ss_res += (si - pred).powi(2);
+        ss_tot += (si - mean_s).powi(2);
     }
     let r2 = if ss_tot > 1e-12 { 1.0 - ss_res / ss_tot } else { 0.0 };
-    AlphaBeta { alpha, alpha_annual: alpha * PERIODS_PER_YEAR, beta, r2 }
+    AlphaBeta {
+        alpha,
+        alpha_annual: alpha * PERIODS_PER_YEAR,
+        beta,
+        r2,
+    }
 }
 
 /// Non-annualized (per-period) Sharpe of a return series.
@@ -89,11 +107,7 @@ pub fn per_period_sharpe(rets: &[f64]) -> f64 {
     let sd = (rets.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n).sqrt();
     // Epsilon (not > 0.0): a near-constant series has sd ~ fp-noise, which would
     // otherwise yield an astronomical mean/sd; treat it as no measurable Sharpe.
-    if sd > 1e-12 {
-        mean / sd
-    } else {
-        0.0
-    }
+    if sd > 1e-12 { mean / sd } else { 0.0 }
 }
 
 /// Standard-normal CDF via an Abramowitz–Stegun erf approximation (7.1.26).
@@ -103,31 +117,43 @@ fn normal_cdf(x: f64) -> f64 {
         let x = x.abs();
         let t = 1.0 / (1.0 + 0.327_591_1 * x);
         let y = 1.0
-            - (((((1.061_405_429 * t - 1.453_152_027) * t) + 1.421_413_741) * t - 0.284_496_736) * t
-                + 0.254_829_592)
+            - (((((1.061_405_429 * t - 1.453_152_027) * t) + 1.421_413_741) * t - 0.284_496_736) * t + 0.254_829_592)
                 * t
                 * (-x * x).exp();
         sign * y
     }
-    0.5 * (1.0 + erf(x / std::f64::consts::SQRT_2))
+    f64::midpoint(1.0, erf(x / std::f64::consts::SQRT_2))
 }
 
 /// Inverse standard-normal CDF (probit) via Acklam's rational approximation.
 fn probit(p: f64) -> f64 {
     const A: [f64; 6] = [
-        -3.969_683_028_665_376e1, 2.209_460_984_245_205e2, -2.759_285_104_469_687e2,
-        1.383_577_518_672_69e2, -3.066_479_806_614_716e1, 2.506_628_277_459_239e0,
+        -3.969_683_028_665_376e1,
+        2.209_460_984_245_205e2,
+        -2.759_285_104_469_687e2,
+        1.383_577_518_672_69e2,
+        -3.066_479_806_614_716e1,
+        2.506_628_277_459_239e0,
     ];
     const B: [f64; 5] = [
-        -5.447_609_879_822_406e1, 1.615_858_368_580_409e2, -1.556_989_798_598_866e2,
-        6.680_131_188_771_972e1, -1.328_068_155_288_572e1,
+        -5.447_609_879_822_406e1,
+        1.615_858_368_580_409e2,
+        -1.556_989_798_598_866e2,
+        6.680_131_188_771_972e1,
+        -1.328_068_155_288_572e1,
     ];
     const C: [f64; 6] = [
-        -7.784_894_002_430_293e-3, -3.223_964_580_411_365e-1, -2.400_758_277_161_838e0,
-        -2.549_732_539_343_734e0, 4.374_664_141_464_968e0, 2.938_163_982_698_783e0,
+        -7.784_894_002_430_293e-3,
+        -3.223_964_580_411_365e-1,
+        -2.400_758_277_161_838e0,
+        -2.549_732_539_343_734e0,
+        4.374_664_141_464_968e0,
+        2.938_163_982_698_783e0,
     ];
     const D: [f64; 4] = [
-        7.784_695_709_041_462e-3, 3.224_671_290_700_398e-1, 2.445_134_137_142_996e0,
+        7.784_695_709_041_462e-3,
+        3.224_671_290_700_398e-1,
+        2.445_134_137_142_996e0,
         3.754_408_661_907_416e0,
     ];
     const P_LOW: f64 = 0.02425;
@@ -234,12 +260,27 @@ pub fn evaluate(result: &BacktestResult) -> Result<Metrics> {
     let hit_rate = rets.iter().filter(|r| **r > 0.0).count() as f64 / n;
 
     let gross_traded: f64 = result.trades.iter().map(|t| t.qty_usd.to_f64().unwrap_or(0.0).abs()).sum();
-    let mean_eq = if eq.is_empty() { 0.0 } else { eq.iter().sum::<f64>() / eq.len() as f64 };
-    let turnover = if mean_eq > 0.0 { gross_traded / (mean_eq * n) } else { 0.0 };
+    let mean_eq = if eq.is_empty() {
+        0.0
+    } else {
+        eq.iter().sum::<f64>() / eq.len() as f64
+    };
+    let turnover = if mean_eq > 0.0 {
+        gross_traded / (mean_eq * n)
+    } else {
+        0.0
+    };
 
     let psr = psr_vs(&rets, 0.0);
 
-    Ok(Metrics { sharpe, sortino, max_drawdown, turnover, hit_rate, psr })
+    Ok(Metrics {
+        sharpe,
+        sortino,
+        max_drawdown,
+        turnover,
+        hit_rate,
+        psr,
+    })
 }
 
 #[cfg(test)]
@@ -315,10 +356,10 @@ mod tests {
         // Near-constant inputs must not yield an astronomical Sharpe, and regressing
         // on a constant market factor must give beta 0 (not fp-noise / fp-noise).
         let flat = vec![0.001_f64; 40];
-        assert_eq!(per_period_sharpe(&flat), 0.0);
-        let ab = alpha_beta(&flat, &vec![0.002_f64; 40]);
-        assert_eq!(ab.beta, 0.0);
-        assert_eq!(ab.r2, 0.0);
+        assert!(per_period_sharpe(&flat).abs() < 1e-12);
+        let ab = alpha_beta(&flat, &[0.002_f64; 40]);
+        assert!(ab.beta.abs() < 1e-12);
+        assert!(ab.r2.abs() < 1e-12);
     }
 
     #[test]

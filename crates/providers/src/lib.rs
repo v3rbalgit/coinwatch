@@ -13,7 +13,9 @@ use cw_core::{Bar, Instrument, Interval, Result};
 /// A request for a contiguous run of bars for one instrument.
 #[derive(Debug, Clone)]
 pub struct BarRequest {
+    /// Instrument whose bars to fetch.
     pub instrument: Instrument,
+    /// Bar aggregation interval.
     pub interval: Interval,
     /// Maximum bars to return (providers cap this; the ingester paginates).
     pub limit: usize,
@@ -24,7 +26,7 @@ pub struct BarRequest {
 #[async_trait]
 pub trait DataSource: Send + Sync {
     /// Stable adapter name for logging/metrics.
-    fn name(&self) -> &str;
+    fn name(&self) -> &'static str;
 
     /// Fetch bars for `req`, oldest-first, OHLC-consistent.
     async fn fetch_bars(&self, req: &BarRequest) -> Result<Vec<Bar>>;

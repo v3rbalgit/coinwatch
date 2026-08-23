@@ -24,8 +24,11 @@ const ILLIQ_SCALE: f64 = 1e6;
 /// Configurable liquidity feature set. Lookbacks are in bars.
 #[derive(Debug, Clone)]
 pub struct LiquidityFeatures {
+    /// Window (bars) for Amihud illiquidity and the dollar-volume z-score.
     pub window: usize,
+    /// Short window (bars) for dollar-volume momentum.
     pub mom_short: usize,
+    /// Long window (bars) for dollar-volume momentum.
     pub mom_long: usize,
 }
 
@@ -58,8 +61,8 @@ fn dec(x: f64) -> Decimal {
 
 /// Dollar-volume momentum: recent mean volume / older mean volume − 1.
 fn dvol_momentum(dvol: &[f64], i: usize, short: usize, long: usize) -> Option<f64> {
-    let recent = mean(&dvol[i - short + 1..=i]);
-    let older = mean(&dvol[i - long + 1..=i]);
+    let recent = mean(dvol.get(i - short + 1..=i)?);
+    let older = mean(dvol.get(i - long + 1..=i)?);
     if older <= 0.0 {
         return None;
     }
@@ -68,11 +71,12 @@ fn dvol_momentum(dvol: &[f64], i: usize, short: usize, long: usize) -> Option<f6
 
 /// Amihud illiquidity over `w` bars ending at `i` (scaled).
 fn amihud(closes: &[f64], dvol: &[f64], i: usize, w: usize) -> Option<f64> {
+    let cwin = closes.get(i - w..=i)?; // w+1 closes
+    let vwin = dvol.get(i - w + 1..=i)?; // w volumes, aligned to each period's close
     let mut acc = 0.0;
     let mut count = 0.0;
-    for t in (i - w + 1)..=i {
-        let (p0, p1, v) = (closes[t - 1], closes[t], dvol[t]);
-        if p0 <= 0.0 || v <= 0.0 {
+    for ((p0, p1), v) in cwin.iter().zip(cwin.iter().skip(1)).zip(vwin.iter()) {
+        if *p0 <= 0.0 || *v <= 0.0 {
             continue;
         }
         acc += (p1 / p0 - 1.0).abs() / v;
@@ -86,7 +90,7 @@ fn amihud(closes: &[f64], dvol: &[f64], i: usize, w: usize) -> Option<f64> {
 
 /// Z-score of the latest dollar volume vs. its `w`-bar window.
 fn dvol_zscore(dvol: &[f64], i: usize, w: usize) -> Option<f64> {
-    let window = &dvol[i - w + 1..=i];
+    let window = dvol.get(i - w + 1..=i)?;
     let m = mean(window);
     let var = window.iter().map(|v| (v - m).powi(2)).sum::<f64>() / window.len() as f64;
     let sd = var.sqrt();
@@ -95,11 +99,11 @@ fn dvol_zscore(dvol: &[f64], i: usize, w: usize) -> Option<f64> {
     if sd <= 1e-12 {
         return None;
     }
-    Some((dvol[i] - m) / sd)
+    Some((*dvol.get(i)? - m) / sd)
 }
 
 impl FeatureModule for LiquidityFeatures {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "liquidity"
     }
 
@@ -186,7 +190,12 @@ mod tests {
             mom_long: 10,
         };
         let dataset = vec![(instrument(), bars)];
-        let frame = module.compute(&FeatureContext { bars: &dataset, funding: &[] }).unwrap();
+        let frame = module
+            .compute(&FeatureContext {
+                bars: &dataset,
+                funding: &[],
+            })
+            .unwrap();
         assert!(!frame.rows.is_empty());
         assert!(frame.rows.last().unwrap().values["dvol_mom"] > Decimal::ZERO);
     }
@@ -201,7 +210,12 @@ mod tests {
             mom_long: 10,
         };
         let dataset = vec![(instrument(), bars)];
-        let frame = module.compute(&FeatureContext { bars: &dataset, funding: &[] }).unwrap();
+        let frame = module
+            .compute(&FeatureContext {
+                bars: &dataset,
+                funding: &[],
+            })
+            .unwrap();
         let row = frame.rows.last().unwrap();
         for name in FEATURES {
             assert!(row.values.contains_key(name), "missing feature {name}");

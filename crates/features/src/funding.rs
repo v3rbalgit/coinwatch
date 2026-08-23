@@ -41,7 +41,7 @@ fn dec(x: f64) -> Decimal {
 }
 
 impl FeatureModule for FundingFeatures {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "funding"
     }
 
@@ -61,7 +61,7 @@ impl FeatureModule for FundingFeatures {
             };
             // hourly -> daily funding (sum of the day's hourly rates)
             let mut daily: BTreeMap<i64, f64> = BTreeMap::new();
-            for p in points.iter() {
+            for p in *points {
                 let day = (p.time.timestamp_millis() / DAY_MS) * DAY_MS;
                 *daily.entry(day).or_insert(0.0) += p.funding_rate.to_f64().unwrap_or(0.0);
             }
@@ -75,13 +75,17 @@ impl FeatureModule for FundingFeatures {
                 .collect();
 
             for (i, bar) in bars.iter().enumerate().skip(warm) {
-                let win = &series[i - self.window + 1..=i];
-                if win.iter().any(Option::is_none) {
-                    continue; // require real data across the whole trailing window
-                }
-                let vals: Vec<f64> = win.iter().map(|v| v.unwrap()).collect();
-                let cur = vals[vals.len() - 1];
-                let smooth_win = &vals[vals.len() - self.smooth..];
+                // Require real funding across the whole trailing window; the Option
+                // collect yields None if any day is missing.
+                let Some(win) = series.get(i - self.window + 1..=i) else {
+                    continue;
+                };
+                let Some(vals) = win.iter().copied().collect::<Option<Vec<f64>>>() else {
+                    continue;
+                };
+                let (Some(&cur), Some(smooth_win)) = (vals.last(), vals.get(vals.len() - self.smooth..)) else {
+                    continue;
+                };
                 let rate = smooth_win.iter().sum::<f64>() / smooth_win.len() as f64;
                 let m = vals.iter().sum::<f64>() / vals.len() as f64;
                 let sd = (vals.iter().map(|v| (v - m).powi(2)).sum::<f64>() / vals.len() as f64).sqrt();
@@ -115,11 +119,23 @@ mod tests {
 
     fn bar(d: i64) -> Bar {
         let c = Decimal::from(100);
-        Bar { ts: day(d), open: c, high: c, low: c, close: c, volume: Decimal::from(1_000_000) }
+        Bar {
+            ts: day(d),
+            open: c,
+            high: c,
+            low: c,
+            close: c,
+            volume: Decimal::from(1_000_000),
+        }
     }
 
     fn instrument() -> Instrument {
-        Instrument { network: Network::Other("hyperliquid".into()), pool: PoolId("X".into()), name: "X".into(), token: None }
+        Instrument {
+            network: Network::Other("hyperliquid".into()),
+            pool: PoolId("X".into()),
+            name: "X".into(),
+            token: None,
+        }
     }
 
     #[test]
@@ -137,7 +153,12 @@ mod tests {
         let bars_ds = vec![(instrument(), bars)];
         let fund_ds = vec![(instrument(), funding)];
         let module = FundingFeatures { smooth: 7, window: 30 };
-        let frame = module.compute(&FeatureContext { bars: &bars_ds, funding: &fund_ds }).unwrap();
+        let frame = module
+            .compute(&FeatureContext {
+                bars: &bars_ds,
+                funding: &fund_ds,
+            })
+            .unwrap();
 
         assert!(!frame.rows.is_empty(), "should emit rows past warmup");
         let last = frame.rows.last().unwrap();
@@ -149,7 +170,10 @@ mod tests {
     fn missing_funding_instrument_is_skipped() {
         let bars_ds = vec![(instrument(), (0..40).map(bar).collect())];
         let frame = FundingFeatures::default()
-            .compute(&FeatureContext { bars: &bars_ds, funding: &[] })
+            .compute(&FeatureContext {
+                bars: &bars_ds,
+                funding: &[],
+            })
             .unwrap();
         assert!(frame.rows.is_empty(), "no funding channel => no funding rows");
     }

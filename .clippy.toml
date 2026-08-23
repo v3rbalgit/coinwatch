@@ -1,0 +1,10 @@
+# Clippy configuration - only non-default values.
+
+# Function parameter limit - allow 8 params instead of the default 7.
+too-many-arguments-threshold = 8
+
+# Allow test-friendly practices in test code.
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true

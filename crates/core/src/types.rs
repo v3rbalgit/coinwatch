@@ -11,15 +11,19 @@ use serde::{Deserialize, Serialize};
 /// a code change; adapters decide what they actually support.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Network {
+    /// Base L2.
     Base,
+    /// Arbitrum One L2.
     Arbitrum,
+    /// Ethereum mainnet.
     Ethereum,
+    /// Any other network, keyed by its provider slug (e.g. `"hyperliquid"`).
     Other(String),
 }
 
 impl Network {
     /// URL/path slug used by data providers (e.g. Ethereum = "eth").
-    pub fn slug(&self) -> &str {
+    pub const fn slug(&self) -> &str {
         match self {
             Network::Base => "base",
             Network::Arbitrum => "arbitrum",
@@ -46,8 +50,11 @@ pub struct PoolId(pub String);
 /// A tradable instrument: a pool plus human-readable metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Instrument {
+    /// Chain the instrument trades on.
     pub network: Network,
+    /// Pool / market identifier on that network.
     pub pool: PoolId,
+    /// Human-readable symbol (e.g. `"BTC"`).
     pub name: String,
     /// Base-token contract address, for joining on-chain data. `None` when unknown
     /// (e.g. reconstructed from an older store row).
@@ -57,8 +64,11 @@ pub struct Instrument {
 /// Bar aggregation interval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Interval {
+    /// One-minute bars.
     Minute,
+    /// One-hour bars.
     Hour,
+    /// Daily bars.
     Day,
 }
 
@@ -68,11 +78,17 @@ pub enum Interval {
 /// and `high >= max(open, close)`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Bar {
+    /// Bar open timestamp (UTC).
     pub ts: DateTime<Utc>,
+    /// Open price.
     pub open: Decimal,
+    /// Highest price in the bar.
     pub high: Decimal,
+    /// Lowest price in the bar.
     pub low: Decimal,
+    /// Close price.
     pub close: Decimal,
+    /// Quote-denominated (USD) volume.
     pub volume: Decimal,
 }
 
@@ -89,7 +105,9 @@ impl Bar {
 /// The sign encodes direction; magnitude is fraction of deployable capital.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TargetWeight {
+    /// Instrument the weight applies to.
     pub instrument: Instrument,
+    /// Signed fraction of deployable capital (sign = direction).
     pub weight: Decimal,
 }
 
@@ -98,7 +116,10 @@ pub struct TargetWeight {
 /// premium. Funding is both a holding cost and a carry-edge signal.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FundingPoint {
+    /// Observation timestamp (UTC).
     pub time: DateTime<Utc>,
+    /// Hourly funding rate longs pay shorts (negative = shorts pay longs).
     pub funding_rate: Decimal,
+    /// Mark-vs-oracle premium at the observation.
     pub premium: Decimal,
 }

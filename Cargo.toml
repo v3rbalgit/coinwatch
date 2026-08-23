@@ -1,25 +1,26 @@
 # Coinwatch quant platform — Rust workspace (Phase 1 skeleton).
 # See DESIGN.md for the architecture and trait-seam rationale.
 [workspace]
-resolver = "2"
+resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.98"
 license = "MIT"
 repository = "https://github.com/v3rbalgit/coinwatch"
 
 [workspace.dependencies]
 # Internal crates
-cw-core = { path = "crates/core" }
-cw-storage = { path = "crates/storage" }
-cw-providers = { path = "crates/providers" }
-cw-features = { path = "crates/features" }
-cw-strategy = { path = "crates/strategy" }
-cw-backtest = { path = "crates/backtest" }
-cw-eval = { path = "crates/eval" }
-cw-harness = { path = "crates/harness" }
+cw-core = { path = "crates/core", version = "0.1.0" }
+cw-storage = { path = "crates/storage", version = "0.1.0" }
+cw-providers = { path = "crates/providers", version = "0.1.0" }
+cw-features = { path = "crates/features", version = "0.1.0" }
+cw-strategy = { path = "crates/strategy", version = "0.1.0" }
+cw-backtest = { path = "crates/backtest", version = "0.1.0" }
+cw-eval = { path = "crates/eval", version = "0.1.0" }
+cw-harness = { path = "crates/harness", version = "0.1.0" }
 
 # Shared third-party
 thiserror = "2"
@@ -30,3 +31,72 @@ chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Deny critical correctness issues.
+suspicious = { level = "deny", priority = -1 }
+
+# Deny common footguns.
+unwrap_used = "deny"
+indexing_slicing = "deny"
+await_holding_lock = "deny"
+let_underscore_future = "deny"
+
+# Warn on performance issues.
+missing_const_for_fn = "warn"
+
+# Pedantic lints.
+allow_attributes = "warn"
+assigning_clones = "warn"
+branches_sharing_code = "warn"
+cloned_instead_of_copied = "warn"
+collapsible_else_if = "warn"
+comparison_chain = "warn"
+default_trait_access = "warn"
+elidable_lifetime_names = "warn"
+explicit_into_iter_loop = "warn"
+explicit_iter_loop = "warn"
+flat_map_option = "warn"
+implicit_clone = "warn"
+ip_constant = "warn"
+iter_filter_is_ok = "warn"
+iter_filter_is_some = "warn"
+manual_let_else = "warn"
+manual_is_variant_and = "warn"
+manual_instant_elapsed = "warn"
+manual_midpoint = "warn"
+manual_string_new = "warn"
+match_bool = "warn"
+map_unwrap_or = "warn"
+needless_continue = "warn"
+needless_raw_string_hashes = "warn"
+needless_pass_by_value = "warn"
+large_types_passed_by_value = "warn"
+semicolon_if_nothing_returned = "warn"
+float_cmp = "deny"
+match_same_arms = "deny"
+match_wild_err_arm = "deny"
+option_as_ref_cloned = "deny"
+pub_underscore_fields = "deny"
+redundant_else = "deny"
+ref_option = "deny"
+ref_option_ref = "deny"
+return_self_not_must_use = "deny"
+trivially_copy_pass_by_ref = "deny"
+unused_self = "warn"
+unnecessary_semicolon = "deny"
+unnecessary_literal_bound = "deny"
+unnecessary_wraps = "deny"
+unnested_or_patterns = "deny"
+unused_async = "deny"
+unicode_not_nfc = "deny"
+
+# Production hygiene.
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "deny"
+expect_used = "deny"

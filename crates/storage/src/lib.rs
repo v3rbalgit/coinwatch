@@ -14,12 +14,14 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use cw_core::{Bar, CoreError, Decimal, FundingPoint, Instrument, Interval, Network, PoolId, Result};
-use duckdb::{params, Connection};
+use duckdb::{Connection, params};
 
 /// A time window `[from, to]` (inclusive) used for point-in-time reads.
 #[derive(Debug, Clone, Copy)]
 pub struct TimeRange {
+    /// Inclusive start of the window (UTC).
     pub from: DateTime<Utc>,
+    /// Inclusive end of the window (UTC).
     pub to: DateTime<Utc>,
 }
 
@@ -47,7 +49,7 @@ pub trait Store {
 }
 
 /// Stable string tag for an interval (matches the on-disk primary key).
-fn interval_tag(iv: Interval) -> &'static str {
+const fn interval_tag(iv: Interval) -> &'static str {
     match iv {
         Interval::Minute => "minute",
         Interval::Hour => "hour",
@@ -58,6 +60,7 @@ fn interval_tag(iv: Interval) -> &'static str {
 /// DuckDB-backed store. The connection is wrapped in a `Mutex` so `&self`
 /// methods are usable across threads (DuckDB `Connection` is `Send` not `Sync`).
 pub struct DuckStore {
+    /// Path to the DuckDB database file.
     pub path: String,
     conn: Mutex<Connection>,
 }
@@ -116,10 +119,7 @@ impl DuckStore {
 
 impl Store for DuckStore {
     fn upsert_bars(&self, instrument: &Instrument, interval: Interval, bars: &[Bar]) -> Result<usize> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| CoreError::Storage(format!("lock: {e}")))?;
+        let conn = self.conn.lock().map_err(|e| CoreError::Storage(format!("lock: {e}")))?;
         let net = instrument.network.slug();
         let pool = instrument.pool.0.as_str();
         let tag = interval_tag(interval);
@@ -148,10 +148,7 @@ impl Store for DuckStore {
     }
 
     fn load_bars(&self, instrument: &Instrument, interval: Interval, range: TimeRange) -> Result<Vec<Bar>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| CoreError::Storage(format!("lock: {e}")))?;
+        let conn = self.conn.lock().map_err(|e| CoreError::Storage(format!("lock: {e}")))?;
         let mut stmt = conn
             .prepare(
                 "SELECT ts, open, high, low, close, volume FROM bars
@@ -188,8 +185,7 @@ impl Store for DuckStore {
 
         let mut out = Vec::new();
         for r in raw {
-            let (ts_ms, open, high, low, close, volume) =
-                r.map_err(|e| CoreError::Storage(format!("row: {e}")))?;
+            let (ts_ms, open, high, low, close, volume) = r.map_err(|e| CoreError::Storage(format!("row: {e}")))?;
             let ts = DateTime::<Utc>::from_timestamp_millis(ts_ms)
                 .ok_or_else(|| CoreError::InvalidData(format!("timestamp out of range: {ts_ms}")))?;
             out.push(Bar {
@@ -278,7 +274,12 @@ impl Store for DuckStore {
             .map_err(|e| CoreError::Storage(format!("prepare funding load: {e}")))?;
         let rows = stmt
             .query_map(
-                params![network.slug(), coin, range.from.timestamp_millis(), range.to.timestamp_millis()],
+                params![
+                    network.slug(),
+                    coin,
+                    range.from.timestamp_millis(),
+                    range.to.timestamp_millis()
+                ],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
             )
             .map_err(|e| CoreError::Storage(format!("funding query: {e}")))?;
@@ -288,7 +289,11 @@ impl Store for DuckStore {
             let (time_ms, rate, prem) = r.map_err(|e| CoreError::Storage(format!("row: {e}")))?;
             let time = DateTime::<Utc>::from_timestamp_millis(time_ms)
                 .ok_or_else(|| CoreError::InvalidData(format!("time out of range: {time_ms}")))?;
-            out.push(FundingPoint { time, funding_rate: dec(&rate), premium: dec(&prem) });
+            out.push(FundingPoint {
+                time,
+                funding_rate: dec(&rate),
+                premium: dec(&prem),
+            });
         }
         Ok(out)
     }

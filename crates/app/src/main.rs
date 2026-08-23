@@ -14,8 +14,11 @@ use std::fs;
 use chrono::{Duration, Utc};
 use cw_backtest::{BacktestResult, Backtester, CostModel, WalkForward};
 use cw_core::{Bar, CoreError, Decimal, FundingPoint, Instrument, Interval, Result};
-use cw_features::{combine, FeatureContext, FeatureFrame, FeatureModule, FeatureRow, FundingFeatures, LiquidityFeatures, TechnicalFeatures};
-use cw_harness::{feature_ic, sweep, walk_forward, WalkForwardResult, WfConfig};
+use cw_features::{
+    FeatureContext, FeatureFrame, FeatureModule, FeatureRow, FundingFeatures, LiquidityFeatures, TechnicalFeatures,
+    combine,
+};
+use cw_harness::{WalkForwardResult, WfConfig, feature_ic, sweep, walk_forward};
 use cw_providers::{BarRequest, DataSource, Hyperliquid};
 use cw_storage::{DuckStore, Store, TimeRange};
 use cw_strategy::CrossSectional;
@@ -88,12 +91,14 @@ async fn ingest() -> Result<()> {
         // Funding (perp carry signal): deep-backfill ~3y, resumable by depth. A coin
         // is done once its funding reaches the target window — or as far back as its
         // own price history goes, for coins listed <3y ago — and is current.
-        let existing = store.load_funding(&inst.network, &inst.pool.0, wide_range()).unwrap_or_default();
+        let existing = store
+            .load_funding(&inst.network, &inst.pool.0, wide_range())
+            .unwrap_or_default();
         let target = Utc::now() - Duration::days(FUNDING_DAYS - 45);
         let earliest_bar = stored.first().map(|b| b.ts);
-        let deep = existing.first().is_some_and(|p| {
-            p.time < target || earliest_bar.is_some_and(|eb| p.time < eb + Duration::days(35))
-        });
+        let deep = existing
+            .first()
+            .is_some_and(|p| p.time < target || earliest_bar.is_some_and(|eb| p.time < eb + Duration::days(35)));
         let current = existing.last().is_some_and(|p| p.time > Utc::now() - Duration::days(3));
         if !(deep && current) {
             match hl.fetch_funding(&inst.pool.0, Utc::now() - Duration::days(FUNDING_DAYS)).await {
@@ -125,7 +130,10 @@ async fn ingest() -> Result<()> {
             Err(e) => eprintln!("  {:<12} fetch failed: {e}", inst.name),
         }
     }
-    println!("ingest complete: {total} bars, {funding_rows} funding rows across {} perps; db: {DB_PATH}", perps.len());
+    println!(
+        "ingest complete: {total} bars, {funding_rows} funding rows across {} perps; db: {DB_PATH}",
+        perps.len()
+    );
     Ok(())
 }
 
@@ -148,7 +156,10 @@ fn analyze() -> Result<()> {
     let total_bars: usize = dataset.iter().map(|(_, b)| b.len()).sum();
     println!(
         "analyze: {}/{} instruments with >={} bars, {} bars total",
-        dataset.len(), instruments.len(), MIN_BARS, total_bars
+        dataset.len(),
+        instruments.len(),
+        MIN_BARS,
+        total_bars
     );
     if dataset.len() < 2 {
         println!("need >=2 instruments for a cross-sectional backtest — ingest more");
@@ -158,7 +169,9 @@ fn analyze() -> Result<()> {
     // Funding series per instrument (perp funding P&L in the backtest).
     let mut funding_dataset: Vec<(Instrument, Vec<FundingPoint>)> = Vec::new();
     for (inst, _) in &dataset {
-        let f = store.load_funding(&inst.network, &inst.pool.0, wide_range()).unwrap_or_default();
+        let f = store
+            .load_funding(&inst.network, &inst.pool.0, wide_range())
+            .unwrap_or_default();
         if !f.is_empty() {
             funding_dataset.push((inst.clone(), f));
         }
@@ -173,11 +186,21 @@ fn analyze() -> Result<()> {
     let technical = TechnicalFeatures::default();
     let liquidity = LiquidityFeatures::default();
     let funding_feat = FundingFeatures::default();
-    let ctx = FeatureContext { bars: &dataset, funding: &funding_dataset };
-    let frame = combine(&[technical.compute(&ctx)?, liquidity.compute(&ctx)?, funding_feat.compute(&ctx)?]);
+    let ctx = FeatureContext {
+        bars: &dataset,
+        funding: &funding_dataset,
+    };
+    let frame = combine(&[
+        technical.compute(&ctx)?,
+        liquidity.compute(&ctx)?,
+        funding_feat.compute(&ctx)?,
+    ]);
     println!(
         "features: modules [{}, {}, {}] -> {} rows",
-        technical.name(), liquidity.name(), funding_feat.name(), frame.rows.len()
+        technical.name(),
+        liquidity.name(),
+        funding_feat.name(),
+        frame.rows.len()
     );
 
     // Cross-sectional leaderboard from the latest feature bar per instrument.
@@ -211,14 +234,26 @@ fn analyze() -> Result<()> {
         for f in &ics {
             println!(
                 "  {:<10} IC={:>7.4}  IC-IR={:>6.2}  t={:>6.2}  hit={:>5.1}%  n={}",
-                f.feature, f.mean_ic, f.icir, f.t_stat, f.hit_rate * 100.0, f.n_periods
+                f.feature,
+                f.mean_ic,
+                f.icir,
+                f.t_stat,
+                f.hit_rate * 100.0,
+                f.n_periods
             );
         }
     }
 
     // In-sample, full-period backtests (the flattering, overfit-prone view).
     run_backtest("in-sample: technical momentum", "mom", &dataset, &frame, &funding_dataset, None)?;
-    run_backtest("in-sample: liquidity dvol-momentum", "dvol_mom", &dataset, &frame, &funding_dataset, None)?;
+    run_backtest(
+        "in-sample: liquidity dvol-momentum",
+        "dvol_mom",
+        &dataset,
+        &frame,
+        &funding_dataset,
+        None,
+    )?;
 
     // ===== OOS validation of the long-only signals (walk-forward + DSR) =====
     // The decisive test: does the in-sample illiquidity alpha survive out-of-sample
@@ -230,7 +265,13 @@ fn analyze() -> Result<()> {
         gas_usd: Decimal::new(50, 2),
     };
     let cadence = 14usize;
-    let wf_cfg = WfConfig { train: 90, test: 30, embargo: 3, vol_target: None, rebalance_every: cadence };
+    let wf_cfg = WfConfig {
+        train: 90,
+        test: 30,
+        embargo: 3,
+        vol_target: None,
+        rebalance_every: cadence,
+    };
     // (label, feature, quantile, allow_short, invert). Long-only harvests + the two
     // bidirectional/perp-native additions: illiquidity L/S (long illiquid, short
     // liquid majors = safe short) and funding carry (long low-funding, short high).
@@ -260,12 +301,23 @@ fn analyze() -> Result<()> {
         println!("\nOOS validation: not enough history for the chosen windows");
         return Ok(());
     }
-    println!("\nOOS validation ({} long-only configs, walk-forward d{cadence}, ranked by Deflated Sharpe):", candidates.len());
-    println!("  {:<14} {:>8} {:>9} {:>8} {:>7} {:>6}", "config", "OOS-Shp", "OOS-ret%", "maxDD%", "DSR%", "folds");
+    println!(
+        "\nOOS validation ({} long-only configs, walk-forward d{cadence}, ranked by Deflated Sharpe):",
+        candidates.len()
+    );
+    println!(
+        "  {:<14} {:>8} {:>9} {:>8} {:>7} {:>6}",
+        "config", "OOS-Shp", "OOS-ret%", "maxDD%", "DSR%", "folds"
+    );
     for r in &rows {
         println!(
             "  {:<14} {:>8.2} {:>9.1} {:>8.1} {:>7.1} {:>6}",
-            r.label, r.oos_sharpe, r.oos_return_pct, r.max_drawdown * 100.0, r.dsr * 100.0, r.n_folds
+            r.label,
+            r.oos_sharpe,
+            r.oos_return_pct,
+            r.max_drawdown * 100.0,
+            r.dsr * 100.0,
+            r.n_folds
         );
     }
 
@@ -283,15 +335,25 @@ fn analyze() -> Result<()> {
     let market_cand = [("market".to_string(), mk("vol", 1.0, false, false))];
     let market_wf = walk_forward(&market_cand, &dataset, &frame, wf_cfg, &costs, &funding_dataset)?;
     let market_oos = cw_eval::returns(&market_wf.oos);
-    println!("\nOOS alpha vs market (walk-forward d{cadence}; market OOS {}%):", oos_ret_pct(&market_wf));
-    println!("  {:<14} {:>9} {:>6} {:>10} {:>6}", "config", "OOS-ret%", "beta", "alpha%/yr", "R2");
+    println!(
+        "\nOOS alpha vs market (walk-forward d{cadence}; market OOS {}%):",
+        oos_ret_pct(&market_wf)
+    );
+    println!(
+        "  {:<14} {:>9} {:>6} {:>10} {:>6}",
+        "config", "OOS-ret%", "beta", "alpha%/yr", "R2"
+    );
     for (label, feature, q, short, invert) in val_specs.iter().filter(|s| !s.3) {
         let cand = [(label.to_string(), mk(feature, *q, *short, *invert))];
         let wf = walk_forward(&cand, &dataset, &frame, wf_cfg, &costs, &funding_dataset)?;
         let ab = cw_eval::alpha_beta(&cw_eval::returns(&wf.oos), &market_oos);
         println!(
             "  {:<14} {:>9} {:>6.2} {:>10.1} {:>6.2}",
-            label, oos_ret_pct(&wf), ab.beta, ab.alpha_annual * 100.0, ab.r2
+            label,
+            oos_ret_pct(&wf),
+            ab.beta,
+            ab.alpha_annual * 100.0,
+            ab.r2
         );
     }
 
@@ -300,9 +362,16 @@ fn analyze() -> Result<()> {
     // long-only, or merely ride crypto's beta. In-sample, full-period, no vol
     // targeting — beta is structural, and near-zero in-sample alpha means no edge.
     let bt = |strat: &CrossSectional, every: usize| -> Result<BacktestResult> {
-        Backtester::new(costs.clone(), WalkForward { train_bars: 90, test_bars: 30, embargo_bars: 3 })
-            .with_rebalance_every(every)
-            .run(strat, &dataset, &frame, &funding_dataset)
+        Backtester::new(
+            costs.clone(),
+            WalkForward {
+                train_bars: 90,
+                test_bars: 30,
+                embargo_bars: 3,
+            },
+        )
+        .with_rebalance_every(every)
+        .run(strat, &dataset, &frame, &funding_dataset)
     };
     let market = CrossSectional {
         rank_feature: "vol".to_string(),
@@ -315,12 +384,21 @@ fn analyze() -> Result<()> {
     let market_rets = cw_eval::returns(&market_bt);
     let market_m = cw_eval::evaluate(&market_bt)?;
     println!("\nlong-only alpha vs beta + rebalance cadence (in-sample; benchmark = equal-weight universe):");
-    println!("  {:<18} {:>8} {:>7} {:>6} {:>6} {:>9} {:>6}", "strategy", "ret%", "sharpe", "turn", "beta", "alpha%/yr", "R2");
-    println!("  {:<18} {:>8} {:>7.2} {:>6.2} {:>6.2} {:>9} {:>6}", "market (EW)", pct(&market_bt), market_m.sharpe, market_m.turnover, 1.0, "-", "-");
-    let longs: &[(&str, &str, f64, bool)] = &[
-        ("low-vol 30%", "vol", 0.30, true),
-        ("illiq 30%", "illiq", 0.30, false),
-    ];
+    println!(
+        "  {:<18} {:>8} {:>7} {:>6} {:>6} {:>9} {:>6}",
+        "strategy", "ret%", "sharpe", "turn", "beta", "alpha%/yr", "R2"
+    );
+    println!(
+        "  {:<18} {:>8} {:>7.2} {:>6.2} {:>6.2} {:>9} {:>6}",
+        "market (EW)",
+        pct(&market_bt),
+        market_m.sharpe,
+        market_m.turnover,
+        1.0,
+        "-",
+        "-"
+    );
+    let longs: &[(&str, &str, f64, bool)] = &[("low-vol 30%", "vol", 0.30, true), ("illiq 30%", "illiq", 0.30, false)];
     for (label, feature, q, invert) in longs {
         let strat = CrossSectional {
             rank_feature: feature.to_string(),
@@ -335,7 +413,13 @@ fn analyze() -> Result<()> {
             let ab = cw_eval::alpha_beta(&cw_eval::returns(&r), &market_rets);
             println!(
                 "  {:<18} {:>8} {:>7.2} {:>6.2} {:>6.2} {:>9.1} {:>6.2}",
-                format!("{label} d{every}"), pct(&r), m.sharpe, m.turnover, ab.beta, ab.alpha_annual * 100.0, ab.r2
+                format!("{label} d{every}"),
+                pct(&r),
+                m.sharpe,
+                m.turnover,
+                ab.beta,
+                ab.alpha_annual * 100.0,
+                ab.r2
             );
         }
     }
@@ -360,12 +444,19 @@ fn run_backtest(
         weight_feature: None,
     };
     let costs = CostModel {
-        fee_frac: Decimal::new(5, 4),        // 5 bps swap fee
-        slippage_coeff: Decimal::new(5, 1),  // linear price-impact coefficient
-        gas_usd: Decimal::new(50, 2),        // $0.50 per position change
+        fee_frac: Decimal::new(5, 4),       // 5 bps swap fee
+        slippage_coeff: Decimal::new(5, 1), // linear price-impact coefficient
+        gas_usd: Decimal::new(50, 2),       // $0.50 per position change
     };
-    let backtester = Backtester::new(costs, WalkForward { train_bars: 90, test_bars: 30, embargo_bars: 3 })
-        .with_vol_target(vol_target);
+    let backtester = Backtester::new(
+        costs,
+        WalkForward {
+            train_bars: 90,
+            test_bars: 30,
+            embargo_bars: 3,
+        },
+    )
+    .with_vol_target(vol_target);
     let result = backtester.run(&strategy, dataset, frame, funding)?;
     let m = cw_eval::evaluate(&result)?;
 

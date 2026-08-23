@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cw_core::{Bar, CoreError, Decimal, FundingPoint, Instrument, Interval, Network, PoolId, Result};
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::json;
 
 use crate::{BarRequest, DataSource};
@@ -42,7 +42,10 @@ impl Default for Hyperliquid {
 }
 
 impl Hyperliquid {
+    /// Construct a paced Hyperliquid `info`-API client with sane defaults.
+    #[must_use]
     pub fn new() -> Self {
+        #[expect(clippy::expect_used, reason = "infallible static reqwest builder config")]
         let client = reqwest::Client::builder()
             .user_agent("coinwatch/0.1")
             .timeout(Duration::from_secs(30))
@@ -59,6 +62,7 @@ impl Hyperliquid {
     /// Block until the next request is allowed under the min-interval budget.
     async fn pace(&self) {
         let wait = {
+            #[expect(clippy::expect_used, reason = "poisoned pace mutex is an unrecoverable bug")]
             let mut guard = self.last_request.lock().expect("pace mutex poisoned");
             let now = Instant::now();
             let target = match *guard {
@@ -108,8 +112,7 @@ impl Hyperliquid {
     /// The perp universe ranked by 24h notional volume, filtered to a minimum,
     /// capped at `limit`. Each instrument is `network=hyperliquid, pool=<coin>`.
     pub async fn top_perps(&self, limit: usize, min_day_vol_usd: Decimal) -> Result<Vec<(Instrument, Decimal)>> {
-        let (meta, ctxs): (Meta, Vec<AssetCtx>) =
-            self.post_json(&json!({ "type": "metaAndAssetCtxs" })).await?;
+        let (meta, ctxs): (Meta, Vec<AssetCtx>) = self.post_json(&json!({ "type": "metaAndAssetCtxs" })).await?;
 
         let mut out: Vec<(Instrument, Decimal)> = meta
             .universe
@@ -128,7 +131,7 @@ impl Hyperliquid {
             .filter(|(_, vol)| *vol >= min_day_vol_usd)
             .collect();
 
-        out.sort_by(|a, b| b.1.cmp(&a.1));
+        out.sort_by_key(|a| std::cmp::Reverse(a.1));
         out.truncate(limit);
         Ok(out)
     }
@@ -168,7 +171,7 @@ impl Hyperliquid {
 }
 
 /// Hyperliquid candle interval + its millis-per-bar (for the start-time window).
-fn interval_spec(iv: Interval) -> (&'static str, i64) {
+const fn interval_spec(iv: Interval) -> (&'static str, i64) {
     match iv {
         Interval::Day => ("1d", 86_400_000),
         Interval::Hour => ("1h", 3_600_000),
@@ -221,7 +224,7 @@ struct FundingRow {
 
 #[async_trait]
 impl DataSource for Hyperliquid {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "hyperliquid"
     }
 

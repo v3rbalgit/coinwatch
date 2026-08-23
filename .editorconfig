@@ -1,0 +1,23 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.rs]
+indent_style = space
+indent_size = 4
+
+[*.{py,md,toml,yml,yaml,json}]
+indent_style = space
+indent_size = 2
+
+# Markdown hard line breaks are trailing whitespace; never trim them away.
+[*.md]
+trim_trailing_whitespace = false
+
+[justfile]
+indent_style = space
+indent_size = 2

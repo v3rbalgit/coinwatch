@@ -20,3 +20,6 @@ cw-eval.workspace = true
 cw-harness.workspace = true
 tokio.workspace = true
 chrono.workspace = true
+
+[lints]
+workspace = true

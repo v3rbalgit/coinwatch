@@ -25,8 +25,11 @@ const OOS_START: f64 = 10_000.0;
 /// feature timestamps (bars); the two knobs are applied to every fold's backtest.
 #[derive(Debug, Clone, Copy)]
 pub struct WfConfig {
+    /// Training window length (bars).
     pub train: usize,
+    /// Test window length (bars).
     pub test: usize,
+    /// Embargo gap (bars) between train and test.
     pub embargo: usize,
     /// Portfolio vol target for each fold's backtest (None = off).
     pub vol_target: Option<Decimal>,
@@ -37,15 +40,20 @@ pub struct WfConfig {
 /// What one fold decided and how the chosen config scored in-sample.
 #[derive(Debug, Clone)]
 pub struct FoldSummary {
+    /// First timestamp of the fold's test window.
     pub test_from: DateTime<Utc>,
+    /// Last timestamp of the fold's test window.
     pub test_to: DateTime<Utc>,
+    /// Label of the config selected on the train window.
     pub chosen: String,
+    /// In-train per-period Sharpe of the selected config.
     pub train_sharpe: f64,
 }
 
 /// Result of a walk-forward run.
 #[derive(Debug, Clone)]
 pub struct WalkForwardResult {
+    /// Per-fold summaries (selection + test window).
     pub folds: Vec<FoldSummary>,
     /// Stitched out-of-sample equity curve across all test windows.
     pub oos: BacktestResult,
@@ -67,11 +75,7 @@ fn subframe(frame: &FeatureFrame, ts_set: &HashSet<i64>) -> FeatureFrame {
 
 fn step_return(e0: &Decimal, e1: &Decimal) -> f64 {
     let (a, b) = (e0.to_f64().unwrap_or(0.0), e1.to_f64().unwrap_or(0.0));
-    if a > 0.0 {
-        b / a - 1.0
-    } else {
-        0.0
-    }
+    if a > 0.0 { b / a - 1.0 } else { 0.0 }
 }
 
 /// Compound `(ts, per-step-return)` points into an equity curve from `OOS_START`.
@@ -117,7 +121,11 @@ pub fn walk_forward<S: Strategy>(
 
     let backtester = Backtester::new(
         costs.clone(),
-        WalkForward { train_bars: cfg.train, test_bars: cfg.test, embargo_bars: cfg.embargo },
+        WalkForward {
+            train_bars: cfg.train,
+            test_bars: cfg.test,
+            embargo_bars: cfg.embargo,
+        },
     )
     .with_vol_target(cfg.vol_target)
     .with_rebalance_every(cfg.rebalance_every);
@@ -129,9 +137,15 @@ pub fn walk_forward<S: Strategy>(
     let mut carry: HashMap<String, Decimal> = HashMap::new();
     let mut i = 0;
     while i + window <= times.len() {
-        let train_set: HashSet<i64> = times[i..i + cfg.train].iter().copied().collect();
+        let Some(train_slice) = times.get(i..i + cfg.train) else {
+            break;
+        };
+        let train_set: HashSet<i64> = train_slice.iter().copied().collect();
         let test_start = i + cfg.train + cfg.embargo;
-        let test_set: HashSet<i64> = times[test_start..test_start + cfg.test].iter().copied().collect();
+        let Some(test_slice) = times.get(test_start..test_start + cfg.test) else {
+            break;
+        };
+        let test_set: HashSet<i64> = test_slice.iter().copied().collect();
 
         // Sweep candidates on the train window; pick the best in-train Sharpe.
         let train_frame = subframe(features, &train_set);
@@ -144,8 +158,10 @@ pub fn walk_forward<S: Strategy>(
                 best = Some((idx, sharpe));
             }
         }
-        let (best_idx, best_sharpe) = best.expect("candidates non-empty");
-        let (chosen_label, chosen_strat) = &candidates[best_idx];
+        let Some((best_idx, best_sharpe)) = best else { break };
+        let Some((chosen_label, chosen_strat)) = candidates.get(best_idx) else {
+            break;
+        };
 
         // Evaluate the winner out-of-sample, carrying positions across folds so the
         // OOS is a continuously-held path: each fold seeds from the prior fold's
@@ -155,13 +171,14 @@ pub fn walk_forward<S: Strategy>(
         let test_frame = subframe(features, &test_set);
         let (test_res, end_held) = backtester.run_stateful(chosen_strat, bars, &test_frame, funding, &carry)?;
         for w in test_res.equity_curve.windows(2) {
-            oos_points.push((w[1].0, step_return(&w[0].1, &w[1].1)));
+            let [a, b] = w else { continue };
+            oos_points.push((b.0, step_return(&a.1, &b.1)));
         }
         carry = end_held;
 
         result.folds.push(FoldSummary {
-            test_from: ms(times[test_start]),
-            test_to: ms(times[test_start + cfg.test - 1]),
+            test_from: times.get(test_start).copied().map(&ms).unwrap_or_default(),
+            test_to: times.get(test_start + cfg.test - 1).copied().map(&ms).unwrap_or_default(),
             chosen: chosen_label.clone(),
             train_sharpe: best_sharpe,
         });
@@ -182,32 +199,35 @@ const MIN_XS: usize = 4;
 /// signal is stable enough to bother backtesting.
 #[derive(Debug, Clone)]
 pub struct FeatureIC {
+    /// Feature column name.
     pub feature: String,
+    /// Time-averaged cross-sectional rank IC.
     pub mean_ic: f64,
+    /// IC information ratio (mean_ic / ic_std).
     pub icir: f64,
+    /// t-statistic of the mean IC.
     pub t_stat: f64,
     /// Fraction of periods with positive IC.
     pub hit_rate: f64,
+    /// Number of cross-sections averaged.
     pub n_periods: usize,
 }
 
 /// Average ranks (1-based, ties share the mean rank).
 fn ranks(v: &[f64]) -> Vec<f64> {
-    let n = v.len();
-    let mut idx: Vec<usize> = (0..n).collect();
-    idx.sort_by(|&a, &b| v[a].partial_cmp(&v[b]).unwrap_or(Ordering::Equal));
-    let mut r = vec![0.0; n];
-    let mut i = 0;
-    while i < n {
-        let mut j = i;
-        while j + 1 < n && v[idx[j + 1]] == v[idx[i]] {
-            j += 1;
+    let mut order: Vec<(usize, f64)> = v.iter().copied().enumerate().collect();
+    order.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let mut r = vec![0.0; v.len()];
+    let mut rank = 1.0;
+    for group in order.chunk_by(|a, b| a.1.total_cmp(&b.1) == Ordering::Equal) {
+        let size = group.len() as f64;
+        let avg = rank + (size - 1.0) / 2.0;
+        for &(orig, _) in group {
+            if let Some(slot) = r.get_mut(orig) {
+                *slot = avg;
+            }
         }
-        let avg = (i + j) as f64 / 2.0 + 1.0;
-        for &k in &idx[i..=j] {
-            r[k] = avg;
-        }
-        i = j + 1;
+        rank += size;
     }
     r
 }
@@ -245,10 +265,11 @@ pub fn feature_ic(bars: &[(Instrument, Vec<Bar>)], features: &FeatureFrame) -> V
         let mut s: Vec<&Bar> = series.iter().collect();
         s.sort_by_key(|b| b.ts);
         for w in s.windows(2) {
-            let c0 = w[0].close.to_f64().unwrap_or(0.0);
-            let c1 = w[1].close.to_f64().unwrap_or(0.0);
+            let [b0, b1] = w else { continue };
+            let c0 = b0.close.to_f64().unwrap_or(0.0);
+            let c1 = b1.close.to_f64().unwrap_or(0.0);
             if c0 > 0.0 {
-                fwd.insert((inst.pool.0.clone(), w[0].ts.timestamp_millis()), c1 / c0 - 1.0);
+                fwd.insert((inst.pool.0.clone(), b0.ts.timestamp_millis()), c1 / c0 - 1.0);
             }
         }
     }
@@ -266,17 +287,15 @@ pub fn feature_ic(bars: &[(Instrument, Vec<Bar>)], features: &FeatureFrame) -> V
         for (ts, rows) in &by_ts {
             let (mut fv, mut rv) = (Vec::new(), Vec::new());
             for row in rows {
-                if let (Some(v), Some(r)) =
-                    (row.values.get(col), fwd.get(&(row.instrument.pool.0.clone(), *ts)))
-                {
+                if let (Some(v), Some(r)) = (row.values.get(col), fwd.get(&(row.instrument.pool.0.clone(), *ts))) {
                     fv.push(v.to_f64().unwrap_or(0.0));
                     rv.push(*r);
                 }
             }
-            if fv.len() >= MIN_XS {
-                if let Some(ic) = spearman(&fv, &rv).filter(|x| x.is_finite()) {
-                    ics.push(ic);
-                }
+            if fv.len() >= MIN_XS
+                && let Some(ic) = spearman(&fv, &rv).filter(|x| x.is_finite())
+            {
+                ics.push(ic);
             }
         }
         if ics.is_empty() {
@@ -303,11 +322,17 @@ pub fn feature_ic(bars: &[(Instrument, Vec<Bar>)], features: &FeatureFrame) -> V
 /// for the number of configs tried.
 #[derive(Debug, Clone)]
 pub struct SweepRow {
+    /// Config label.
     pub label: String,
+    /// Out-of-sample annualized Sharpe.
     pub oos_sharpe: f64,
+    /// Out-of-sample total return (%).
     pub oos_return_pct: f64,
+    /// Maximum out-of-sample drawdown (fraction).
     pub max_drawdown: f64,
+    /// Deflated Sharpe Ratio (multiple-testing-aware).
     pub dsr: f64,
+    /// Number of walk-forward folds.
     pub n_folds: usize,
 }
 
@@ -383,7 +408,10 @@ mod tests {
                     let c = Decimal::from_f64_retain(p).unwrap();
                     Bar {
                         ts: Utc.timestamp_opt(1_700_000_000 + d as i64 * 86_400, 0).unwrap(),
-                        open: c, high: c, low: c, close: c,
+                        open: c,
+                        high: c,
+                        low: c,
+                        close: c,
                         volume: Decimal::from(1000),
                     }
                 })
@@ -400,7 +428,10 @@ mod tests {
                 rows.push(FeatureRow {
                     instrument: instrument.clone(),
                     ts: bar.ts,
-                    values: BTreeMap::from([("mom".to_string(), Decimal::from(if up { d as i64 } else { -(d as i64) }))]),
+                    values: BTreeMap::from([(
+                        "mom".to_string(),
+                        Decimal::from(if up { d as i64 } else { -(d as i64) }),
+                    )]),
                 });
             }
         }
@@ -412,14 +443,34 @@ mod tests {
         let (bars, frame) = synthetic(40);
         let candidates = vec![(
             "mom@50".to_string(),
-            CrossSectional { rank_feature: "mom".to_string(), top_quantile: 0.5, allow_short: false, invert: false, weight_feature: None },
+            CrossSectional {
+                rank_feature: "mom".to_string(),
+                top_quantile: 0.5,
+                allow_short: false,
+                invert: false,
+                weight_feature: None,
+            },
         )];
         let costs = CostModel {
             fee_frac: Decimal::new(5, 4),
             slippage_coeff: Decimal::new(10, 4),
             gas_usd: Decimal::ZERO,
         };
-        let wf = walk_forward(&candidates, &bars, &frame, WfConfig { train: 15, test: 5, embargo: 1, vol_target: None, rebalance_every: 1 }, &costs, &[]).unwrap();
+        let wf = walk_forward(
+            &candidates,
+            &bars,
+            &frame,
+            WfConfig {
+                train: 15,
+                test: 5,
+                embargo: 1,
+                vol_target: None,
+                rebalance_every: 1,
+            },
+            &costs,
+            &[],
+        )
+        .unwrap();
         assert!(!wf.folds.is_empty());
         assert!(!wf.oos.equity_curve.is_empty());
         assert_eq!(wf.trial_sharpes.len(), wf.folds.len()); // 1 candidate per fold
@@ -437,7 +488,14 @@ mod tests {
             let series: Vec<Bar> = (0..6)
                 .map(|d| {
                     let c = Decimal::from_f64_retain(100.0 * (1.0 + rate).powi(d as i32)).unwrap();
-                    Bar { ts: day(d), open: c, high: c, low: c, close: c, volume: Decimal::from(1000) }
+                    Bar {
+                        ts: day(d),
+                        open: c,
+                        high: c,
+                        low: c,
+                        close: c,
+                        volume: Decimal::from(1000),
+                    }
                 })
                 .collect();
             for bar in &series {
@@ -459,11 +517,47 @@ mod tests {
     fn sweep_returns_a_row_per_candidate() {
         let (bars, frame) = synthetic(40);
         let candidates = vec![
-            ("mom@50".to_string(), CrossSectional { rank_feature: "mom".to_string(), top_quantile: 0.5, allow_short: false, invert: false, weight_feature: None }),
-            ("mom@30".to_string(), CrossSectional { rank_feature: "mom".to_string(), top_quantile: 0.3, allow_short: false, invert: false, weight_feature: None }),
+            (
+                "mom@50".to_string(),
+                CrossSectional {
+                    rank_feature: "mom".to_string(),
+                    top_quantile: 0.5,
+                    allow_short: false,
+                    invert: false,
+                    weight_feature: None,
+                },
+            ),
+            (
+                "mom@30".to_string(),
+                CrossSectional {
+                    rank_feature: "mom".to_string(),
+                    top_quantile: 0.3,
+                    allow_short: false,
+                    invert: false,
+                    weight_feature: None,
+                },
+            ),
         ];
-        let costs = CostModel { fee_frac: Decimal::new(5, 4), slippage_coeff: Decimal::new(5, 1), gas_usd: Decimal::ZERO };
-        let rows = sweep(&candidates, &bars, &frame, WfConfig { train: 15, test: 5, embargo: 1, vol_target: None, rebalance_every: 1 }, &costs, &[]).unwrap();
+        let costs = CostModel {
+            fee_frac: Decimal::new(5, 4),
+            slippage_coeff: Decimal::new(5, 1),
+            gas_usd: Decimal::ZERO,
+        };
+        let rows = sweep(
+            &candidates,
+            &bars,
+            &frame,
+            WfConfig {
+                train: 15,
+                test: 5,
+                embargo: 1,
+                vol_target: None,
+                rebalance_every: 1,
+            },
+            &costs,
+            &[],
+        )
+        .unwrap();
         assert_eq!(rows.len(), 2);
     }
 }

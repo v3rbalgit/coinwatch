@@ -48,30 +48,41 @@ pub struct CostModel {
 /// parametric CV; unused by the single-pass Phase-1 run.
 #[derive(Debug, Clone, Copy)]
 pub struct WalkForward {
+    /// Training window length in bars.
     pub train_bars: usize,
+    /// Out-of-sample test window length in bars.
     pub test_bars: usize,
+    /// Embargo gap (bars) between train and test to prevent leakage.
     pub embargo_bars: usize,
 }
 
 /// One realized fill in the simulated ledger.
 #[derive(Debug, Clone)]
 pub struct Trade {
+    /// Fill timestamp (UTC).
     pub ts: DateTime<Utc>,
+    /// Human-readable instrument symbol.
     pub instrument_name: String,
+    /// Signed traded notional (USD); sign = buy/sell.
     pub qty_usd: Decimal,
+    /// Transaction cost charged for the fill (USD).
     pub cost_usd: Decimal,
 }
 
 /// Backtest output: the equity curve plus the trade ledger for attribution.
 #[derive(Debug, Default, Clone)]
 pub struct BacktestResult {
+    /// Equity value at each rebalance timestamp.
     pub equity_curve: Vec<(DateTime<Utc>, Decimal)>,
+    /// Per-fill ledger for cost/turnover attribution.
     pub trades: Vec<Trade>,
 }
 
 /// Drives a [`Strategy`] over historical bars + features under a [`CostModel`].
 pub struct Backtester {
+    /// Transaction-cost model applied to every fill.
     pub costs: CostModel,
+    /// Walk-forward split (carried for the harness; single runs ignore it).
     pub walk_forward: WalkForward,
     /// Optional target daily volatility; when set, gross exposure is scaled each
     /// step by target / trailing-realized-vol (capped) to control the geometric
@@ -96,26 +107,41 @@ fn vol_target_scale(target: Option<Decimal>, past: &[f64]) -> Decimal {
     if past.len() < 5 || tf <= 0.0 {
         return Decimal::ONE;
     }
-    let w = &past[past.len().saturating_sub(VOL_WINDOW)..];
+    let Some(w) = past.get(past.len().saturating_sub(VOL_WINDOW)..) else {
+        return Decimal::ONE;
+    };
     let mean = w.iter().sum::<f64>() / w.len() as f64;
     let var = w.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / w.len() as f64;
     let vol = var.sqrt();
-    let s = if vol > 1e-9 { (tf / vol).min(MAX_LEVERAGE) } else { MAX_LEVERAGE };
+    let s = if vol > 1e-9 {
+        (tf / vol).min(MAX_LEVERAGE)
+    } else {
+        MAX_LEVERAGE
+    };
     Decimal::from_f64_retain(s.max(0.0)).unwrap_or(Decimal::ONE)
 }
 
 impl Backtester {
-    pub fn new(costs: CostModel, walk_forward: WalkForward) -> Self {
-        Self { costs, walk_forward, vol_target: None, rebalance_every: 1 }
+    /// Create a backtester from a cost model and a walk-forward split.
+    #[must_use]
+    pub const fn new(costs: CostModel, walk_forward: WalkForward) -> Self {
+        Self {
+            costs,
+            walk_forward,
+            vol_target: None,
+            rebalance_every: 1,
+        }
     }
 
     /// Enable portfolio volatility targeting at `target` daily vol.
-    pub fn with_vol_target(mut self, target: Option<Decimal>) -> Self {
+    #[must_use]
+    pub const fn with_vol_target(mut self, target: Option<Decimal>) -> Self {
         self.vol_target = target;
         self
     }
 
     /// Rebalance every `every` bars (turnover control); `every` < 1 is treated as 1.
+    #[must_use]
     pub fn with_rebalance_every(mut self, every: usize) -> Self {
         self.rebalance_every = every.max(1);
         self
@@ -186,19 +212,20 @@ impl Backtester {
         let mut held: HashMap<String, Decimal> = initial_held.clone();
         let mut net_returns: Vec<f64> = Vec::new();
         let mut result = BacktestResult {
-            equity_curve: vec![(ms_to_dt(times[0])?, equity)],
+            equity_curve: vec![(ms_to_dt(times.first().copied().unwrap_or_default())?, equity)],
             trades: Vec::new(),
         };
         let cadence = self.rebalance_every.max(1);
 
         for (step, pair) in times.windows(2).enumerate() {
-            let (t0, t1) = (pair[0], pair[1]);
+            let &[t0, t1] = pair else { continue };
 
             // Rebalance only every `cadence` bars; between, hold weights and pay no
             // costs — the turnover-control lever.
             let mut total_cost = Decimal::ZERO;
             if step % cadence == 0 {
-                let targets = strategy.target_weights(&sections[&t0])?;
+                let Some(section) = sections.get(&t0) else { continue };
+                let targets = strategy.target_weights(section)?;
                 // Vol targeting scales gross exposure from trailing realized vol.
                 let scale = vol_target_scale(self.vol_target, &net_returns);
                 let mut target: HashMap<String, Decimal> = HashMap::new();
@@ -244,12 +271,11 @@ impl Backtester {
                 if *w == Decimal::ZERO {
                     continue;
                 }
-                if let Some(cmap) = closes.get(pool) {
-                    if let (Some(c0), Some(c1)) = (cmap.get(&t0), cmap.get(&t1)) {
-                        if *c0 > Decimal::ZERO {
-                            gross += *w * (c1 / c0 - Decimal::ONE);
-                        }
-                    }
+                if let Some(cmap) = closes.get(pool)
+                    && let (Some(c0), Some(c1)) = (cmap.get(&t0), cmap.get(&t1))
+                    && *c0 > Decimal::ZERO
+                {
+                    gross += *w * (c1 / c0 - Decimal::ONE);
                 }
             }
 
@@ -257,12 +283,20 @@ impl Backtester {
             let mut funding_pnl = Decimal::ZERO;
             for (pool, w) in &held {
                 if *w != Decimal::ZERO {
-                    let f = funding_daily.get(pool).and_then(|m| m.get(&t0)).copied().unwrap_or(Decimal::ZERO);
+                    let f = funding_daily
+                        .get(pool)
+                        .and_then(|m| m.get(&t0))
+                        .copied()
+                        .unwrap_or(Decimal::ZERO);
                     funding_pnl -= *w * f;
                 }
             }
 
-            let cost_drag = if equity > Decimal::ZERO { total_cost / equity } else { Decimal::ZERO };
+            let cost_drag = if equity > Decimal::ZERO {
+                total_cost / equity
+            } else {
+                Decimal::ZERO
+            };
             let net = gross + funding_pnl - cost_drag;
             // A real account can't go below zero — ruin floors equity at 0.
             equity = (equity + equity * net).max(Decimal::ZERO);
@@ -283,7 +317,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn inst(name: &str) -> Instrument {
-        Instrument { network: Network::Base, pool: PoolId(name.into()), name: name.into(), token: None }
+        Instrument {
+            network: Network::Base,
+            pool: PoolId(name.into()),
+            name: name.into(),
+            token: None,
+        }
     }
 
     // Flat prices (gross return = 0) so final equity reflects *costs only*. Momentum
@@ -306,18 +345,40 @@ mod tests {
         let mut rows = Vec::new();
         for d in 0..4 {
             let (ma, mb) = if d % 2 == 0 { (1, 0) } else { (0, 1) };
-            rows.push(FeatureRow { instrument: a.clone(), ts: day(d), values: BTreeMap::from([("mom".to_string(), Decimal::from(ma))]) });
-            rows.push(FeatureRow { instrument: b.clone(), ts: day(d), values: BTreeMap::from([("mom".to_string(), Decimal::from(mb))]) });
+            rows.push(FeatureRow {
+                instrument: a.clone(),
+                ts: day(d),
+                values: BTreeMap::from([("mom".to_string(), Decimal::from(ma))]),
+            });
+            rows.push(FeatureRow {
+                instrument: b.clone(),
+                ts: day(d),
+                values: BTreeMap::from([("mom".to_string(), Decimal::from(mb))]),
+            });
         }
         (bars, FeatureFrame { rows })
     }
 
     fn final_equity(volume: i64) -> Decimal {
         let (bars, frame) = scenario(volume);
-        let strat = CrossSectional { rank_feature: "mom".to_string(), top_quantile: 0.5, allow_short: false, invert: false, weight_feature: None };
+        let strat = CrossSectional {
+            rank_feature: "mom".to_string(),
+            top_quantile: 0.5,
+            allow_short: false,
+            invert: false,
+            weight_feature: None,
+        };
         let bt = Backtester::new(
-            CostModel { fee_frac: Decimal::new(5, 4), slippage_coeff: Decimal::new(5, 1), gas_usd: Decimal::ZERO },
-            WalkForward { train_bars: 1, test_bars: 1, embargo_bars: 0 },
+            CostModel {
+                fee_frac: Decimal::new(5, 4),
+                slippage_coeff: Decimal::new(5, 1),
+                gas_usd: Decimal::ZERO,
+            },
+            WalkForward {
+                train_bars: 1,
+                test_bars: 1,
+                embargo_bars: 0,
+            },
         );
         bt.run(&strat, &bars, &frame, &[]).unwrap().equity_curve.last().unwrap().1
     }
@@ -336,12 +397,34 @@ mod tests {
         // Momentum flips daily, so daily rebalancing rotates A<->B every step; a
         // long cadence rebalances once and holds, trading (and paying) far less.
         let (bars, frame) = scenario(1_000_000);
-        let strat = CrossSectional { rank_feature: "mom".to_string(), top_quantile: 0.5, allow_short: false, invert: false, weight_feature: None };
-        let costs = CostModel { fee_frac: Decimal::new(5, 4), slippage_coeff: Decimal::new(5, 1), gas_usd: Decimal::ZERO };
-        let wf = WalkForward { train_bars: 1, test_bars: 1, embargo_bars: 0 };
+        let strat = CrossSectional {
+            rank_feature: "mom".to_string(),
+            top_quantile: 0.5,
+            allow_short: false,
+            invert: false,
+            weight_feature: None,
+        };
+        let costs = CostModel {
+            fee_frac: Decimal::new(5, 4),
+            slippage_coeff: Decimal::new(5, 1),
+            gas_usd: Decimal::ZERO,
+        };
+        let wf = WalkForward {
+            train_bars: 1,
+            test_bars: 1,
+            embargo_bars: 0,
+        };
         let daily = Backtester::new(costs.clone(), wf).run(&strat, &bars, &frame, &[]).unwrap();
-        let rare = Backtester::new(costs, wf).with_rebalance_every(10).run(&strat, &bars, &frame, &[]).unwrap();
-        assert!(rare.trades.len() < daily.trades.len(), "rare {} < daily {}", rare.trades.len(), daily.trades.len());
+        let rare = Backtester::new(costs, wf)
+            .with_rebalance_every(10)
+            .run(&strat, &bars, &frame, &[])
+            .unwrap();
+        assert!(
+            rare.trades.len() < daily.trades.len(),
+            "rare {} < daily {}",
+            rare.trades.len(),
+            daily.trades.len()
+        );
         // Flat prices => equity reflects costs only; fewer trades ends richer.
         let (de, re) = (daily.equity_curve.last().unwrap().1, rare.equity_curve.last().unwrap().1);
         assert!(re > de, "rare {re} should beat daily {de} on cost savings");
@@ -353,13 +436,34 @@ mod tests {
         // Seeding a segment with its own opening positions skips the cash-entry cost
         // (the walk-forward carry that keeps OOS returns from being deflated).
         let (bars, frame) = scenario(1_000);
-        let strat = CrossSectional { rank_feature: "mom".to_string(), top_quantile: 0.5, allow_short: false, invert: false, weight_feature: None };
-        let costs = CostModel { fee_frac: Decimal::new(5, 4), slippage_coeff: Decimal::new(5, 1), gas_usd: Decimal::ZERO };
-        let bt = Backtester::new(costs, WalkForward { train_bars: 1, test_bars: 1, embargo_bars: 0 });
+        let strat = CrossSectional {
+            rank_feature: "mom".to_string(),
+            top_quantile: 0.5,
+            allow_short: false,
+            invert: false,
+            weight_feature: None,
+        };
+        let costs = CostModel {
+            fee_frac: Decimal::new(5, 4),
+            slippage_coeff: Decimal::new(5, 1),
+            gas_usd: Decimal::ZERO,
+        };
+        let bt = Backtester::new(
+            costs,
+            WalkForward {
+                train_bars: 1,
+                test_bars: 1,
+                embargo_bars: 0,
+            },
+        );
         let t0 = frame.rows.iter().map(|r| r.ts).min().unwrap();
         let cs: Vec<FeatureRow> = frame.rows.iter().filter(|r| r.ts == t0).cloned().collect();
-        let opening: HashMap<String, Decimal> =
-            strat.target_weights(&cs).unwrap().into_iter().map(|tw| (tw.instrument.pool.0, tw.weight)).collect();
+        let opening: HashMap<String, Decimal> = strat
+            .target_weights(&cs)
+            .unwrap()
+            .into_iter()
+            .map(|tw| (tw.instrument.pool.0, tw.weight))
+            .collect();
         let cash = bt.run(&strat, &bars, &frame, &[]).unwrap();
         let (seeded, _end) = bt.run_stateful(&strat, &bars, &frame, &[], &opening).unwrap();
         let (c, s) = (cash.equity_curve.last().unwrap().1, seeded.equity_curve.last().unwrap().1);

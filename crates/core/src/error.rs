@@ -26,4 +26,5 @@ pub enum CoreError {
     Config(String),
 }
 
+/// Workspace result alias: `Ok(T)` or a [`CoreError`].
 pub type Result<T> = std::result::Result<T, CoreError>;

@@ -9,3 +9,6 @@ license.workspace = true
 cw-core.workspace = true
 chrono.workspace = true
 rust_decimal.workspace = true
+
+[lints]
+workspace = true

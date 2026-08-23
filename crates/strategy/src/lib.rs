@@ -10,7 +10,8 @@ use cw_features::FeatureRow;
 
 /// Maps a rebalance-point cross-section to desired positions.
 pub trait Strategy {
-    fn name(&self) -> &str;
+    /// Stable strategy name for logging.
+    fn name(&self) -> &'static str;
 
     /// Produce target weights from the cross-section of features at one instant.
     /// Implementations must be pure (no hidden state, no lookahead).
@@ -41,7 +42,7 @@ pub struct CrossSectional {
 }
 
 impl Strategy for CrossSectional {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "cross_sectional"
     }
 
@@ -57,9 +58,9 @@ impl Strategy for CrossSectional {
             return Ok(Vec::new());
         }
         if self.invert {
-            ranked.sort_by(|a, b| a.1.cmp(&b.1)); // ascending: long the low end
+            ranked.sort_by_key(|a| a.1); // ascending: long the low end
         } else {
-            ranked.sort_by(|a, b| b.1.cmp(&a.1)); // descending: long the high end
+            ranked.sort_by_key(|a| std::cmp::Reverse(a.1)); // descending: long the high end
         }
 
         let n = ranked.len();
@@ -96,8 +97,15 @@ fn allocate(rows: &[&FeatureRow], gross: Decimal, weight_feature: Option<&str>) 
     rows.iter()
         .zip(&raws)
         .map(|(r, raw)| {
-            let frac = if total > Decimal::ZERO { *raw / total } else { Decimal::ONE / n };
-            TargetWeight { instrument: r.instrument.clone(), weight: gross * frac }
+            let frac = if total > Decimal::ZERO {
+                *raw / total
+            } else {
+                Decimal::ONE / n
+            };
+            TargetWeight {
+                instrument: r.instrument.clone(),
+                weight: gross * frac,
+            }
         })
         .collect()
 }

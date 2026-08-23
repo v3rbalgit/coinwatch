@@ -13,3 +13,6 @@ cw-backtest.workspace = true
 cw-eval.workspace = true
 chrono.workspace = true
 rust_decimal.workspace = true
+
+[lints]
+workspace = true

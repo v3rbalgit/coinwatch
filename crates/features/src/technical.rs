@@ -24,8 +24,11 @@ const FEATURES: [&str; 3] = ["mom", "vol", "rsi"];
 /// Configurable TA feature set. Lookbacks are in bars of the source interval.
 #[derive(Debug, Clone)]
 pub struct TechnicalFeatures {
+    /// Lookback (bars) for the momentum feature.
     pub momentum_lookback: usize,
+    /// Lookback (bars) for the volatility feature.
     pub vol_lookback: usize,
+    /// Lookback (bars) for RSI.
     pub rsi_lookback: usize,
 }
 
@@ -42,27 +45,25 @@ impl Default for TechnicalFeatures {
 impl TechnicalFeatures {
     /// Bars of history required before the first row can be emitted.
     fn warmup(&self) -> usize {
-        self.momentum_lookback
-            .max(self.vol_lookback)
-            .max(self.rsi_lookback)
+        self.momentum_lookback.max(self.vol_lookback).max(self.rsi_lookback)
     }
 }
 
 /// Simple return over `lb` bars ending at index `i`.
 fn momentum(closes: &[f64], i: usize, lb: usize) -> Option<f64> {
-    let prev = closes[i - lb];
+    let prev = *closes.get(i - lb)?;
     if prev == 0.0 {
         return None;
     }
-    Some(closes[i] / prev - 1.0)
+    Some(*closes.get(i)? / prev - 1.0)
 }
 
 /// Population stdev of log returns over the `lb` bars ending at index `i`.
 fn volatility(closes: &[f64], i: usize, lb: usize) -> Option<f64> {
+    let window = closes.get(i - lb..=i)?;
     let mut rets = Vec::with_capacity(lb);
-    for t in (i - lb + 1)..=i {
-        let (p0, p1) = (closes[t - 1], closes[t]);
-        if p0 <= 0.0 || p1 <= 0.0 {
+    for (p0, p1) in window.iter().zip(window.iter().skip(1)) {
+        if *p0 <= 0.0 || *p1 <= 0.0 {
             return None;
         }
         rets.push((p1 / p0).ln());
@@ -75,9 +76,10 @@ fn volatility(closes: &[f64], i: usize, lb: usize) -> Option<f64> {
 
 /// Simple (SMA-based) RSI over the `lb` deltas ending at index `i`.
 fn rsi(closes: &[f64], i: usize, lb: usize) -> Option<f64> {
+    let window = closes.get(i - lb..=i)?;
     let (mut gain, mut loss) = (0.0, 0.0);
-    for t in (i - lb + 1)..=i {
-        let d = closes[t] - closes[t - 1];
+    for (p0, p1) in window.iter().zip(window.iter().skip(1)) {
+        let d = p1 - p0;
         if d >= 0.0 {
             gain += d;
         } else {
@@ -98,7 +100,7 @@ fn dec(x: f64) -> Decimal {
 }
 
 impl FeatureModule for TechnicalFeatures {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "technical"
     }
 
@@ -185,7 +187,12 @@ mod tests {
             rsi_lookback: 5,
         };
         let dataset = vec![(instrument(), bars)];
-        let frame = module.compute(&FeatureContext { bars: &dataset, funding: &[] }).unwrap();
+        let frame = module
+            .compute(&FeatureContext {
+                bars: &dataset,
+                funding: &[],
+            })
+            .unwrap();
 
         assert!(!frame.rows.is_empty());
         let last = frame.rows.last().unwrap();
@@ -204,7 +211,12 @@ mod tests {
             rsi_lookback: 10,
         };
         let dataset = vec![(instrument(), bars)];
-        let frame = module.compute(&FeatureContext { bars: &dataset, funding: &[] }).unwrap();
+        let frame = module
+            .compute(&FeatureContext {
+                bars: &dataset,
+                funding: &[],
+            })
+            .unwrap();
         assert!(frame.rows.is_empty());
     }
 
@@ -218,7 +230,12 @@ mod tests {
             rsi_lookback: 5,
         };
         let dataset = vec![(instrument(), bars)];
-        let frame = module.compute(&FeatureContext { bars: &dataset, funding: &[] }).unwrap();
+        let frame = module
+            .compute(&FeatureContext {
+                bars: &dataset,
+                funding: &[],
+            })
+            .unwrap();
         let last = frame.rows.last().unwrap();
         assert!(last.values["mom"] < Decimal::ZERO);
         assert_eq!(last.values["rsi"], dec(0.0));

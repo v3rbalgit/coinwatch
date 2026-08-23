@@ -19,14 +19,18 @@ use cw_core::{Bar, Decimal, FundingPoint, Instrument, Result};
 /// the engine (`strategy`/`backtest`/`eval`) never sees this — it's a feature-layer
 /// concern. New signal channels (alt-data) are added here as needed.
 pub struct FeatureContext<'a> {
+    /// Per-instrument bars, oldest-first.
     pub bars: &'a [(Instrument, Vec<Bar>)],
+    /// Per-instrument hourly funding, oldest-first.
     pub funding: &'a [(Instrument, Vec<FundingPoint>)],
 }
 
 /// One row of computed features for one instrument at one timestamp.
 #[derive(Debug, Clone)]
 pub struct FeatureRow {
+    /// Instrument this row describes.
     pub instrument: Instrument,
+    /// Rebalance timestamp (UTC).
     pub ts: DateTime<Utc>,
     /// Named feature values (ordered for stable serialization).
     pub values: BTreeMap<String, Decimal>,
@@ -35,14 +39,18 @@ pub struct FeatureRow {
 /// The `(entity × time × feature)` matrix a module produces.
 #[derive(Debug, Default, Clone)]
 pub struct FeatureFrame {
+    /// All computed rows, one per `(instrument, timestamp)`.
     pub rows: Vec<FeatureRow>,
 }
 
 /// A pluggable edge hypothesis. `feature_names` declares the columns this
 /// module contributes so the strategy layer can bind to them by name.
 pub trait FeatureModule {
-    fn name(&self) -> &str;
+    /// Stable module name for logging.
+    fn name(&self) -> &'static str;
+    /// The feature columns this module contributes.
     fn feature_names(&self) -> &[&str];
+    /// Compute the `(instrument × time × feature)` matrix for `ctx`.
     fn compute(&self, ctx: &FeatureContext<'_>) -> Result<FeatureFrame>;
 }
 

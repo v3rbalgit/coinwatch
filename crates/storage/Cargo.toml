@@ -9,3 +9,6 @@ license.workspace = true
 cw-core.workspace = true
 chrono.workspace = true
 duckdb = { version = "1", features = ["bundled"] }
+
+[lints]
+workspace = true

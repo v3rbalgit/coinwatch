@@ -1,0 +1,13 @@
+# Rustfmt configuration - only non-default values.
+# See all defaults: `rustfmt --print-config default`
+
+# Use Rust 2024 edition parsing rules.
+edition = "2024"
+
+# Allow longer lines for complex expressions (default: 100).
+max_width = 120
+
+# Allow wider function calls and method chains before wrapping (default: 60).
+# Prevents excessive line breaking in fluent APIs and builder patterns.
+fn_call_width = 80
+chain_width = 80
