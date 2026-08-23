@@ -77,9 +77,9 @@ fn bench_sweep(c: &mut Criterion) {
         FundingFeatures::default().compute(&ctx).unwrap_or_default(),
     ]);
     let costs = CostModel {
-        fee_frac: Decimal::new(5, 4),
+        fee_frac: Decimal::new(45, 5),
+        spread_frac: Decimal::new(5, 4),
         slippage_coeff: Decimal::new(5, 1),
-        gas_usd: Decimal::new(50, 2),
     };
     let mk = |feature: &str, invert: bool| CrossSectional {
         rank_feature: feature.to_string(),

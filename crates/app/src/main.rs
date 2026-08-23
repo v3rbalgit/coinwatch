@@ -79,40 +79,20 @@ fn pct(r: &BacktestResult) -> Decimal {
 async fn ingest() -> Result<()> {
     let hl = Hyperliquid::new();
     let store = open_store()?;
-    let perps = hl.top_perps(40, Decimal::from(1_000_000u64)).await?;
-    println!("hyperliquid: {} perps (min 24h vol $1M)", perps.len());
+    // Widen the universe: illiquidity needs genuine dispersion, so include every
+    // tradeable perp (floor keeps out untradeable dust), not just the top-40 liquid.
+    let perps = hl.top_perps(300, Decimal::from(250_000u64)).await?;
+    println!("hyperliquid: {} perps (min 24h vol $250k)", perps.len());
 
-    let (mut total, mut funding_rows) = (0usize, 0usize);
+    // Pass 1 — BARS for every coin first. candleSnapshot doesn't throttle, so all
+    // ~117 coins fetch in a couple minutes; this unblocks cross-sectional analysis
+    // (the illiquidity edge needs only bars) before the slow funding backfill.
+    let mut total = 0usize;
     for (inst, day_vol) in &perps {
         store.register_instrument(inst)?;
-
         let stored = store.load_bars(inst, Interval::Day, wide_range()).unwrap_or_default();
-
-        // Funding (perp carry signal): deep-backfill ~3y, resumable by depth. A coin
-        // is done once its funding reaches the target window — or as far back as its
-        // own price history goes, for coins listed <3y ago — and is current.
-        let existing = store
-            .load_funding(&inst.network, &inst.pool.0, wide_range())
-            .unwrap_or_default();
-        let target = Utc::now() - Duration::days(FUNDING_DAYS - 45);
-        let earliest_bar = stored.first().map(|b| b.ts);
-        let deep = existing
-            .first()
-            .is_some_and(|p| p.time < target || earliest_bar.is_some_and(|eb| p.time < eb + Duration::days(35)));
-        let current = existing.last().is_some_and(|p| p.time > Utc::now() - Duration::days(3));
-        if !(deep && current) {
-            match hl.fetch_funding(&inst.pool.0, Utc::now() - Duration::days(FUNDING_DAYS)).await {
-                Ok(f) if !f.is_empty() => {
-                    funding_rows += store.upsert_funding(&inst.network, &inst.pool.0, &f)?;
-                }
-                Ok(_) => {}
-                Err(e) => eprintln!("  {:<12} funding: {e}", inst.name),
-            }
-        }
-
-        // Bars: resumable — skip coins already backfilled and current.
         if stored.len() >= 300 && stored.last().is_some_and(|b| b.ts > Utc::now() - Duration::days(2)) {
-            println!("  {:<12} up-to-date", inst.name);
+            println!("  {:<12} bars up-to-date", inst.name);
             continue;
         }
         let req = BarRequest {
@@ -127,7 +107,41 @@ async fn ingest() -> Result<()> {
                 println!("  {:<12} {:>5} bars  24h_vol=${:>14.0}", inst.name, n, day_vol);
             }
             Ok(_) => println!("  {:<12} no bars", inst.name),
-            Err(e) => eprintln!("  {:<12} fetch failed: {e}", inst.name),
+            Err(e) => eprintln!("  {:<12} bars failed: {e}", inst.name),
+        }
+    }
+    println!(
+        "bars pass complete: {total} bars across {} perps; backfilling funding...",
+        perps.len()
+    );
+
+    // Pass 2 — deep funding backfill (~3y, resumable by depth). fundingHistory
+    // throttles to ~1 req/s under pagination, so this is the slow part, but it runs
+    // after bars so analysis can proceed on the wide universe meanwhile. A coin is
+    // done once its funding reaches the target window (or as far back as its own
+    // price history goes, for coins listed <3y ago) and is current.
+    let mut funding_rows = 0usize;
+    for (inst, _) in &perps {
+        let stored = store.load_bars(inst, Interval::Day, wide_range()).unwrap_or_default();
+        let existing = store
+            .load_funding(&inst.network, &inst.pool.0, wide_range())
+            .unwrap_or_default();
+        let target = Utc::now() - Duration::days(FUNDING_DAYS - 45);
+        let earliest_bar = stored.first().map(|b| b.ts);
+        let deep = existing
+            .first()
+            .is_some_and(|p| p.time < target || earliest_bar.is_some_and(|eb| p.time < eb + Duration::days(35)));
+        let current = existing.last().is_some_and(|p| p.time > Utc::now() - Duration::days(3));
+        if deep && current {
+            continue;
+        }
+        match hl.fetch_funding(&inst.pool.0, Utc::now() - Duration::days(FUNDING_DAYS)).await {
+            Ok(f) if !f.is_empty() => {
+                funding_rows += store.upsert_funding(&inst.network, &inst.pool.0, &f)?;
+                println!("  {:<12} {:>6} funding rows", inst.name, f.len());
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("  {:<12} funding: {e}", inst.name),
         }
     }
     println!(
@@ -260,9 +274,9 @@ fn analyze() -> Result<()> {
     // and multiple-testing deflation? Long-only, biweekly rebalance (turnover
     // control), no vol targeting.
     let costs = CostModel {
-        fee_frac: Decimal::new(5, 4),
-        slippage_coeff: Decimal::new(5, 1),
-        gas_usd: Decimal::new(50, 2),
+        fee_frac: Decimal::new(45, 5),      // 4.5 bps HL taker
+        spread_frac: Decimal::new(5, 4),    // 5 bps close-to-fill (half-spread + timing gap)
+        slippage_coeff: Decimal::new(5, 1), // linear market impact vs participation
     };
     let cadence = 14usize;
     let wf_cfg = WfConfig {
@@ -314,6 +328,33 @@ fn analyze() -> Result<()> {
             sleeves: vec![
                 (Decimal::new(5, 1), mk("illiq", 0.30, true, false)),
                 (Decimal::new(5, 1), mk("fund_z", 0.30, true, true)),
+            ],
+        },
+    ));
+    // Two disciplined variants, deflated alongside everything: a Sharpe-proportional
+    // illiq-heavy tilt, and inverse-vol position sizing within each sleeve.
+    let iv = |feature: &str, invert: bool| CrossSectional {
+        rank_feature: feature.to_string(),
+        top_quantile: 0.30,
+        allow_short: true,
+        invert,
+        weight_feature: Some("vol".to_string()),
+    };
+    candidates.push((
+        "blend 60/40".to_string(),
+        Blend {
+            sleeves: vec![
+                (Decimal::new(6, 1), mk("illiq", 0.30, true, false)),
+                (Decimal::new(4, 1), mk("fund_z", 0.30, true, true)),
+            ],
+        },
+    ));
+    candidates.push((
+        "blend iv 50/50".to_string(),
+        Blend {
+            sleeves: vec![
+                (Decimal::new(5, 1), iv("illiq", false)),
+                (Decimal::new(5, 1), iv("fund_z", true)),
             ],
         },
     ));
@@ -512,9 +553,9 @@ fn run_backtest(
         weight_feature: None,
     };
     let costs = CostModel {
-        fee_frac: Decimal::new(5, 4),       // 5 bps swap fee
-        slippage_coeff: Decimal::new(5, 1), // linear price-impact coefficient
-        gas_usd: Decimal::new(50, 2),       // $0.50 per position change
+        fee_frac: Decimal::new(45, 5),      // 4.5 bps HL taker
+        spread_frac: Decimal::new(5, 4),    // 5 bps close-to-fill
+        slippage_coeff: Decimal::new(5, 1), // linear market impact vs participation
     };
     let backtester = Backtester::new(
         costs,

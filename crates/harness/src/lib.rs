@@ -463,7 +463,7 @@ mod tests {
         let costs = CostModel {
             fee_frac: Decimal::new(5, 4),
             slippage_coeff: Decimal::new(10, 4),
-            gas_usd: Decimal::ZERO,
+            spread_frac: Decimal::ZERO,
         };
         let wf = walk_forward(
             &candidates,
@@ -550,7 +550,7 @@ mod tests {
         let costs = CostModel {
             fee_frac: Decimal::new(5, 4),
             slippage_coeff: Decimal::new(5, 1),
-            gas_usd: Decimal::ZERO,
+            spread_frac: Decimal::ZERO,
         };
         let rows = sweep(
             &candidates,

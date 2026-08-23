@@ -35,13 +35,15 @@ const MAX_PARTICIPATION: f64 = 0.5;
 /// Transaction-cost parameters applied to every simulated fill.
 #[derive(Debug, Clone)]
 pub struct CostModel {
-    /// DEX swap fee as a fraction (e.g. 0.0005 for a 5 bps pool).
+    /// Taker fee as a fraction of notional (Hyperliquid perps ≈ 0.00045 = 4.5 bps).
     pub fee_frac: Decimal,
-    /// Flat gas cost per changed position, in quote currency (USD).
-    pub gas_usd: Decimal,
-    /// Linear price-impact coefficient. Per-trade slippage = `coeff × notional ×
-    /// participation`, where `participation = min(notional / pool_daily_volume, 0.5)`.
-    /// So small trades in deep pools cost ~nothing; large trades in thin pools cost more.
+    /// Close-to-fill cost as a fraction of notional: the half-spread plus the gap
+    /// between the signal's daily close and the actual fill. HL has no per-trade gas,
+    /// so execution cost is proportional to notional, not a flat charge.
+    pub spread_frac: Decimal,
+    /// Linear market-impact coefficient. Per-trade impact = `coeff × notional ×
+    /// participation`, where `participation = min(notional / daily_volume, 0.5)`.
+    /// Small trades in deep books cost ~nothing; large trades in thin books cost more.
     pub slippage_coeff: Decimal,
 }
 
@@ -267,7 +269,7 @@ impl Backtester {
         let to_dec = |x: f64| Decimal::from_f64_retain(x).unwrap_or_default();
         let fee = self.costs.fee_frac.to_f64().unwrap_or(0.0);
         let slip = self.costs.slippage_coeff.to_f64().unwrap_or(0.0);
-        let gas = self.costs.gas_usd.to_f64().unwrap_or(0.0);
+        let spread = self.costs.spread_frac.to_f64().unwrap_or(0.0);
 
         let mut equity = INITIAL_CAPITAL_USD as f64;
         let mut held: HashMap<String, f64> = initial_held
@@ -316,7 +318,7 @@ impl Backtester {
                     } else {
                         MAX_PARTICIPATION
                     };
-                    let cost = fee * notional + slip * notional * participation + gas;
+                    let cost = notional * (fee + spread + slip * participation);
                     total_cost += cost;
                     if ledger {
                         result.trades.push(Trade {
@@ -427,7 +429,7 @@ mod tests {
             CostModel {
                 fee_frac: Decimal::new(5, 4),
                 slippage_coeff: Decimal::new(5, 1),
-                gas_usd: Decimal::ZERO,
+                spread_frac: Decimal::ZERO,
             },
             WalkForward {
                 train_bars: 1,
@@ -462,7 +464,7 @@ mod tests {
         let costs = CostModel {
             fee_frac: Decimal::new(5, 4),
             slippage_coeff: Decimal::new(5, 1),
-            gas_usd: Decimal::ZERO,
+            spread_frac: Decimal::ZERO,
         };
         let wf = WalkForward {
             train_bars: 1,
@@ -501,7 +503,7 @@ mod tests {
         let costs = CostModel {
             fee_frac: Decimal::new(5, 4),
             slippage_coeff: Decimal::new(5, 1),
-            gas_usd: Decimal::ZERO,
+            spread_frac: Decimal::ZERO,
         };
         let bt = Backtester::new(
             costs,
