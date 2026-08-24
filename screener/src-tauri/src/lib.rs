@@ -5,13 +5,17 @@
 //! them to the Svelte frontend as Tauri commands.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{Duration, Utc};
 use cw_core::{Bar, FundingPoint, Instrument, Interval};
-use cw_features::{FeatureContext, FeatureModule, FeatureRow, FundingFeatures, LiquidityFeatures, TechnicalFeatures, combine};
+use cw_features::{FeatureContext, FeatureModule, FeatureRow, FundingFeatures, TechnicalFeatures, combine};
 use cw_storage::{DuckStore, Store, TimeRange};
-use hl_feed::{HyperliquidAdapter, MarketEvent};
+use hl_feed::{HyperliquidAdapter, MarketEvent, fetch_universe};
+use indicators::{DivergenceDirection, DivergenceKind};
 use rust_decimal::prelude::ToPrimitive;
+use scanner::{ScanConfig, Signal, SignalSource, scan_coin};
 use serde::Serialize;
 use tauri::Emitter;
 use tokio::sync::broadcast::error::RecvError;
@@ -30,12 +34,8 @@ struct ScreenerRow {
     price: f64,
     change_24h_pct: f64,
     volume_usd: f64,
-    momentum: f64,
     rsi: f64,
-    vol: f64,
-    illiq: f64,
     funding_rate: f64,
-    funding_z: f64,
 }
 
 fn wide_range() -> TimeRange {
@@ -73,7 +73,6 @@ fn screener_rows() -> Result<Vec<ScreenerRow>, String> {
     let ctx = FeatureContext { bars: &dataset, funding: &funding };
     let frame = combine(&[
         TechnicalFeatures::default().compute(&ctx).unwrap_or_default(),
-        LiquidityFeatures::default().compute(&ctx).unwrap_or_default(),
         FundingFeatures::default().compute(&ctx).unwrap_or_default(),
     ]);
 
@@ -102,12 +101,8 @@ fn screener_rows() -> Result<Vec<ScreenerRow>, String> {
             price,
             change_24h_pct,
             volume_usd: last.volume.to_f64().unwrap_or(0.0),
-            momentum: fr.map_or(0.0, |r| fval(r, "mom")),
             rsi: fr.map_or(0.0, |r| fval(r, "rsi")),
-            vol: fr.map_or(0.0, |r| fval(r, "vol")),
-            illiq: fr.map_or(0.0, |r| fval(r, "illiq")),
             funding_rate: fr.map_or(0.0, |r| fval(r, "fund_rate")),
-            funding_z: fr.map_or(0.0, |r| fval(r, "fund_z")),
         });
     }
     Ok(rows)
@@ -120,6 +115,102 @@ struct MidPayload {
     price: f64,
 }
 
+/// A divergence setup forwarded to the frontend as a `scan:signal` event.
+#[derive(Clone, Serialize)]
+struct SignalPayload {
+    coin: String,
+    timeframe: String,
+    source: String,
+    kind: String,
+    direction: String,
+    at: String,
+}
+
+impl From<&Signal> for SignalPayload {
+    fn from(signal: &Signal) -> Self {
+        Self {
+            coin: signal.coin.clone(),
+            timeframe: signal.timeframe.as_hl().to_owned(),
+            source: match signal.source {
+                SignalSource::Rsi => "RSI",
+                SignalSource::Macd => "MACD",
+            }
+            .to_owned(),
+            kind: match signal.kind {
+                DivergenceKind::Regular => "Regular",
+                DivergenceKind::Hidden => "Hidden",
+            }
+            .to_owned(),
+            direction: match signal.direction {
+                DivergenceDirection::Bullish => "Bullish",
+                DivergenceDirection::Bearish => "Bearish",
+            }
+            .to_owned(),
+            at: signal.at.to_rfc3339(),
+        }
+    }
+}
+
+/// A coin whose scan failed, forwarded as a `scan:failure` event.
+#[derive(Clone, Serialize)]
+struct FailurePayload {
+    coin: String,
+    error: String,
+}
+
+/// Guards against overlapping scans.
+struct ScanRunning(Arc<AtomicBool>);
+
+/// Kick off a background universe scan; signals stream to the UI as events.
+#[tauri::command]
+fn start_scan(app: tauri::AppHandle, state: tauri::State<'_, ScanRunning>, limit: usize) -> Result<(), String> {
+    let running = Arc::clone(&state.0);
+    if running.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return Err("a scan is already running".to_owned());
+    }
+    tauri::async_runtime::spawn(async move {
+        run_scan(&app, limit).await;
+        running.store(false, Ordering::SeqCst);
+    });
+    Ok(())
+}
+
+/// Fetch the top `limit` coins by volume and scan each for fresh RSI/MACD
+/// divergences, emitting `scan:*` events as it progresses.
+async fn run_scan(app: &tauri::AppHandle, limit: usize) {
+    let client = reqwest::Client::new();
+    let config = ScanConfig::default();
+
+    let coins = match fetch_universe(&client, limit, 1_000_000.0).await {
+        Ok(coins) => coins,
+        Err(error) => {
+            let _ = app.emit("scan:error", error.to_string());
+            return;
+        }
+    };
+
+    let total = coins.len();
+    let _ = app.emit("scan:started", total);
+    for (index, coin) in coins.iter().enumerate() {
+        match scan_coin(&client, &coin.coin, &config).await {
+            Ok(signals) => {
+                for signal in &signals {
+                    let _ = app.emit("scan:signal", SignalPayload::from(signal));
+                }
+            }
+            Err(error) => {
+                let _ = app.emit(
+                    "scan:failure",
+                    FailurePayload { coin: coin.coin.clone(), error: error.to_string() },
+                );
+            }
+        }
+        let _ = app.emit("scan:progress", index + 1);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+    let _ = app.emit("scan:done", total);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // rustls needs a process-wide crypto provider before the first TLS handshake
@@ -128,6 +219,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .manage(ScanRunning(Arc::new(AtomicBool::new(false))))
         .setup(|app| {
             // Stream live Hyperliquid mids and relay them to the UI as `mid` events.
             let handle = app.handle().clone();
@@ -152,7 +244,7 @@ pub fn run() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![screener_rows])
+        .invoke_handler(tauri::generate_handler![screener_rows, start_scan])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

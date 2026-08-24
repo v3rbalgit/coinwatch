@@ -4081,6 +4081,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "scanner"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hl-feed",
+ "indicators",
+ "reqwest 0.12.28",
+ "rust_decimal",
+ "rustls",
+ "tokio",
+]
+
+[[package]]
 name = "schemars"
 version = "0.8.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4147,8 +4160,11 @@ dependencies = [
  "cw-providers",
  "cw-storage",
  "hl-feed",
+ "indicators",
+ "reqwest 0.12.28",
  "rust_decimal",
  "rustls",
+ "scanner",
  "serde",
  "serde_json",
  "tauri",

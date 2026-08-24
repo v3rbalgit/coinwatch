@@ -26,8 +26,11 @@ cw-storage = { workspace = true }
 cw-providers = { workspace = true }
 cw-features = { workspace = true }
 hl-feed = { workspace = true }
+indicators = { workspace = true }
+scanner = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }
 rust_decimal = { workspace = true }
+reqwest = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 

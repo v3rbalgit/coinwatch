@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
-const INFO_URL: &str = "https://api.hyperliquid.xyz/info";
+pub(crate) const INFO_URL: &str = "https://api.hyperliquid.xyz/info";
 
 /// A higher-timeframe interval the setup-finder scans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

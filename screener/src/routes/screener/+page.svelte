@@ -8,12 +8,8 @@
     price: number;
     change_24h_pct: number;
     volume_usd: number;
-    momentum: number;
     rsi: number;
-    vol: number;
-    illiq: number;
     funding_rate: number;
-    funding_z: number;
   };
 
   let rows = $state<Row[]>([]);
@@ -77,12 +73,8 @@
     { key: "price", label: "Price", num: true },
     { key: "change_24h_pct", label: "24h %", num: true },
     { key: "volume_usd", label: "Volume", num: true },
-    { key: "momentum", label: "Mom", num: true },
     { key: "rsi", label: "RSI", num: true },
-    { key: "vol", label: "Vol", num: true },
-    { key: "illiq", label: "Illiq", num: true },
     { key: "funding_rate", label: "Funding", num: true },
-    { key: "funding_z", label: "Fund-Z", num: true },
   ];
 </script>
 
@@ -125,12 +117,8 @@
               <td class="num">{fmtPrice(livePrices[r.coin] ?? r.price)}</td>
               <td class="num" class:up={r.change_24h_pct > 0} class:down={r.change_24h_pct < 0}>{r.change_24h_pct.toFixed(2)}%</td>
               <td class="num">{fmtUsd(r.volume_usd)}</td>
-              <td class="num">{r.momentum.toFixed(2)}</td>
               <td class="num" class:hot={r.rsi >= 70} class:cold={r.rsi <= 30}>{r.rsi.toFixed(0)}</td>
-              <td class="num">{(r.vol * 100).toFixed(1)}%</td>
-              <td class="num">{r.illiq.toFixed(2)}</td>
               <td class="num" class:up={r.funding_rate > 0} class:down={r.funding_rate < 0}>{(r.funding_rate * 100).toFixed(3)}%</td>
-              <td class="num">{r.funding_z.toFixed(2)}</td>
             </tr>
           {/each}
         </tbody>
