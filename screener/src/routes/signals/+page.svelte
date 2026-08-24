@@ -3,6 +3,9 @@
   import { listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
 
+  import Badge from "$lib/components/ui/badge.svelte";
+  import Button from "$lib/components/ui/button.svelte";
+
   type Signal = {
     coin: string;
     timeframe: string;
@@ -65,18 +68,14 @@
   }
 </script>
 
-<div class="flex h-full flex-col p-6">
-  <div class="flex flex-wrap items-center gap-3">
-    <h1 class="text-lg font-semibold text-primary">Signals</h1>
-    <button
-      onclick={startScan}
-      disabled={scanning}
-      class="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground transition-opacity disabled:opacity-50"
-    >
-      {scanning ? `Scanning ${done}/${total}\u2026` : "Scan"}
-    </button>
+<div class="flex h-full flex-col p-4">
+  <div class="flex flex-wrap items-center gap-3 pb-1">
+    <h1 class="text-base font-semibold tracking-tight text-primary">Signals</h1>
+    <Button size="sm" onclick={startScan} disabled={scanning}>
+      {scanning ? `Scanning ${done}/${total}…` : "Scan"}
+    </Button>
     <span class="text-sm text-muted-foreground">
-      {signals.length} signals{failures ? ` \u00b7 ${failures} failed` : ""}
+      {signals.length} signals{failures ? ` · ${failures} failed` : ""}
     </span>
   </div>
 
@@ -84,14 +83,14 @@
     RSI &amp; MACD divergences (regular + hidden) on 1h / 4h / 1d / 1w &mdash; freshest setups only.
   </p>
 
-  <div class="mt-4 flex-1 overflow-auto rounded-lg border border-border">
+  <div class="mt-4 min-h-0 flex-1 overflow-auto rounded-lg border border-border">
     {#if signals.length === 0}
       <div class="flex h-full items-center justify-center text-sm text-muted-foreground">
-        {scanning ? "Scanning the universe\u2026" : "Run a scan to surface divergence setups."}
+        {scanning ? "Scanning the universe…" : "Run a scan to surface divergence setups."}
       </div>
     {:else}
       <table class="w-full text-sm">
-        <thead class="sticky top-0 bg-card text-left text-muted-foreground">
+        <thead class="sticky top-0 bg-card text-left text-xs text-muted-foreground">
           <tr>
             <th class="px-3 py-2 font-medium">Coin</th>
             <th class="px-3 py-2 font-medium">TF</th>
@@ -102,12 +101,12 @@
         </thead>
         <tbody>
           {#each signals as s (s.coin + s.timeframe + s.source + s.kind + s.at)}
-            <tr class="border-t border-border hover:bg-accent/40">
-              <td class="px-3 py-1.5 font-medium">{s.coin}</td>
+            <tr class="border-t border-border/60 hover:bg-accent/40">
+              <td class="px-3 py-1.5 font-medium text-foreground">{s.coin}</td>
               <td class="px-3 py-1.5 text-muted-foreground">{s.timeframe}</td>
               <td class="px-3 py-1.5">{s.source} &middot; {s.kind}</td>
-              <td class="px-3 py-1.5 font-medium {s.direction === 'Bullish' ? 'text-green-500' : 'text-red-500'}">
-                {s.direction}
+              <td class="px-3 py-1.5">
+                <Badge variant={s.direction === "Bullish" ? "success" : "destructive"}>{s.direction}</Badge>
               </td>
               <td class="px-3 py-1.5 text-muted-foreground">{fmtTime(s.at)}</td>
             </tr>

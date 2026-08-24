@@ -3,6 +3,9 @@
   import { listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
 
+  import Badge from "$lib/components/ui/badge.svelte";
+  import Input from "$lib/components/ui/input.svelte";
+
   type Row = {
     coin: string;
     price: number;
@@ -87,32 +90,40 @@
   ];
 </script>
 
-<div class="screener">
-  <header>
-    <h1>Hyperliquid Screener</h1>
-    <div class="controls">
-      {#if live}<span class="live">● live</span>{/if}
-      <input placeholder="Filter coin…" bind:value={query} />
-      <span class="count">{filtered.length} / {rows.length}</span>
+<div class="flex h-full flex-col p-4">
+  <header class="flex flex-shrink-0 items-center justify-between gap-4 pb-3 pt-1">
+    <h1 class="text-base font-semibold tracking-tight text-primary">Hyperliquid Screener</h1>
+    <div class="flex items-center gap-3">
+      {#if live}<Badge variant="success">● live</Badge>{/if}
+      <Input placeholder="Filter coin…" bind:value={query} class="h-8 w-44" />
+      <span class="text-xs tabular-nums text-muted-foreground">{filtered.length} / {rows.length}</span>
     </div>
   </header>
 
   {#if loading && rows.length === 0}
-    <p class="msg">Loading market…</p>
+    <p class="py-8 text-sm text-muted-foreground">Warming up the market cache…</p>
   {:else if error}
-    <p class="msg err">{error}</p>
+    <p class="py-8 text-sm text-destructive">{error}</p>
     {#if error.includes("__TAURI") || error.includes("invoke")}
-      <p class="msg">Open the desktop window from <code>pnpm tauri dev</code> — the backend isn't reachable from the plain browser preview at localhost:1420.</p>
+      <p class="text-sm text-muted-foreground">
+        Open the desktop window from <code class="rounded bg-muted px-1 py-0.5">pnpm tauri dev</code> — the backend isn't
+        reachable from the plain browser preview.
+      </p>
     {/if}
   {:else if rows.length === 0}
-    <p class="msg">No data yet. Run <code>coinwatch ingest</code> to populate the store.</p>
+    <p class="py-8 text-sm text-muted-foreground">Warming up the market cache…</p>
   {:else}
-    <div class="tablewrap">
-      <table>
-        <thead>
+    <div class="min-h-0 flex-1 overflow-auto rounded-lg border border-border">
+      <table class="w-full text-sm tabular-nums">
+        <thead class="sticky top-0 bg-card text-left text-xs text-muted-foreground">
           <tr>
             {#each cols as c (c.key)}
-              <th class:num={c.num} onclick={() => sortBy(c.key)}>
+              <th
+                class="cursor-pointer select-none whitespace-nowrap px-3 py-2 font-medium hover:text-foreground {c.num
+                  ? 'text-right'
+                  : ''}"
+                onclick={() => sortBy(c.key)}
+              >
                 {c.label}{sortKey === c.key ? (sortDir === 1 ? " ▲" : " ▼") : ""}
               </th>
             {/each}
@@ -120,13 +131,25 @@
         </thead>
         <tbody>
           {#each filtered as r (r.coin)}
-            <tr>
-              <td class="coin">{r.coin}</td>
-              <td class="num">{fmtPrice(livePrices[r.coin] ?? r.price)}</td>
-              <td class="num" class:up={r.change_24h_pct > 0} class:down={r.change_24h_pct < 0}>{r.change_24h_pct.toFixed(2)}%</td>
-              <td class="num">{fmtUsd(r.volume_usd)}</td>
-              <td class="num">{fmtUsd(r.open_interest_usd)}</td>
-              <td class="num" class:up={r.funding > 0} class:down={r.funding < 0}>{(r.funding * 100).toFixed(4)}%</td>
+            <tr class="border-t border-border/60 hover:bg-accent/40">
+              <td class="whitespace-nowrap px-3 py-1.5 font-medium text-foreground">{r.coin}</td>
+              <td class="px-3 py-1.5 text-right">{fmtPrice(livePrices[r.coin] ?? r.price)}</td>
+              <td
+                class="px-3 py-1.5 text-right {r.change_24h_pct > 0
+                  ? 'text-green-500'
+                  : r.change_24h_pct < 0
+                    ? 'text-red-500'
+                    : ''}"
+              >
+                {r.change_24h_pct.toFixed(2)}%
+              </td>
+              <td class="px-3 py-1.5 text-right text-muted-foreground">{fmtUsd(r.volume_usd)}</td>
+              <td class="px-3 py-1.5 text-right text-muted-foreground">{fmtUsd(r.open_interest_usd)}</td>
+              <td
+                class="px-3 py-1.5 text-right {r.funding > 0 ? 'text-green-500' : r.funding < 0 ? 'text-red-500' : ''}"
+              >
+                {(r.funding * 100).toFixed(4)}%
+              </td>
             </tr>
           {/each}
         </tbody>
@@ -134,114 +157,3 @@
     </div>
   {/if}
 </div>
-
-<style>
-  .screener {
-    height: 100%;
-    display: flex;
-    flex-direction: column;
-    padding: 0 1rem;
-    box-sizing: border-box;
-  }
-  header {
-    flex: 0 0 auto;
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 1rem;
-    padding: 0.8rem 0 0.6rem;
-  }
-  h1 {
-    font-size: 1.1rem;
-    margin: 0;
-    color: #58a6ff;
-    letter-spacing: 0.02em;
-  }
-  .controls {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-  }
-  .count {
-    color: #8b949e;
-    font-size: 0.8rem;
-    font-variant-numeric: tabular-nums;
-  }
-  input {
-    background: #161b22;
-    border: 1px solid #30363d;
-    color: #c9d1d9;
-    border-radius: 6px;
-    padding: 0.35rem 0.6rem;
-    font-size: 0.85rem;
-    outline: none;
-  }
-  input:focus {
-    border-color: #58a6ff;
-  }
-  .msg {
-    color: #8b949e;
-    padding: 2rem 0;
-  }
-  .msg.err {
-    color: #f85149;
-  }
-  code {
-    background: #161b22;
-    padding: 0.1rem 0.3rem;
-    border-radius: 4px;
-  }
-  .tablewrap {
-    flex: 1 1 auto;
-    overflow: auto;
-  }
-  table {
-    border-collapse: collapse;
-    width: 100%;
-    font-size: 0.82rem;
-    font-variant-numeric: tabular-nums;
-  }
-  thead th {
-    position: sticky;
-    top: 0;
-    z-index: 1;
-    background: #161b22;
-    color: #8b949e;
-    text-align: left;
-    padding: 0.4rem 0.7rem;
-    border-bottom: 1px solid #30363d;
-    cursor: pointer;
-    user-select: none;
-    white-space: nowrap;
-  }
-  th.num {
-    text-align: right;
-  }
-  tbody td {
-    padding: 0.3rem 0.7rem;
-    border-bottom: 1px solid #21262d;
-    white-space: nowrap;
-  }
-  td.num {
-    text-align: right;
-  }
-  td.coin {
-    font-weight: 600;
-    color: #e6edf3;
-  }
-  tbody tr:hover {
-    background: #161b22;
-  }
-  .up {
-    color: #3fb950;
-  }
-  .down {
-    color: #f85149;
-  }
-  .live {
-    color: #3fb950;
-    font-size: 0.72rem;
-    font-weight: 600;
-    letter-spacing: 0.02em;
-  }
-</style>
