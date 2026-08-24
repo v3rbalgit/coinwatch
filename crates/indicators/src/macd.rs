@@ -10,7 +10,6 @@ pub fn ema(values: &[f64], period: usize) -> Vec<Option<f64>> {
         return out;
     }
 
-    #[expect(clippy::cast_precision_loss, reason = "indicator periods are tiny, well within f64")]
     let period_f = period as f64;
     let alpha = 2.0 / (period_f + 1.0);
 

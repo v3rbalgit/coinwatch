@@ -20,7 +20,6 @@ pub fn rsi(closes: &[f64], period: usize) -> Vec<Option<f64>> {
         .map(|(prev, next)| next - prev)
         .collect();
 
-    #[expect(clippy::cast_precision_loss, reason = "indicator periods are tiny, well within f64")]
     let period_f = period as f64;
 
     // Seed the averages with the simple mean of the first `period` gains/losses.
