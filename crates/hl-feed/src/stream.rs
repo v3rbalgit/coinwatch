@@ -156,8 +156,12 @@ async fn run_session(feed: &MarketFeed, store: &MarketStore, intervals: &[Timefr
 }
 
 fn publish_frame(text: &str, feed: &MarketFeed, store: &MarketStore) {
-    let Ok(message) = serde_json::from_str::<WsMessage>(text) else {
-        return;
+    let message = match serde_json::from_str::<WsMessage>(text) {
+        Ok(message) => message,
+        Err(error) => {
+            tracing::debug!(%error, "unparseable websocket frame");
+            return;
+        }
     };
     let timestamp = Utc::now();
     match message {
@@ -174,6 +178,7 @@ fn publish_frame(text: &str, feed: &MarketFeed, store: &MarketStore) {
         }
         WsMessage::FastAssetCtxs { data } => {
             let Some(prices) = decode_fast_asset_ctxs(&data) else {
+                tracing::debug!("failed to decode fastAssetCtxs frame");
                 return;
             };
             for (symbol, ctx) in prices {

@@ -51,7 +51,13 @@ impl Default for SyncConfig {
 #[must_use]
 pub fn spawn_sync(store: Arc<MarketStore>, config: SyncConfig, persistence: Arc<dyn CandleStore>) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let client = reqwest::Client::new();
+        let client = match reqwest::Client::builder().build() {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::error!(%error, "failed to build HTTP client; market sync disabled");
+                return;
+            }
+        };
         let limiter = WeightLimiter::new(config.weight_budget_per_min);
         let mut backfilled: HashSet<(String, Timeframe)> = HashSet::new();
 
@@ -90,6 +96,11 @@ async fn refresh(
     backfilled: &mut HashSet<(String, Timeframe)>,
     persistence: &dyn CandleStore,
 ) {
+    // Heal gaps: the WebSocket flags non-contiguous timeframes; re-backfill them.
+    for stale in store.take_stale() {
+        backfilled.remove(&stale);
+    }
+
     let universe = match fetch_universe(client, limiter, config.universe_limit, config.min_day_volume_usd).await {
         Ok(universe) => universe,
         Err(error) => {

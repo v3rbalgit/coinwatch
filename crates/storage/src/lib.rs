@@ -4,7 +4,7 @@
 //! epoch milliseconds. The same port can back onto Postgres later without touching
 //! the sync.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use chrono::DateTime;
@@ -61,8 +61,23 @@ pub struct SqliteCandleStore {
 }
 
 impl SqliteCandleStore {
-    /// Open (creating if missing) the candle database at `path` and ensure the schema.
+    /// Open (creating if missing) the candle database at `path`. A corrupt cache is
+    /// discarded and recreated — candles are regenerable from the API.
     pub async fn open(path: &Path) -> Result<Self, StoreError> {
+        if let Ok(store) = Self::connect(path).await {
+            if store.is_healthy().await {
+                return Ok(store);
+            }
+            drop(store);
+            tracing::warn!(path = %path.display(), "candle cache failed its integrity check; recreating");
+        } else {
+            tracing::warn!(path = %path.display(), "candle cache could not be opened; recreating");
+        }
+        remove_db_files(path);
+        Self::connect(path).await
+    }
+
+    async fn connect(path: &Path) -> Result<Self, StoreError> {
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
@@ -70,6 +85,22 @@ impl SqliteCandleStore {
         let pool = SqlitePool::connect_with(options).await?;
         sqlx::query(SCHEMA).execute(&pool).await?;
         Ok(Self { pool })
+    }
+
+    async fn is_healthy(&self) -> bool {
+        matches!(
+            sqlx::query_scalar::<_, String>("PRAGMA integrity_check").fetch_one(&self.pool).await,
+            Ok(result) if result == "ok"
+        )
+    }
+}
+
+/// Delete a SQLite database file and its WAL/SHM sidecars.
+fn remove_db_files(path: &Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut file = path.as_os_str().to_owned();
+        file.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(file));
     }
 }
 
@@ -196,5 +227,19 @@ mod tests {
                 candles
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn recreates_a_corrupt_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("candles.db");
+        std::fs::write(&path, b"this is not a sqlite database").expect("write garbage");
+
+        let store = SqliteCandleStore::open(&path).await.expect("open recovers from corruption");
+        store
+            .save("BTC", Timeframe::Hour1, &[candle(1, "1", "1", "1", "1", "0")])
+            .await
+            .expect("save");
+        assert_eq!(store.load().await.expect("load").len(), 1);
     }
 }

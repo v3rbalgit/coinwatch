@@ -1,7 +1,9 @@
 //! In-memory hot cache of live Hyperliquid market state.
 
-use std::sync::{Arc, RwLock};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
+use chrono::TimeDelta;
 use dashmap::DashMap;
 use domain::{Candle, Timeframe};
 use tokio::sync::watch;
@@ -76,6 +78,8 @@ pub struct MarketStore {
     candles: DashMap<(String, Timeframe), Vec<Candle>>,
     universe: RwLock<Vec<UniverseCoin>>,
     status: watch::Sender<MarketStatus>,
+    /// (coin, timeframe) sets the WebSocket saw a gap in; the sync re-backfills them.
+    stale: Mutex<HashSet<(String, Timeframe)>>,
 }
 
 impl MarketStore {
@@ -87,6 +91,7 @@ impl MarketStore {
             candles: DashMap::new(),
             universe: RwLock::new(Vec::new()),
             status,
+            stale: Mutex::new(HashSet::new()),
         })
     }
 
@@ -102,7 +107,7 @@ impl MarketStore {
     /// A snapshot of the current volume-ranked universe.
     #[must_use]
     pub fn universe(&self) -> Vec<UniverseCoin> {
-        self.universe.read().map(|guard| guard.clone()).unwrap_or_default()
+        self.universe.read().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
     /// The current sync status.
@@ -125,25 +130,64 @@ impl MarketStore {
     /// Merge a streamed candle: update the forming bar in place when its open time
     /// matches the last cached bar, otherwise append the new bar (capping length).
     pub(crate) fn merge_candle(&self, coin: &str, timeframe: Timeframe, candle: Candle) {
+        enum Merge {
+            Replace,
+            Append { gap: bool },
+            Ignore,
+        }
+
         let mut entry = self.candles.entry((coin.to_owned(), timeframe)).or_default();
         let buffer = entry.value_mut();
-        match buffer.last_mut() {
-            Some(last) if last.open_time == candle.open_time => *last = candle,
-            _ => {
+        let merge = match buffer.last() {
+            Some(last) if last.open_time == candle.open_time => Merge::Replace,
+            Some(last) if candle.open_time > last.open_time => {
+                let contiguous = last
+                    .open_time
+                    .checked_add_signed(TimeDelta::milliseconds(timeframe.duration_ms()))
+                    .is_some_and(|next_open| candle.open_time <= next_open);
+                Merge::Append { gap: !contiguous }
+            }
+            Some(_) => Merge::Ignore,
+            None => Merge::Append { gap: false },
+        };
+        match merge {
+            Merge::Replace => {
+                if let Some(last) = buffer.last_mut() {
+                    *last = candle;
+                }
+            }
+            Merge::Append { gap } => {
                 buffer.push(candle);
                 if buffer.len() > MAX_CANDLES {
                     let excess = buffer.len() - MAX_CANDLES;
                     buffer.drain(0..excess);
                 }
+                if gap {
+                    self.mark_stale(coin, timeframe);
+                }
             }
+            Merge::Ignore => {}
         }
+    }
+
+    /// Flag a (coin, timeframe) whose streamed candles are non-contiguous so the
+    /// sync re-backfills it and heals the gap.
+    fn mark_stale(&self, coin: &str, timeframe: Timeframe) {
+        self.stale
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((coin.to_owned(), timeframe));
+    }
+
+    /// Drain the (coin, timeframe) sets flagged as gapped since the last call.
+    pub(crate) fn take_stale(&self) -> HashSet<(String, Timeframe)> {
+        let mut stale = self.stale.lock().unwrap_or_else(PoisonError::into_inner);
+        std::mem::take(&mut *stale)
     }
 
     /// Replace the cached universe.
     pub(crate) fn set_universe(&self, universe: Vec<UniverseCoin>) {
-        if let Ok(mut guard) = self.universe.write() {
-            *guard = universe;
-        }
+        *self.universe.write().unwrap_or_else(PoisonError::into_inner) = universe;
     }
 
     /// Update the WebSocket connection state.
@@ -174,5 +218,43 @@ impl MarketStore {
             status.backfill_errors = errors;
             status.fetch_rate = fetch_rate;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+    use domain::{Candle, Timeframe};
+    use rust_decimal::Decimal;
+
+    use super::MarketStore;
+
+    fn candle(hour: i64) -> Candle {
+        Candle {
+            open_time: Utc.timestamp_opt(hour * 3600, 0).single().expect("timestamp"),
+            open: Decimal::ONE,
+            high: Decimal::ONE,
+            low: Decimal::ONE,
+            close: Decimal::ONE,
+            volume: Decimal::ZERO,
+        }
+    }
+
+    #[test]
+    fn contiguous_merges_flag_nothing() {
+        let store = MarketStore::new();
+        for hour in 0..3 {
+            store.merge_candle("BTC", Timeframe::Hour1, candle(hour));
+        }
+        assert!(store.take_stale().is_empty());
+    }
+
+    #[test]
+    fn a_missed_bar_flags_stale_once() {
+        let store = MarketStore::new();
+        store.merge_candle("BTC", Timeframe::Hour1, candle(0));
+        store.merge_candle("BTC", Timeframe::Hour1, candle(2));
+        assert!(store.take_stale().contains(&("BTC".to_owned(), Timeframe::Hour1)));
+        assert!(store.take_stale().is_empty());
     }
 }
