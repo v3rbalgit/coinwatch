@@ -8,8 +8,8 @@
     price: number;
     change_24h_pct: number;
     volume_usd: number;
-    rsi: number;
-    funding_rate: number;
+    open_interest_usd: number;
+    funding: number;
   };
 
   let rows = $state<Row[]>([]);
@@ -39,7 +39,10 @@
       live = true;
       livePrices[event.payload.coin] = event.payload.price;
     });
+    // The cache updates itself; reload rows quietly so newly-synced coins appear.
+    const reload = setInterval(load, 5000);
     return () => {
+      clearInterval(reload);
       void unlisten.then((off) => off());
     };
   });
@@ -73,8 +76,8 @@
     { key: "price", label: "Price", num: true },
     { key: "change_24h_pct", label: "24h %", num: true },
     { key: "volume_usd", label: "Volume", num: true },
-    { key: "rsi", label: "RSI", num: true },
-    { key: "funding_rate", label: "Funding", num: true },
+    { key: "open_interest_usd", label: "OI", num: true },
+    { key: "funding", label: "Funding", num: true },
   ];
 </script>
 
@@ -85,11 +88,10 @@
       {#if live}<span class="live">● live</span>{/if}
       <input placeholder="Filter coin…" bind:value={query} />
       <span class="count">{filtered.length} / {rows.length}</span>
-      <button onclick={load} disabled={loading}>{loading ? "…" : "Refresh"}</button>
     </div>
   </header>
 
-  {#if loading}
+  {#if loading && rows.length === 0}
     <p class="msg">Loading market…</p>
   {:else if error}
     <p class="msg err">{error}</p>
@@ -117,8 +119,8 @@
               <td class="num">{fmtPrice(livePrices[r.coin] ?? r.price)}</td>
               <td class="num" class:up={r.change_24h_pct > 0} class:down={r.change_24h_pct < 0}>{r.change_24h_pct.toFixed(2)}%</td>
               <td class="num">{fmtUsd(r.volume_usd)}</td>
-              <td class="num" class:hot={r.rsi >= 70} class:cold={r.rsi <= 30}>{r.rsi.toFixed(0)}</td>
-              <td class="num" class:up={r.funding_rate > 0} class:down={r.funding_rate < 0}>{(r.funding_rate * 100).toFixed(3)}%</td>
+              <td class="num">{fmtUsd(r.open_interest_usd)}</td>
+              <td class="num" class:up={r.funding > 0} class:down={r.funding < 0}>{(r.funding * 100).toFixed(4)}%</td>
             </tr>
           {/each}
         </tbody>
@@ -169,18 +171,6 @@
     outline: none;
   }
   input:focus {
-    border-color: #58a6ff;
-  }
-  button {
-    background: #21262d;
-    border: 1px solid #30363d;
-    color: #c9d1d9;
-    border-radius: 6px;
-    padding: 0.35rem 0.8rem;
-    cursor: pointer;
-    font-size: 0.85rem;
-  }
-  button:hover:not(:disabled) {
     border-color: #58a6ff;
   }
   .msg {
@@ -247,11 +237,5 @@
     font-size: 0.72rem;
     font-weight: 600;
     letter-spacing: 0.02em;
-  }
-  .hot {
-    color: #f0883e;
-  }
-  .cold {
-    color: #58a6ff;
   }
 </style>

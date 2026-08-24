@@ -5,65 +5,11 @@
 //! `MarketEvent::Candle` variant.
 
 use chrono::{DateTime, Utc};
+use domain::{Candle, Timeframe};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
 pub(crate) const INFO_URL: &str = "https://api.hyperliquid.xyz/info";
-
-/// A higher-timeframe interval the setup-finder scans.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Timeframe {
-    /// One hour.
-    Hour1,
-    /// Four hours — the primary intraday timeframe.
-    Hour4,
-    /// One day.
-    Day1,
-    /// One week.
-    Week1,
-}
-
-impl Timeframe {
-    /// Hyperliquid's interval string.
-    #[must_use]
-    pub const fn as_hl(self) -> &'static str {
-        match self {
-            Self::Hour1 => "1h",
-            Self::Hour4 => "4h",
-            Self::Day1 => "1d",
-            Self::Week1 => "1w",
-        }
-    }
-
-    /// Nominal bar duration in milliseconds (for the backfill window).
-    #[must_use]
-    pub const fn duration_ms(self) -> i64 {
-        match self {
-            Self::Hour1 => 3_600_000,
-            Self::Hour4 => 14_400_000,
-            Self::Day1 => 86_400_000,
-            Self::Week1 => 604_800_000,
-        }
-    }
-}
-
-/// A single OHLCV candle. Prices are exchange-precise `Decimal`; the scanner
-/// converts closes to `f64` for the indicators.
-#[derive(Debug, Clone)]
-pub struct Candle {
-    /// Candle open time (UTC).
-    pub open_time: DateTime<Utc>,
-    /// Open price.
-    pub open: Decimal,
-    /// Highest price in the bar.
-    pub high: Decimal,
-    /// Lowest price in the bar.
-    pub low: Decimal,
-    /// Close price.
-    pub close: Decimal,
-    /// Volume in base-coin units.
-    pub volume: Decimal,
-}
 
 type FetchError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -137,7 +83,9 @@ fn to_decimal(value: &serde_json::Value) -> Result<Decimal, FetchError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Timeframe, fetch_candles};
+    use domain::Timeframe;
+
+    use super::fetch_candles;
 
     /// Live smoke test: fetch recent BTC 1h candles and check OHLC consistency.
     /// Requires network access.

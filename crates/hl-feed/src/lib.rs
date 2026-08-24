@@ -11,12 +11,16 @@ mod candle;
 mod event;
 mod feed;
 mod hyperliquid;
+mod store;
+mod sync;
 mod universe;
 
-pub use candle::{Candle, Timeframe, fetch_candles};
+pub use candle::fetch_candles;
 pub use event::{MarketEvent, MidEvent};
 pub use feed::MarketFeed;
 pub use hyperliquid::HyperliquidAdapter;
+pub use store::{MarketStatus, MarketStore};
+pub use sync::{SyncConfig, spawn_sync};
 pub use universe::{UniverseCoin, fetch_universe};
 
 #[cfg(test)]

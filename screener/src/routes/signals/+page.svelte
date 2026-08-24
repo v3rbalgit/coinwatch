@@ -17,7 +17,6 @@
   let total = $state(0);
   let done = $state(0);
   let failures = $state(0);
-  let limit = $state(30);
 
   function fmtTime(iso: string): string {
     const date = new Date(iso);
@@ -59,7 +58,7 @@
     scanning = true;
     signals = [];
     try {
-      await invoke("start_scan", { limit });
+      await invoke("start_scan");
     } catch {
       scanning = false;
     }
@@ -69,17 +68,6 @@
 <div class="flex h-full flex-col p-6">
   <div class="flex flex-wrap items-center gap-3">
     <h1 class="text-lg font-semibold text-primary">Signals</h1>
-    <label class="text-sm text-muted-foreground">
-      Top
-      <input
-        type="number"
-        bind:value={limit}
-        min="1"
-        max="200"
-        class="ml-1 w-20 rounded-md border border-input bg-background px-2 py-1 text-sm text-foreground"
-      />
-      by volume
-    </label>
     <button
       onclick={startScan}
       disabled={scanning}

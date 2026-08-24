@@ -1446,6 +1446,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "domain"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rust_decimal",
+]
+
+[[package]]
 name = "dpi"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2196,8 +2204,11 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 name = "hl-feed"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "dashmap",
+ "domain",
+ "flate2",
  "futures-util",
  "reqwest 0.12.28",
  "rust_decimal",
@@ -4085,12 +4096,10 @@ name = "scanner"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "domain",
  "hl-feed",
  "indicators",
- "reqwest 0.12.28",
  "rust_decimal",
- "rustls",
- "tokio",
 ]
 
 [[package]]
@@ -4155,13 +4164,9 @@ name = "screener"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "cw-core",
- "cw-features",
- "cw-providers",
- "cw-storage",
+ "domain",
  "hl-feed",
  "indicators",
- "reqwest 0.12.28",
  "rust_decimal",
  "rustls",
  "scanner",

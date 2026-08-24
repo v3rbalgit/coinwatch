@@ -1,14 +1,14 @@
-//! Divergence-based setup scanner over the Hyperliquid universe.
+//! Divergence-based setup scanner over the cached Hyperliquid universe.
 //!
-//! Ties [`hl_feed`] candle backfill to the [`indicators`] divergence detector: for
-//! each coin and timeframe it fetches candles, computes RSI and MACD, and reports
-//! fresh regular/hidden divergences as [`Signal`]s. Pure detection lives in
-//! [`signals_from_candles`]; the async entry points fetch, then delegate to it.
-
-use std::time::Duration;
+//! Reads candles from the [`MarketStore`](hl_feed::MarketStore) hot cache and runs
+//! RSI/MACD divergence detection — pure CPU, no network on the scan path. The market
+//! sync engine keeps the cache warm; this crate only computes. Pure detection lives
+//! in [`signals_from_candles`]; [`scan_coin`] and [`scan_universe`] fan it over the
+//! cache.
 
 use chrono::{DateTime, Utc};
-use hl_feed::{Candle, Timeframe, fetch_candles};
+use domain::{Candle, Timeframe};
+use hl_feed::MarketStore;
 use indicators::{DivergenceDirection, DivergenceKind, detect_divergences, macd, rsi};
 use rust_decimal::prelude::ToPrimitive;
 
@@ -44,8 +44,6 @@ pub struct Signal {
 pub struct ScanConfig {
     /// Timeframes to scan.
     pub timeframes: Vec<Timeframe>,
-    /// Candles fetched per coin/timeframe.
-    pub lookback: usize,
     /// RSI period.
     pub rsi_period: usize,
     /// MACD fast/slow/signal periods.
@@ -65,7 +63,6 @@ impl Default for ScanConfig {
     fn default() -> Self {
         Self {
             timeframes: vec![Timeframe::Hour1, Timeframe::Hour4, Timeframe::Day1, Timeframe::Week1],
-            lookback: 300,
             rsi_period: 14,
             macd_periods: (12, 26, 9),
             pivot_left: 5,
@@ -111,64 +108,34 @@ pub fn signals_from_candles(coin: &str, timeframe: Timeframe, candles: &[Candle]
     signals
 }
 
-type ScanError = Box<dyn std::error::Error + Send + Sync>;
-
-/// Scan one coin across all configured timeframes, fetching candles then running
-/// [`signals_from_candles`].
-pub async fn scan_coin(client: &reqwest::Client, coin: &str, config: &ScanConfig) -> Result<Vec<Signal>, ScanError> {
+/// Scan one coin across all configured timeframes using cached candles — pure CPU,
+/// no network. Timeframes with nothing cached yet are skipped.
+#[must_use]
+pub fn scan_coin(store: &MarketStore, coin: &str, config: &ScanConfig) -> Vec<Signal> {
     let mut signals = Vec::new();
     for &timeframe in &config.timeframes {
-        let candles = fetch_candles(client, coin, timeframe, config.lookback).await?;
-        signals.extend(signals_from_candles(coin, timeframe, &candles, config));
-    }
-    Ok(signals)
-}
-
-/// A coin whose scan failed, kept rather than silently dropped.
-#[derive(Debug, Clone)]
-pub struct ScanFailure {
-    /// Coin that failed.
-    pub coin: String,
-    /// Human-readable error.
-    pub error: String,
-}
-
-/// The outcome of scanning a set of coins.
-#[derive(Debug, Clone, Default)]
-pub struct ScanReport {
-    /// All detected signals.
-    pub signals: Vec<Signal>,
-    /// Coins whose scan failed (rate limits, transient network).
-    pub failures: Vec<ScanFailure>,
-}
-
-/// Scan every coin in `coins`, pacing requests by `delay` to respect Hyperliquid
-/// rate limits. Per-coin failures are collected into the report rather than
-/// aborting the whole sweep.
-pub async fn scan_universe(
-    client: &reqwest::Client,
-    coins: &[String],
-    config: &ScanConfig,
-    delay: Duration,
-) -> ScanReport {
-    let mut report = ScanReport::default();
-    for coin in coins {
-        match scan_coin(client, coin, config).await {
-            Ok(signals) => report.signals.extend(signals),
-            Err(error) => report.failures.push(ScanFailure { coin: coin.clone(), error: error.to_string() }),
+        if let Some(candles) = store.candles(coin, timeframe) {
+            signals.extend(signals_from_candles(coin, timeframe, &candles, config));
         }
-        tokio::time::sleep(delay).await;
     }
-    report
+    signals
+}
+
+/// Scan the whole cached universe. Reads only the cache, so it runs in
+/// milliseconds regardless of universe size.
+#[must_use]
+pub fn scan_universe(store: &MarketStore, config: &ScanConfig) -> Vec<Signal> {
+    store.universe().iter().flat_map(|coin| scan_coin(store, &coin.coin, config)).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
-    use hl_feed::{Candle, Timeframe};
+    use domain::{Candle, Timeframe};
+    use hl_feed::MarketStore;
     use rust_decimal::Decimal;
 
-    use super::{ScanConfig, scan_coin, signals_from_candles};
+    use super::{ScanConfig, scan_universe, signals_from_candles};
 
     fn candles_from(closes: &[f64]) -> Vec<Candle> {
         closes
@@ -203,14 +170,9 @@ mod tests {
         assert!(signals.is_empty(), "a monotonic uptrend must not diverge: {signals:?}");
     }
 
-    /// Live wiring check: scanning a real coin succeeds and every signal is tagged
-    /// with the coin and a requested timeframe. Requires network access.
-    #[tokio::test]
-    async fn scan_coin_runs_against_live_data() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = reqwest::Client::new();
-        let config = ScanConfig { timeframes: vec![Timeframe::Day1], ..ScanConfig::default() };
-        let signals = scan_coin(&client, "BTC", &config).await.expect("scan BTC daily");
-        assert!(signals.iter().all(|signal| signal.coin == "BTC" && signal.timeframe == Timeframe::Day1));
+    #[test]
+    fn empty_store_yields_no_signals() {
+        let store = MarketStore::new();
+        assert!(scan_universe(&store, &ScanConfig::default()).is_empty());
     }
 }

@@ -1,8 +1,20 @@
 <script lang="ts">
   import "../app.css";
   import { page } from "$app/stores";
+  import { listen } from "@tauri-apps/api/event";
+  import { onMount } from "svelte";
 
   let { children } = $props();
+
+  type Status = { state: string; done: number; total: number };
+  let status = $state<Status>({ state: "connecting", done: 0, total: 0 });
+
+  onMount(() => {
+    const unlisten = listen<Status>("status", (event) => {
+      status = event.payload;
+    });
+    return () => void unlisten.then((off) => off());
+  });
 
   const nav = [
     { href: "/", label: "Home" },
@@ -28,7 +40,24 @@
         </a>
       {/each}
     </nav>
-    <div class="border-t border-border px-4 py-3 text-xs text-muted-foreground">Hyperliquid</div>
+    <div class="border-t border-border px-4 py-3 text-xs text-muted-foreground">
+      {#if status.state === "live"}
+        <div class="flex items-center gap-2">
+          <span class="h-2 w-2 rounded-full bg-green-500"></span>
+          Live · synced
+        </div>
+      {:else if status.state === "backfilling"}
+        <div class="flex items-center gap-2">
+          <span class="h-2 w-2 animate-pulse rounded-full bg-amber-500"></span>
+          Backfilling {status.done}/{status.total}
+        </div>
+      {:else}
+        <div class="flex items-center gap-2">
+          <span class="h-2 w-2 animate-pulse rounded-full bg-muted-foreground"></span>
+          Connecting…
+        </div>
+      {/if}
+    </div>
   </aside>
 
   <main class="min-w-0 flex-1 overflow-hidden">

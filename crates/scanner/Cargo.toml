@@ -1,20 +1,16 @@
 [package]
 name = "scanner"
-description = "Divergence-based setup scanner over the Hyperliquid universe."
+description = "Divergence-based setup scanner over the cached Hyperliquid universe."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+domain = { workspace = true }
 hl-feed = { workspace = true }
 indicators = { workspace = true }
-reqwest = { workspace = true }
-tokio = { workspace = true }
 chrono = { workspace = true }
 rust_decimal = { workspace = true }
-
-[dev-dependencies]
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [lints]
 workspace = true

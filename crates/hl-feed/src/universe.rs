@@ -6,13 +6,22 @@ use crate::candle::INFO_URL;
 
 type FetchError = Box<dyn std::error::Error + Send + Sync>;
 
-/// A perp in the tradable universe with its trailing 24h notional volume (USD).
+/// A perp in the tradable universe with a live metadata snapshot from
+/// `metaAndAssetCtxs`.
 #[derive(Debug, Clone)]
 pub struct UniverseCoin {
     /// Coin symbol (e.g. `BTC`).
     pub coin: String,
     /// Trailing 24h notional volume in USD.
     pub day_volume_usd: f64,
+    /// Latest mark price.
+    pub mark_px: Option<f64>,
+    /// Previous-day price (for the 24h change).
+    pub prev_day_px: Option<f64>,
+    /// Current funding rate (per hour).
+    pub funding: Option<f64>,
+    /// Open interest in base-coin units.
+    pub open_interest: Option<f64>,
 }
 
 /// Fetch the perp universe ranked by day volume (descending), keeping coins with
@@ -37,8 +46,21 @@ pub async fn fetch_universe(
         .into_iter()
         .zip(contexts)
         .filter_map(|(entry, context)| {
+            if entry.is_delisted {
+                return None;
+            }
             let day_volume_usd = value_to_f64(&context.day_ntl_vlm)?;
-            (day_volume_usd >= min_day_volume_usd).then_some(UniverseCoin { coin: entry.name, day_volume_usd })
+            if day_volume_usd < min_day_volume_usd {
+                return None;
+            }
+            Some(UniverseCoin {
+                coin: entry.name,
+                day_volume_usd,
+                mark_px: context.mark_px.as_ref().and_then(value_to_f64),
+                prev_day_px: context.prev_day_px.as_ref().and_then(value_to_f64),
+                funding: context.funding.as_ref().and_then(value_to_f64),
+                open_interest: context.open_interest.as_ref().and_then(value_to_f64),
+            })
         })
         .collect();
 
@@ -64,12 +86,21 @@ struct Meta {
 #[derive(Deserialize)]
 struct UniverseEntry {
     name: String,
+    #[serde(rename = "isDelisted", default)]
+    is_delisted: bool,
 }
 
 #[derive(Deserialize)]
 struct AssetContext {
     #[serde(rename = "dayNtlVlm")]
     day_ntl_vlm: serde_json::Value,
+    #[serde(rename = "markPx")]
+    mark_px: Option<serde_json::Value>,
+    #[serde(rename = "prevDayPx")]
+    prev_day_px: Option<serde_json::Value>,
+    funding: Option<serde_json::Value>,
+    #[serde(rename = "openInterest")]
+    open_interest: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
