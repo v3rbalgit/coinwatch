@@ -24,6 +24,7 @@
 
   let rows = $state<Row[]>([]);
   let lists = $state<ListView[]>([]);
+  let logoMap = $state<Record<string, string>>({});
   let activeList = $state<string | null>(null);
   let loading = $state(true);
   let error = $state("");
@@ -52,8 +53,12 @@
   async function loadLists() {
     lists = await invoke<ListView[]>("lists");
   }
+  async function loadLogos() {
+    logoMap = await invoke<Record<string, string>>("logos");
+  }
   loadRows();
   loadLists();
+  loadLogos();
 
   onMount(() => {
     const unlisten = listen<{ coin: string; price: number }>("mid", (event) => {
@@ -61,8 +66,11 @@
       livePrices[event.payload.coin] = event.payload.price;
     });
     const reload = setInterval(loadRows, 5000);
+    // Pick up logos as the background cache task fills them in this session.
+    const logoReload = setInterval(loadLogos, 20000);
     return () => {
       clearInterval(reload);
+      clearInterval(logoReload);
       void unlisten.then((off) => off());
     };
   });
@@ -259,7 +267,7 @@
             >
               <td class="whitespace-nowrap px-3 py-1.5 font-medium text-foreground">
                 <span class="flex items-center gap-2">
-                  <CoinIcon coin={row.coin} />
+                  <CoinIcon coin={row.coin} svg={logoMap[row.coin]} />
                   {row.coin}
                 </span>
               </td>

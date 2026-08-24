@@ -3596,6 +3596,7 @@ dependencies = [
  "domain",
  "hl-feed",
  "indicators",
+ "reqwest",
  "rust_decimal",
  "rustls",
  "scanner",

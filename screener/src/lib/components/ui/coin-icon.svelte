@@ -1,10 +1,18 @@
 <script lang="ts">
   import { cn } from "$lib/utils";
 
-  let { coin, size = 20, class: className }: { coin: string; size?: number; class?: string } = $props();
+  let { coin, svg, size = 20, class: className }: { coin: string; svg?: string; size?: number; class?: string } =
+    $props();
 
-  // Hyperliquid serves per-coin SVGs; missing ones fall back to a monogram.
+  // Prefer the locally-cached SVG; otherwise load Hyperliquid's, with a monogram fallback.
   let failed = $state(false);
+  const src = $derived(
+    svg ? `data:image/svg+xml,${encodeURIComponent(svg)}` : `https://app.hyperliquid.xyz/coins/${coin}.svg`,
+  );
+  $effect(() => {
+    void src;
+    failed = false;
+  });
 </script>
 
 {#if failed}
@@ -19,7 +27,7 @@
   </span>
 {:else}
   <img
-    src="https://app.hyperliquid.xyz/coins/{coin}.svg"
+    {src}
     alt=""
     width={size}
     height={size}

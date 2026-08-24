@@ -5,7 +5,9 @@
 //! scans), so the UI never waits on the network. Live mids stream in over the
 //! WebSocket and are relayed to the frontend as `mid` events.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use domain::Timeframe;
 use hl_feed::{
@@ -192,6 +194,67 @@ async fn remove_from_list(store: tauri::State<'_, Arc<SqliteStore>>, list: Strin
     store.remove_from_list(&list, &coin).await.map_err(|error| error.to_string())
 }
 
+/// Every cached coin logo, keyed by coin.
+#[tauri::command]
+async fn logos(store: tauri::State<'_, Arc<SqliteStore>>) -> Result<HashMap<String, String>, String> {
+    store
+        .logos()
+        .await
+        .map(|rows| rows.into_iter().collect())
+        .map_err(|error| error.to_string())
+}
+
+/// Fetch a coin's SVG logo from Hyperliquid; None when it has no real SVG.
+async fn fetch_logo(client: &reqwest::Client, coin: &str) -> Option<String> {
+    let response = client
+        .get(format!("https://app.hyperliquid.xyz/coins/{coin}.svg"))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let is_svg = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|content_type| content_type.contains("svg"));
+    if !is_svg {
+        return None;
+    }
+    let body = response.text().await.ok()?;
+    body.contains("<svg").then_some(body)
+}
+
+/// Download the universe's coin logos into the store, paced to spare the CDN.
+/// Cached coins are skipped; a periodic re-scan picks up new listings.
+async fn cache_logos(market: Arc<MarketStore>, db: Arc<SqliteStore>) {
+    let Ok(client) = reqwest::Client::builder().build() else {
+        tracing::error!("failed to build the logo HTTP client; logo caching disabled");
+        return;
+    };
+    loop {
+        let universe = market.universe();
+        if universe.is_empty() {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+        let cached = db.logo_coins().await.unwrap_or_default();
+        for coin in universe {
+            if cached.contains(&coin.coin) {
+                continue;
+            }
+            if let Some(svg) = fetch_logo(&client, &coin.coin).await {
+                if let Err(error) = db.cache_logo(&coin.coin, &svg).await {
+                    tracing::warn!(coin = %coin.coin, %error, "failed to cache logo");
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(600)).await;
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _ = tracing_subscriber::fmt()
@@ -209,6 +272,7 @@ pub fn run() {
     let sync_store = Arc::clone(&store);
     let status_store = Arc::clone(&store);
     let adapter_store = Arc::clone(&store);
+    let logo_market_store = Arc::clone(&store);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -229,10 +293,13 @@ pub fn run() {
                         min_day_volume_usd: 0.0,
                         ..SyncConfig::default()
                     };
+                    let logo_db = Arc::clone(&store);
                     // Keep the hot cache warm from Hyperliquid — the whole tradable universe.
                     tauri::async_runtime::spawn(async move {
                         let _sync = spawn_sync(sync_store, config, store);
                     });
+                    // Cache coin logos locally so they load instantly and offline.
+                    tauri::async_runtime::spawn(cache_logos(logo_market_store, logo_db));
                 }
                 Err(error) => tracing::error!(%error, "failed to open the local database; market sync disabled"),
             }
@@ -283,7 +350,8 @@ pub fn run() {
             create_list,
             delete_list,
             add_to_list,
-            remove_from_list
+            remove_from_list,
+            logos
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

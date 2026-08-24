@@ -2,6 +2,7 @@
 //! user watchlists. OHLCV values are text for exact [`Decimal`] precision; open
 //! times are epoch milliseconds. The same store can back onto Postgres later.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -67,6 +68,7 @@ CREATE TABLE IF NOT EXISTS list_members (
     coin TEXT NOT NULL,
     PRIMARY KEY (list, coin)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS logos (coin TEXT PRIMARY KEY, svg TEXT NOT NULL) WITHOUT ROWID;
 ";
 
 /// The local SQLite store.
@@ -177,6 +179,27 @@ impl SqliteStore {
         sqlx::query("DELETE FROM list_members WHERE list = ? AND coin = ?")
             .bind(list)
             .bind(coin)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Every cached (coin, svg) logo.
+    pub async fn logos(&self) -> Result<Vec<(String, String)>, StoreError> {
+        Ok(sqlx::query_as("SELECT coin, svg FROM logos").fetch_all(&self.pool).await?)
+    }
+
+    /// Coins whose logo is already cached.
+    pub async fn logo_coins(&self) -> Result<HashSet<String>, StoreError> {
+        let coins: Vec<String> = sqlx::query_scalar("SELECT coin FROM logos").fetch_all(&self.pool).await?;
+        Ok(coins.into_iter().collect())
+    }
+
+    /// Cache a coin's SVG logo.
+    pub async fn cache_logo(&self, coin: &str, svg: &str) -> Result<(), StoreError> {
+        sqlx::query("INSERT OR REPLACE INTO logos (coin, svg) VALUES (?, ?)")
+            .bind(coin)
+            .bind(svg)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -351,5 +374,21 @@ mod tests {
         let lists = store.lists().await.expect("lists");
         assert_eq!(lists.len(), 1);
         assert_eq!(lists[0].coins, vec!["ETH".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn logos_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(&dir.path().join("cw.db")).await.expect("open");
+
+        assert!(store.logo_coins().await.expect("coins").is_empty());
+        store.cache_logo("BTC", "<svg/>").await.expect("cache");
+        store.cache_logo("BTC", "<svg-updated/>").await.expect("recache");
+
+        assert_eq!(store.logo_coins().await.expect("coins").len(), 1);
+        assert_eq!(
+            store.logos().await.expect("logos"),
+            vec![("BTC".to_owned(), "<svg-updated/>".to_owned())]
+        );
     }
 }
