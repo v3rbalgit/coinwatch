@@ -80,7 +80,11 @@ pub fn macd(closes: &[f64], fast: usize, slow: usize, signal: usize) -> Macd {
         })
         .collect();
 
-    Macd { macd: macd_line, signal: signal_line, histogram }
+    Macd {
+        macd: macd_line,
+        signal: signal_line,
+        histogram,
+    }
 }
 
 #[cfg(test)]

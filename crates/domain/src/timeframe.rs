@@ -1,43 +1,39 @@
 //! Candle timeframes the setup-finder scans.
 
-/// A higher-timeframe interval the setup-finder scans.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+use strum::{EnumString, IntoStaticStr};
+
+/// A higher-timeframe interval the setup-finder scans. String forms are
+/// Hyperliquid's `candle` interval codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, IntoStaticStr, EnumString)]
 pub enum Timeframe {
     /// One hour.
+    #[strum(serialize = "1h")]
     Hour1,
-    /// Four hours — the primary intraday timeframe.
+    /// Four hours.
+    #[strum(serialize = "4h")]
     Hour4,
     /// One day.
+    #[strum(serialize = "1d")]
     Day1,
     /// One week.
+    #[strum(serialize = "1w")]
     Week1,
 }
 
 impl Timeframe {
-    /// Hyperliquid's interval string.
+    /// Hyperliquid's interval code.
     #[must_use]
-    pub const fn as_hl(self) -> &'static str {
-        match self {
-            Self::Hour1 => "1h",
-            Self::Hour4 => "4h",
-            Self::Day1 => "1d",
-            Self::Week1 => "1w",
-        }
+    pub fn as_hl(self) -> &'static str {
+        self.into()
     }
 
-    /// Parse Hyperliquid's interval string back into a timeframe.
+    /// Parse a Hyperliquid interval code.
     #[must_use]
     pub fn from_hl(interval: &str) -> Option<Self> {
-        match interval {
-            "1h" => Some(Self::Hour1),
-            "4h" => Some(Self::Hour4),
-            "1d" => Some(Self::Day1),
-            "1w" => Some(Self::Week1),
-            _ => None,
-        }
+        interval.parse().ok()
     }
 
-    /// Nominal bar duration in milliseconds (for backfill windows).
+    /// Nominal bar duration in milliseconds.
     #[must_use]
     pub const fn duration_ms(self) -> i64 {
         match self {
@@ -46,5 +42,24 @@ impl Timeframe {
             Self::Day1 => 86_400_000,
             Self::Week1 => 604_800_000,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Timeframe;
+
+    #[test]
+    fn hl_codes_round_trip() {
+        for (timeframe, code) in [
+            (Timeframe::Hour1, "1h"),
+            (Timeframe::Hour4, "4h"),
+            (Timeframe::Day1, "1d"),
+            (Timeframe::Week1, "1w"),
+        ] {
+            assert_eq!(timeframe.as_hl(), code);
+            assert_eq!(Timeframe::from_hl(code), Some(timeframe));
+        }
+        assert_eq!(Timeframe::from_hl("2h"), None);
     }
 }

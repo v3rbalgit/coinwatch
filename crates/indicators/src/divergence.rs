@@ -69,9 +69,19 @@ pub fn detect_divergences(
             continue;
         };
         if recent.value < prior.value && recent_osc > prior_osc {
-            out.push(Divergence { kind: Regular, direction: Bullish, prior_index: prior.index, recent_index: recent.index });
+            out.push(Divergence {
+                kind: Regular,
+                direction: Bullish,
+                prior_index: prior.index,
+                recent_index: recent.index,
+            });
         } else if recent.value > prior.value && recent_osc < prior_osc {
-            out.push(Divergence { kind: Hidden, direction: Bullish, prior_index: prior.index, recent_index: recent.index });
+            out.push(Divergence {
+                kind: Hidden,
+                direction: Bullish,
+                prior_index: prior.index,
+                recent_index: recent.index,
+            });
         }
     }
 
@@ -86,9 +96,19 @@ pub fn detect_divergences(
             continue;
         };
         if recent.value > prior.value && recent_osc < prior_osc {
-            out.push(Divergence { kind: Regular, direction: Bearish, prior_index: prior.index, recent_index: recent.index });
+            out.push(Divergence {
+                kind: Regular,
+                direction: Bearish,
+                prior_index: prior.index,
+                recent_index: recent.index,
+            });
         } else if recent.value < prior.value && recent_osc > prior_osc {
-            out.push(Divergence { kind: Hidden, direction: Bearish, prior_index: prior.index, recent_index: recent.index });
+            out.push(Divergence {
+                kind: Hidden,
+                direction: Bearish,
+                prior_index: prior.index,
+                recent_index: recent.index,
+            });
         }
     }
 
@@ -106,7 +126,15 @@ mod tests {
     fn detects_regular_bullish() {
         // Oscillator makes a HIGHER low (30 -> 40) while price makes a lower low.
         let osc: Vec<Option<f64>> = vec![
-            Some(50.0), Some(50.0), Some(30.0), Some(50.0), Some(50.0), Some(50.0), Some(40.0), Some(50.0), Some(50.0),
+            Some(50.0),
+            Some(50.0),
+            Some(30.0),
+            Some(50.0),
+            Some(50.0),
+            Some(50.0),
+            Some(40.0),
+            Some(50.0),
+            Some(50.0),
         ];
         let divs = detect_divergences(&PRICE, &osc, 2, 2, 100);
         assert!(divs.iter().any(|d| d.kind == DivergenceKind::Regular
@@ -119,7 +147,15 @@ mod tests {
     fn confirmed_downtrend_is_not_a_divergence() {
         // Oscillator ALSO makes a lower low (30 -> 20): price and oscillator agree.
         let osc: Vec<Option<f64>> = vec![
-            Some(50.0), Some(50.0), Some(30.0), Some(50.0), Some(50.0), Some(50.0), Some(20.0), Some(50.0), Some(50.0),
+            Some(50.0),
+            Some(50.0),
+            Some(30.0),
+            Some(50.0),
+            Some(50.0),
+            Some(50.0),
+            Some(20.0),
+            Some(50.0),
+            Some(50.0),
         ];
         let divs = detect_divergences(&PRICE, &osc, 2, 2, 100);
         assert!(!divs.iter().any(|d| d.direction == DivergenceDirection::Bullish));

@@ -9,11 +9,11 @@ use std::sync::Arc;
 
 use domain::Timeframe;
 use hl_feed::{
-    ConnectionState, HyperliquidAdapter, MarketEvent, MarketStatus, MarketStore, SyncConfig, SyncPhase, spawn_sync,
+    spawn_sync, ConnectionState, HyperliquidAdapter, MarketEvent, MarketStatus, MarketStore, SyncConfig, SyncPhase,
 };
 use indicators::{DivergenceDirection, DivergenceKind};
 use rust_decimal::prelude::ToPrimitive;
-use scanner::{ScanConfig, Signal, SignalSource, scan_universe};
+use scanner::{scan_universe, ScanConfig, Signal, SignalSource};
 use serde::Serialize;
 use tauri::Emitter;
 use tokio::sync::broadcast::error::RecvError;
@@ -164,8 +164,11 @@ pub fn run() {
         .setup(move |app| {
             // Keep the hot cache warm from Hyperliquid — the whole tradable universe.
             tauri::async_runtime::spawn(async move {
-                let config =
-                    SyncConfig { universe_limit: usize::MAX, min_day_volume_usd: 0.0, ..SyncConfig::default() };
+                let config = SyncConfig {
+                    universe_limit: usize::MAX,
+                    min_day_volume_usd: 0.0,
+                    ..SyncConfig::default()
+                };
                 let _sync = spawn_sync(sync_store, config);
             });
 
@@ -185,8 +188,7 @@ pub fn run() {
             // Stream live mids and relay them to the UI as `mid` events.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                let mut adapter =
-                    HyperliquidAdapter::new(adapter_store, vec![Timeframe::Hour1, Timeframe::Hour4]);
+                let mut adapter = HyperliquidAdapter::new(adapter_store, vec![Timeframe::Hour1, Timeframe::Hour4]);
                 let mut events = adapter.feed().subscribe_all();
                 adapter.connect();
                 loop {

@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 domain = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
@@ -16,13 +17,12 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 rust_decimal = { workspace = true }
 reqwest = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 flate2 = "1"
 
 [dev-dependencies]
-# The live smoke test needs a rustls crypto provider installed, which is the
-# binary's job in real use; the test stands in for that here.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

@@ -7,21 +7,15 @@ use chrono::{DateTime, Utc};
 use domain::{Candle, Timeframe};
 use serde::Deserialize;
 
+use crate::error::FeedError;
 use crate::ratelimit::WeightLimiter;
 
 const INFO_URL: &str = "https://api.hyperliquid.xyz/info";
-
-/// metaAndAssetCtxs is a standard weight-20 info request.
 const META_WEIGHT: u32 = 20;
 
-type FetchError = Box<dyn std::error::Error + Send + Sync>;
-
-/// candleSnapshot weight: base 20 plus one per 60 candles requested.
 fn candle_weight(limit: usize) -> u32 {
     20 + u32::try_from(limit.div_ceil(60)).unwrap_or(200)
 }
-
-// --- Candles (candleSnapshot) ---
 
 /// Fetch up to `limit` most-recent candles for `coin` at `timeframe`, oldest-first,
 /// reusing the caller's `client`. Requires a process-wide rustls provider.
@@ -31,7 +25,7 @@ pub(crate) async fn fetch_candles(
     coin: &str,
     timeframe: Timeframe,
     limit: usize,
-) -> Result<Vec<Candle>, FetchError> {
+) -> Result<Vec<Candle>, FeedError> {
     let end = Utc::now().timestamp_millis();
     let bars = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
     let start = end - timeframe.duration_ms().saturating_mul(bars);
@@ -53,8 +47,7 @@ pub(crate) async fn fetch_candles(
 
     let mut candles = Vec::with_capacity(raw.len());
     for bar in &raw {
-        let open_time = DateTime::<Utc>::from_timestamp_millis(bar.t)
-            .ok_or_else(|| FetchError::from(format!("candle timestamp out of range: {}", bar.t)))?;
+        let open_time = DateTime::<Utc>::from_timestamp_millis(bar.t).ok_or(FeedError::Timestamp(bar.t))?;
         candles.push(Candle {
             open_time,
             open: to_decimal(&bar.o)?,
@@ -79,18 +72,16 @@ struct RawCandle {
 }
 
 /// Parse a Hyperliquid decimal (string, or bare number as a fallback).
-pub(crate) fn to_decimal(value: &serde_json::Value) -> Result<rust_decimal::Decimal, FetchError> {
+pub(crate) fn to_decimal(value: &serde_json::Value) -> Result<rust_decimal::Decimal, FeedError> {
     match value {
-        serde_json::Value::String(text) => {
-            text.parse().map_err(|_| FetchError::from(format!("malformed decimal: {text}")))
-        }
-        serde_json::Value::Number(number) => rust_decimal::Decimal::try_from(number.as_f64().unwrap_or(f64::NAN))
-            .map_err(|_| FetchError::from(format!("malformed number: {number}"))),
-        other => Err(FetchError::from(format!("expected a number, got {other}"))),
+        serde_json::Value::String(text) => text.parse().map_err(|_| FeedError::Decimal(text.clone())),
+        serde_json::Value::Number(number) => number
+            .as_f64()
+            .and_then(|value| rust_decimal::Decimal::try_from(value).ok())
+            .ok_or_else(|| FeedError::Decimal(number.to_string())),
+        other => Err(FeedError::Decimal(other.to_string())),
     }
 }
-
-// --- Universe / metadata (metaAndAssetCtxs) ---
 
 /// A perp in the tradable universe with a live metadata snapshot from
 /// `metaAndAssetCtxs`.
@@ -117,7 +108,7 @@ pub(crate) async fn fetch_universe(
     limiter: &WeightLimiter,
     limit: usize,
     min_day_volume_usd: f64,
-) -> Result<Vec<UniverseCoin>, FetchError> {
+) -> Result<Vec<UniverseCoin>, FeedError> {
     limiter.acquire(META_WEIGHT).await;
     let (meta, contexts): (Meta, Vec<AssetContext>) = client
         .post(INFO_URL)
@@ -201,8 +192,9 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::new();
         let limiter = WeightLimiter::new(1100);
-        let candles =
-            fetch_candles(&client, &limiter, "BTC", Timeframe::Hour1, 50).await.expect("fetch BTC 1h candles");
+        let candles = fetch_candles(&client, &limiter, "BTC", Timeframe::Hour1, 50)
+            .await
+            .expect("fetch BTC 1h candles");
         assert!(!candles.is_empty(), "expected candles back");
         for candle in &candles {
             assert!(candle.high >= candle.low, "high below low");
@@ -216,10 +208,14 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::new();
         let limiter = WeightLimiter::new(1100);
-        let coins = fetch_universe(&client, &limiter, 20, 1_000_000.0).await.expect("fetch universe");
+        let coins = fetch_universe(&client, &limiter, 20, 1_000_000.0)
+            .await
+            .expect("fetch universe");
         assert!(!coins.is_empty(), "expected some coins");
         assert!(
-            coins.windows(2).all(|pair| matches!(pair, [a, b] if a.day_volume_usd >= b.day_volume_usd)),
+            coins
+                .windows(2)
+                .all(|pair| matches!(pair, [a, b] if a.day_volume_usd >= b.day_volume_usd)),
             "universe must be ranked by day volume descending",
         );
     }

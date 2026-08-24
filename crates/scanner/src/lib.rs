@@ -90,11 +90,14 @@ pub fn signals_from_candles(coin: &str, timeframe: Timeframe, candles: &[Candle]
 
     let mut signals = Vec::new();
     for (source, oscillator) in [(SignalSource::Rsi, &rsi_series), (SignalSource::Macd, &macd_line)] {
-        for divergence in detect_divergences(&closes, oscillator, config.pivot_left, config.pivot_right, config.max_gap) {
+        for divergence in detect_divergences(&closes, oscillator, config.pivot_left, config.pivot_right, config.max_gap)
+        {
             if latest_confirmable.saturating_sub(divergence.recent_index) > config.recent_within {
                 continue;
             }
-            let Some(candle) = candles.get(divergence.recent_index) else { continue };
+            let Some(candle) = candles.get(divergence.recent_index) else {
+                continue;
+            };
             signals.push(Signal {
                 coin: coin.to_owned(),
                 timeframe,
@@ -125,7 +128,11 @@ pub fn scan_coin(store: &MarketStore, coin: &str, config: &ScanConfig) -> Vec<Si
 /// milliseconds regardless of universe size.
 #[must_use]
 pub fn scan_universe(store: &MarketStore, config: &ScanConfig) -> Vec<Signal> {
-    store.universe().iter().flat_map(|coin| scan_coin(store, &coin.coin, config)).collect()
+    store
+        .universe()
+        .iter()
+        .flat_map(|coin| scan_coin(store, &coin.coin, config))
+        .collect()
 }
 
 #[cfg(test)]

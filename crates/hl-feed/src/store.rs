@@ -83,14 +83,20 @@ impl MarketStore {
     #[must_use]
     pub fn new() -> Arc<Self> {
         let (status, _) = watch::channel(MarketStatus::default());
-        Arc::new(Self { candles: DashMap::new(), universe: RwLock::new(Vec::new()), status })
+        Arc::new(Self {
+            candles: DashMap::new(),
+            universe: RwLock::new(Vec::new()),
+            status,
+        })
     }
 
     /// The latest cached candles for a (coin, timeframe), if backfilled yet.
     /// Returns a shared slice — no copy of the buffer.
     #[must_use]
     pub fn candles(&self, coin: &str, timeframe: Timeframe) -> Option<Arc<[Candle]>> {
-        self.candles.get(&(coin.to_owned(), timeframe)).map(|entry| entry.value().clone().into())
+        self.candles
+            .get(&(coin.to_owned(), timeframe))
+            .map(|entry| entry.value().clone().into())
     }
 
     /// A snapshot of the current volume-ranked universe.

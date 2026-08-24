@@ -2,8 +2,7 @@
 //!
 //! Backfills the universe and candle buffers over REST, then refreshes them on an
 //! interval so the cache stays warm. Consumers read the store instead of fetching,
-//! which is what makes scans and screener reads instant. WebSocket candle streaming
-//! can later replace the periodic refresh for lower latency.
+//! which is what makes scans and screener reads instant.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -76,10 +75,7 @@ async fn refresh(
     store.set_universe_size(coins.len());
     store.set_universe(universe);
 
-    // Only fetch candles we haven't backfilled yet. The WebSocket keeps streamed
-    // timeframes live, so re-downloading everything each cycle is pure waste (and
-    // looks like it's stuck "downloading"). New coins fill in on the cycle they
-    // first appear; a failed fetch is left unmarked so it retries next cycle.
+    // Fetch only not-yet-backfilled sets; the WebSocket keeps streamed timeframes live.
     let pending: Vec<(String, Timeframe)> = coins
         .iter()
         .flat_map(|coin| config.timeframes.iter().map(move |&timeframe| (coin.clone(), timeframe)))
@@ -147,9 +143,11 @@ mod tests {
 
         let universe = store.universe();
         assert!(!universe.is_empty(), "universe should populate");
-        let cached = universe
-            .iter()
-            .any(|coin| store.candles(&coin.coin, Timeframe::Day1).is_some_and(|candles| !candles.is_empty()));
+        let cached = universe.iter().any(|coin| {
+            store
+                .candles(&coin.coin, Timeframe::Day1)
+                .is_some_and(|candles| !candles.is_empty())
+        });
         assert!(cached, "at least one coin should have cached daily candles");
     }
 }

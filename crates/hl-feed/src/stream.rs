@@ -23,6 +23,7 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::error::FeedError;
 use crate::event::{CandleEvent, MarketEvent, MidEvent};
 use crate::feed::MarketFeed;
 use crate::rest::to_decimal;
@@ -50,7 +51,12 @@ impl HyperliquidAdapter {
     /// them into `store`.
     #[must_use]
     pub fn new(store: Arc<MarketStore>, candle_intervals: Vec<Timeframe>) -> Self {
-        Self { feed: MarketFeed::new(), store, candle_intervals, task: None }
+        Self {
+            feed: MarketFeed::new(),
+            store,
+            candle_intervals,
+            task: None,
+        }
     }
 
     /// The shared feed to subscribe on.
@@ -78,8 +84,6 @@ impl HyperliquidAdapter {
     }
 }
 
-type SessionError = Box<dyn std::error::Error + Send + Sync>;
-
 async fn ws_loop(feed: MarketFeed, store: Arc<MarketStore>, intervals: Vec<Timeframe>) {
     let mut backoff = RECONNECT_BASE;
     loop {
@@ -92,15 +96,17 @@ async fn ws_loop(feed: MarketFeed, store: Arc<MarketStore>, intervals: Vec<Timef
     }
 }
 
-async fn run_session(feed: &MarketFeed, store: &MarketStore, intervals: &[Timeframe]) -> Result<(), SessionError> {
+async fn run_session(feed: &MarketFeed, store: &MarketStore, intervals: &[Timeframe]) -> Result<(), FeedError> {
     let (stream, _) = connect_async(WS_URL).await?;
     let (mut write, mut read) = stream.split();
     store.set_connection(ConnectionState::Live);
 
-    // Prices are universe-independent — subscribe immediately.
     for subscription in [Subscription::AllMids, Subscription::FastAssetCtxs] {
-        let subscribe = serde_json::to_string(&Subscribe { method: "subscribe", subscription })?;
-        write.send(Message::Text(subscribe)).await?;
+        let subscribe = serde_json::to_string(&Subscribe {
+            method: "subscribe",
+            subscription,
+        })?;
+        write.send(Message::Text(subscribe.into())).await?;
     }
 
     let mut ping = tokio::time::interval(PING_INTERVAL);
@@ -120,7 +126,7 @@ async fn run_session(feed: &MarketFeed, store: &MarketStore, intervals: &[Timefr
             }
             _ = ping.tick() => {
                 let ping = serde_json::json!({ "method": "ping" }).to_string();
-                write.send(Message::Text(ping)).await?;
+                write.send(Message::Text(ping.into())).await?;
             }
             _ = universe_check.tick(), if !candles_subscribed => {
                 let coins = store.universe();
@@ -132,7 +138,7 @@ async fn run_session(feed: &MarketFeed, store: &MarketStore, intervals: &[Timefr
                                 interval: interval.as_hl().to_owned(),
                             };
                             let subscribe = serde_json::to_string(&Subscribe { method: "subscribe", subscription })?;
-                            write.send(Message::Text(subscribe)).await?;
+                            write.send(Message::Text(subscribe.into())).await?;
                         }
                     }
                     candles_subscribed = true;
@@ -143,8 +149,6 @@ async fn run_session(feed: &MarketFeed, store: &MarketStore, intervals: &[Timefr
     }
 }
 
-/// Decode one text frame and publish/merge what it carries. Prices go to the feed;
-/// candles go to both the feed and the store. Unrecognized channels are ignored.
 fn publish_frame(text: &str, feed: &MarketFeed, store: &MarketStore) {
     let Ok(message) = serde_json::from_str::<WsMessage>(text) else {
         return;
@@ -154,16 +158,28 @@ fn publish_frame(text: &str, feed: &MarketFeed, store: &MarketStore) {
         WsMessage::AllMids { data } => {
             for (symbol, price) in data.mids {
                 if let Ok(price) = price.parse::<Decimal>() {
-                    feed.publish(MarketEvent::Mid(MidEvent { symbol, price, timestamp }));
+                    feed.publish(MarketEvent::Mid(MidEvent {
+                        symbol,
+                        price,
+                        timestamp,
+                    }));
                 }
             }
         }
         WsMessage::FastAssetCtxs { data } => {
-            let Some(prices) = decode_fast_asset_ctxs(&data) else { return };
+            let Some(prices) = decode_fast_asset_ctxs(&data) else {
+                return;
+            };
             for (symbol, ctx) in prices {
-                let Some(raw) = ctx.mark_px.or(ctx.mid_px) else { continue };
+                let Some(raw) = ctx.mark_px.or(ctx.mid_px) else {
+                    continue;
+                };
                 if let Ok(price) = raw.parse::<Decimal>() {
-                    feed.publish(MarketEvent::Mid(MidEvent { symbol, price, timestamp }));
+                    feed.publish(MarketEvent::Mid(MidEvent {
+                        symbol,
+                        price,
+                        timestamp,
+                    }));
                 }
             }
         }

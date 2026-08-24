@@ -8,6 +8,7 @@
 //!
 //! The process must install a rustls crypto provider at startup (the binary's job).
 
+mod error;
 mod event;
 mod feed;
 mod ratelimit;

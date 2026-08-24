@@ -34,12 +34,26 @@ pub fn pivots(series: &[f64], left: usize, right: usize) -> Vec<Pivot> {
     let mut out = Vec::new();
     for (start, window) in series.windows(width).enumerate() {
         let Some(&center) = window.get(left) else { continue };
-        let is_high = window.iter().enumerate().all(|(offset, &value)| offset == left || value < center);
-        let is_low = window.iter().enumerate().all(|(offset, &value)| offset == left || value > center);
+        let is_high = window
+            .iter()
+            .enumerate()
+            .all(|(offset, &value)| offset == left || value < center);
+        let is_low = window
+            .iter()
+            .enumerate()
+            .all(|(offset, &value)| offset == left || value > center);
         if is_high {
-            out.push(Pivot { index: start + left, value: center, kind: PivotKind::High });
+            out.push(Pivot {
+                index: start + left,
+                value: center,
+                kind: PivotKind::High,
+            });
         } else if is_low {
-            out.push(Pivot { index: start + left, value: center, kind: PivotKind::Low });
+            out.push(Pivot {
+                index: start + left,
+                value: center,
+                kind: PivotKind::Low,
+            });
         }
     }
     out
