@@ -6,17 +6,19 @@
   type Row = {
     coin: string;
     price: number;
-    change_24h_pct: number;
+    prev_day: number;
     volume_usd: number;
     open_interest_usd: number;
     funding: number;
   };
+  // 24h % is derived live from the streaming price and the previous-day price.
+  type DisplayRow = Row & { change_24h_pct: number };
 
   let rows = $state<Row[]>([]);
   let loading = $state(true);
   let error = $state("");
   let query = $state("");
-  let sortKey = $state<keyof Row>("volume_usd");
+  let sortKey = $state<keyof DisplayRow>("volume_usd");
   let sortDir = $state<1 | -1>(-1);
   let livePrices = $state<Record<string, number>>({});
   let live = $state(false);
@@ -47,7 +49,7 @@
     };
   });
 
-  function sortBy(key: keyof Row) {
+  function sortBy(key: keyof DisplayRow) {
     if (sortKey === key) sortDir = (sortDir === 1 ? -1 : 1) as 1 | -1;
     else {
       sortKey = key;
@@ -57,7 +59,11 @@
 
   const filtered = $derived.by(() => {
     const q = query.trim().toLowerCase();
-    const r = q ? rows.filter((x) => x.coin.toLowerCase().includes(q)) : rows.slice();
+    const mapped: DisplayRow[] = rows.map((row) => {
+      const price = livePrices[row.coin] ?? row.price;
+      return { ...row, change_24h_pct: row.prev_day > 0 ? (price / row.prev_day - 1) * 100 : 0 };
+    });
+    const r = q ? mapped.filter((x) => x.coin.toLowerCase().includes(q)) : mapped;
     r.sort((a, b) => {
       const av = a[sortKey];
       const bv = b[sortKey];
@@ -71,7 +77,7 @@
     n >= 1e9 ? (n / 1e9).toFixed(2) + "B" : n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(0) + "k" : n.toFixed(0);
   const fmtPrice = (n: number) => (n >= 100 ? n.toFixed(2) : n >= 1 ? n.toFixed(3) : n.toPrecision(4));
 
-  const cols: { key: keyof Row; label: string; num: boolean }[] = [
+  const cols: { key: keyof DisplayRow; label: string; num: boolean }[] = [
     { key: "coin", label: "Coin", num: false },
     { key: "price", label: "Price", num: true },
     { key: "change_24h_pct", label: "24h %", num: true },

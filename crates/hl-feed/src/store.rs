@@ -8,6 +8,9 @@ use tokio::sync::watch;
 
 use crate::UniverseCoin;
 
+/// Cap on candles retained per (coin, timeframe).
+const MAX_CANDLES: usize = 500;
+
 /// What the market sync is currently doing — surfaced in the UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarketStatus {
@@ -28,7 +31,7 @@ pub enum MarketStatus {
 /// timeframe), the ranked universe, and the sync status. Cheap to share (`Arc`);
 /// reads never touch the network, so all computation runs against this cache.
 pub struct MarketStore {
-    candles: DashMap<(String, Timeframe), Arc<[Candle]>>,
+    candles: DashMap<(String, Timeframe), Vec<Candle>>,
     universe: RwLock<Vec<UniverseCoin>>,
     status: watch::Sender<MarketStatus>,
 }
@@ -45,7 +48,7 @@ impl MarketStore {
     /// Returns a shared slice — no copy of the buffer.
     #[must_use]
     pub fn candles(&self, coin: &str, timeframe: Timeframe) -> Option<Arc<[Candle]>> {
-        self.candles.get(&(coin.to_owned(), timeframe)).map(|entry| Arc::clone(entry.value()))
+        self.candles.get(&(coin.to_owned(), timeframe)).map(|entry| entry.value().clone().into())
     }
 
     /// A snapshot of the current volume-ranked universe.
@@ -66,9 +69,26 @@ impl MarketStore {
         self.status.subscribe()
     }
 
-    /// Replace the cached candles for a (coin, timeframe).
-    pub(crate) fn set_candles(&self, coin: String, timeframe: Timeframe, candles: Arc<[Candle]>) {
+    /// Replace the cached candles for a (coin, timeframe) — the REST backfill.
+    pub(crate) fn set_candles(&self, coin: String, timeframe: Timeframe, candles: Vec<Candle>) {
         self.candles.insert((coin, timeframe), candles);
+    }
+
+    /// Merge a streamed candle: update the forming bar in place when its open time
+    /// matches the last cached bar, otherwise append the new bar (capping length).
+    pub(crate) fn merge_candle(&self, coin: &str, timeframe: Timeframe, candle: Candle) {
+        let mut entry = self.candles.entry((coin.to_owned(), timeframe)).or_default();
+        let buffer = entry.value_mut();
+        match buffer.last_mut() {
+            Some(last) if last.open_time == candle.open_time => *last = candle,
+            _ => {
+                buffer.push(candle);
+                if buffer.len() > MAX_CANDLES {
+                    let excess = buffer.len() - MAX_CANDLES;
+                    buffer.drain(0..excess);
+                }
+            }
+        }
     }
 
     /// Replace the cached universe.

@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use domain::Timeframe;
 use hl_feed::{HyperliquidAdapter, MarketEvent, MarketStatus, MarketStore, SyncConfig, spawn_sync};
 use indicators::{DivergenceDirection, DivergenceKind};
 use rust_decimal::prelude::ToPrimitive;
@@ -21,7 +22,7 @@ use tokio::sync::broadcast::error::RecvError;
 struct ScreenerRow {
     coin: String,
     price: f64,
-    change_24h_pct: f64,
+    prev_day: f64,
     volume_usd: f64,
     open_interest_usd: f64,
     funding: f64,
@@ -34,10 +35,6 @@ fn screener_rows(store: tauri::State<'_, Arc<MarketStore>>) -> Vec<ScreenerRow> 
         .universe()
         .iter()
         .map(|coin| {
-            let change_24h_pct = match (coin.mark_px, coin.prev_day_px) {
-                (Some(mark), Some(prev)) if prev > 0.0 => (mark / prev - 1.0) * 100.0,
-                _ => 0.0,
-            };
             let open_interest_usd = match (coin.open_interest, coin.mark_px) {
                 (Some(oi), Some(mark)) => oi * mark,
                 _ => 0.0,
@@ -45,7 +42,7 @@ fn screener_rows(store: tauri::State<'_, Arc<MarketStore>>) -> Vec<ScreenerRow> 
             ScreenerRow {
                 coin: coin.coin.clone(),
                 price: coin.mark_px.unwrap_or(0.0),
-                change_24h_pct,
+                prev_day: coin.prev_day_px.unwrap_or(0.0),
                 volume_usd: coin.day_volume_usd,
                 open_interest_usd,
                 funding: coin.funding.unwrap_or(0.0),
@@ -139,6 +136,7 @@ pub fn run() {
     let store = MarketStore::new();
     let sync_store = Arc::clone(&store);
     let status_store = Arc::clone(&store);
+    let adapter_store = Arc::clone(&store);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -167,18 +165,20 @@ pub fn run() {
             // Stream live mids and relay them to the UI as `mid` events.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                let mut adapter = HyperliquidAdapter::new();
+                let mut adapter =
+                    HyperliquidAdapter::new(adapter_store, vec![Timeframe::Hour1, Timeframe::Hour4]);
                 let mut events = adapter.feed().subscribe_all();
                 adapter.connect();
                 loop {
                     match events.recv().await {
                         Ok(event) => {
-                            let MarketEvent::Mid(mid) = &*event;
-                            let payload = MidPayload {
-                                coin: mid.symbol.clone(),
-                                price: mid.price.to_f64().unwrap_or(0.0),
-                            };
-                            let _ = handle.emit("mid", payload);
+                            if let MarketEvent::Mid(mid) = &*event {
+                                let payload = MidPayload {
+                                    coin: mid.symbol.clone(),
+                                    price: mid.price.to_f64().unwrap_or(0.0),
+                                };
+                                let _ = handle.emit("mid", payload);
+                            }
                         }
                         Err(RecvError::Lagged(_)) => {}
                         Err(RecvError::Closed) => break,

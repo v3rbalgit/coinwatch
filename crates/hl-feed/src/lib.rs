@@ -1,40 +1,38 @@
 //! Real-time Hyperliquid market-data feed.
 //!
-//! A [`HyperliquidAdapter`] holds Hyperliquid's public WebSocket and publishes typed
-//! [`MarketEvent`]s onto a shared [`MarketFeed`] (per-symbol and global `broadcast`
-//! channels). Consumers subscribe to the feed; the adapter reconnects on its own.
+//! A [`HyperliquidAdapter`] runs one Hyperliquid WebSocket session, streaming
+//! prices and candles as typed [`MarketEvent`]s onto a shared [`MarketFeed`] and
+//! merging candles into the [`MarketStore`] hot cache. [`spawn_sync`] keeps the
+//! cache warm over REST (universe metadata + candle history). Consumers read the
+//! store or subscribe to the feed; the adapter reconnects on its own.
 //!
-//! The process must install a rustls crypto provider at startup (the binary's job,
-//! per convention) before the first TLS handshake.
+//! The process must install a rustls crypto provider at startup (the binary's job).
 
-mod candle;
 mod event;
 mod feed;
-mod hyperliquid;
+mod rest;
 mod store;
+mod stream;
 mod sync;
-mod universe;
 
-pub use candle::fetch_candles;
-pub use event::{MarketEvent, MidEvent};
+pub use event::{CandleEvent, MarketEvent, MidEvent};
 pub use feed::MarketFeed;
-pub use hyperliquid::HyperliquidAdapter;
+pub use rest::UniverseCoin;
 pub use store::{MarketStatus, MarketStore};
+pub use stream::HyperliquidAdapter;
 pub use sync::{SyncConfig, spawn_sync};
-pub use universe::{UniverseCoin, fetch_universe};
 
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use crate::{HyperliquidAdapter, MarketEvent};
+    use crate::{HyperliquidAdapter, MarketEvent, MarketStore};
 
-    /// Live smoke test: connect to Hyperliquid and confirm mid events flow through
-    /// the feed's global channel. Requires network access.
+    /// Live smoke test: connect and confirm mid events flow through the feed.
     #[tokio::test]
     async fn receives_live_mids() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let mut adapter = HyperliquidAdapter::new();
+        let mut adapter = HyperliquidAdapter::new(MarketStore::new(), Vec::new());
         let mut rx = adapter.feed().subscribe_all();
         adapter.connect();
 

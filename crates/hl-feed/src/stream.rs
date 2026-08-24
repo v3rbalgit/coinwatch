@@ -1,12 +1,20 @@
-//! Hyperliquid market-data adapter over the public WebSocket.
+//! The Hyperliquid WebSocket adapter: one session streaming prices and candles.
+//!
+//! Subscribes to `allMids` + `fastAssetCtxs` (prices) and, once the universe is
+//! known, `candle` streams for the configured timeframes. Prices publish as
+//! [`MarketEvent::Mid`] and candles as [`MarketEvent::Candle`] onto the shared
+//! [`MarketFeed`]; candles are also merged into the [`MarketStore`] for reads.
+//! Reconnects with exponential backoff, re-subscribing each session.
 
 use std::collections::HashMap;
 use std::io::Read;
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use domain::{Candle, Timeframe};
 use flate2::read::DeflateDecoder;
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
@@ -15,29 +23,34 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::event::{MarketEvent, MidEvent};
+use crate::event::{CandleEvent, MarketEvent, MidEvent};
 use crate::feed::MarketFeed;
+use crate::rest::to_decimal;
+use crate::store::MarketStore;
 
 const WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 const RECONNECT_BASE: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
+const UNIVERSE_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Streams live Hyperliquid market data into a shared [`MarketFeed`]. Construct,
-/// take a [`feed`](Self::feed) to subscribe on, then [`connect`](Self::connect) to
-/// spawn the streaming task. The task is detached and reconnects with exponential
-/// backoff, so the adapter may be dropped once connected; [`disconnect`](Self::disconnect)
-/// stops it. Requires a process-wide rustls crypto provider (installed by the binary).
+/// Streams live Hyperliquid market data (prices + candles) into a shared
+/// [`MarketFeed`] and [`MarketStore`]. Construct, take a [`feed`](Self::feed) to
+/// subscribe on, then [`connect`](Self::connect). The task reconnects on its own;
+/// requires a process-wide rustls crypto provider (installed by the binary).
 pub struct HyperliquidAdapter {
     feed: MarketFeed,
+    store: Arc<MarketStore>,
+    candle_intervals: Vec<Timeframe>,
     task: Option<JoinHandle<()>>,
 }
 
 impl HyperliquidAdapter {
-    /// Create an adapter over a fresh feed.
+    /// Create an adapter that streams candles for `candle_intervals` and merges
+    /// them into `store`.
     #[must_use]
-    pub fn new() -> Self {
-        Self { feed: MarketFeed::new(), task: None }
+    pub fn new(store: Arc<MarketStore>, candle_intervals: Vec<Timeframe>) -> Self {
+        Self { feed: MarketFeed::new(), store, candle_intervals, task: None }
     }
 
     /// The shared feed to subscribe on.
@@ -51,7 +64,10 @@ impl HyperliquidAdapter {
         if self.task.is_some() {
             return;
         }
-        self.task = Some(tokio::spawn(ws_loop(self.feed.clone())));
+        let feed = self.feed.clone();
+        let store = Arc::clone(&self.store);
+        let intervals = self.candle_intervals.clone();
+        self.task = Some(tokio::spawn(ws_loop(feed, store, intervals)));
     }
 
     /// Stop the streaming task; a later [`connect`](Self::connect) restarts it.
@@ -62,18 +78,12 @@ impl HyperliquidAdapter {
     }
 }
 
-impl Default for HyperliquidAdapter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 type SessionError = Box<dyn std::error::Error + Send + Sync>;
 
-async fn ws_loop(feed: MarketFeed) {
+async fn ws_loop(feed: MarketFeed, store: Arc<MarketStore>, intervals: Vec<Timeframe>) {
     let mut backoff = RECONNECT_BASE;
     loop {
-        match run_session(&feed).await {
+        match run_session(&feed, &store, &intervals).await {
             Ok(()) => backoff = RECONNECT_BASE,
             Err(_) => backoff = (backoff * 2).min(RECONNECT_MAX),
         }
@@ -81,24 +91,26 @@ async fn ws_loop(feed: MarketFeed) {
     }
 }
 
-async fn run_session(feed: &MarketFeed) -> Result<(), SessionError> {
+async fn run_session(feed: &MarketFeed, store: &MarketStore, intervals: &[Timeframe]) -> Result<(), SessionError> {
     let (stream, _) = connect_async(WS_URL).await?;
     let (mut write, mut read) = stream.split();
 
-    // allMids gives every coin a price on a ~5s cadence; fastAssetCtxs pushes only
-    // what moved on a ~1s cadence, so prices stay near real-time.
+    // Prices are universe-independent — subscribe immediately.
     for subscription in [Subscription::AllMids, Subscription::FastAssetCtxs] {
         let subscribe = serde_json::to_string(&Subscribe { method: "subscribe", subscription })?;
         write.send(Message::Text(subscribe)).await?;
     }
 
     let mut ping = tokio::time::interval(PING_INTERVAL);
+    let mut universe_check = tokio::time::interval(UNIVERSE_CHECK_INTERVAL);
+    let mut candles_subscribed = false;
+
     loop {
         tokio::select! {
             frame = read.next() => {
                 let Some(frame) = frame else { return Ok(()) };
                 match frame? {
-                    Message::Text(text) => publish_frame(&text, feed),
+                    Message::Text(text) => publish_frame(&text, feed, store),
                     Message::Ping(payload) => write.send(Message::Pong(payload)).await?,
                     Message::Close(_) => return Ok(()),
                     _ => {}
@@ -108,14 +120,29 @@ async fn run_session(feed: &MarketFeed) -> Result<(), SessionError> {
                 let ping = serde_json::json!({ "method": "ping" }).to_string();
                 write.send(Message::Text(ping)).await?;
             }
+            _ = universe_check.tick(), if !candles_subscribed => {
+                let coins = store.universe();
+                if !coins.is_empty() {
+                    for coin in &coins {
+                        for &interval in intervals {
+                            let subscription = Subscription::Candle {
+                                coin: coin.coin.clone(),
+                                interval: interval.as_hl().to_owned(),
+                            };
+                            let subscribe = serde_json::to_string(&Subscribe { method: "subscribe", subscription })?;
+                            write.send(Message::Text(subscribe)).await?;
+                        }
+                    }
+                    candles_subscribed = true;
+                }
+            }
         }
     }
 }
 
-/// Deserialize one text frame and publish the events it carries. Unrecognized
-/// channels (subscription acks, pongs) parse to [`WsMessage::Other`] and are
-/// ignored; a malformed frame is dropped rather than dropping the connection.
-fn publish_frame(text: &str, feed: &MarketFeed) {
+/// Decode one text frame and publish/merge what it carries. Prices go to the feed;
+/// candles go to both the feed and the store. Unrecognized channels are ignored.
+fn publish_frame(text: &str, feed: &MarketFeed, store: &MarketStore) {
     let Ok(message) = serde_json::from_str::<WsMessage>(text) else {
         return;
     };
@@ -137,8 +164,31 @@ fn publish_frame(text: &str, feed: &MarketFeed) {
                 }
             }
         }
+        WsMessage::Candle { data } => {
+            if let Some(event) = candle_event(&data) {
+                store.merge_candle(&event.coin, event.timeframe, event.candle.clone());
+                feed.publish(MarketEvent::Candle(event));
+            }
+        }
         WsMessage::Other => {}
     }
+}
+
+fn candle_event(data: &WsCandle) -> Option<CandleEvent> {
+    let timeframe = Timeframe::from_hl(&data.i)?;
+    let open_time = DateTime::from_timestamp_millis(data.t)?;
+    Some(CandleEvent {
+        coin: data.s.clone(),
+        timeframe,
+        candle: Candle {
+            open_time,
+            open: to_decimal(&data.o).ok()?,
+            high: to_decimal(&data.h).ok()?,
+            low: to_decimal(&data.l).ok()?,
+            close: to_decimal(&data.c).ok()?,
+            volume: to_decimal(&data.v).ok()?,
+        },
+    })
 }
 
 /// Decode a `fastAssetCtxs` frame: base64 of a raw deflate stream (no zlib
@@ -161,6 +211,7 @@ struct Subscribe {
 enum Subscription {
     AllMids,
     FastAssetCtxs,
+    Candle { coin: String, interval: String },
 }
 
 #[derive(Deserialize)]
@@ -170,6 +221,8 @@ enum WsMessage {
     AllMids { data: AllMidsData },
     #[serde(rename = "fastAssetCtxs")]
     FastAssetCtxs { data: String },
+    #[serde(rename = "candle")]
+    Candle { data: Box<WsCandle> },
     #[serde(other)]
     Other,
 }
@@ -186,6 +239,19 @@ struct FastPrices {
     mark_px: Option<String>,
     #[serde(rename = "midPx")]
     mid_px: Option<String>,
+}
+
+/// A Hyperliquid WS candle payload (`o`/`h`/`l`/`c`/`v` arrive as JSON strings).
+#[derive(Deserialize)]
+struct WsCandle {
+    t: i64,
+    s: String,
+    i: String,
+    o: serde_json::Value,
+    h: serde_json::Value,
+    l: serde_json::Value,
+    c: serde_json::Value,
+    v: serde_json::Value,
 }
 
 #[cfg(test)]

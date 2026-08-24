@@ -11,7 +11,8 @@ use std::time::Duration;
 use domain::Timeframe;
 use tokio::task::JoinHandle;
 
-use crate::{MarketStatus, MarketStore, fetch_candles, fetch_universe};
+use crate::rest::{fetch_candles, fetch_universe};
+use crate::{MarketStatus, MarketStore};
 
 /// How the sync engine seeds and refreshes the store.
 #[derive(Debug, Clone)]
@@ -76,7 +77,7 @@ async fn refresh(store: &MarketStore, client: &reqwest::Client, config: &SyncCon
         }
         for &timeframe in &config.timeframes {
             if let Ok(candles) = fetch_candles(client, coin, timeframe, config.lookback).await {
-                store.set_candles(coin.clone(), timeframe, candles.into());
+                store.set_candles(coin.clone(), timeframe, candles);
             }
             tokio::time::sleep(config.request_delay).await;
         }

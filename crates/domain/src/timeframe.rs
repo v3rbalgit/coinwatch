@@ -25,6 +25,18 @@ impl Timeframe {
         }
     }
 
+    /// Parse Hyperliquid's interval string back into a timeframe.
+    #[must_use]
+    pub fn from_hl(interval: &str) -> Option<Self> {
+        match interval {
+            "1h" => Some(Self::Hour1),
+            "4h" => Some(Self::Hour4),
+            "1d" => Some(Self::Day1),
+            "1w" => Some(Self::Week1),
+            _ => None,
+        }
+    }
+
     /// Nominal bar duration in milliseconds (for backfill windows).
     #[must_use]
     pub const fn duration_ms(self) -> i64 {
