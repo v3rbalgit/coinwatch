@@ -1,0 +1,33 @@
+[package]
+name = "screener"
+version = "0.1.0"
+description = "Hyperliquid market screener and mission-control desktop app"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "screener_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+cw-core = { workspace = true }
+cw-storage = { workspace = true }
+cw-providers = { workspace = true }
+cw-features = { workspace = true }
+hl-feed = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
