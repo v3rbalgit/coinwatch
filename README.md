@@ -1,68 +1,60 @@
 # Coinwatch
 
-A modular, **backtest-first quant research platform** for on-chain (DEX) crypto markets,
-written in Rust. It ingests on-chain market data, computes pluggable feature modules,
-backtests strategies with honest transaction costs and point-in-time correctness, and
-validates them with walk-forward cross-validation and overfitting-aware statistics.
+A real-time **Hyperliquid market screener and mission-control** desktop app — a Tauri v2 +
+SvelteKit front end over a Rust market-data engine. It streams the live perp universe,
+screens it on live metadata (price, 24h change, volume, open interest, funding), and scans
+candle history for RSI/MACD divergence setups across 1h / 4h / 1d / 1w.
 
-The goal is a durable **research harness** — strategies decay, the harness outlives them —
-on the path from *finding* an edge to *verifying* it (realistic backtest + paper trading)
-to *executing* it on-chain.
+Single-user and GUI-first: screen the market, (soon) chart it, filter by indicator, and keep
+a journal — a decision-support tool, not an auto-trader.
 
-> **History:** Coinwatch began as a Python CEX data-collection system. That original
-> project is archived on the [`v1-python`](../../tree/v1-python) branch (tag `v1.0-python`).
-> `main` is the Rust rewrite. See [`DESIGN.md`](DESIGN.md) for architecture and rationale.
-
-## Status
-
-Working end-to-end research pipeline (research-grade, **not** an alpha generator yet):
-ingest → store → features → strategy → cost-aware backtest → walk-forward CV → metrics.
-Demo backtests are architecture confirmation on a small in-sample window — the platform's
-own Deflated Sharpe Ratio says so out loud. The current focus is deepening data and adding
-differentiated on-chain features so the search can surface real, verifiable edges.
+> **History:** Coinwatch began as a Python CEX collector (archived on
+> [`v1-python`](../../tree/v1-python), tag `v1.0-python`), then a Rust backtest-research
+> engine (preserved on [`experiment/backtest-research`](../../tree/experiment/backtest-research)).
+> This branch is the real-time screener. See [`DESIGN.md`](DESIGN.md) for the architecture.
 
 ## Architecture
 
-A Cargo workspace of small crates wired as a clean DAG (details in [`DESIGN.md`](DESIGN.md)):
+A Cargo workspace of four library crates plus the Tauri app (details in [`DESIGN.md`](DESIGN.md)):
 
 | Crate | Responsibility |
-| ------- | ---------------- |
-| `cw-core` | Canonical domain types, fixed-point `Decimal`, shared errors |
-| `cw-storage` | DuckDB-backed bar store + instrument registry (point-in-time reads) |
-| `cw-providers` | `DataSource` / `UniverseSource` seams; GeckoTerminal adapter |
-| `cw-features` | `FeatureModule` seam; technical + liquidity modules; `combine()` |
-| `cw-strategy` | `Strategy` seam; cross-sectional strategy |
-| `cw-backtest` | Point-in-time engine; fees + slippage + gas; equity curve + ledger |
-| `cw-eval` | Sharpe/Sortino/maxDD/turnover/hit-rate + PSR + Deflated Sharpe |
-| `cw-harness` | Walk-forward CV: fold sweep, OOS selection, deflation |
-| `cw-app` | `coinwatch` CLI: `ingest` / `analyze` |
+| ------ | --------------- |
+| `domain` | Shared market types (`Candle`, `Timeframe`) |
+| `hl-feed` | Hyperliquid engine: one WebSocket session (prices + candles), REST backfill (universe + candle history), an in-memory `MarketStore` hot cache, and a rate-limited sync |
+| `indicators` | Pure indicator + divergence math (RSI, MACD; regular + hidden) |
+| `scanner` | Pure divergence scan over the cache, per timeframe |
+| `screener` (`screener/src-tauri`) | Tauri v2 app: commands read the cache; mids/candles stream to the UI |
 
-The engine sees only canonical types and trait seams, so new data providers and edge
-hypotheses (feature modules) slot in without touching it.
+The engine feeds an in-memory cache; the UI never waits on the network. Prices stream over the
+WebSocket (~1s); candle history backfills over REST within Hyperliquid's rate limit.
 
-## Quickstart
+## Prerequisites
 
-Requires a Rust toolchain and a C++ compiler (for the bundled DuckDB build).
+- **Rust** (stable toolchain).
+- **Node + pnpm** for the front end.
+- **System WebKitGTK** for the Tauri window (Linux: `webkit2gtk-4.1`, `libgtk-3`, and the
+  usual Tauri build dependencies).
+- A **display** — it is a desktop GUI and cannot run headless.
+
+## Run
 
 ```bash
-# Discover the universe (Base + Arbitrum) and backfill daily bars into DuckDB.
-# Networked + incremental; safe to re-run (skips up-to-date pools).
-cargo run -p cw-app -- ingest
-
-# Offline research over the stored universe: features, leaderboard,
-# in-sample backtests, and honest walk-forward CV with Deflated Sharpe.
-cargo run -p cw-app -- analyze
+just setup   # install front-end deps (once, and after dependency changes)
+just run     # launch the desktop app in dev (Vite on :1420 + the Rust app)
 ```
 
-Data lands in `research/data/coinwatch.duckdb`. The research layer (Polars/DuckDB) reads
-the same artifacts for ad-hoc analysis.
+Or directly: `cd screener && pnpm install && pnpm tauri dev`.
 
 ## Development
 
 ```bash
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+just check   # cargo check across the workspace
+just lint    # clippy, warnings denied (lint policy in Cargo.toml [workspace.lints])
+just test    # cargo test across the workspace
+just quality # full gate: fmt + clippy + test + doc + cargo-deny + git diff --check
 ```
+
+Front-end checks: `cd screener && pnpm check` (svelte-check).
 
 ## License
 
