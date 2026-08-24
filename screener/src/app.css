@@ -77,4 +77,14 @@
   body {
     @apply bg-background text-foreground;
   }
+  /* Tailwind v4 preflight drops the interactive-button cursor; restore it. */
+  button:not(:disabled) {
+    cursor: pointer;
+  }
+}
+
+/* Reserve the scrollbar's gutter so row actions stay clear of it; the webview's
+   native scrollbar handles showing on scroll and fading when idle. */
+.scrollable {
+  scrollbar-gutter: stable;
 }
