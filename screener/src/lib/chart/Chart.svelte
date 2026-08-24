@@ -10,6 +10,7 @@
     HistogramSeries,
     LineSeries,
     LineStyle,
+    PriceScaleMode,
     createChart,
     type IChartApi,
     type ISeriesApi,
@@ -17,7 +18,7 @@
   } from "lightweight-charts";
   import { onMount } from "svelte";
 
-  import { analyze, defaultIndicatorConfig, loadIndicators, type IndicatorConfig } from "./indicators";
+  import { analyze, defaultIndicatorConfig, loadIndicators, type Analysis, type IndicatorConfig } from "./indicators";
   import { chartTheme, fmtPrice } from "./theme";
 
   // `seed` changes when the whole series is replaced (coin / timeframe switch or a
@@ -55,25 +56,41 @@
   let ready = $state(false);
   let wasmReady = $state(false);
 
-  type Ohlc = { open: number; high: number; low: number; close: number };
-  let legend = $state<Ohlc | null>(null);
+  type LegendData = {
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number;
+    change: number;
+    rsi: number | null;
+    macd: number | null;
+  };
+  let legend = $state<LegendData | null>(null);
+  let logScale = $state(false);
+  let latestAnalysis: Analysis | undefined;
 
-  function toOhlc(data: unknown): Ohlc | null {
-    if (
-      data &&
-      typeof data === "object" &&
-      "open" in data &&
-      "high" in data &&
-      "low" in data &&
-      "close" in data &&
-      typeof data.open === "number" &&
-      typeof data.high === "number" &&
-      typeof data.low === "number" &&
-      typeof data.close === "number"
-    ) {
-      return { open: data.open, high: data.high, low: data.low, close: data.close };
-    }
-    return null;
+  const defined = (value: number | undefined) => (value !== undefined && !Number.isNaN(value) ? value : null);
+  const fmtVol = (value: number) =>
+    value >= 1e9
+      ? (value / 1e9).toFixed(2) + "B"
+      : value >= 1e6
+        ? (value / 1e6).toFixed(1) + "M"
+        : value >= 1e3
+          ? (value / 1e3).toFixed(0) + "k"
+          : value.toFixed(0);
+
+  function legendFor(bar: Bar, index: number): LegendData {
+    return {
+      open: bar.open,
+      high: bar.high,
+      low: bar.low,
+      close: bar.close,
+      volume: bar.volume,
+      change: bar.open !== 0 ? (bar.close / bar.open - 1) * 100 : 0,
+      rsi: defined(latestAnalysis?.rsi[index]),
+      macd: defined(latestAnalysis?.macd[index]),
+    };
   }
 
   // lightweight-charts' UTCTimestamp is a branded number; the cast is the library's
@@ -181,14 +198,15 @@
     panes[2]?.setStretchFactor(1);
 
     chart.subscribeCrosshairMove((param) => {
-      const hovered = candles ? toOhlc(param.seriesData.get(candles)) : null;
-      if (hovered) {
+      const index = param.time === undefined ? -1 : bars.findIndex((bar) => bar.time === param.time);
+      const bar = index >= 0 ? bars[index] : undefined;
+      if (bar) {
         hovering = true;
-        legend = hovered;
+        legend = legendFor(bar, index);
       } else {
         hovering = false;
         const last = bars.at(-1);
-        legend = last ? { open: last.open, high: last.high, low: last.low, close: last.close } : null;
+        legend = last ? legendFor(last, bars.length - 1) : null;
       }
     });
 
@@ -245,8 +263,13 @@
     lastTime = bars[bars.length - 1].time;
     if (!hovering) {
       const last = bars[bars.length - 1];
-      legend = { open: last.open, high: last.high, low: last.low, close: last.close };
+      legend = legendFor(last, bars.length - 1);
     }
+  });
+
+  // Toggle the price pane between linear and logarithmic.
+  $effect(() => {
+    chart?.priceScale("right").applyOptions({ mode: logScale ? PriceScaleMode.Logarithmic : PriceScaleMode.Normal });
   });
 
   // Indicators: compute RSI/MACD + divergences via the WASM engine over the current
@@ -258,6 +281,7 @@
     }
     const closes = Float64Array.from(bars, (bar) => bar.close);
     const analysis = analyze(closes, config);
+    latestAnalysis = analysis;
     const firstTime = bars[0].time;
 
     if (seed !== plottedIndicatorSeed || firstTime < plottedIndicatorFirstTime) {
@@ -314,14 +338,37 @@
   });
 </script>
 
-<div class="relative h-full w-full">
-  <div bind:this={container} class="h-full w-full"></div>
-  {#if legend}
-    <div class="pointer-events-none absolute left-2 top-2 flex gap-3 text-xs tabular-nums text-muted-foreground">
-      <span>O <span class="text-foreground">{fmtPrice(legend.open)}</span></span>
-      <span>H <span class="text-foreground">{fmtPrice(legend.high)}</span></span>
-      <span>L <span class="text-foreground">{fmtPrice(legend.low)}</span></span>
-      <span>C <span class="text-foreground">{fmtPrice(legend.close)}</span></span>
-    </div>
-  {/if}
+<div class="flex h-full w-full">
+  <div class="flex w-9 flex-shrink-0 flex-col gap-1 border-r border-border p-1">
+    <button
+      class="rounded py-1 text-[10px] font-medium {logScale
+        ? 'bg-accent text-accent-foreground'
+        : 'text-muted-foreground hover:bg-accent/50'}"
+      title="Logarithmic price scale"
+      onclick={() => (logScale = !logScale)}
+    >
+      log
+    </button>
+  </div>
+  <div class="relative min-w-0 flex-1">
+    <div bind:this={container} class="h-full w-full"></div>
+    {#if legend}
+      <div
+        class="pointer-events-none absolute left-2 top-2 flex flex-wrap gap-x-3 gap-y-0.5 text-xs tabular-nums text-muted-foreground"
+      >
+        <span>O <span class="text-foreground">{fmtPrice(legend.open)}</span></span>
+        <span>H <span class="text-foreground">{fmtPrice(legend.high)}</span></span>
+        <span>L <span class="text-foreground">{fmtPrice(legend.low)}</span></span>
+        <span>C <span class="text-foreground">{fmtPrice(legend.close)}</span></span>
+        <span>V <span class="text-foreground">{fmtVol(legend.volume)}</span></span>
+        <span class={legend.change > 0 ? "text-green-500" : legend.change < 0 ? "text-red-500" : ""}>
+          {legend.change >= 0 ? "+" : ""}{legend.change.toFixed(2)}%
+        </span>
+        {#if legend.rsi !== null}<span>RSI <span style="color: {chartTheme.rsi}">{legend.rsi.toFixed(1)}</span></span>{/if}
+        {#if legend.macd !== null}
+          <span>MACD <span style="color: {chartTheme.macd}">{legend.macd.toFixed(4)}</span></span>
+        {/if}
+      </div>
+    {/if}
+  </div>
 </div>
