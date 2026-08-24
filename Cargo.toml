@@ -23,6 +23,7 @@ cw-eval = { path = "crates/eval", version = "0.1.0" }
 cw-harness = { path = "crates/harness", version = "0.1.0" }
 # Real-time product crates (the screener/mission-control direction)
 hl-feed = { path = "crates/hl-feed", version = "0.1.0" }
+indicators = { path = "crates/indicators", version = "0.1.0" }
 
 # Shared third-party
 thiserror = "2"

@@ -2199,6 +2199,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "futures-util",
+ "reqwest 0.12.28",
  "rust_decimal",
  "rustls",
  "serde",
@@ -2481,6 +2482,10 @@ dependencies = [
  "serde",
  "serde_core",
 ]
+
+[[package]]
+name = "indicators"
+version = "0.1.0"
 
 [[package]]
 name = "infer"

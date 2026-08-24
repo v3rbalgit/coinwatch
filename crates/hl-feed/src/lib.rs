@@ -7,10 +7,12 @@
 //! The process must install a rustls crypto provider at startup (the binary's job,
 //! per convention) before the first TLS handshake.
 
+mod candle;
 mod event;
 mod feed;
 mod hyperliquid;
 
+pub use candle::{Candle, Timeframe, fetch_candles};
 pub use event::{MarketEvent, MidEvent};
 pub use feed::MarketFeed;
 pub use hyperliquid::HyperliquidAdapter;

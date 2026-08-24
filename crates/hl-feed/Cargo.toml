@@ -14,6 +14,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 rust_decimal = { workspace = true }
+reqwest = { workspace = true }
 
 [dev-dependencies]
 # The live smoke test needs a rustls crypto provider installed, which is the
