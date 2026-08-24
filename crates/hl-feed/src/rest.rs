@@ -7,9 +7,19 @@ use chrono::{DateTime, Utc};
 use domain::{Candle, Timeframe};
 use serde::Deserialize;
 
+use crate::ratelimit::WeightLimiter;
+
 const INFO_URL: &str = "https://api.hyperliquid.xyz/info";
 
+/// metaAndAssetCtxs is a standard weight-20 info request.
+const META_WEIGHT: u32 = 20;
+
 type FetchError = Box<dyn std::error::Error + Send + Sync>;
+
+/// candleSnapshot weight: base 20 plus one per 60 candles requested.
+fn candle_weight(limit: usize) -> u32 {
+    20 + u32::try_from(limit.div_ceil(60)).unwrap_or(200)
+}
 
 // --- Candles (candleSnapshot) ---
 
@@ -17,6 +27,7 @@ type FetchError = Box<dyn std::error::Error + Send + Sync>;
 /// reusing the caller's `client`. Requires a process-wide rustls provider.
 pub(crate) async fn fetch_candles(
     client: &reqwest::Client,
+    limiter: &WeightLimiter,
     coin: &str,
     timeframe: Timeframe,
     limit: usize,
@@ -30,6 +41,7 @@ pub(crate) async fn fetch_candles(
         "req": { "coin": coin, "interval": timeframe.as_hl(), "startTime": start, "endTime": end },
     });
 
+    limiter.acquire(candle_weight(limit)).await;
     let raw: Vec<RawCandle> = client
         .post(INFO_URL)
         .json(&body)
@@ -102,9 +114,11 @@ pub struct UniverseCoin {
 /// coins with at least `min_day_volume_usd` and capping at `limit`.
 pub(crate) async fn fetch_universe(
     client: &reqwest::Client,
+    limiter: &WeightLimiter,
     limit: usize,
     min_day_volume_usd: f64,
 ) -> Result<Vec<UniverseCoin>, FetchError> {
+    limiter.acquire(META_WEIGHT).await;
     let (meta, contexts): (Meta, Vec<AssetContext>) = client
         .post(INFO_URL)
         .json(&serde_json::json!({ "type": "metaAndAssetCtxs" }))
@@ -180,13 +194,15 @@ struct AssetContext {
 mod tests {
     use domain::Timeframe;
 
-    use super::{fetch_candles, fetch_universe};
+    use super::{WeightLimiter, fetch_candles, fetch_universe};
 
     #[tokio::test]
     async fn fetches_live_btc_candles() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::new();
-        let candles = fetch_candles(&client, "BTC", Timeframe::Hour1, 50).await.expect("fetch BTC 1h candles");
+        let limiter = WeightLimiter::new(1100);
+        let candles =
+            fetch_candles(&client, &limiter, "BTC", Timeframe::Hour1, 50).await.expect("fetch BTC 1h candles");
         assert!(!candles.is_empty(), "expected candles back");
         for candle in &candles {
             assert!(candle.high >= candle.low, "high below low");
@@ -199,7 +215,8 @@ mod tests {
     async fn fetches_ranked_universe() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::new();
-        let coins = fetch_universe(&client, 20, 1_000_000.0).await.expect("fetch universe");
+        let limiter = WeightLimiter::new(1100);
+        let coins = fetch_universe(&client, &limiter, 20, 1_000_000.0).await.expect("fetch universe");
         assert!(!coins.is_empty(), "expected some coins");
         assert!(
             coins.windows(2).all(|pair| matches!(pair, [a, b] if a.day_volume_usd >= b.day_volume_usd)),

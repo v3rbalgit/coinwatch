@@ -10,6 +10,7 @@
 
 mod event;
 mod feed;
+mod ratelimit;
 mod rest;
 mod store;
 mod stream;

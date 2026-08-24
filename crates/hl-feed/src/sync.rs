@@ -11,6 +11,7 @@ use std::time::Duration;
 use domain::Timeframe;
 use tokio::task::JoinHandle;
 
+use crate::ratelimit::WeightLimiter;
 use crate::rest::{fetch_candles, fetch_universe};
 use crate::{MarketStatus, MarketStore};
 
@@ -25,8 +26,8 @@ pub struct SyncConfig {
     pub min_day_volume_usd: f64,
     /// Candles fetched per (coin, timeframe).
     pub lookback: usize,
-    /// Delay between REST requests, to respect rate limits.
-    pub request_delay: Duration,
+    /// REST weight budget per rolling minute (HL's cap is 1200; keep margin).
+    pub weight_budget_per_min: u32,
     /// Pause between full refresh cycles.
     pub refresh_interval: Duration,
 }
@@ -38,7 +39,7 @@ impl Default for SyncConfig {
             universe_limit: 60,
             min_day_volume_usd: 1_000_000.0,
             lookback: 300,
-            request_delay: Duration::from_millis(120),
+            weight_budget_per_min: 1100,
             refresh_interval: Duration::from_secs(60),
         }
     }
@@ -50,9 +51,10 @@ impl Default for SyncConfig {
 pub fn spawn_sync(store: Arc<MarketStore>, config: SyncConfig) -> JoinHandle<()> {
     tokio::spawn(async move {
         let client = reqwest::Client::new();
+        let limiter = WeightLimiter::new(config.weight_budget_per_min);
         let mut first = true;
         loop {
-            refresh(&store, &client, &config, first).await;
+            refresh(&store, &client, &limiter, &config, first).await;
             first = false;
             tokio::time::sleep(config.refresh_interval).await;
         }
@@ -60,11 +62,17 @@ pub fn spawn_sync(store: Arc<MarketStore>, config: SyncConfig) -> JoinHandle<()>
 }
 
 /// One full pass: refresh the universe, then backfill each coin/timeframe.
-async fn refresh(store: &MarketStore, client: &reqwest::Client, config: &SyncConfig, first: bool) {
+async fn refresh(
+    store: &MarketStore,
+    client: &reqwest::Client,
+    limiter: &WeightLimiter,
+    config: &SyncConfig,
+    first: bool,
+) {
     if first {
         store.set_status(MarketStatus::Connecting);
     }
-    let Ok(universe) = fetch_universe(client, config.universe_limit, config.min_day_volume_usd).await else {
+    let Ok(universe) = fetch_universe(client, limiter, config.universe_limit, config.min_day_volume_usd).await else {
         return;
     };
     let coins: Vec<String> = universe.iter().map(|coin| coin.coin.clone()).collect();
@@ -76,10 +84,9 @@ async fn refresh(store: &MarketStore, client: &reqwest::Client, config: &SyncCon
             store.set_status(MarketStatus::Backfilling { done: index, total });
         }
         for &timeframe in &config.timeframes {
-            if let Ok(candles) = fetch_candles(client, coin, timeframe, config.lookback).await {
+            if let Ok(candles) = fetch_candles(client, limiter, coin, timeframe, config.lookback).await {
                 store.set_candles(coin.clone(), timeframe, candles);
             }
-            tokio::time::sleep(config.request_delay).await;
         }
     }
     store.set_status(MarketStatus::Live);
