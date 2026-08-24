@@ -8,7 +8,9 @@
 use std::sync::Arc;
 
 use domain::Timeframe;
-use hl_feed::{HyperliquidAdapter, MarketEvent, MarketStatus, MarketStore, SyncConfig, spawn_sync};
+use hl_feed::{
+    ConnectionState, HyperliquidAdapter, MarketEvent, MarketStatus, MarketStore, SyncConfig, SyncPhase, spawn_sync,
+};
 use indicators::{DivergenceDirection, DivergenceKind};
 use rust_decimal::prelude::ToPrimitive;
 use scanner::{ScanConfig, Signal, SignalSource, scan_universe};
@@ -58,22 +60,40 @@ struct MidPayload {
     price: f64,
 }
 
-/// The market sync status forwarded to the frontend as a `status` event.
+/// The market engine status forwarded to the frontend as a `status` event.
 #[derive(Clone, Serialize)]
 struct StatusPayload {
-    state: String,
-    done: usize,
-    total: usize,
+    connection: String,
+    phase: String,
+    universe: usize,
+    backfill_done: usize,
+    backfill_total: usize,
+    backfill_errors: usize,
+    streaming: usize,
+    fetch_rate: u32,
 }
 
 impl From<&MarketStatus> for StatusPayload {
     fn from(status: &MarketStatus) -> Self {
-        match status {
-            MarketStatus::Connecting => Self { state: "connecting".to_owned(), done: 0, total: 0 },
-            MarketStatus::Backfilling { done, total } => {
-                Self { state: "backfilling".to_owned(), done: *done, total: *total }
-            }
-            MarketStatus::Live => Self { state: "live".to_owned(), done: 0, total: 0 },
+        let connection = match status.connection {
+            ConnectionState::Connecting => "connecting",
+            ConnectionState::Live => "live",
+            ConnectionState::Reconnecting => "reconnecting",
+        };
+        let phase = match status.phase {
+            SyncPhase::LoadingUniverse => "loading",
+            SyncPhase::Backfilling => "backfilling",
+            SyncPhase::Live => "live",
+        };
+        Self {
+            connection: connection.to_owned(),
+            phase: phase.to_owned(),
+            universe: status.universe,
+            backfill_done: status.backfill_done,
+            backfill_total: status.backfill_total,
+            backfill_errors: status.backfill_errors,
+            streaming: status.streaming,
+            fetch_rate: status.fetch_rate,
         }
     }
 }

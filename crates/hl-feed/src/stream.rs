@@ -26,7 +26,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::event::{CandleEvent, MarketEvent, MidEvent};
 use crate::feed::MarketFeed;
 use crate::rest::to_decimal;
-use crate::store::MarketStore;
+use crate::store::{ConnectionState, MarketStore};
 
 const WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 const PING_INTERVAL: Duration = Duration::from_secs(15);
@@ -87,6 +87,7 @@ async fn ws_loop(feed: MarketFeed, store: Arc<MarketStore>, intervals: Vec<Timef
             Ok(()) => backoff = RECONNECT_BASE,
             Err(_) => backoff = (backoff * 2).min(RECONNECT_MAX),
         }
+        store.set_connection(ConnectionState::Reconnecting);
         tokio::time::sleep(backoff).await;
     }
 }
@@ -94,6 +95,7 @@ async fn ws_loop(feed: MarketFeed, store: Arc<MarketStore>, intervals: Vec<Timef
 async fn run_session(feed: &MarketFeed, store: &MarketStore, intervals: &[Timeframe]) -> Result<(), SessionError> {
     let (stream, _) = connect_async(WS_URL).await?;
     let (mut write, mut read) = stream.split();
+    store.set_connection(ConnectionState::Live);
 
     // Prices are universe-independent — subscribe immediately.
     for subscription in [Subscription::AllMids, Subscription::FastAssetCtxs] {
@@ -134,6 +136,7 @@ async fn run_session(feed: &MarketFeed, store: &MarketStore, intervals: &[Timefr
                         }
                     }
                     candles_subscribed = true;
+                    store.set_streaming(coins.len().saturating_mul(intervals.len()));
                 }
             }
         }

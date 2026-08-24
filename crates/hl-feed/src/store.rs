@@ -11,20 +11,62 @@ use crate::UniverseCoin;
 /// Cap on candles retained per (coin, timeframe).
 const MAX_CANDLES: usize = 500;
 
-/// What the market sync is currently doing — surfaced in the UI.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MarketStatus {
-    /// Establishing the first connection and fetching the universe.
+/// WebSocket connection state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionState {
+    /// Opening the first WebSocket connection.
     Connecting,
-    /// Backfilling candle history: `done` of `total` coins seeded so far.
-    Backfilling {
-        /// Coins seeded so far.
-        done: usize,
-        /// Total coins to seed.
-        total: usize,
-    },
-    /// Fully warm; refreshing quietly in the background.
+    /// Connected and streaming.
     Live,
+    /// Dropped; backing off before a reconnect.
+    Reconnecting,
+}
+
+/// What the REST sync is doing right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncPhase {
+    /// Fetching the universe/metadata snapshot.
+    LoadingUniverse,
+    /// Backfilling candle history over REST.
+    Backfilling,
+    /// Warm; candles refresh quietly in the background.
+    Live,
+}
+
+/// A granular snapshot of what the market engine is doing, surfaced in the UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketStatus {
+    /// WebSocket connection state.
+    pub connection: ConnectionState,
+    /// Current REST sync phase.
+    pub phase: SyncPhase,
+    /// Active coins in the universe.
+    pub universe: usize,
+    /// Candle (coin, timeframe) sets cached so far this backfill pass.
+    pub backfill_done: usize,
+    /// Total (coin, timeframe) sets to backfill this pass.
+    pub backfill_total: usize,
+    /// Candle fetches skipped this pass (rate-limit / errors).
+    pub backfill_errors: usize,
+    /// Candle streams currently subscribed over the WebSocket.
+    pub streaming: usize,
+    /// Recent candle-fetch rate, in fetches per minute.
+    pub fetch_rate: u32,
+}
+
+impl Default for MarketStatus {
+    fn default() -> Self {
+        Self {
+            connection: ConnectionState::Connecting,
+            phase: SyncPhase::LoadingUniverse,
+            universe: 0,
+            backfill_done: 0,
+            backfill_total: 0,
+            backfill_errors: 0,
+            streaming: 0,
+            fetch_rate: 0,
+        }
+    }
 }
 
 /// A lock-free hot cache of live market state: recent candles per (coin,
@@ -40,7 +82,7 @@ impl MarketStore {
     /// Create an empty store behind an `Arc`.
     #[must_use]
     pub fn new() -> Arc<Self> {
-        let (status, _) = watch::channel(MarketStatus::Connecting);
+        let (status, _) = watch::channel(MarketStatus::default());
         Arc::new(Self { candles: DashMap::new(), universe: RwLock::new(Vec::new()), status })
     }
 
@@ -98,8 +140,33 @@ impl MarketStore {
         }
     }
 
-    /// Publish a new sync status to watchers.
-    pub(crate) fn set_status(&self, status: MarketStatus) {
-        let _ = self.status.send(status);
+    /// Update the WebSocket connection state.
+    pub(crate) fn set_connection(&self, connection: ConnectionState) {
+        self.status.send_modify(|status| status.connection = connection);
+    }
+
+    /// Update the number of subscribed candle streams.
+    pub(crate) fn set_streaming(&self, streaming: usize) {
+        self.status.send_modify(|status| status.streaming = streaming);
+    }
+
+    /// Update the REST sync phase.
+    pub(crate) fn set_phase(&self, phase: SyncPhase) {
+        self.status.send_modify(|status| status.phase = phase);
+    }
+
+    /// Update the universe size.
+    pub(crate) fn set_universe_size(&self, universe: usize) {
+        self.status.send_modify(|status| status.universe = universe);
+    }
+
+    /// Update backfill progress: sets cached / total, skipped fetches, and rate.
+    pub(crate) fn set_backfill(&self, done: usize, total: usize, errors: usize, fetch_rate: u32) {
+        self.status.send_modify(|status| {
+            status.backfill_done = done;
+            status.backfill_total = total;
+            status.backfill_errors = errors;
+            status.fetch_rate = fetch_rate;
+        });
     }
 }

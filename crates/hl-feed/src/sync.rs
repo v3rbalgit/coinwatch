@@ -5,15 +5,16 @@
 //! which is what makes scans and screener reads instant. WebSocket candle streaming
 //! can later replace the periodic refresh for lower latency.
 
+use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use domain::Timeframe;
 use tokio::task::JoinHandle;
 
 use crate::ratelimit::WeightLimiter;
 use crate::rest::{fetch_candles, fetch_universe};
-use crate::{MarketStatus, MarketStore};
+use crate::{MarketStore, SyncPhase};
 
 /// How the sync engine seeds and refreshes the store.
 #[derive(Debug, Clone)]
@@ -52,10 +53,9 @@ pub fn spawn_sync(store: Arc<MarketStore>, config: SyncConfig) -> JoinHandle<()>
     tokio::spawn(async move {
         let client = reqwest::Client::new();
         let limiter = WeightLimiter::new(config.weight_budget_per_min);
-        let mut first = true;
+        let mut backfilled: HashSet<(String, Timeframe)> = HashSet::new();
         loop {
-            refresh(&store, &client, &limiter, &config, first).await;
-            first = false;
+            refresh(&store, &client, &limiter, &config, &mut backfilled).await;
             tokio::time::sleep(config.refresh_interval).await;
         }
     })
@@ -67,29 +67,57 @@ async fn refresh(
     client: &reqwest::Client,
     limiter: &WeightLimiter,
     config: &SyncConfig,
-    first: bool,
+    backfilled: &mut HashSet<(String, Timeframe)>,
 ) {
-    if first {
-        store.set_status(MarketStatus::Connecting);
-    }
     let Ok(universe) = fetch_universe(client, limiter, config.universe_limit, config.min_day_volume_usd).await else {
         return;
     };
     let coins: Vec<String> = universe.iter().map(|coin| coin.coin.clone()).collect();
-    let total = coins.len();
+    store.set_universe_size(coins.len());
     store.set_universe(universe);
 
-    for (index, coin) in coins.iter().enumerate() {
-        if first {
-            store.set_status(MarketStatus::Backfilling { done: index, total });
-        }
-        for &timeframe in &config.timeframes {
-            if let Ok(candles) = fetch_candles(client, limiter, coin, timeframe, config.lookback).await {
-                store.set_candles(coin.clone(), timeframe, candles);
-            }
-        }
+    // Only fetch candles we haven't backfilled yet. The WebSocket keeps streamed
+    // timeframes live, so re-downloading everything each cycle is pure waste (and
+    // looks like it's stuck "downloading"). New coins fill in on the cycle they
+    // first appear; a failed fetch is left unmarked so it retries next cycle.
+    let pending: Vec<(String, Timeframe)> = coins
+        .iter()
+        .flat_map(|coin| config.timeframes.iter().map(move |&timeframe| (coin.clone(), timeframe)))
+        .filter(|key| !backfilled.contains(key))
+        .collect();
+
+    if pending.is_empty() {
+        store.set_phase(SyncPhase::Live);
+        return;
     }
-    store.set_status(MarketStatus::Live);
+
+    let total = pending.len();
+    store.set_phase(SyncPhase::Backfilling);
+    let started = Instant::now();
+    let mut done = 0;
+    let mut errors = 0;
+    for (coin, timeframe) in pending {
+        match fetch_candles(client, limiter, &coin, timeframe, config.lookback).await {
+            Ok(candles) => {
+                store.set_candles(coin.clone(), timeframe, candles);
+                backfilled.insert((coin, timeframe));
+            }
+            Err(_) => errors += 1,
+        }
+        done += 1;
+        store.set_backfill(done, total, errors, fetch_rate(done, started));
+    }
+    store.set_phase(SyncPhase::Live);
+}
+
+/// Average candle-fetch rate (fetches per minute) since the pass started.
+fn fetch_rate(done: usize, since: Instant) -> u32 {
+    let secs = since.elapsed().as_secs();
+    if secs == 0 {
+        return 0;
+    }
+    let done = u64::try_from(done).unwrap_or(u64::MAX);
+    u32::try_from(done.saturating_mul(60) / secs).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]

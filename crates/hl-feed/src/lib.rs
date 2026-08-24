@@ -19,7 +19,7 @@ mod sync;
 pub use event::{CandleEvent, MarketEvent, MidEvent};
 pub use feed::MarketFeed;
 pub use rest::UniverseCoin;
-pub use store::{MarketStatus, MarketStore};
+pub use store::{ConnectionState, MarketStatus, MarketStore, SyncPhase};
 pub use stream::HyperliquidAdapter;
 pub use sync::{SyncConfig, spawn_sync};
 
