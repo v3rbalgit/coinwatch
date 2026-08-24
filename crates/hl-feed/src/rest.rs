@@ -29,13 +29,36 @@ pub(crate) async fn fetch_candles(
     let end = Utc::now().timestamp_millis();
     let bars = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
     let start = end - timeframe.duration_ms().saturating_mul(bars);
+    limiter.acquire(candle_weight(limit)).await;
+    request_candles(client, coin, timeframe, start, end).await
+}
 
+/// Fetch `count` candles for `coin` at `timeframe` ending at `end_ms`, oldest-first —
+/// for on-demand history paging on the detail chart (called rarely, so unmetered).
+pub async fn fetch_candle_range(
+    client: &reqwest::Client,
+    coin: &str,
+    timeframe: Timeframe,
+    end_ms: i64,
+    count: usize,
+) -> Result<Vec<Candle>, FeedError> {
+    let bars = i64::try_from(count.max(1)).unwrap_or(i64::MAX);
+    let start = end_ms - timeframe.duration_ms().saturating_mul(bars);
+    request_candles(client, coin, timeframe, start, end_ms).await
+}
+
+/// Post a `candleSnapshot` for `[start, end]` and parse the oldest-first candles.
+async fn request_candles(
+    client: &reqwest::Client,
+    coin: &str,
+    timeframe: Timeframe,
+    start: i64,
+    end: i64,
+) -> Result<Vec<Candle>, FeedError> {
     let body = serde_json::json!({
         "type": "candleSnapshot",
         "req": { "coin": coin, "interval": timeframe.as_hl(), "startTime": start, "endTime": end },
     });
-
-    limiter.acquire(candle_weight(limit)).await;
     let raw: Vec<RawCandle> = client
         .post(INFO_URL)
         .json(&body)

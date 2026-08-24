@@ -8,10 +8,7 @@ use dashmap::DashMap;
 use domain::{Candle, Timeframe};
 use tokio::sync::watch;
 
-use crate::UniverseCoin;
-
-/// Cap on candles retained per (coin, timeframe).
-const MAX_CANDLES: usize = 500;
+use crate::{CANDLE_WINDOW, UniverseCoin};
 
 /// WebSocket connection state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,8 +169,8 @@ impl MarketStore {
             }
             Merge::Append { gap } => {
                 buffer.push(candle);
-                if buffer.len() > MAX_CANDLES {
-                    let excess = buffer.len() - MAX_CANDLES;
+                if buffer.len() > CANDLE_WINDOW {
+                    let excess = buffer.len() - CANDLE_WINDOW;
                     buffer.drain(0..excess);
                 }
                 if gap {

@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 
 use crate::ratelimit::WeightLimiter;
 use crate::rest::{fetch_candles, fetch_universe};
-use crate::{MarketStore, SyncPhase};
+use crate::{CANDLE_WINDOW, MarketStore, SyncPhase};
 
 /// How the sync engine seeds and refreshes the store.
 #[derive(Debug, Clone)]
@@ -39,7 +39,7 @@ impl Default for SyncConfig {
             timeframes: vec![Timeframe::Hour1, Timeframe::Hour4, Timeframe::Day1, Timeframe::Week1],
             universe_limit: 60,
             min_day_volume_usd: 1_000_000.0,
-            lookback: 300,
+            lookback: CANDLE_WINDOW,
             weight_budget_per_min: 1100,
             refresh_interval: Duration::from_secs(60),
         }
@@ -61,7 +61,7 @@ pub fn spawn_sync(store: Arc<MarketStore>, config: SyncConfig, persistence: Arc<
         let limiter = WeightLimiter::new(config.weight_budget_per_min);
         let mut backfilled: HashSet<(String, Timeframe)> = HashSet::new();
 
-        match persistence.load().await {
+        match persistence.load_recent(CANDLE_WINDOW).await {
             Ok(series) => {
                 let restored = series.len();
                 for CandleSeries {
@@ -176,7 +176,7 @@ mod tests {
 
     #[async_trait]
     impl CandleStore for NoopStore {
-        async fn load(&self) -> Result<Vec<CandleSeries>, StoreError> {
+        async fn load_recent(&self, _limit: usize) -> Result<Vec<CandleSeries>, StoreError> {
             Ok(Vec::new())
         }
         async fn save(&self, _coin: &str, _timeframe: Timeframe, _candles: &[Candle]) -> Result<(), StoreError> {
