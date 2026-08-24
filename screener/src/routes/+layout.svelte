@@ -60,7 +60,7 @@
 
   const nav = [
     { href: "/", label: "Home" },
-    { href: "/screener", label: "Screener" },
+    { href: "/browse", label: "Browse" },
     { href: "/signals", label: "Signals" },
   ];
 </script>
@@ -74,7 +74,8 @@
       {#each nav as item (item.href)}
         <a
           href={item.href}
-          class="block rounded-md px-3 py-2 text-sm transition-colors {$page.url.pathname === item.href
+          class="block rounded-md px-3 py-2 text-sm transition-colors {$page.url.pathname === item.href ||
+          (item.href !== '/' && $page.url.pathname.startsWith(item.href + '/'))
             ? 'bg-accent text-accent-foreground'
             : 'text-muted-foreground hover:bg-accent/50 hover:text-foreground'}"
         >

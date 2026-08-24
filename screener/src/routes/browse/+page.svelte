@@ -1,9 +1,11 @@
 <script lang="ts">
+  import { goto } from "$app/navigation";
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
 
   import Badge from "$lib/components/ui/badge.svelte";
+  import CoinIcon from "$lib/components/ui/coin-icon.svelte";
   import Input from "$lib/components/ui/input.svelte";
 
   type Row = {
@@ -14,14 +16,13 @@
     open_interest_usd: number;
     funding: number;
   };
-  // 24h % is derived live from the streaming price and the previous-day price.
-  type DisplayRow = Row & { change_24h_pct: number };
+  type SortKey = "coin" | "price" | "change_24h_pct" | "volume_usd" | "open_interest_usd" | "funding";
 
   let rows = $state<Row[]>([]);
   let loading = $state(true);
   let error = $state("");
   let query = $state("");
-  let sortKey = $state<keyof DisplayRow>("volume_usd");
+  let sortKey = $state<SortKey>("volume_usd");
   let sortDir = $state<1 | -1>(-1);
   let livePrices = $state<Record<string, number>>({});
   let live = $state(false);
@@ -44,7 +45,7 @@
       live = true;
       livePrices[event.payload.coin] = event.payload.price;
     });
-    // The cache updates itself; reload rows quietly so newly-synced coins appear.
+    // The cache updates itself; reload quietly so newly-synced coins appear.
     const reload = setInterval(load, 5000);
     return () => {
       clearInterval(reload);
@@ -52,7 +53,7 @@
     };
   });
 
-  function sortBy(key: keyof DisplayRow) {
+  function sortBy(key: SortKey) {
     if (sortKey === key) sortDir = (sortDir === 1 ? -1 : 1) as 1 | -1;
     else {
       sortKey = key;
@@ -60,27 +61,27 @@
     }
   }
 
-  const filtered = $derived.by(() => {
+  const change = (row: Row, price: number) => (row.prev_day > 0 ? (price / row.prev_day - 1) * 100 : 0);
+
+  // Depends only on rows/query/sort, never livePrices, so a price tick can't
+  // re-sort or re-render the table — the live overlay is applied per cell below.
+  const sorted = $derived.by(() => {
     const q = query.trim().toLowerCase();
-    const mapped: DisplayRow[] = rows.map((row) => {
-      const price = livePrices[row.coin] ?? row.price;
-      return { ...row, change_24h_pct: row.prev_day > 0 ? (price / row.prev_day - 1) * 100 : 0 };
+    const list = q ? rows.filter((r) => r.coin.toLowerCase().includes(q)) : rows.slice();
+    list.sort((a, b) => {
+      if (sortKey === "coin") return a.coin.localeCompare(b.coin) * sortDir;
+      const av = sortKey === "change_24h_pct" ? change(a, a.price) : a[sortKey];
+      const bv = sortKey === "change_24h_pct" ? change(b, b.price) : b[sortKey];
+      return (av - bv) * sortDir;
     });
-    const r = q ? mapped.filter((x) => x.coin.toLowerCase().includes(q)) : mapped;
-    r.sort((a, b) => {
-      const av = a[sortKey];
-      const bv = b[sortKey];
-      if (typeof av === "number" && typeof bv === "number") return (av - bv) * sortDir;
-      return String(av).localeCompare(String(bv)) * sortDir;
-    });
-    return r;
+    return list;
   });
 
   const fmtUsd = (n: number) =>
     n >= 1e9 ? (n / 1e9).toFixed(2) + "B" : n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(0) + "k" : n.toFixed(0);
   const fmtPrice = (n: number) => (n >= 100 ? n.toFixed(2) : n >= 1 ? n.toFixed(3) : n.toPrecision(4));
 
-  const cols: { key: keyof DisplayRow; label: string; num: boolean }[] = [
+  const cols: { key: SortKey; label: string; num: boolean }[] = [
     { key: "coin", label: "Coin", num: false },
     { key: "price", label: "Price", num: true },
     { key: "change_24h_pct", label: "24h %", num: true },
@@ -92,11 +93,11 @@
 
 <div class="flex h-full flex-col p-4">
   <header class="flex flex-shrink-0 items-center justify-between gap-4 pb-3 pt-1">
-    <h1 class="text-base font-semibold tracking-tight text-primary">Hyperliquid Screener</h1>
+    <h1 class="text-base font-semibold tracking-tight text-primary">Browse</h1>
     <div class="flex items-center gap-3">
       {#if live}<Badge variant="success">● live</Badge>{/if}
       <Input placeholder="Filter coin…" bind:value={query} class="h-8 w-44" />
-      <span class="text-xs tabular-nums text-muted-foreground">{filtered.length} / {rows.length}</span>
+      <span class="text-xs tabular-nums text-muted-foreground">{sorted.length} / {rows.length}</span>
     </div>
   </header>
 
@@ -104,14 +105,6 @@
     <p class="py-8 text-sm text-muted-foreground">Warming up the market cache…</p>
   {:else if error}
     <p class="py-8 text-sm text-destructive">{error}</p>
-    {#if error.includes("__TAURI") || error.includes("invoke")}
-      <p class="text-sm text-muted-foreground">
-        Open the desktop window from <code class="rounded bg-muted px-1 py-0.5">pnpm tauri dev</code> — the backend isn't
-        reachable from the plain browser preview.
-      </p>
-    {/if}
-  {:else if rows.length === 0}
-    <p class="py-8 text-sm text-muted-foreground">Warming up the market cache…</p>
   {:else}
     <div class="min-h-0 flex-1 overflow-auto rounded-lg border border-border">
       <table class="w-full text-sm tabular-nums">
@@ -130,25 +123,29 @@
           </tr>
         </thead>
         <tbody>
-          {#each filtered as r (r.coin)}
-            <tr class="border-t border-border/60 hover:bg-accent/40">
-              <td class="whitespace-nowrap px-3 py-1.5 font-medium text-foreground">{r.coin}</td>
-              <td class="px-3 py-1.5 text-right">{fmtPrice(livePrices[r.coin] ?? r.price)}</td>
-              <td
-                class="px-3 py-1.5 text-right {r.change_24h_pct > 0
-                  ? 'text-green-500'
-                  : r.change_24h_pct < 0
-                    ? 'text-red-500'
-                    : ''}"
-              >
-                {r.change_24h_pct.toFixed(2)}%
+          {#each sorted as row (row.coin)}
+            {@const price = livePrices[row.coin] ?? row.price}
+            {@const chg = change(row, price)}
+            <tr
+              class="cursor-pointer border-t border-border/60 hover:bg-accent/40"
+              onclick={() => goto(`/browse/${row.coin}`)}
+            >
+              <td class="whitespace-nowrap px-3 py-1.5 font-medium text-foreground">
+                <span class="flex items-center gap-2">
+                  <CoinIcon coin={row.coin} />
+                  {row.coin}
+                </span>
               </td>
-              <td class="px-3 py-1.5 text-right text-muted-foreground">{fmtUsd(r.volume_usd)}</td>
-              <td class="px-3 py-1.5 text-right text-muted-foreground">{fmtUsd(r.open_interest_usd)}</td>
+              <td class="px-3 py-1.5 text-right">{fmtPrice(price)}</td>
+              <td class="px-3 py-1.5 text-right {chg > 0 ? 'text-green-500' : chg < 0 ? 'text-red-500' : ''}">
+                {chg.toFixed(2)}%
+              </td>
+              <td class="px-3 py-1.5 text-right text-muted-foreground">{fmtUsd(row.volume_usd)}</td>
+              <td class="px-3 py-1.5 text-right text-muted-foreground">{fmtUsd(row.open_interest_usd)}</td>
               <td
-                class="px-3 py-1.5 text-right {r.funding > 0 ? 'text-green-500' : r.funding < 0 ? 'text-red-500' : ''}"
+                class="px-3 py-1.5 text-right {row.funding > 0 ? 'text-green-500' : row.funding < 0 ? 'text-red-500' : ''}"
               >
-                {(r.funding * 100).toFixed(4)}%
+                {(row.funding * 100).toFixed(4)}%
               </td>
             </tr>
           {/each}

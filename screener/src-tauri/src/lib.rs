@@ -13,9 +13,9 @@ use hl_feed::{
 };
 use indicators::{DivergenceDirection, DivergenceKind};
 use rust_decimal::prelude::ToPrimitive;
-use scanner::{scan_universe, ScanConfig, Signal, SignalSource};
+use scanner::{scan_coin as scan_one, scan_universe, ScanConfig, Signal, SignalSource};
 use serde::Serialize;
-use storage::SqliteCandleStore;
+use storage::{ListView, SqliteStore};
 use tauri::{Emitter, Manager};
 use tokio::sync::broadcast::error::RecvError;
 
@@ -148,6 +148,50 @@ fn start_scan(app: tauri::AppHandle, store: tauri::State<'_, Arc<MarketStore>>) 
     Ok(())
 }
 
+/// Scan a single coin for fresh divergences.
+#[tauri::command]
+fn scan_coin(store: tauri::State<'_, Arc<MarketStore>>, coin: String) -> Vec<SignalPayload> {
+    scan_one(store.inner(), &coin, &ScanConfig::default())
+        .iter()
+        .map(SignalPayload::from)
+        .collect()
+}
+
+/// Open a coin's Hyperliquid trade page in the browser.
+#[tauri::command]
+fn open_on_hyperliquid(app: tauri::AppHandle, coin: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(format!("https://app.hyperliquid.xyz/trade/{coin}"), None::<&str>)
+        .map_err(|error| error.to_string())
+}
+
+/// Every watchlist with its coins.
+#[tauri::command]
+async fn lists(store: tauri::State<'_, Arc<SqliteStore>>) -> Result<Vec<ListView>, String> {
+    store.lists().await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn create_list(store: tauri::State<'_, Arc<SqliteStore>>, name: String) -> Result<(), String> {
+    store.create_list(&name).await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn delete_list(store: tauri::State<'_, Arc<SqliteStore>>, name: String) -> Result<(), String> {
+    store.delete_list(&name).await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn add_to_list(store: tauri::State<'_, Arc<SqliteStore>>, list: String, coin: String) -> Result<(), String> {
+    store.add_to_list(&list, &coin).await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn remove_from_list(store: tauri::State<'_, Arc<SqliteStore>>, list: String, coin: String) -> Result<(), String> {
+    store.remove_from_list(&list, &coin).await.map_err(|error| error.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _ = tracing_subscriber::fmt()
@@ -170,25 +214,28 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(store)
         .setup(move |app| {
-            // Persist candles under the app data dir so restarts skip re-downloading.
+            // The local database holds candles + watchlists. Open it synchronously so
+            // the list commands have their managed state before the UI can call them.
             let data_dir = app.path().app_data_dir().unwrap_or_else(|_| std::env::temp_dir());
             let _ = std::fs::create_dir_all(&data_dir);
-            let db_path = data_dir.join("candles.db");
+            let db_path = data_dir.join("coinwatch.db");
 
-            // Keep the hot cache warm from Hyperliquid — the whole tradable universe.
-            tauri::async_runtime::spawn(async move {
-                let config = SyncConfig {
-                    universe_limit: usize::MAX,
-                    min_day_volume_usd: 0.0,
-                    ..SyncConfig::default()
-                };
-                match SqliteCandleStore::open(&db_path).await {
-                    Ok(db) => {
-                        let _sync = spawn_sync(sync_store, config, Arc::new(db));
-                    }
-                    Err(error) => tracing::error!(%error, "failed to open candle cache; market sync disabled"),
+            match tauri::async_runtime::block_on(SqliteStore::open(&db_path)) {
+                Ok(store) => {
+                    let store = Arc::new(store);
+                    app.manage(Arc::clone(&store));
+                    let config = SyncConfig {
+                        universe_limit: usize::MAX,
+                        min_day_volume_usd: 0.0,
+                        ..SyncConfig::default()
+                    };
+                    // Keep the hot cache warm from Hyperliquid — the whole tradable universe.
+                    tauri::async_runtime::spawn(async move {
+                        let _sync = spawn_sync(sync_store, config, store);
+                    });
                 }
-            });
+                Err(error) => tracing::error!(%error, "failed to open the local database; market sync disabled"),
+            }
 
             // Relay sync status (connecting / backfilling / live) to the UI.
             let status_handle = app.handle().clone();
@@ -227,7 +274,17 @@ pub fn run() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![screener_rows, start_scan])
+        .invoke_handler(tauri::generate_handler![
+            screener_rows,
+            start_scan,
+            scan_coin,
+            open_on_hyperliquid,
+            lists,
+            create_list,
+            delete_list,
+            add_to_list,
+            remove_from_list
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

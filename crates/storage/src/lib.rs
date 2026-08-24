@@ -1,8 +1,6 @@
-//! SQLite-backed candle persistence: the [`CandleStore`] port and its local adapter.
-//!
-//! OHLCV values are stored as text for exact [`Decimal`] precision; open times as
-//! epoch milliseconds. The same port can back onto Postgres later without touching
-//! the sync.
+//! SQLite-backed local store: candle persistence (the [`CandleStore`] port) plus
+//! user watchlists. OHLCV values are text for exact [`Decimal`] precision; open
+//! times are epoch milliseconds. The same store can back onto Postgres later.
 
 use std::path::{Path, PathBuf};
 
@@ -24,7 +22,16 @@ pub struct CandleSeries {
     pub candles: Vec<Candle>,
 }
 
-/// A candle-store backend failure.
+/// A user watchlist with its coins.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ListView {
+    /// List name.
+    pub name: String,
+    /// Coins on the list.
+    pub coins: Vec<String>,
+}
+
+/// A store-backend failure.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     /// The database rejected the operation.
@@ -32,8 +39,7 @@ pub enum StoreError {
     Database(#[from] sqlx::Error),
 }
 
-/// A durable candle cache. The sync seeds the in-memory store from it on startup
-/// and writes each backfilled series through, so restarts skip re-downloading.
+/// A durable candle cache the sync seeds from on startup and writes through.
 #[async_trait]
 pub trait CandleStore: Send + Sync {
     /// Load every persisted series.
@@ -43,7 +49,8 @@ pub trait CandleStore: Send + Sync {
     async fn save(&self, coin: &str, timeframe: Timeframe, candles: &[Candle]) -> Result<(), StoreError>;
 }
 
-const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS candles (
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS candles (
     coin      TEXT    NOT NULL,
     timeframe TEXT    NOT NULL,
     open_time INTEGER NOT NULL,
@@ -53,25 +60,32 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS candles (
     close     TEXT    NOT NULL,
     volume    TEXT    NOT NULL,
     PRIMARY KEY (coin, timeframe, open_time)
-) WITHOUT ROWID";
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS lists (name TEXT PRIMARY KEY) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS list_members (
+    list TEXT NOT NULL,
+    coin TEXT NOT NULL,
+    PRIMARY KEY (list, coin)
+) WITHOUT ROWID;
+";
 
-/// A local SQLite candle cache.
-pub struct SqliteCandleStore {
+/// The local SQLite store.
+pub struct SqliteStore {
     pool: SqlitePool,
 }
 
-impl SqliteCandleStore {
-    /// Open (creating if missing) the candle database at `path`. A corrupt cache is
-    /// discarded and recreated — candles are regenerable from the API.
+impl SqliteStore {
+    /// Open (creating if missing) the database at `path`. A corrupt file is
+    /// discarded and recreated — candles are regenerable and lists are cheap.
     pub async fn open(path: &Path) -> Result<Self, StoreError> {
         if let Ok(store) = Self::connect(path).await {
             if store.is_healthy().await {
                 return Ok(store);
             }
             drop(store);
-            tracing::warn!(path = %path.display(), "candle cache failed its integrity check; recreating");
+            tracing::warn!(path = %path.display(), "local database failed its integrity check; recreating");
         } else {
-            tracing::warn!(path = %path.display(), "candle cache could not be opened; recreating");
+            tracing::warn!(path = %path.display(), "local database could not be opened; recreating");
         }
         remove_db_files(path);
         Self::connect(path).await
@@ -83,7 +97,7 @@ impl SqliteCandleStore {
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal);
         let pool = SqlitePool::connect_with(options).await?;
-        sqlx::query(SCHEMA).execute(&pool).await?;
+        sqlx::raw_sql(SCHEMA).execute(&pool).await?;
         Ok(Self { pool })
     }
 
@@ -92,6 +106,80 @@ impl SqliteCandleStore {
             sqlx::query_scalar::<_, String>("PRAGMA integrity_check").fetch_one(&self.pool).await,
             Ok(result) if result == "ok"
         )
+    }
+
+    /// Every watchlist with its coins, sorted by name then coin.
+    pub async fn lists(&self) -> Result<Vec<ListView>, StoreError> {
+        let names: Vec<String> = sqlx::query_scalar("SELECT name FROM lists ORDER BY name")
+            .fetch_all(&self.pool)
+            .await?;
+        let members: Vec<(String, String)> = sqlx::query_as("SELECT list, coin FROM list_members ORDER BY coin")
+            .fetch_all(&self.pool)
+            .await?;
+
+        let mut views: Vec<ListView> = names
+            .into_iter()
+            .map(|name| ListView {
+                name,
+                coins: Vec::new(),
+            })
+            .collect();
+        for (list, coin) in members {
+            if let Some(view) = views.iter_mut().find(|view| view.name == list) {
+                view.coins.push(coin);
+            }
+        }
+        Ok(views)
+    }
+
+    /// Create an empty list (a no-op if it already exists).
+    pub async fn create_list(&self, name: &str) -> Result<(), StoreError> {
+        sqlx::query("INSERT OR IGNORE INTO lists (name) VALUES (?)")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Delete a list and its members.
+    pub async fn delete_list(&self, name: &str) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM list_members WHERE list = ?")
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM lists WHERE name = ?")
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Add a coin to a list, creating the list if it does not exist.
+    pub async fn add_to_list(&self, list: &str, coin: &str) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT OR IGNORE INTO lists (name) VALUES (?)")
+            .bind(list)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT OR IGNORE INTO list_members (list, coin) VALUES (?, ?)")
+            .bind(list)
+            .bind(coin)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Remove a coin from a list.
+    pub async fn remove_from_list(&self, list: &str, coin: &str) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM list_members WHERE list = ? AND coin = ?")
+            .bind(list)
+            .bind(coin)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 
@@ -105,7 +193,7 @@ fn remove_db_files(path: &Path) {
 }
 
 #[async_trait]
-impl CandleStore for SqliteCandleStore {
+impl CandleStore for SqliteStore {
     async fn load(&self) -> Result<Vec<CandleSeries>, StoreError> {
         let rows = sqlx::query(
             "SELECT coin, timeframe, open_time, open, high, low, close, volume \
@@ -191,7 +279,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use domain::{Candle, Timeframe};
 
-    use super::{CandleSeries, CandleStore, SqliteCandleStore};
+    use super::{CandleSeries, CandleStore, SqliteStore};
 
     fn candle(hour: i64, open: &str, high: &str, low: &str, close: &str, volume: &str) -> Candle {
         Candle {
@@ -205,19 +293,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn round_trips_a_series_across_reopen() {
+    async fn candles_round_trip_across_reopen() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("candles.db");
+        let path = dir.path().join("cw.db");
         let candles = vec![
             candle(1, "100.5", "101", "99.5", "100.75", "12.3"),
             candle(2, "100.75", "102", "100", "101.5", "8.1"),
         ];
 
-        let store = SqliteCandleStore::open(&path).await.expect("open");
+        let store = SqliteStore::open(&path).await.expect("open");
         store.save("BTC", Timeframe::Hour1, &candles).await.expect("save");
         drop(store);
 
-        let reopened = SqliteCandleStore::open(&path).await.expect("reopen");
+        let reopened = SqliteStore::open(&path).await.expect("reopen");
         let loaded = reopened.load().await.expect("load");
         assert_eq!(
             loaded,
@@ -232,14 +320,36 @@ mod tests {
     #[tokio::test]
     async fn recreates_a_corrupt_database() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("candles.db");
+        let path = dir.path().join("cw.db");
         std::fs::write(&path, b"this is not a sqlite database").expect("write garbage");
 
-        let store = SqliteCandleStore::open(&path).await.expect("open recovers from corruption");
+        let store = SqliteStore::open(&path).await.expect("open recovers from corruption");
         store
             .save("BTC", Timeframe::Hour1, &[candle(1, "1", "1", "1", "1", "0")])
             .await
             .expect("save");
         assert_eq!(store.load().await.expect("load").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn watchlists_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(&dir.path().join("cw.db")).await.expect("open");
+
+        store.add_to_list("Favourites", "BTC").await.expect("add");
+        store.add_to_list("Favourites", "ETH").await.expect("add");
+        store.create_list("Empty").await.expect("create");
+
+        let lists = store.lists().await.expect("lists");
+        assert_eq!(lists.len(), 2);
+        let favourites = lists.iter().find(|list| list.name == "Favourites").expect("favourites");
+        assert_eq!(favourites.coins, vec!["BTC".to_owned(), "ETH".to_owned()]);
+
+        store.remove_from_list("Favourites", "BTC").await.expect("remove");
+        store.delete_list("Empty").await.expect("delete");
+
+        let lists = store.lists().await.expect("lists");
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0].coins, vec!["ETH".to_owned()]);
     }
 }
