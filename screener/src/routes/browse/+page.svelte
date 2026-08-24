@@ -10,6 +10,7 @@
   import Button from "$lib/components/ui/button.svelte";
   import CoinIcon from "$lib/components/ui/coin-icon.svelte";
   import Input from "$lib/components/ui/input.svelte";
+  import Skeleton from "$lib/components/ui/skeleton.svelte";
 
   type Row = {
     coin: string;
@@ -161,6 +162,8 @@
     { key: "funding", label: "Funding", num: true },
   ];
 
+  const skeletonRows = Array.from({ length: 14 }, (_, index) => index);
+
   const menuContent =
     "z-50 min-w-[13rem] rounded-md border border-border bg-card p-1 text-foreground shadow-lg focus:outline-none";
   const menuItem =
@@ -236,7 +239,18 @@
   </header>
 
   {#if loading && rows.length === 0}
-    <p class="py-8 text-sm text-muted-foreground">Warming up the market cache…</p>
+    <div class="min-h-0 flex-1 space-y-1 overflow-hidden rounded-lg border border-border p-2">
+      {#each skeletonRows as index (index)}
+        <div class="flex items-center gap-3 px-1 py-1.5">
+          <Skeleton class="size-5 rounded-full" />
+          <Skeleton class="h-4 w-16" />
+          <Skeleton class="ml-auto h-4 w-16" />
+          <Skeleton class="h-4 w-12" />
+          <Skeleton class="h-4 w-16" />
+          <Skeleton class="h-4 w-14" />
+        </div>
+      {/each}
+    </div>
   {:else if error}
     <p class="py-8 text-sm text-destructive">{error}</p>
   {:else}

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use domain::Timeframe;
+use domain::{Candle, Timeframe};
 use hl_feed::{
     spawn_sync, ConnectionState, HyperliquidAdapter, MarketEvent, MarketStatus, MarketStore, SyncConfig, SyncPhase,
 };
@@ -157,6 +157,56 @@ fn scan_coin(store: tauri::State<'_, Arc<MarketStore>>, coin: String) -> Vec<Sig
         .iter()
         .map(SignalPayload::from)
         .collect()
+}
+
+/// A candle in the shape lightweight-charts expects: epoch-second time, numeric OHLCV.
+#[derive(Clone, Serialize)]
+struct CandlePayload {
+    time: i64,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: f64,
+}
+
+impl From<&Candle> for CandlePayload {
+    fn from(candle: &Candle) -> Self {
+        Self {
+            time: candle.open_time.timestamp(),
+            open: candle.open.to_f64().unwrap_or(0.0),
+            high: candle.high.to_f64().unwrap_or(0.0),
+            low: candle.low.to_f64().unwrap_or(0.0),
+            close: candle.close.to_f64().unwrap_or(0.0),
+            volume: candle.volume.to_f64().unwrap_or(0.0),
+        }
+    }
+}
+
+/// Cached candles for a (coin, timeframe), oldest first, for the detail chart.
+#[tauri::command]
+fn coin_candles(store: tauri::State<'_, Arc<MarketStore>>, coin: String, timeframe: String) -> Vec<CandlePayload> {
+    let Some(timeframe) = Timeframe::from_hl(&timeframe) else {
+        return Vec::new();
+    };
+    store
+        .candles(&coin, timeframe)
+        .map(|candles| candles.iter().map(CandlePayload::from).collect())
+        .unwrap_or_default()
+}
+
+/// A live candle update for the active coin, pushed to the detail chart.
+#[derive(Clone, Serialize)]
+struct CandleEventPayload {
+    coin: String,
+    timeframe: String,
+    candle: CandlePayload,
+}
+
+/// Set (or clear) the coin whose live candles are streamed to the UI (the open detail page).
+#[tauri::command]
+fn set_active_coin(store: tauri::State<'_, Arc<MarketStore>>, coin: Option<String>) {
+    store.set_active_coin(coin);
 }
 
 /// Open a coin's Hyperliquid trade page in the browser.
@@ -320,20 +370,31 @@ pub fn run() {
             // Stream live mids and relay them to the UI as `mid` events.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                let event_store = Arc::clone(&adapter_store);
                 let mut adapter = HyperliquidAdapter::new(adapter_store, vec![Timeframe::Hour1, Timeframe::Hour4]);
                 let mut events = adapter.feed().subscribe_all();
                 adapter.connect();
                 loop {
                     match events.recv().await {
-                        Ok(event) => {
-                            if let MarketEvent::Mid(mid) = &*event {
+                        Ok(event) => match &*event {
+                            MarketEvent::Mid(mid) => {
                                 let payload = MidPayload {
                                     coin: mid.symbol.clone(),
                                     price: mid.price.to_f64().unwrap_or(0.0),
                                 };
                                 let _ = handle.emit("mid", payload);
                             }
-                        }
+                            MarketEvent::Candle(candle) => {
+                                if event_store.active_coin().as_deref() == Some(candle.coin.as_str()) {
+                                    let payload = CandleEventPayload {
+                                        coin: candle.coin.clone(),
+                                        timeframe: candle.timeframe.as_hl().to_owned(),
+                                        candle: CandlePayload::from(&candle.candle),
+                                    };
+                                    let _ = handle.emit("candle", payload);
+                                }
+                            }
+                        },
                         Err(RecvError::Lagged(_)) => {}
                         Err(RecvError::Closed) => break,
                     }
@@ -351,7 +412,9 @@ pub fn run() {
             delete_list,
             add_to_list,
             remove_from_list,
-            logos
+            logos,
+            coin_candles,
+            set_active_coin
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

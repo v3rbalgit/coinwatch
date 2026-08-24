@@ -80,6 +80,8 @@ pub struct MarketStore {
     status: watch::Sender<MarketStatus>,
     /// (coin, timeframe) sets the WebSocket saw a gap in; the sync re-backfills them.
     stale: Mutex<HashSet<(String, Timeframe)>>,
+    /// The coin whose live candles the UI wants forwarded (the open detail page).
+    active_coin: RwLock<Option<String>>,
 }
 
 impl MarketStore {
@@ -92,6 +94,7 @@ impl MarketStore {
             universe: RwLock::new(Vec::new()),
             status,
             stale: Mutex::new(HashSet::new()),
+            active_coin: RwLock::new(None),
         })
     }
 
@@ -108,6 +111,17 @@ impl MarketStore {
     #[must_use]
     pub fn universe(&self) -> Vec<UniverseCoin> {
         self.universe.read().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// The coin whose live candles the UI wants forwarded (the open detail page).
+    #[must_use]
+    pub fn active_coin(&self) -> Option<String> {
+        self.active_coin.read().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Set (or clear) the coin whose live candles are forwarded to the UI.
+    pub fn set_active_coin(&self, coin: Option<String>) {
+        *self.active_coin.write().unwrap_or_else(PoisonError::into_inner) = coin;
     }
 
     /// The current sync status.
