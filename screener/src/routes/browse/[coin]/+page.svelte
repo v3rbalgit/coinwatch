@@ -39,6 +39,27 @@
       seed += 1;
     }
   }
+
+  let loadingOlder = false;
+  let exhausted = false;
+  // Page older history in on scroll-back; the backend serves the cache and fetches
+  // from Hyperliquid + stores on a miss, so depth accumulates.
+  async function loadOlder() {
+    const oldest = bars[0]?.time;
+    if (loadingOlder || exhausted || oldest === undefined) return;
+    loadingOlder = true;
+    const [c, t] = [coin, tf];
+    try {
+      const older = await invoke<Bar[]>("coin_history", { coin: c, timeframe: t, beforeSeconds: oldest });
+      if (c === coin && t === tf) {
+        const fresh = older.filter((bar) => bar.time < oldest);
+        if (fresh.length === 0) exhausted = true;
+        else bars = [...fresh, ...bars];
+      }
+    } finally {
+      loadingOlder = false;
+    }
+  }
   async function loadMeta() {
     const rows = await invoke<Row[]>("screener_rows");
     meta = rows.find((row) => row.coin === coin) ?? null;
@@ -64,7 +85,10 @@
   $effect(() => {
     void coin;
     void tf;
-    if (coin) loadCandles();
+    if (coin) {
+      exhausted = false;
+      loadCandles();
+    }
   });
 
   onMount(() => {
@@ -150,7 +174,7 @@
   </div>
 
   <div class="relative min-h-0 flex-1 overflow-hidden rounded-lg border border-border">
-    <Chart {bars} {seed} />
+    <Chart {bars} {seed} onLoadOlder={loadOlder} />
     {#if bars.length === 0}
       <div class="absolute inset-0 flex items-center justify-center gap-2 text-sm text-muted-foreground">
         <LoaderCircle class="size-4 animate-spin" />

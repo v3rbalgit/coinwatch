@@ -11,13 +11,14 @@ use std::time::Duration;
 
 use domain::{Candle, Timeframe};
 use hl_feed::{
-    spawn_sync, ConnectionState, HyperliquidAdapter, MarketEvent, MarketStatus, MarketStore, SyncConfig, SyncPhase,
+    fetch_candle_range, spawn_sync, ConnectionState, HyperliquidAdapter, MarketEvent, MarketStatus, MarketStore,
+    SyncConfig, SyncPhase,
 };
 use indicators::{DivergenceDirection, DivergenceKind};
 use rust_decimal::prelude::ToPrimitive;
 use scanner::{scan_coin as scan_one, scan_universe, ScanConfig, Signal, SignalSource};
 use serde::Serialize;
-use storage::{ListView, SqliteStore};
+use storage::{CandleStore, ListView, SqliteStore};
 use tauri::{Emitter, Manager};
 use tokio::sync::broadcast::error::RecvError;
 
@@ -195,6 +196,51 @@ fn coin_candles(store: tauri::State<'_, Arc<MarketStore>>, coin: String, timefra
         .unwrap_or_default()
 }
 
+/// Older candles to load per scroll-back page — ~2x the chart's ~150-bar visible
+/// window, so each page loads a couple screens of scrollback past the trigger.
+const CHART_PAGE: usize = 300;
+
+/// Candles just before `before_seconds`, oldest-first, for lazy history paging.
+/// Serves from the accumulating DB cache; on a miss it fetches from Hyperliquid and
+/// stores the result, so scroll-back depth accumulates.
+#[tauri::command]
+async fn coin_history(
+    store: tauri::State<'_, Arc<SqliteStore>>,
+    client: tauri::State<'_, reqwest::Client>,
+    coin: String,
+    timeframe: String,
+    before_seconds: i64,
+) -> Result<Vec<CandlePayload>, String> {
+    let Some(timeframe) = Timeframe::from_hl(&timeframe) else {
+        return Ok(Vec::new());
+    };
+    let before_ms = before_seconds.saturating_mul(1000);
+
+    let cached = store
+        .candles_before(&coin, timeframe, before_ms, CHART_PAGE)
+        .await
+        .map_err(|error| error.to_string())?;
+    if cached.len() >= CHART_PAGE {
+        return Ok(cached.iter().map(CandlePayload::from).collect());
+    }
+
+    // The cache doesn't reach that far back; fetch from Hyperliquid and store it.
+    match fetch_candle_range(client.inner(), &coin, timeframe, before_ms, CHART_PAGE).await {
+        Ok(fetched) if !fetched.is_empty() => {
+            if let Err(error) = store.save(&coin, timeframe, &fetched).await {
+                tracing::warn!(coin = %coin, %error, "failed to cache paged candles");
+            }
+            let merged = store
+                .candles_before(&coin, timeframe, before_ms, CHART_PAGE)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(merged.iter().map(CandlePayload::from).collect())
+        }
+        Ok(_) => Ok(cached.iter().map(CandlePayload::from).collect()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 /// A live candle update for the active coin, pushed to the detail chart.
 #[derive(Clone, Serialize)]
 struct CandleEventPayload {
@@ -278,11 +324,7 @@ async fn fetch_logo(client: &reqwest::Client, coin: &str) -> Option<String> {
 
 /// Download the universe's coin logos into the store, paced to spare the CDN.
 /// Cached coins are skipped; a periodic re-scan picks up new listings.
-async fn cache_logos(market: Arc<MarketStore>, db: Arc<SqliteStore>) {
-    let Ok(client) = reqwest::Client::builder().build() else {
-        tracing::error!("failed to build the logo HTTP client; logo caching disabled");
-        return;
-    };
+async fn cache_logos(market: Arc<MarketStore>, db: Arc<SqliteStore>, client: reqwest::Client) {
     loop {
         let universe = market.universe();
         if universe.is_empty() {
@@ -328,6 +370,11 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(store)
         .setup(move |app| {
+            // One shared HTTP client: managed for the history-paging command and reused
+            // by the logo cache task (Client clones share one connection pool).
+            let http = reqwest::Client::new();
+            app.manage(http.clone());
+
             // The local database holds candles + watchlists. Open it synchronously so
             // the list commands have their managed state before the UI can call them.
             let data_dir = app.path().app_data_dir().unwrap_or_else(|_| std::env::temp_dir());
@@ -349,7 +396,7 @@ pub fn run() {
                         let _sync = spawn_sync(sync_store, config, store);
                     });
                     // Cache coin logos locally so they load instantly and offline.
-                    tauri::async_runtime::spawn(cache_logos(logo_market_store, logo_db));
+                    tauri::async_runtime::spawn(cache_logos(logo_market_store, logo_db, http));
                 }
                 Err(error) => tracing::error!(%error, "failed to open the local database; market sync disabled"),
             }
@@ -414,6 +461,7 @@ pub fn run() {
             remove_from_list,
             logos,
             coin_candles,
+            coin_history,
             set_active_coin
         ])
         .run(tauri::generate_context!())

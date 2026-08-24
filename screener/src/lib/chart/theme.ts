@@ -8,6 +8,12 @@ export const chartTheme = {
   down: "#ef4444",
   volumeUp: "rgba(34, 197, 94, 0.28)",
   volumeDown: "rgba(239, 68, 68, 0.28)",
+  rsi: "#a78bfa",
+  macd: "#60a5fa",
+  signal: "#fbbf24",
+  histUp: "rgba(34, 197, 94, 0.5)",
+  histDown: "rgba(239, 68, 68, 0.5)",
+  guide: "#3a4150",
 } as const;
 
 /** Format a price with magnitude-appropriate precision. */
