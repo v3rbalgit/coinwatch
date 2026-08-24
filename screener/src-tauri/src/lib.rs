@@ -15,7 +15,8 @@ use indicators::{DivergenceDirection, DivergenceKind};
 use rust_decimal::prelude::ToPrimitive;
 use scanner::{scan_universe, ScanConfig, Signal, SignalSource};
 use serde::Serialize;
-use tauri::Emitter;
+use storage::SqliteCandleStore;
+use tauri::{Emitter, Manager};
 use tokio::sync::broadcast::error::RecvError;
 
 /// One screener row: live metadata from `metaAndAssetCtxs`. Reads memory only —
@@ -149,6 +150,13 @@ fn start_scan(app: tauri::AppHandle, store: tauri::State<'_, Arc<MarketStore>>) 
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     // rustls needs a process-wide crypto provider before the first TLS handshake
     // (the binary's job); the market feed and sync rely on it.
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -162,6 +170,11 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(store)
         .setup(move |app| {
+            // Persist candles under the app data dir so restarts skip re-downloading.
+            let data_dir = app.path().app_data_dir().unwrap_or_else(|_| std::env::temp_dir());
+            let _ = std::fs::create_dir_all(&data_dir);
+            let db_path = data_dir.join("candles.db");
+
             // Keep the hot cache warm from Hyperliquid — the whole tradable universe.
             tauri::async_runtime::spawn(async move {
                 let config = SyncConfig {
@@ -169,7 +182,12 @@ pub fn run() {
                     min_day_volume_usd: 0.0,
                     ..SyncConfig::default()
                 };
-                let _sync = spawn_sync(sync_store, config);
+                match SqliteCandleStore::open(&db_path).await {
+                    Ok(db) => {
+                        let _sync = spawn_sync(sync_store, config, Arc::new(db));
+                    }
+                    Err(error) => tracing::error!(%error, "failed to open candle cache; market sync disabled"),
+                }
             });
 
             // Relay sync status (connecting / backfilling / live) to the UI.

@@ -5,7 +5,7 @@ use rust_decimal::Decimal;
 
 /// A single OHLCV candle. Prices are exchange-precise `Decimal`; consumers convert
 /// closes to `f64` for the indicators.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candle {
     /// Candle open time (UTC).
     pub open_time: DateTime<Utc>,

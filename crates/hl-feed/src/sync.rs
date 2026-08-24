@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use domain::Timeframe;
+use storage::{CandleSeries, CandleStore};
 use tokio::task::JoinHandle;
 
 use crate::ratelimit::WeightLimiter;
@@ -48,13 +49,33 @@ impl Default for SyncConfig {
 /// Spawn the background sync: fetch the universe, backfill candles for every
 /// (coin, timeframe), then refresh on an interval. The task runs until aborted.
 #[must_use]
-pub fn spawn_sync(store: Arc<MarketStore>, config: SyncConfig) -> JoinHandle<()> {
+pub fn spawn_sync(store: Arc<MarketStore>, config: SyncConfig, persistence: Arc<dyn CandleStore>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let client = reqwest::Client::new();
         let limiter = WeightLimiter::new(config.weight_budget_per_min);
         let mut backfilled: HashSet<(String, Timeframe)> = HashSet::new();
+
+        match persistence.load().await {
+            Ok(series) => {
+                let restored = series.len();
+                for CandleSeries {
+                    coin,
+                    timeframe,
+                    candles,
+                } in series
+                {
+                    if !candles.is_empty() {
+                        store.set_candles(coin.clone(), timeframe, candles);
+                        backfilled.insert((coin, timeframe));
+                    }
+                }
+                tracing::info!(restored, "restored persisted candle series");
+            }
+            Err(error) => tracing::error!(%error, "failed to load persisted candles"),
+        }
+
         loop {
-            refresh(&store, &client, &limiter, &config, &mut backfilled).await;
+            refresh(&store, &client, &limiter, &config, &mut backfilled, persistence.as_ref()).await;
             tokio::time::sleep(config.refresh_interval).await;
         }
     })
@@ -67,9 +88,14 @@ async fn refresh(
     limiter: &WeightLimiter,
     config: &SyncConfig,
     backfilled: &mut HashSet<(String, Timeframe)>,
+    persistence: &dyn CandleStore,
 ) {
-    let Ok(universe) = fetch_universe(client, limiter, config.universe_limit, config.min_day_volume_usd).await else {
-        return;
+    let universe = match fetch_universe(client, limiter, config.universe_limit, config.min_day_volume_usd).await {
+        Ok(universe) => universe,
+        Err(error) => {
+            tracing::warn!(%error, "universe fetch failed");
+            return;
+        }
     };
     let coins: Vec<String> = universe.iter().map(|coin| coin.coin.clone()).collect();
     store.set_universe_size(coins.len());
@@ -95,14 +121,21 @@ async fn refresh(
     for (coin, timeframe) in pending {
         match fetch_candles(client, limiter, &coin, timeframe, config.lookback).await {
             Ok(candles) => {
+                if let Err(error) = persistence.save(&coin, timeframe, &candles).await {
+                    tracing::warn!(coin = %coin, timeframe = timeframe.as_hl(), %error, "failed to persist candles");
+                }
                 store.set_candles(coin.clone(), timeframe, candles);
                 backfilled.insert((coin, timeframe));
             }
-            Err(_) => errors += 1,
+            Err(error) => {
+                tracing::debug!(coin = %coin, timeframe = timeframe.as_hl(), %error, "candle fetch failed");
+                errors += 1;
+            }
         }
         done += 1;
         store.set_backfill(done, total, errors, fetch_rate(done, started));
     }
+    tracing::info!(done, errors, "candle backfill pass complete");
     store.set_phase(SyncPhase::Live);
 }
 
@@ -121,10 +154,24 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use domain::Timeframe;
+    use async_trait::async_trait;
+    use domain::{Candle, Timeframe};
+    use storage::{CandleSeries, CandleStore, StoreError};
 
     use super::{SyncConfig, spawn_sync};
     use crate::MarketStore;
+
+    struct NoopStore;
+
+    #[async_trait]
+    impl CandleStore for NoopStore {
+        async fn load(&self) -> Result<Vec<CandleSeries>, StoreError> {
+            Ok(Vec::new())
+        }
+        async fn save(&self, _coin: &str, _timeframe: Timeframe, _candles: &[Candle]) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
 
     /// Live smoke test: the sync backfills the store's universe and candles.
     #[tokio::test]
@@ -137,7 +184,7 @@ mod tests {
             lookback: 60,
             ..SyncConfig::default()
         };
-        let handle = spawn_sync(Arc::clone(&store), config);
+        let handle = spawn_sync(Arc::clone(&store), config, Arc::new(NoopStore));
         tokio::time::sleep(Duration::from_secs(10)).await;
         handle.abort();
 

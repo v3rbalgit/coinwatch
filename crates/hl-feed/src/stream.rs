@@ -89,7 +89,10 @@ async fn ws_loop(feed: MarketFeed, store: Arc<MarketStore>, intervals: Vec<Timef
     loop {
         match run_session(&feed, &store, &intervals).await {
             Ok(()) => backoff = RECONNECT_BASE,
-            Err(_) => backoff = (backoff * 2).min(RECONNECT_MAX),
+            Err(error) => {
+                tracing::warn!(%error, ?backoff, "websocket session ended, reconnecting");
+                backoff = (backoff * 2).min(RECONNECT_MAX);
+            }
         }
         store.set_connection(ConnectionState::Reconnecting);
         tokio::time::sleep(backoff).await;
@@ -100,6 +103,7 @@ async fn run_session(feed: &MarketFeed, store: &MarketStore, intervals: &[Timefr
     let (stream, _) = connect_async(WS_URL).await?;
     let (mut write, mut read) = stream.split();
     store.set_connection(ConnectionState::Live);
+    tracing::info!("websocket connected");
 
     for subscription in [Subscription::AllMids, Subscription::FastAssetCtxs] {
         let subscribe = serde_json::to_string(&Subscribe {
@@ -141,8 +145,10 @@ async fn run_session(feed: &MarketFeed, store: &MarketStore, intervals: &[Timefr
                             write.send(Message::Text(subscribe.into())).await?;
                         }
                     }
+                    let streams = coins.len().saturating_mul(intervals.len());
                     candles_subscribed = true;
-                    store.set_streaming(coins.len().saturating_mul(intervals.len()));
+                    store.set_streaming(streams);
+                    tracing::debug!(streams, "subscribed candle streams");
                 }
             }
         }

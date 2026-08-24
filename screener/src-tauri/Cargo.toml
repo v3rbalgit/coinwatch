@@ -26,8 +26,11 @@ domain = { workspace = true }
 hl-feed = { workspace = true }
 indicators = { workspace = true }
 scanner = { workspace = true }
+storage = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }
 rust_decimal = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
