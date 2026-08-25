@@ -7,6 +7,7 @@
   import { onMount } from "svelte";
 
   import Chart, { type Bar } from "$lib/chart/Chart.svelte";
+  import type { IndicatorInstance } from "$lib/chart/indicators";
   import { fmtPrice } from "$lib/chart/theme";
   import Button from "$lib/components/ui/button.svelte";
   import CoinIcon from "$lib/components/ui/coin-icon.svelte";
@@ -29,6 +30,14 @@
   let seed = $state(0);
   let meta = $state<Row | null>(null);
   let livePrice = $state<number | null>(null);
+  // Which indicators the chart shows; seeded with the scanner's signals, then the
+  // user toggles the rest via the chart's picker.
+  let indicatorInstances = $state<IndicatorInstance[]>([
+    { id: "rsi", params: {} },
+    { id: "macd", params: {} },
+    { id: "rsiDivergence", params: {} },
+    { id: "macdDivergence", params: {} },
+  ]);
 
   async function loadCandles() {
     const [c, t] = [coin, tf];
@@ -174,7 +183,13 @@
   </div>
 
   <div class="relative min-h-0 flex-1 overflow-hidden rounded-lg border border-border">
-    <Chart {bars} {seed} onLoadOlder={loadOlder} />
+    <Chart
+      {bars}
+      {seed}
+      instances={indicatorInstances}
+      onInstancesChange={(next) => (indicatorInstances = next)}
+      onLoadOlder={loadOlder}
+    />
     {#if bars.length === 0}
       <div class="absolute inset-0 flex items-center justify-center gap-2 text-sm text-muted-foreground">
         <LoaderCircle class="size-4 animate-spin" />

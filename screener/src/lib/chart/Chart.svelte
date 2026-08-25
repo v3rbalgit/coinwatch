@@ -42,11 +42,13 @@
       { id: "macdDivergence", params: {} },
     ],
     onLoadOlder,
+    onInstancesChange,
   }: {
     bars: Bar[];
     seed?: number;
     instances?: IndicatorInstance[];
     onLoadOlder?: () => void;
+    onInstancesChange?: (instances: IndicatorInstance[]) => void;
   } = $props();
 
   const VISIBLE_BARS = 150;
@@ -76,6 +78,8 @@
   let hovering = false;
   let ready = $state(false);
   let wasmReady = $state(false);
+  let pickerOpen = $state(false);
+  let availableDescriptors = $state<IndicatorDescriptor[]>([]);
 
   type LegendData = { open: number; high: number; low: number; close: number; volume: number; change: number };
   type Readout = { label: string; value: number; color: string };
@@ -103,6 +107,12 @@
       volume: bar.volume,
       change: bar.open !== 0 ? (bar.close / bar.open - 1) * 100 : 0,
     };
+  }
+
+  // Toggle an indicator in/out of the visible set (parent owns the state + persistence).
+  function toggleIndicator(id: string) {
+    const exists = instances.some((instance) => instance.id === id);
+    onInstancesChange?.(exists ? instances.filter((instance) => instance.id !== id) : [...instances, { id, params: {} }]);
   }
 
   // Each visible pane indicator's primary value at a bar, for the crosshair readout.
@@ -226,7 +236,9 @@
     });
 
     void loadIndicators().then(() => {
-      for (const descriptor of indicatorDescriptors()) descriptorsById.set(descriptor.id, descriptor);
+      const list = indicatorDescriptors();
+      for (const descriptor of list) descriptorsById.set(descriptor.id, descriptor);
+      availableDescriptors = list;
       wasmReady = true;
     });
 
@@ -414,6 +426,15 @@
     >
       log
     </button>
+    <button
+      class="rounded py-1 text-[10px] font-medium {pickerOpen
+        ? 'bg-accent text-accent-foreground'
+        : 'text-muted-foreground hover:bg-accent/50'}"
+      title="Indicators"
+      onclick={() => (pickerOpen = !pickerOpen)}
+    >
+      ƒx
+    </button>
   </div>
   <div class="relative min-w-0 flex-1">
     <div bind:this={container} class="h-full w-full"></div>
@@ -431,6 +452,22 @@
         </span>
         {#each readouts as readout (readout.label)}
           <span>{readout.label} <span style="color: {readout.color}">{fmtReadout(readout.value)}</span></span>
+        {/each}
+      </div>
+    {/if}
+    {#if pickerOpen}
+      <div
+        class="absolute left-2 top-2 z-20 flex max-h-[85%] w-44 flex-col overflow-y-auto rounded-md border border-border bg-background/95 p-1 text-xs shadow-lg backdrop-blur"
+      >
+        {#each availableDescriptors as descriptor (descriptor.id)}
+          <label class="flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 hover:bg-accent/50">
+            <input
+              type="checkbox"
+              checked={instances.some((instance) => instance.id === descriptor.id)}
+              onchange={() => toggleIndicator(descriptor.id)}
+            />
+            <span class="text-foreground">{descriptor.label}</span>
+          </label>
         {/each}
       </div>
     {/if}
