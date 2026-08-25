@@ -6,6 +6,8 @@
   import { Check, ChevronDown, EllipsisVertical, ExternalLink, Plus, ScanSearch, X } from "@lucide/svelte";
   import { onMount } from "svelte";
 
+  import type { Snapshot } from "@sveltejs/kit";
+
   import Badge from "$lib/components/ui/badge.svelte";
   import Button from "$lib/components/ui/button.svelte";
   import CoinIcon from "$lib/components/ui/coin-icon.svelte";
@@ -40,6 +42,17 @@
   let creating = $state(false);
   let creatingCoin = $state<string | null>(null);
   let newListName = $state("");
+
+  // Preserve the view (sort / filter / list) when navigating to a coin and back.
+  export const snapshot: Snapshot<{ sortKey: SortKey; sortDir: 1 | -1; query: string; activeList: string | null }> = {
+    capture: () => ({ sortKey, sortDir, query, activeList }),
+    restore: (value) => {
+      sortKey = value.sortKey;
+      sortDir = value.sortDir;
+      query = value.query;
+      activeList = value.activeList;
+    },
+  };
 
   async function loadRows() {
     try {
