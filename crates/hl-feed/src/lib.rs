@@ -11,6 +11,7 @@
 mod error;
 mod event;
 mod feed;
+mod history;
 mod ratelimit;
 mod rest;
 mod store;
@@ -20,7 +21,8 @@ mod sync;
 pub use error::FeedError;
 pub use event::{CandleEvent, MarketEvent, MidEvent};
 pub use feed::MarketFeed;
-pub use rest::{UniverseCoin, fetch_candle_range};
+pub use history::{CandleHistory, HistoryError};
+pub use rest::{HyperliquidRest, UniverseCoin};
 pub use store::{ConnectionState, MarketStatus, MarketStore, SyncPhase};
 pub use stream::HyperliquidAdapter;
 pub use sync::{SyncConfig, spawn_sync};

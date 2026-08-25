@@ -12,8 +12,7 @@ use domain::Timeframe;
 use storage::{CandleSeries, CandleStore};
 use tokio::task::JoinHandle;
 
-use crate::ratelimit::WeightLimiter;
-use crate::rest::{fetch_candles, fetch_universe};
+use crate::rest::HyperliquidRest;
 use crate::store::ReconcileMode;
 use crate::{CANDLE_WINDOW, MarketStore, SyncPhase};
 
@@ -116,17 +115,13 @@ fn candle_fetch(
 /// Spawn the background sync: fetch the universe, backfill candles for every
 /// (coin, timeframe), then refresh on an interval. The task runs until aborted.
 #[must_use]
-pub fn spawn_sync(store: Arc<MarketStore>, config: SyncConfig, persistence: Arc<dyn CandleStore>) -> JoinHandle<()> {
+pub fn spawn_sync(
+    store: Arc<MarketStore>,
+    config: SyncConfig,
+    persistence: Arc<dyn CandleStore>,
+    rest: Arc<HyperliquidRest>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let client = match reqwest::Client::builder().build() {
-            Ok(client) => client,
-            Err(error) => {
-                tracing::error!(%error, "failed to build HTTP client; market sync disabled");
-                return;
-            }
-        };
-        let limiter = WeightLimiter::new(config.weight_budget_per_min);
-
         match persistence.load_recent(CANDLE_WINDOW).await {
             Ok(series) => {
                 let restored = series.len();
@@ -146,21 +141,15 @@ pub fn spawn_sync(store: Arc<MarketStore>, config: SyncConfig, persistence: Arc<
         }
 
         loop {
-            refresh(&store, &client, &limiter, &config, persistence.as_ref()).await;
+            refresh(&store, &rest, &config, persistence.as_ref()).await;
             tokio::time::sleep(config.refresh_interval).await;
         }
     })
 }
 
 /// One full pass: refresh the universe, then backfill each coin/timeframe.
-async fn refresh(
-    store: &MarketStore,
-    client: &reqwest::Client,
-    limiter: &WeightLimiter,
-    config: &SyncConfig,
-    persistence: &dyn CandleStore,
-) {
-    let universe = match fetch_universe(client, limiter, config.universe_limit, config.min_day_volume_usd).await {
+async fn refresh(store: &MarketStore, rest: &HyperliquidRest, config: &SyncConfig, persistence: &dyn CandleStore) {
+    let universe = match rest.universe(config.universe_limit, config.min_day_volume_usd).await {
         Ok(universe) => universe,
         Err(error) => {
             tracing::warn!(%error, "universe fetch failed");
@@ -195,7 +184,7 @@ async fn refresh(
             limit,
             mode,
         } = fetch;
-        match fetch_candles(client, limiter, &coin, timeframe, limit).await {
+        match rest.recent_candles(&coin, timeframe, limit).await {
             Ok(candles) if candles.is_empty() => {
                 tracing::warn!(coin = %coin, timeframe = timeframe.as_hl(), "candle fetch returned no rows");
                 errors += 1;
@@ -254,7 +243,7 @@ mod tests {
 
     use super::{SyncConfig, candle_fetch, spawn_sync};
     use crate::store::ReconcileMode;
-    use crate::{CANDLE_WINDOW, MarketStore};
+    use crate::{CANDLE_WINDOW, HyperliquidRest, MarketStore};
 
     struct NoopStore;
 
@@ -276,6 +265,15 @@ mod tests {
         }
         async fn save(&self, _coin: &str, _timeframe: Timeframe, _candles: &[Candle]) -> Result<(), StoreError> {
             Ok(())
+        }
+        async fn candles_before(
+            &self,
+            _coin: &str,
+            _timeframe: Timeframe,
+            _before_ms: i64,
+            _limit: usize,
+        ) -> Result<Vec<Candle>, StoreError> {
+            Ok(Vec::new())
         }
     }
 
@@ -385,7 +383,8 @@ mod tests {
             lookback: 60,
             ..SyncConfig::default()
         };
-        let handle = spawn_sync(Arc::clone(&store), config, Arc::new(NoopStore));
+        let rest = Arc::new(HyperliquidRest::new(reqwest::Client::new(), config.weight_budget_per_min));
+        let handle = spawn_sync(Arc::clone(&store), config, Arc::new(NoopStore), rest);
         tokio::time::sleep(Duration::from_secs(10)).await;
         handle.abort();
 

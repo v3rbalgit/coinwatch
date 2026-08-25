@@ -21,6 +21,9 @@ pub enum FeedError {
     /// A candle timestamp was outside the representable range.
     #[error("candle timestamp out of range: {0}")]
     Timestamp(i64),
+    /// A requested candle range cannot be represented in epoch milliseconds.
+    #[error("candle request range is outside the supported timestamp range")]
+    CandleRange,
 }
 
 impl From<tungstenite::Error> for FeedError {
