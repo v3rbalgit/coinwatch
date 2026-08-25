@@ -355,6 +355,12 @@ pub fn run() {
     let status_store = Arc::clone(&store);
     let adapter_store = Arc::clone(&store);
     let logo_market_store = Arc::clone(&store);
+    let sync_config = SyncConfig {
+        universe_limit: usize::MAX,
+        min_day_volume_usd: 0.0,
+        ..SyncConfig::default()
+    };
+    let streamed_timeframes = sync_config.streamed_timeframes.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -375,15 +381,10 @@ pub fn run() {
                 Ok(store) => {
                     let store = Arc::new(store);
                     app.manage(Arc::clone(&store));
-                    let config = SyncConfig {
-                        universe_limit: usize::MAX,
-                        min_day_volume_usd: 0.0,
-                        ..SyncConfig::default()
-                    };
                     let logo_db = Arc::clone(&store);
                     // Keep the hot cache warm from Hyperliquid — the whole tradable universe.
                     tauri::async_runtime::spawn(async move {
-                        let _sync = spawn_sync(sync_store, config, store);
+                        let _sync = spawn_sync(sync_store, sync_config, store);
                     });
                     // Cache coin logos locally so they load instantly and offline.
                     tauri::async_runtime::spawn(cache_logos(logo_market_store, logo_db, http));
@@ -408,7 +409,7 @@ pub fn run() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let event_store = Arc::clone(&adapter_store);
-                let mut adapter = HyperliquidAdapter::new(adapter_store, vec![Timeframe::Hour1, Timeframe::Hour4]);
+                let mut adapter = HyperliquidAdapter::new(adapter_store, streamed_timeframes);
                 let mut events = adapter.feed().subscribe_all();
                 adapter.connect();
                 loop {

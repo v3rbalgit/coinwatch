@@ -1,8 +1,9 @@
 //! Store-backed signal runs: collect completed candle slices per coin and evaluate.
 //!
 //! The hot cache includes the still-forming trailing bar. Runs share its `Arc`
-//! buffers and expose only the completed prefix, avoiding both repainting and a
-//! clone of every `Candle`.
+//! buffers and expose only the completed prefix. A series is omitted while its
+//! expected current bar is missing or a gap is being reconciled, avoiding both
+//! repainting and stale-data matches.
 
 use chrono::{DateTime, Utc};
 use domain::{Candle, Timeframe};
@@ -41,8 +42,9 @@ pub fn collect_coin_data(
     now: DateTime<Utc>,
 ) -> CoinData {
     let mut data = CoinData::default();
+    let now_ms = now.timestamp_millis();
     for timeframe in referenced_timeframes(definition) {
-        if let Some(candles) = store.candles(coin, timeframe) {
+        if let Some(candles) = store.current_candles(coin, timeframe, now_ms) {
             let completed = completed_len(&candles, timeframe, now);
             data.insert_shared(timeframe, candles, completed);
         }

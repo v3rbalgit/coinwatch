@@ -1,10 +1,10 @@
-//! Candle timeframes the setup-finder scans.
+//! Candle timeframes supported by the market-data and signal layers.
 
 use serde::{Deserialize, Deserializer, Serialize};
 use strum::{EnumString, IntoStaticStr};
 
-/// A higher-timeframe interval the setup-finder scans. String forms are
-/// Hyperliquid's `candle` interval codes.
+/// A supported market-data interval. String forms are Hyperliquid's `candle`
+/// interval codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, IntoStaticStr, EnumString, Serialize)]
 #[serde(into = "&'static str")]
 pub enum Timeframe {
@@ -58,6 +58,22 @@ impl Timeframe {
             Self::Week1 => 604_800_000,
         }
     }
+
+    /// UTC open time of the bar containing `timestamp_ms`.
+    ///
+    /// Hyperliquid aligns intervals to Unix-epoch multiples. This yields UTC
+    /// hour/day boundaries and its Thursday-anchored weekly boundary.
+    #[must_use]
+    pub const fn bar_open_ms(self, timestamp_ms: i64) -> i64 {
+        let duration = self.duration_ms();
+        timestamp_ms.div_euclid(duration).saturating_mul(duration)
+    }
+
+    /// Whether `open_ms` lies exactly on this timeframe's bar grid.
+    #[must_use]
+    pub const fn is_aligned(self, open_ms: i64) -> bool {
+        open_ms.rem_euclid(self.duration_ms()) == 0
+    }
 }
 
 #[cfg(test)]
@@ -76,5 +92,17 @@ mod tests {
             assert_eq!(Timeframe::from_hl(code), Some(timeframe));
         }
         assert_eq!(Timeframe::from_hl("2h"), None);
+    }
+
+    #[test]
+    fn bar_opens_share_the_epoch_aligned_grid() {
+        let hour = Timeframe::Hour1.duration_ms();
+        let day = Timeframe::Day1.duration_ms();
+        assert_eq!(Timeframe::Hour4.bar_open_ms(5 * hour), 4 * hour);
+        assert_eq!(Timeframe::Day1.bar_open_ms(day + hour), day);
+        assert_eq!(Timeframe::Week1.bar_open_ms(6 * day), 0);
+        assert_eq!(Timeframe::Week1.bar_open_ms(8 * day), 7 * day);
+        assert!(Timeframe::Week1.is_aligned(7 * day));
+        assert!(!Timeframe::Week1.is_aligned(7 * day + hour));
     }
 }
