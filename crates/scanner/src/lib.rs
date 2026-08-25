@@ -1,6 +1,6 @@
 //! Divergence-based setup scanner over the cached Hyperliquid universe.
 //!
-//! Reads candles from the [`MarketStore`](hl_feed::MarketStore) hot cache and runs
+//! Reads candles from the [`MarketStore`] hot cache and runs
 //! RSI/MACD divergence detection — pure CPU, no network on the scan path. The market
 //! sync engine keeps the cache warm; this crate only computes. Pure detection lives
 //! in [`signals_from_candles`]; [`scan_coin`] and [`scan_universe`] fan it over the
