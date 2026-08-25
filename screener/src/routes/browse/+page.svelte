@@ -6,13 +6,12 @@
   import { Check, ChevronDown, EllipsisVertical, ExternalLink, Plus, ScanSearch, X } from "@lucide/svelte";
   import { onMount } from "svelte";
 
-  import type { Snapshot } from "@sveltejs/kit";
-
   import Badge from "$lib/components/ui/badge.svelte";
   import Button from "$lib/components/ui/button.svelte";
   import CoinIcon from "$lib/components/ui/coin-icon.svelte";
   import Input from "$lib/components/ui/input.svelte";
   import Skeleton from "$lib/components/ui/skeleton.svelte";
+  import { browseView, type SortKey } from "$lib/browse-view.svelte";
 
   type Row = {
     coin: string;
@@ -23,17 +22,16 @@
     funding: number;
   };
   type ListView = { name: string; coins: string[] };
-  type SortKey = "coin" | "price" | "change_24h_pct" | "volume_usd" | "open_interest_usd" | "funding";
 
   let rows = $state<Row[]>([]);
   let lists = $state<ListView[]>([]);
   let logoMap = $state<Record<string, string>>({});
-  let activeList = $state<string | null>(null);
+  let activeList = $state<string | null>(browseView.activeList);
   let loading = $state(true);
   let error = $state("");
-  let query = $state("");
-  let sortKey = $state<SortKey>("volume_usd");
-  let sortDir = $state<1 | -1>(-1);
+  let query = $state(browseView.query);
+  let sortKey = $state<SortKey>(browseView.sortKey);
+  let sortDir = $state<1 | -1>(browseView.sortDir);
   let livePrices = $state<Record<string, number>>({});
   let live = $state(false);
   let toast = $state("");
@@ -43,16 +41,14 @@
   let creatingCoin = $state<string | null>(null);
   let newListName = $state("");
 
-  // Preserve the view (sort / filter / list) when navigating to a coin and back.
-  export const snapshot: Snapshot<{ sortKey: SortKey; sortDir: 1 | -1; query: string; activeList: string | null }> = {
-    capture: () => ({ sortKey, sortDir, query, activeList }),
-    restore: (value) => {
-      sortKey = value.sortKey;
-      sortDir = value.sortDir;
-      query = value.query;
-      activeList = value.activeList;
-    },
-  };
+  // Persist the view (sort / filter / list) module-level so it survives navigating
+  // into a coin and back — the page remounts on goto, losing component-local state.
+  $effect(() => {
+    browseView.sortKey = sortKey;
+    browseView.sortDir = sortDir;
+    browseView.query = query;
+    browseView.activeList = activeList;
+  });
 
   async function loadRows() {
     try {
