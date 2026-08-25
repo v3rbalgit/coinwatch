@@ -18,7 +18,14 @@
   } from "lightweight-charts";
   import { onMount } from "svelte";
 
-  import { analyze, defaultIndicatorConfig, loadIndicators, type Analysis, type IndicatorConfig } from "./indicators";
+  import {
+    computeIndicators,
+    indicatorDescriptors,
+    loadIndicators,
+    type IndicatorDescriptor,
+    type IndicatorInstance,
+    type InstanceOutput,
+  } from "./indicators";
   import { chartTheme, fmtPrice } from "./theme";
 
   // `seed` changes when the whole series is replaced (coin / timeframe switch or a
@@ -28,49 +35,54 @@
   let {
     bars,
     seed = 0,
-    config = defaultIndicatorConfig,
+    instances = [
+      { id: "rsi", params: {} },
+      { id: "macd", params: {} },
+      { id: "rsiDivergence", params: {} },
+      { id: "macdDivergence", params: {} },
+    ],
     onLoadOlder,
-  }: { bars: Bar[]; seed?: number; config?: IndicatorConfig; onLoadOlder?: () => void } = $props();
+  }: {
+    bars: Bar[];
+    seed?: number;
+    instances?: IndicatorInstance[];
+    onLoadOlder?: () => void;
+  } = $props();
 
   const VISIBLE_BARS = 150;
   const RIGHT_OFFSET = 6;
   const LOAD_OLDER_THRESHOLD = 10;
+  const BASE_PANES = 1; // price pane; indicator panes are appended after it
 
   let container: HTMLDivElement;
   let chart: IChartApi | undefined;
   let candles: ISeriesApi<"Candlestick"> | undefined;
   let volume: ISeriesApi<"Histogram"> | undefined;
-  let rsiSeries: ISeriesApi<"Line"> | undefined;
-  let macdSeries: ISeriesApi<"Line"> | undefined;
-  let signalSeries: ISeriesApi<"Line"> | undefined;
-  let histSeries: ISeriesApi<"Histogram"> | undefined;
-  let divergenceLines: ISeriesApi<"Line">[] = [];
+  const descriptorsById = new Map<string, IndicatorDescriptor>();
+  type RenderedSeries =
+    | { outputKey: string; kind: "line"; api: ISeriesApi<"Line"> }
+    | { outputKey: string; kind: "histogram"; api: ISeriesApi<"Histogram"> };
+  type RenderedInstance = { series: RenderedSeries[]; spanLines: ISeriesApi<"Line">[]; spanKey: string };
+  let rendered: RenderedInstance[] = [];
+  let latestComputed: InstanceOutput[] = [];
+  let latestChosen: IndicatorInstance[] = [];
+  let plottedRenderKey = "";
+  let plottedRenderSeed = -1;
+  let plottedRenderFirstTime = 0;
   let plottedSeed = -1;
-  let plottedIndicatorSeed = -1;
   let plottedFirstTime = 0;
-  let plottedIndicatorFirstTime = 0;
-  let divergenceKey = "";
   let lastTime = 0;
   let suppressLoadOlder = false;
   let hovering = false;
   let ready = $state(false);
   let wasmReady = $state(false);
 
-  type LegendData = {
-    open: number;
-    high: number;
-    low: number;
-    close: number;
-    volume: number;
-    change: number;
-    rsi: number | null;
-    macd: number | null;
-  };
+  type LegendData = { open: number; high: number; low: number; close: number; volume: number; change: number };
+  type Readout = { label: string; value: number; color: string };
   let legend = $state<LegendData | null>(null);
+  let readouts = $state<Readout[]>([]);
   let logScale = $state(false);
-  let latestAnalysis: Analysis | undefined;
 
-  const defined = (value: number | undefined) => (value !== undefined && !Number.isNaN(value) ? value : null);
   const fmtVol = (value: number) =>
     value >= 1e9
       ? (value / 1e9).toFixed(2) + "B"
@@ -79,8 +91,10 @@
         : value >= 1e3
           ? (value / 1e3).toFixed(0) + "k"
           : value.toFixed(0);
+  const fmtReadout = (value: number) =>
+    Math.abs(value) >= 100 ? value.toFixed(0) : Math.abs(value) >= 1 ? value.toFixed(2) : value.toFixed(4);
 
-  function legendFor(bar: Bar, index: number): LegendData {
+  function legendFor(bar: Bar): LegendData {
     return {
       open: bar.open,
       high: bar.high,
@@ -88,9 +102,23 @@
       close: bar.close,
       volume: bar.volume,
       change: bar.open !== 0 ? (bar.close / bar.open - 1) * 100 : 0,
-      rsi: defined(latestAnalysis?.rsi[index]),
-      macd: defined(latestAnalysis?.macd[index]),
     };
+  }
+
+  // Each visible pane indicator's primary value at a bar, for the crosshair readout.
+  function readoutsFor(index: number): Readout[] {
+    const result: Readout[] = [];
+    latestChosen.forEach((instance, position) => {
+      const descriptor = descriptorsById.get(instance.id);
+      const primary = descriptor?.outputs[0];
+      const output = latestComputed[position];
+      if (!descriptor || descriptor.target !== "pane" || !primary || !output) return;
+      const value = output.outputs.find((series) => series.key === primary.key)?.values[index];
+      if (value !== undefined && !Number.isNaN(value)) {
+        result.push({ label: descriptor.label, value, color: primary.color });
+      }
+    });
+    return result;
   }
 
   // lightweight-charts' UTCTimestamp is a branded number; the cast is the library's
@@ -133,6 +161,16 @@
       }
     }
   }
+  function updateLastHistogram(series: ISeriesApi<"Histogram">, values: number[]) {
+    for (let index = values.length - 1; index >= 0; index--) {
+      const value = values[index];
+      const bar = bars[index];
+      if (bar && value !== undefined && !Number.isNaN(value)) {
+        series.update({ time: stamp(bar.time), value, color: value >= 0 ? chartTheme.histUp : chartTheme.histDown });
+        return;
+      }
+    }
+  }
 
   onMount(() => {
     chart = createChart(container, {
@@ -164,49 +202,18 @@
     });
     chart.priceScale("volume").applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } });
 
-    // RSI pane (fixed 0–100 with 30/70 guides).
-    rsiSeries = chart.addSeries(
-      LineSeries,
-      {
-        color: chartTheme.rsi,
-        lineWidth: 1,
-        priceLineVisible: false,
-        lastValueVisible: true,
-        autoscaleInfoProvider: () => ({ priceRange: { minValue: 0, maxValue: 100 } }),
-      },
-      1,
-    );
-    for (const level of [30, 70]) {
-      rsiSeries.createPriceLine({
-        price: level,
-        color: chartTheme.guide,
-        lineWidth: 1,
-        lineStyle: LineStyle.Dashed,
-        axisLabelVisible: false,
-        title: "",
-      });
-    }
-
-    // MACD pane (histogram behind the two lines).
-    histSeries = chart.addSeries(HistogramSeries, { priceLineVisible: false, lastValueVisible: false }, 2);
-    macdSeries = chart.addSeries(LineSeries, { color: chartTheme.macd, lineWidth: 1, priceLineVisible: false }, 2);
-    signalSeries = chart.addSeries(LineSeries, { color: chartTheme.signal, lineWidth: 1, priceLineVisible: false }, 2);
-
-    const panes = chart.panes();
-    panes[0]?.setStretchFactor(3);
-    panes[1]?.setStretchFactor(1);
-    panes[2]?.setStretchFactor(1);
-
     chart.subscribeCrosshairMove((param) => {
       const index = param.time === undefined ? -1 : bars.findIndex((bar) => bar.time === param.time);
       const bar = index >= 0 ? bars[index] : undefined;
       if (bar) {
         hovering = true;
-        legend = legendFor(bar, index);
+        legend = legendFor(bar);
+        readouts = readoutsFor(index);
       } else {
         hovering = false;
         const last = bars.at(-1);
-        legend = last ? legendFor(last, bars.length - 1) : null;
+        legend = last ? legendFor(last) : null;
+        readouts = readoutsFor(bars.length - 1);
       }
     });
 
@@ -219,6 +226,7 @@
     });
 
     void loadIndicators().then(() => {
+      for (const descriptor of indicatorDescriptors()) descriptorsById.set(descriptor.id, descriptor);
       wasmReady = true;
     });
 
@@ -263,7 +271,8 @@
     lastTime = bars[bars.length - 1].time;
     if (!hovering) {
       const last = bars[bars.length - 1];
-      legend = legendFor(last, bars.length - 1);
+      legend = legendFor(last);
+      readouts = readoutsFor(bars.length - 1);
     }
   });
 
@@ -272,69 +281,125 @@
     chart?.priceScale("right").applyOptions({ mode: logScale ? PriceScaleMode.Logarithmic : PriceScaleMode.Normal });
   });
 
-  // Indicators: compute RSI/MACD + divergences via the WASM engine over the current
-  // bars. Full replot on reseed, per-tick tail updates otherwise; divergence lines
-  // are rebuilt only when the set actually changes.
+  // Instance-driven indicators: overlays (SMA/EMA/Bollinger/…) as lines on the price
+  // pane, oscillators (Stochastic/Williams/CCI/MFI/ADX/ATR/OBV) in their own panes
+  // after the pinned RSI/MACD. Rebuild series on instance-set change; otherwise fill
+  // from the bars (reseed on coin/tf switch or history prepend, tail per tick).
+  const renderKey = (instance: IndicatorInstance) => `${instance.id}:${JSON.stringify(instance.params)}`;
+
   $effect(() => {
-    if (!ready || !wasmReady || !chart || !rsiSeries || !macdSeries || !signalSeries || !histSeries || bars.length === 0) {
-      return;
+    if (!ready || !wasmReady || !chart || bars.length === 0) return;
+    const activeChart = chart;
+    const chosen = instances.filter((instance) => descriptorsById.has(instance.id));
+
+    const key = chosen.map(renderKey).join("|");
+    if (key !== plottedRenderKey) {
+      for (const item of rendered) {
+        for (const line of item.series) activeChart.removeSeries(line.api);
+        for (const spanLine of item.spanLines) activeChart.removeSeries(spanLine);
+      }
+      rendered = [];
+      while (activeChart.panes().length > BASE_PANES) activeChart.removePane(activeChart.panes().length - 1);
+      let nextPane = BASE_PANES;
+      for (const instance of chosen) {
+        const descriptor = descriptorsById.get(instance.id);
+        if (!descriptor) continue;
+        const paneIndex = descriptor.target === "overlay" ? 0 : nextPane++;
+        const range = descriptor.range;
+        const scale = range
+          ? { autoscaleInfoProvider: () => ({ priceRange: { minValue: range[0], maxValue: range[1] } }) }
+          : {};
+        const series = descriptor.outputs.map((output): RenderedSeries => {
+          if (output.kind === "histogram") {
+            return {
+              outputKey: output.key,
+              kind: "histogram",
+              api: activeChart.addSeries(HistogramSeries, { priceLineVisible: false, lastValueVisible: false, ...scale }, paneIndex),
+            };
+          }
+          return {
+            outputKey: output.key,
+            kind: "line",
+            api: activeChart.addSeries(
+              LineSeries,
+              { color: output.color, lineWidth: 1, priceLineVisible: false, lastValueVisible: descriptor.target === "pane", ...scale },
+              paneIndex,
+            ),
+          };
+        });
+        for (const level of descriptor.guides) {
+          series[0]?.api.createPriceLine({
+            price: level,
+            color: chartTheme.guide,
+            lineWidth: 1,
+            lineStyle: LineStyle.Dashed,
+            axisLabelVisible: false,
+            title: "",
+          });
+        }
+        rendered.push({ series, spanLines: [], spanKey: "" });
+      }
+      activeChart.panes().forEach((pane, index) => pane.setStretchFactor(index === 0 ? 3 : 1));
+      plottedRenderKey = key;
+      plottedRenderSeed = -1;
     }
-    const closes = Float64Array.from(bars, (bar) => bar.close);
-    const analysis = analyze(closes, config);
-    latestAnalysis = analysis;
+    if (rendered.length === 0) return;
+
+    const high = Float64Array.from(bars, (bar) => bar.high);
+    const low = Float64Array.from(bars, (bar) => bar.low);
+    const close = Float64Array.from(bars, (bar) => bar.close);
+    const volume = Float64Array.from(bars, (bar) => bar.volume);
+    const computed = computeIndicators(chosen, high, low, close, volume);
+    latestComputed = computed;
+    latestChosen = chosen;
     const firstTime = bars[0].time;
-
-    if (seed !== plottedIndicatorSeed || firstTime < plottedIndicatorFirstTime) {
-      rsiSeries.setData(toLine(analysis.rsi));
-      macdSeries.setData(toLine(analysis.macd));
-      signalSeries.setData(toLine(analysis.signal));
-      histSeries.setData(toHistogram(analysis.histogram));
-      plottedIndicatorSeed = seed;
-    } else {
-      updateLast(rsiSeries, analysis.rsi);
-      updateLast(macdSeries, analysis.macd);
-      updateLast(signalSeries, analysis.signal);
-      const point = analysis.histogram.reduceRight<{ index: number; value: number } | null>((found, value, index) => {
-        if (found || value === undefined || Number.isNaN(value)) return found;
-        return { index, value };
-      }, null);
-      const bar = point ? bars[point.index] : undefined;
-      if (point && bar) {
-        histSeries.update({ time: stamp(bar.time), value: point.value, color: point.value >= 0 ? chartTheme.histUp : chartTheme.histDown });
+    const reseed = seed !== plottedRenderSeed || firstTime < plottedRenderFirstTime;
+    rendered.forEach((item, index) => {
+      const output = computed[index];
+      if (!output) return;
+      for (const line of item.series) {
+        const values = output.outputs.find((series) => series.key === line.outputKey)?.values;
+        if (!values) continue;
+        if (line.kind === "histogram") {
+          if (reseed) line.api.setData(toHistogram(values));
+          else updateLastHistogram(line.api, values);
+        } else {
+          if (reseed) line.api.setData(toLine(values));
+          else updateLast(line.api, values);
+        }
       }
-    }
-    plottedIndicatorFirstTime = firstTime;
-
-    const key = analysis.divergences
-      .map((div) => `${div.source}:${div.kind}:${div.direction}:${div.priorIndex}:${div.recentIndex}`)
-      .join("|");
-    if (key !== divergenceKey) {
-      for (const line of divergenceLines) chart.removeSeries(line);
-      divergenceLines = [];
-      for (const div of analysis.divergences) {
-        const from = bars[div.priorIndex];
-        const to = bars[div.recentIndex];
-        if (!from || !to) continue;
-        const line = chart.addSeries(
-          LineSeries,
-          {
-            color: div.direction === "Bullish" ? chartTheme.up : chartTheme.down,
-            lineWidth: 2,
-            lineStyle: div.kind === "Regular" ? LineStyle.Solid : LineStyle.Dashed,
-            priceLineVisible: false,
-            lastValueVisible: false,
-            crosshairMarkerVisible: false,
-          },
-          0,
-        );
-        line.setData([
-          { time: stamp(from.time), value: from.close },
-          { time: stamp(to.time), value: to.close },
-        ]);
-        divergenceLines.push(line);
+      const spanKey = output.divergences
+        .map((span) => `${span.direction}:${span.kind}:${span.fromIndex}:${span.toIndex}`)
+        .join("|");
+      if (spanKey !== item.spanKey) {
+        for (const spanLine of item.spanLines) activeChart.removeSeries(spanLine);
+        item.spanLines = output.divergences.flatMap((span) => {
+          const from = bars[span.fromIndex];
+          const to = bars[span.toIndex];
+          if (!from || !to) return [];
+          const spanLine = activeChart.addSeries(
+            LineSeries,
+            {
+              color: span.direction === "Bullish" ? chartTheme.up : chartTheme.down,
+              lineWidth: 2,
+              lineStyle: span.kind === "Regular" ? LineStyle.Solid : LineStyle.Dashed,
+              priceLineVisible: false,
+              lastValueVisible: false,
+              crosshairMarkerVisible: false,
+            },
+            0,
+          );
+          spanLine.setData([
+            { time: stamp(from.time), value: from.close },
+            { time: stamp(to.time), value: to.close },
+          ]);
+          return [spanLine];
+        });
+        item.spanKey = spanKey;
       }
-      divergenceKey = key;
-    }
+    });
+    plottedRenderSeed = seed;
+    plottedRenderFirstTime = firstTime;
   });
 </script>
 
@@ -364,10 +429,9 @@
         <span class={legend.change > 0 ? "text-green-500" : legend.change < 0 ? "text-red-500" : ""}>
           {legend.change >= 0 ? "+" : ""}{legend.change.toFixed(2)}%
         </span>
-        {#if legend.rsi !== null}<span>RSI <span style="color: {chartTheme.rsi}">{legend.rsi.toFixed(1)}</span></span>{/if}
-        {#if legend.macd !== null}
-          <span>MACD <span style="color: {chartTheme.macd}">{legend.macd.toFixed(4)}</span></span>
-        {/if}
+        {#each readouts as readout (readout.label)}
+          <span>{readout.label} <span style="color: {readout.color}">{fmtReadout(readout.value)}</span></span>
+        {/each}
       </div>
     {/if}
   </div>

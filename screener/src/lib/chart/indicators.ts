@@ -110,9 +110,18 @@ export type OutputSeries = {
   values: number[];
 };
 
-/** The outputs of one computed instance, in descriptor order. */
+/** A divergence line between two pivots (indices into the analyzed series). */
+export type DivergenceSpan = {
+  fromIndex: number;
+  toIndex: number;
+  kind: "Regular" | "Hidden";
+  direction: "Bullish" | "Bearish";
+};
+
+/** The outputs of one computed instance: plotted series and/or divergence spans. */
 export type InstanceOutput = {
   outputs: OutputSeries[];
+  divergences: DivergenceSpan[];
 };
 
 /** The indicator registry (metadata for the toggle picker). `loadIndicators()` must have resolved. */

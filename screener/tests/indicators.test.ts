@@ -63,9 +63,9 @@ describe("wasm indicator engine (instance-driven, toggleable)", () => {
     return { high: values, low: values, close: values, volume: values };
   };
 
-  it("describes 17 toggleable indicators with targets, ranges, and guides", () => {
+  it("describes every indicator with targets, ranges, and guides", () => {
     const descriptors: IndicatorDescriptor[] = indicatorDescriptors();
-    expect(descriptors).toHaveLength(17);
+    expect(descriptors).toHaveLength(19);
     const sma = descriptors.find((descriptor) => descriptor.id === "sma");
     expect(sma?.target).toBe("overlay");
     expect(sma?.outputs[0]?.key).toBe("sma");
@@ -73,6 +73,9 @@ describe("wasm indicator engine (instance-driven, toggleable)", () => {
     expect(rsi?.target).toBe("pane");
     expect(rsi?.range).toEqual([0, 100]);
     expect(rsi?.guides).toEqual([30, 70]);
+    const divergence = descriptors.find((descriptor) => descriptor.id === "rsiDivergence");
+    expect(divergence?.target).toBe("overlay");
+    expect(divergence?.outputs).toHaveLength(0);
   });
 
   it("computes an SMA aligned to the input length", () => {

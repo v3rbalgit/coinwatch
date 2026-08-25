@@ -11,8 +11,9 @@
 use std::collections::HashMap;
 
 use indicators::{
-    Adx, Bollinger, Donchian, Macd, Stochastic, Supertrend, adx, atr, bollinger, cci, donchian, ema, macd, mfi, obv,
-    psar, rsi, sma, stochastic, supertrend, vwap, williams_r, wma,
+    Adx, Bollinger, DivergenceDirection, DivergenceKind, Donchian, Macd, Stochastic, Supertrend, adx, atr, bollinger,
+    cci, detect_divergences, donchian, ema, macd, mfi, obv, psar, rsi, sma, stochastic, supertrend, vwap, williams_r,
+    wma,
 };
 use serde::{Deserialize, Serialize};
 
@@ -105,11 +106,29 @@ pub struct OutputSeries {
     pub values: Vec<f64>,
 }
 
-/// The outputs of one computed instance, in descriptor order.
+/// A divergence line between two pivots (indices into the input series); the
+/// renderer styles it by direction (color) and kind (solid/dashed).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DivergenceSpan {
+    /// Index of the earlier pivot.
+    pub from_index: usize,
+    /// Index of the later pivot.
+    pub to_index: usize,
+    /// Reversal (`Regular`) or continuation (`Hidden`).
+    pub kind: DivergenceKind,
+    /// Bullish or bearish.
+    pub direction: DivergenceDirection,
+}
+
+/// One computed instance: plotted series and/or divergence spans (either may be
+/// empty), in descriptor order.
 #[derive(Debug, Clone, Serialize)]
 pub struct InstanceOutput {
-    /// One entry per plotted output.
+    /// One entry per plotted output series.
     pub outputs: Vec<OutputSeries>,
+    /// Divergence spans (empty for non-divergence indicators).
+    pub divergences: Vec<DivergenceSpan>,
 }
 
 /// OHLCV column slices (equal length) for one instrument+timeframe.
@@ -194,10 +213,46 @@ fn compute_one(instance: &Instance, data: &Ohlcv) -> Vec<OutputSeries> {
     }
 }
 
-/// Compute every instance's outputs over one OHLCV series.
+/// Divergence spans for a divergence instance (empty for other ids): `close` is
+/// compared against the instance's oscillator using its pivot/gap params (defaults
+/// mirror the scanner).
+fn compute_divergences(instance: &Instance, data: &Ohlcv) -> Vec<DivergenceSpan> {
+    let params = &instance.params;
+    let close = data.close;
+    let oscillator = match instance.id.as_str() {
+        "rsiDivergence" => rsi(close, period(params, "period", 14.0)),
+        "macdDivergence" => {
+            macd(close, period(params, "fast", 12.0), period(params, "slow", 26.0), period(params, "signal", 9.0)).macd
+        }
+        _ => return Vec::new(),
+    };
+    detect_divergences(
+        close,
+        &oscillator,
+        period(params, "pivotLeft", 5.0),
+        period(params, "pivotRight", 5.0),
+        period(params, "maxGap", 60.0),
+    )
+    .into_iter()
+    .map(|divergence| DivergenceSpan {
+        from_index: divergence.prior_index,
+        to_index: divergence.recent_index,
+        kind: divergence.kind,
+        direction: divergence.direction,
+    })
+    .collect()
+}
+
+/// Compute every instance over one OHLCV series: series outputs and divergence spans.
 #[must_use]
 pub fn compute(instances: &[Instance], data: &Ohlcv) -> Vec<InstanceOutput> {
-    instances.iter().map(|instance| InstanceOutput { outputs: compute_one(instance, data) }).collect()
+    instances
+        .iter()
+        .map(|instance| InstanceOutput {
+            outputs: compute_one(instance, data),
+            divergences: compute_divergences(instance, data),
+        })
+        .collect()
 }
 
 fn param(key: &str, label: &str, default: f64, min: f64, max: f64, step: f64) -> Param {
@@ -324,6 +379,32 @@ pub fn descriptors() -> Vec<Descriptor> {
         },
         descriptor("atr", "ATR", Target::Pane, vec![period(14.0)], vec![line("atr", "ATR", "#f59e0b")]),
         descriptor("obv", "OBV", Target::Pane, Vec::new(), vec![line("obv", "OBV", "#22c55e")]),
+        descriptor(
+            "rsiDivergence",
+            "RSI Divergence",
+            Target::Overlay,
+            vec![
+                period(14.0),
+                param("pivotLeft", "Pivot left", 5.0, 1.0, 50.0, 1.0),
+                param("pivotRight", "Pivot right", 5.0, 1.0, 50.0, 1.0),
+                param("maxGap", "Max gap", 60.0, 1.0, 500.0, 1.0),
+            ],
+            Vec::new(),
+        ),
+        descriptor(
+            "macdDivergence",
+            "MACD Divergence",
+            Target::Overlay,
+            vec![
+                param("fast", "Fast", 12.0, 1.0, 100.0, 1.0),
+                param("slow", "Slow", 26.0, 1.0, 200.0, 1.0),
+                param("signal", "Signal", 9.0, 1.0, 100.0, 1.0),
+                param("pivotLeft", "Pivot left", 5.0, 1.0, 50.0, 1.0),
+                param("pivotRight", "Pivot right", 5.0, 1.0, 50.0, 1.0),
+                param("maxGap", "Max gap", 60.0, 1.0, 500.0, 1.0),
+            ],
+            Vec::new(),
+        ),
     ]
 }
 
@@ -337,10 +418,10 @@ mod tests {
     }
 
     #[test]
-    fn descriptors_cover_the_seventeen_indicators() {
+    fn descriptors_cover_every_indicator() {
         let ids: Vec<String> = descriptors().into_iter().map(|descriptor| descriptor.id).collect();
-        assert_eq!(ids.len(), 17);
-        for id in ["sma", "ema", "wma", "bollinger", "vwap", "donchian", "supertrend", "psar", "rsi", "macd", "obv"] {
+        assert_eq!(ids.len(), 19);
+        for id in ["sma", "bollinger", "vwap", "supertrend", "psar", "rsi", "macd", "obv", "rsiDivergence", "macdDivergence"] {
             assert!(ids.iter().any(|candidate| candidate == id), "missing descriptor {id}");
         }
     }
@@ -368,6 +449,24 @@ mod tests {
         let values = series();
         let data = Ohlcv { high: &values, low: &values, close: &values, volume: &values };
         let computed = compute(&[Instance { id: "nope".to_owned(), params: HashMap::new() }], &data);
-        assert!(computed.first().expect("one instance").outputs.is_empty());
+        let output = computed.first().expect("one instance");
+        assert!(output.outputs.is_empty() && output.divergences.is_empty());
+    }
+
+    #[test]
+    fn rsi_divergence_matches_detect_divergences_and_has_no_series() {
+        use indicators::{detect_divergences, rsi};
+        let close: Vec<f64> =
+            (0..120).map(|index| 100.0 + (f64::from(index) / 7.0).sin() * 15.0 - f64::from(index) * 0.05).collect();
+        let data = Ohlcv { high: &close, low: &close, close: &close, volume: &close };
+        let computed = compute(&[Instance { id: "rsiDivergence".to_owned(), params: HashMap::new() }], &data);
+        let output = computed.first().expect("one instance");
+        assert!(output.outputs.is_empty(), "a divergence indicator has no series outputs");
+        let expected = detect_divergences(&close, &rsi(&close, 14), 5, 5, 60);
+        assert_eq!(output.divergences.len(), expected.len());
+        for (span, divergence) in output.divergences.iter().zip(&expected) {
+            assert_eq!(span.from_index, divergence.prior_index);
+            assert_eq!(span.to_index, divergence.recent_index);
+        }
     }
 }
