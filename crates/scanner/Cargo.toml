@@ -1,0 +1,17 @@
+[package]
+name = "scanner"
+description = "Divergence-based setup scanner over the cached Hyperliquid universe."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+domain = { workspace = true }
+hl-feed = { workspace = true }
+indicators = { workspace = true }
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+
+[lints]
+workspace = true

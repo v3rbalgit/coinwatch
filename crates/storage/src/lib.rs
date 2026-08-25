@@ -1,300 +1,544 @@
-//! `cw-storage` — the canonical bar store behind a [`Store`] trait.
-//!
-//! Point-in-time correctness is a storage responsibility: [`Store::load_bars`]
-//! takes an explicit `[from, to]` window so callers cannot accidentally read
-//! future bars. The Phase-1 backend is DuckDB (the shared research artifact);
-//! a Postgres/Timescale backend can implement the same trait for scale.
-//!
-//! OHLCV values are stored as text to preserve exact [`Decimal`] precision across
-//! the huge dynamic range of on-chain prices (memecoin dust → blue-chip). Bar
-//! timestamps are stored as epoch milliseconds (BIGINT) for unambiguous ordering.
+//! SQLite-backed local store: candle persistence (the [`CandleStore`] port) plus
+//! user watchlists. OHLCV values are text for exact [`Decimal`] precision; open
+//! times are epoch milliseconds. The same store can back onto Postgres later.
 
-use std::str::FromStr;
-use std::sync::Mutex;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
-use cw_core::{Bar, CoreError, Decimal, FundingPoint, Instrument, Interval, Network, PoolId, Result};
-use duckdb::{Connection, params};
+use async_trait::async_trait;
+use chrono::DateTime;
+use domain::{Candle, Timeframe};
+use rust_decimal::Decimal;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteRow};
+use sqlx::{Row, SqlitePool};
 
-/// A time window `[from, to]` (inclusive) used for point-in-time reads.
-#[derive(Debug, Clone, Copy)]
-pub struct TimeRange {
-    /// Inclusive start of the window (UTC).
-    pub from: DateTime<Utc>,
-    /// Inclusive end of the window (UTC).
-    pub to: DateTime<Utc>,
+/// A persisted candle series for one (coin, timeframe), oldest candle first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandleSeries {
+    /// Coin symbol.
+    pub coin: String,
+    /// Timeframe of the series.
+    pub timeframe: Timeframe,
+    /// The candles.
+    pub candles: Vec<Candle>,
 }
 
-/// Persistence seam for canonical bars. Implementations must be idempotent so
-/// continuous ingestion can re-run a window without creating duplicates.
-pub trait Store {
-    /// Insert-or-replace bars for `(instrument, interval)`. Returns rows written.
-    fn upsert_bars(&self, instrument: &Instrument, interval: Interval, bars: &[Bar]) -> Result<usize>;
-
-    /// Load bars for `(instrument, interval)` within `range` (point-in-time).
-    fn load_bars(&self, instrument: &Instrument, interval: Interval, range: TimeRange) -> Result<Vec<Bar>>;
-
-    /// Record an instrument in the registry (idempotent) so the analysis side
-    /// can reconstruct the universe from the store alone (offline research).
-    fn register_instrument(&self, instrument: &Instrument) -> Result<()>;
-
-    /// All registered instruments (the persisted universe).
-    fn list_instruments(&self) -> Result<Vec<Instrument>>;
-
-    /// Insert-or-replace perp funding points for a coin (idempotent).
-    fn upsert_funding(&self, network: &Network, coin: &str, points: &[FundingPoint]) -> Result<usize>;
-
-    /// Load perp funding points for a coin within `range` (point-in-time).
-    fn load_funding(&self, network: &Network, coin: &str, range: TimeRange) -> Result<Vec<FundingPoint>>;
+/// A user watchlist with its coins.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ListView {
+    /// List name.
+    pub name: String,
+    /// Coins on the list.
+    pub coins: Vec<String>,
 }
 
-/// Stable string tag for an interval (matches the on-disk primary key).
-const fn interval_tag(iv: Interval) -> &'static str {
-    match iv {
-        Interval::Minute => "minute",
-        Interval::Hour => "hour",
-        Interval::Day => "day",
-    }
+/// A store-backend failure.
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    /// The database rejected the operation.
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
 }
 
-/// DuckDB-backed store. The connection is wrapped in a `Mutex` so `&self`
-/// methods are usable across threads (DuckDB `Connection` is `Send` not `Sync`).
-pub struct DuckStore {
-    /// Path to the DuckDB database file.
-    pub path: String,
-    conn: Mutex<Connection>,
+/// A durable candle cache the sync seeds from on startup and writes through.
+#[async_trait]
+pub trait CandleStore: Send + Sync {
+    /// Load the most recent `limit` candles per (coin, timeframe) — the sync's hot
+    /// working set, not the whole accumulated cache.
+    async fn load_recent(&self, limit: usize) -> Result<Vec<CandleSeries>, StoreError>;
+
+    /// Insert-or-replace one (coin, timeframe) series.
+    async fn save(&self, coin: &str, timeframe: Timeframe, candles: &[Candle]) -> Result<(), StoreError>;
 }
 
-impl DuckStore {
-    /// Open (or create) a DuckDB database at `path`, or `":memory:"` for an
-    /// ephemeral store. Ensures the `bars` schema exists.
-    pub fn open(path: impl Into<String>) -> Result<Self> {
-        let path = path.into();
-        let conn = if path == ":memory:" {
-            Connection::open_in_memory()
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS candles (
+    coin      TEXT    NOT NULL,
+    timeframe TEXT    NOT NULL,
+    open_time INTEGER NOT NULL,
+    open      TEXT    NOT NULL,
+    high      TEXT    NOT NULL,
+    low       TEXT    NOT NULL,
+    close     TEXT    NOT NULL,
+    volume    TEXT    NOT NULL,
+    PRIMARY KEY (coin, timeframe, open_time)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS lists (name TEXT PRIMARY KEY) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS list_members (
+    list TEXT NOT NULL,
+    coin TEXT NOT NULL,
+    PRIMARY KEY (list, coin)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS logos (coin TEXT PRIMARY KEY, svg TEXT NOT NULL) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
+";
+
+/// The local SQLite store.
+pub struct SqliteStore {
+    pool: SqlitePool,
+}
+
+impl SqliteStore {
+    /// Open (creating if missing) the database at `path`. A corrupt file is
+    /// discarded and recreated — candles are regenerable and lists are cheap.
+    pub async fn open(path: &Path) -> Result<Self, StoreError> {
+        if let Ok(store) = Self::connect(path).await {
+            if store.is_healthy().await {
+                return Ok(store);
+            }
+            drop(store);
+            tracing::warn!(path = %path.display(), "local database failed its integrity check; recreating");
         } else {
-            Connection::open(&path)
+            tracing::warn!(path = %path.display(), "local database could not be opened; recreating");
         }
-        .map_err(|e| CoreError::Storage(format!("open {path}: {e}")))?;
+        remove_db_files(path);
+        Self::connect(path).await
+    }
 
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS bars (
-                network  VARCHAR NOT NULL,
-                pool     VARCHAR NOT NULL,
-                interval VARCHAR NOT NULL,
-                ts       BIGINT  NOT NULL,
-                open     VARCHAR NOT NULL,
-                high     VARCHAR NOT NULL,
-                low      VARCHAR NOT NULL,
-                close    VARCHAR NOT NULL,
-                volume   VARCHAR NOT NULL,
-                PRIMARY KEY (network, pool, interval, ts)
-            );
-            CREATE TABLE IF NOT EXISTS instruments (
-                network VARCHAR NOT NULL,
-                pool    VARCHAR NOT NULL,
-                name    VARCHAR NOT NULL,
-                token   VARCHAR,
-                PRIMARY KEY (network, pool)
-            );
-            CREATE TABLE IF NOT EXISTS funding (
-                network      VARCHAR NOT NULL,
-                coin         VARCHAR NOT NULL,
-                time         BIGINT  NOT NULL,
-                funding_rate VARCHAR NOT NULL,
-                premium      VARCHAR NOT NULL,
-                PRIMARY KEY (network, coin, time)
-            );",
+    async fn connect(path: &Path) -> Result<Self, StoreError> {
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal);
+        let pool = SqlitePool::connect_with(options).await?;
+        sqlx::raw_sql(SCHEMA).execute(&pool).await?;
+        Ok(Self { pool })
+    }
+
+    async fn is_healthy(&self) -> bool {
+        matches!(
+            sqlx::query_scalar::<_, String>("PRAGMA integrity_check").fetch_one(&self.pool).await,
+            Ok(result) if result == "ok"
         )
-        .map_err(|e| CoreError::Storage(format!("schema: {e}")))?;
-        // Best-effort migrations for stores created before these columns existed.
-        let _ = conn.execute("ALTER TABLE instruments ADD COLUMN token VARCHAR", []);
-
-        Ok(Self {
-            path,
-            conn: Mutex::new(conn),
-        })
     }
-}
 
-impl Store for DuckStore {
-    fn upsert_bars(&self, instrument: &Instrument, interval: Interval, bars: &[Bar]) -> Result<usize> {
-        let conn = self.conn.lock().map_err(|e| CoreError::Storage(format!("lock: {e}")))?;
-        let net = instrument.network.slug();
-        let pool = instrument.pool.0.as_str();
-        let tag = interval_tag(interval);
+    /// Every watchlist with its coins, sorted by name then coin.
+    pub async fn lists(&self) -> Result<Vec<ListView>, StoreError> {
+        let names: Vec<String> = sqlx::query_scalar("SELECT name FROM lists ORDER BY name")
+            .fetch_all(&self.pool)
+            .await?;
+        let members: Vec<(String, String)> = sqlx::query_as("SELECT list, coin FROM list_members ORDER BY coin")
+            .fetch_all(&self.pool)
+            .await?;
 
-        let mut stmt = conn
-            .prepare("INSERT OR REPLACE INTO bars VALUES (?,?,?,?,?,?,?,?,?)")
-            .map_err(|e| CoreError::Storage(format!("prepare upsert: {e}")))?;
-
-        let mut written = 0usize;
-        for b in bars {
-            stmt.execute(params![
-                net,
-                pool,
-                tag,
-                b.ts.timestamp_millis(),
-                b.open.to_string(),
-                b.high.to_string(),
-                b.low.to_string(),
-                b.close.to_string(),
-                b.volume.to_string(),
-            ])
-            .map_err(|e| CoreError::Storage(format!("upsert: {e}")))?;
-            written += 1;
+        let mut views: Vec<ListView> = names
+            .into_iter()
+            .map(|name| ListView {
+                name,
+                coins: Vec::new(),
+            })
+            .collect();
+        for (list, coin) in members {
+            if let Some(view) = views.iter_mut().find(|view| view.name == list) {
+                view.coins.push(coin);
+            }
         }
-        Ok(written)
+        Ok(views)
     }
 
-    fn load_bars(&self, instrument: &Instrument, interval: Interval, range: TimeRange) -> Result<Vec<Bar>> {
-        let conn = self.conn.lock().map_err(|e| CoreError::Storage(format!("lock: {e}")))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT ts, open, high, low, close, volume FROM bars
-                 WHERE network = ? AND pool = ? AND interval = ? AND ts BETWEEN ? AND ?
-                 ORDER BY ts",
-            )
-            .map_err(|e| CoreError::Storage(format!("prepare load: {e}")))?;
-
-        let raw = stmt
-            .query_map(
-                params![
-                    instrument.network.slug(),
-                    instrument.pool.0.as_str(),
-                    interval_tag(interval),
-                    range.from.timestamp_millis(),
-                    range.to.timestamp_millis(),
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                },
-            )
-            .map_err(|e| CoreError::Storage(format!("query: {e}")))?;
-
-        let dec = |s: &str| -> Result<Decimal> {
-            Decimal::from_str(s).map_err(|e| CoreError::InvalidData(format!("decimal '{s}': {e}")))
-        };
-
-        let mut out = Vec::new();
-        for r in raw {
-            let (ts_ms, open, high, low, close, volume) = r.map_err(|e| CoreError::Storage(format!("row: {e}")))?;
-            let ts = DateTime::<Utc>::from_timestamp_millis(ts_ms)
-                .ok_or_else(|| CoreError::InvalidData(format!("timestamp out of range: {ts_ms}")))?;
-            out.push(Bar {
-                ts,
-                open: dec(&open)?,
-                high: dec(&high)?,
-                low: dec(&low)?,
-                close: dec(&close)?,
-                volume: dec(&volume)?,
-            });
-        }
-        Ok(out)
-    }
-
-    fn register_instrument(&self, instrument: &Instrument) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| CoreError::Storage(format!("lock: {e}")))?;
-        conn.execute(
-            "INSERT OR REPLACE INTO instruments VALUES (?,?,?,?)",
-            params![
-                instrument.network.slug(),
-                instrument.pool.0.as_str(),
-                instrument.name.as_str(),
-                instrument.token.as_deref()
-            ],
-        )
-        .map_err(|e| CoreError::Storage(format!("register: {e}")))?;
+    /// Create an empty list (a no-op if it already exists).
+    pub async fn create_list(&self, name: &str) -> Result<(), StoreError> {
+        sqlx::query("INSERT OR IGNORE INTO lists (name) VALUES (?)")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
-    fn list_instruments(&self) -> Result<Vec<Instrument>> {
-        let conn = self.conn.lock().map_err(|e| CoreError::Storage(format!("lock: {e}")))?;
-        let mut stmt = conn
-            .prepare("SELECT network, pool, name, token FROM instruments ORDER BY network, name")
-            .map_err(|e| CoreError::Storage(format!("prepare list: {e}")))?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                ))
-            })
-            .map_err(|e| CoreError::Storage(format!("query: {e}")))?;
-        let mut out = Vec::new();
-        for r in rows {
-            let (network, pool, name, token) = r.map_err(|e| CoreError::Storage(format!("row: {e}")))?;
-            out.push(Instrument {
-                network: Network::from_slug(&network),
-                pool: PoolId(pool),
-                name,
-                token,
-            });
-        }
-        Ok(out)
+    /// Delete a list and its members.
+    pub async fn delete_list(&self, name: &str) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM list_members WHERE list = ?")
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM lists WHERE name = ?")
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
-    fn upsert_funding(&self, network: &Network, coin: &str, points: &[FundingPoint]) -> Result<usize> {
-        let conn = self.conn.lock().map_err(|e| CoreError::Storage(format!("lock: {e}")))?;
-        let mut stmt = conn
-            .prepare("INSERT OR REPLACE INTO funding VALUES (?,?,?,?,?)")
-            .map_err(|e| CoreError::Storage(format!("prepare funding upsert: {e}")))?;
-        let mut written = 0usize;
-        for p in points {
-            stmt.execute(params![
-                network.slug(),
-                coin,
-                p.time.timestamp_millis(),
-                p.funding_rate.to_string(),
-                p.premium.to_string(),
-            ])
-            .map_err(|e| CoreError::Storage(format!("funding upsert: {e}")))?;
-            written += 1;
-        }
-        Ok(written)
+    /// Add a coin to a list, creating the list if it does not exist.
+    pub async fn add_to_list(&self, list: &str, coin: &str) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT OR IGNORE INTO lists (name) VALUES (?)")
+            .bind(list)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT OR IGNORE INTO list_members (list, coin) VALUES (?, ?)")
+            .bind(list)
+            .bind(coin)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
-    fn load_funding(&self, network: &Network, coin: &str, range: TimeRange) -> Result<Vec<FundingPoint>> {
-        let conn = self.conn.lock().map_err(|e| CoreError::Storage(format!("lock: {e}")))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT time, funding_rate, premium FROM funding
-                 WHERE network = ? AND coin = ? AND time BETWEEN ? AND ?
-                 ORDER BY time",
-            )
-            .map_err(|e| CoreError::Storage(format!("prepare funding load: {e}")))?;
-        let rows = stmt
-            .query_map(
-                params![
-                    network.slug(),
-                    coin,
-                    range.from.timestamp_millis(),
-                    range.to.timestamp_millis()
-                ],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
-            )
-            .map_err(|e| CoreError::Storage(format!("funding query: {e}")))?;
-        let dec = |s: &str| Decimal::from_str(s).unwrap_or_default();
-        let mut out = Vec::new();
-        for r in rows {
-            let (time_ms, rate, prem) = r.map_err(|e| CoreError::Storage(format!("row: {e}")))?;
-            let time = DateTime::<Utc>::from_timestamp_millis(time_ms)
-                .ok_or_else(|| CoreError::InvalidData(format!("time out of range: {time_ms}")))?;
-            out.push(FundingPoint {
-                time,
-                funding_rate: dec(&rate),
-                premium: dec(&prem),
-            });
+    /// Remove a coin from a list.
+    pub async fn remove_from_list(&self, list: &str, coin: &str) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM list_members WHERE list = ? AND coin = ?")
+            .bind(list)
+            .bind(coin)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Every cached (coin, svg) logo.
+    pub async fn logos(&self) -> Result<Vec<(String, String)>, StoreError> {
+        Ok(sqlx::query_as("SELECT coin, svg FROM logos").fetch_all(&self.pool).await?)
+    }
+
+    /// Coins whose logo is already cached.
+    pub async fn logo_coins(&self) -> Result<HashSet<String>, StoreError> {
+        let coins: Vec<String> = sqlx::query_scalar("SELECT coin FROM logos").fetch_all(&self.pool).await?;
+        Ok(coins.into_iter().collect())
+    }
+
+    /// Cache a coin's SVG logo.
+    pub async fn cache_logo(&self, coin: &str, svg: &str) -> Result<(), StoreError> {
+        sqlx::query("INSERT OR REPLACE INTO logos (coin, svg) VALUES (?, ?)")
+            .bind(coin)
+            .bind(svg)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Read a persisted UI/app setting (an opaque string — JSON or scalar), if set.
+    pub async fn get_setting(&self, key: &str) -> Result<Option<String>, StoreError> {
+        Ok(sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
+    /// Insert-or-replace a persisted UI/app setting.
+    pub async fn set_setting(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        sqlx::query("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+            .bind(key)
+            .bind(value)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Up to `limit` cached candles for a (coin, timeframe) with open time before
+    /// `before_ms`, oldest-first — for lazily paging chart history.
+    pub async fn candles_before(
+        &self,
+        coin: &str,
+        timeframe: Timeframe,
+        before_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<Candle>, StoreError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = sqlx::query(
+            "SELECT open_time, open, high, low, close, volume FROM candles \
+             WHERE coin = ? AND timeframe = ? AND open_time < ? \
+             ORDER BY open_time DESC LIMIT ?",
+        )
+        .bind(coin)
+        .bind(timeframe.as_hl())
+        .bind(before_ms)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut candles = Vec::with_capacity(rows.len());
+        for row in &rows {
+            if let Some(candle) = row_to_candle(row)? {
+                candles.push(candle);
+            }
         }
-        Ok(out)
+        candles.reverse();
+        Ok(candles)
+    }
+}
+
+/// Delete a SQLite database file and its WAL/SHM sidecars.
+fn remove_db_files(path: &Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut file = path.as_os_str().to_owned();
+        file.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(file));
+    }
+}
+
+#[async_trait]
+impl CandleStore for SqliteStore {
+    async fn load_recent(&self, limit: usize) -> Result<Vec<CandleSeries>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let groups = sqlx::query("SELECT DISTINCT coin, timeframe FROM candles ORDER BY coin, timeframe")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut series = Vec::with_capacity(groups.len());
+
+        // Small primary-key range reads avoid both ranking the accumulated cache and
+        // materializing every series' SQLx rows at once during startup.
+        for group in &groups {
+            let coin: &str = group.try_get("coin")?;
+            let interval: &str = group.try_get("timeframe")?;
+            let Some(timeframe) = Timeframe::from_hl(interval) else {
+                continue;
+            };
+            let rows = sqlx::query(
+                "SELECT open_time, open, high, low, close, volume FROM candles \
+                 WHERE coin = ? AND timeframe = ? ORDER BY open_time DESC LIMIT ?",
+            )
+            .bind(coin)
+            .bind(interval)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+            let mut candles = Vec::with_capacity(rows.len());
+            for row in &rows {
+                if let Some(candle) = row_to_candle(row)? {
+                    candles.push(candle);
+                }
+            }
+            candles.reverse();
+            if !candles.is_empty() {
+                series.push(CandleSeries {
+                    coin: coin.to_owned(),
+                    timeframe,
+                    candles,
+                });
+            }
+        }
+        Ok(series)
+    }
+
+    async fn save(&self, coin: &str, timeframe: Timeframe, candles: &[Candle]) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        for candle in candles {
+            sqlx::query(
+                "INSERT OR REPLACE INTO candles \
+                 (coin, timeframe, open_time, open, high, low, close, volume) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(coin)
+            .bind(timeframe.as_hl())
+            .bind(candle.open_time.timestamp_millis())
+            .bind(candle.open.to_string())
+            .bind(candle.high.to_string())
+            .bind(candle.low.to_string())
+            .bind(candle.close.to_string())
+            .bind(candle.volume.to_string())
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
+/// Read one row into a candle; a malformed timestamp or decimal skips the row.
+fn row_to_candle(row: &SqliteRow) -> Result<Option<Candle>, StoreError> {
+    let open_ms: i64 = row.try_get("open_time")?;
+    let open: &str = row.try_get("open")?;
+    let high: &str = row.try_get("high")?;
+    let low: &str = row.try_get("low")?;
+    let close: &str = row.try_get("close")?;
+    let volume: &str = row.try_get("volume")?;
+
+    let (Some(open_time), Ok(open), Ok(high), Ok(low), Ok(close), Ok(volume)) = (
+        DateTime::from_timestamp_millis(open_ms),
+        open.parse::<Decimal>(),
+        high.parse::<Decimal>(),
+        low.parse::<Decimal>(),
+        close.parse::<Decimal>(),
+        volume.parse::<Decimal>(),
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(Candle {
+        open_time,
+        open,
+        high,
+        low,
+        close,
+        volume,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+    use domain::{Candle, Timeframe};
+
+    use super::{CandleSeries, CandleStore, SqliteStore};
+
+    fn candle(hour: i64, open: &str, high: &str, low: &str, close: &str, volume: &str) -> Candle {
+        Candle {
+            open_time: Utc.timestamp_opt(hour * 3600, 0).single().expect("timestamp"),
+            open: open.parse().expect("open"),
+            high: high.parse().expect("high"),
+            low: low.parse().expect("low"),
+            close: close.parse().expect("close"),
+            volume: volume.parse().expect("volume"),
+        }
+    }
+
+    #[tokio::test]
+    async fn candles_round_trip_across_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cw.db");
+        let candles = vec![
+            candle(1, "100.5", "101", "99.5", "100.75", "12.3"),
+            candle(2, "100.75", "102", "100", "101.5", "8.1"),
+        ];
+
+        let store = SqliteStore::open(&path).await.expect("open");
+        store.save("BTC", Timeframe::Hour1, &candles).await.expect("save");
+        drop(store);
+
+        let reopened = SqliteStore::open(&path).await.expect("reopen");
+        let loaded = reopened.load_recent(100).await.expect("load");
+        assert_eq!(
+            loaded,
+            vec![CandleSeries {
+                coin: "BTC".to_owned(),
+                timeframe: Timeframe::Hour1,
+                candles
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn load_recent_limits_each_series_oldest_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cw.db");
+        let store = SqliteStore::open(&path).await.expect("open");
+        let btc_hourly = (1..=4)
+            .map(|hour| candle(hour, "100", "101", "99", "100", "10"))
+            .collect::<Vec<_>>();
+        let btc_four_hour = (1..=3)
+            .map(|hour| candle(hour, "200", "201", "199", "200", "20"))
+            .collect::<Vec<_>>();
+        let eth_hourly = vec![candle(1, "300", "301", "299", "300", "30")];
+        store.save("BTC", Timeframe::Hour1, &btc_hourly).await.expect("save hourly BTC");
+        store
+            .save("BTC", Timeframe::Hour4, &btc_four_hour)
+            .await
+            .expect("save four-hour BTC");
+        store.save("ETH", Timeframe::Hour1, &eth_hourly).await.expect("save hourly ETH");
+
+        let loaded = store.load_recent(2).await.expect("load");
+        assert_eq!(
+            loaded,
+            vec![
+                CandleSeries {
+                    coin: "BTC".to_owned(),
+                    timeframe: Timeframe::Hour1,
+                    candles: btc_hourly[2..].to_vec(),
+                },
+                CandleSeries {
+                    coin: "BTC".to_owned(),
+                    timeframe: Timeframe::Hour4,
+                    candles: btc_four_hour[1..].to_vec(),
+                },
+                CandleSeries {
+                    coin: "ETH".to_owned(),
+                    timeframe: Timeframe::Hour1,
+                    candles: eth_hourly,
+                },
+            ]
+        );
+        assert!(store.load_recent(0).await.expect("load zero").is_empty());
+    }
+
+    #[tokio::test]
+    async fn recreates_a_corrupt_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cw.db");
+        std::fs::write(&path, b"this is not a sqlite database").expect("write garbage");
+
+        let store = SqliteStore::open(&path).await.expect("open recovers from corruption");
+        store
+            .save("BTC", Timeframe::Hour1, &[candle(1, "1", "1", "1", "1", "0")])
+            .await
+            .expect("save");
+        assert_eq!(store.load_recent(100).await.expect("load").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn watchlists_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(&dir.path().join("cw.db")).await.expect("open");
+
+        store.add_to_list("Favourites", "BTC").await.expect("add");
+        store.add_to_list("Favourites", "ETH").await.expect("add");
+        store.create_list("Empty").await.expect("create");
+
+        let lists = store.lists().await.expect("lists");
+        assert_eq!(lists.len(), 2);
+        let favourites = lists.iter().find(|list| list.name == "Favourites").expect("favourites");
+        assert_eq!(favourites.coins, vec!["BTC".to_owned(), "ETH".to_owned()]);
+
+        store.remove_from_list("Favourites", "BTC").await.expect("remove");
+        store.delete_list("Empty").await.expect("delete");
+
+        let lists = store.lists().await.expect("lists");
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0].coins, vec!["ETH".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn logos_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(&dir.path().join("cw.db")).await.expect("open");
+
+        assert!(store.logo_coins().await.expect("coins").is_empty());
+        store.cache_logo("BTC", "<svg/>").await.expect("cache");
+        store.cache_logo("BTC", "<svg-updated/>").await.expect("recache");
+
+        assert_eq!(store.logo_coins().await.expect("coins").len(), 1);
+        assert_eq!(
+            store.logos().await.expect("logos"),
+            vec![("BTC".to_owned(), "<svg-updated/>".to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(&dir.path().join("cw.db")).await.expect("open");
+        assert_eq!(store.get_setting("chart.indicators").await.expect("get"), None);
+        store.set_setting("chart.indicators", "[{\"id\":\"rsi\"}]").await.expect("set");
+        store
+            .set_setting("chart.indicators", "[{\"id\":\"macd\"}]")
+            .await
+            .expect("update");
+        assert_eq!(
+            store.get_setting("chart.indicators").await.expect("get"),
+            Some("[{\"id\":\"macd\"}]".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn candles_before_pages_oldest_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(&dir.path().join("cw.db")).await.expect("open");
+        let candles: Vec<Candle> = (1..=10).map(|hour| candle(hour, "1", "1", "1", "1", "0")).collect();
+        store.save("BTC", Timeframe::Hour1, &candles).await.expect("save");
+
+        let before = candle(6, "1", "1", "1", "1", "0").open_time.timestamp_millis();
+        let page = store.candles_before("BTC", Timeframe::Hour1, before, 3).await.expect("page");
+
+        assert_eq!(page.len(), 3);
+        assert_eq!(
+            page.first().map(|bar| bar.open_time),
+            Some(candle(3, "1", "1", "1", "1", "0").open_time)
+        );
+        assert_eq!(
+            page.last().map(|bar| bar.open_time),
+            Some(candle(5, "1", "1", "1", "1", "0").open_time)
+        );
     }
 }

@@ -1,8 +1,8 @@
-# Coinwatch quant platform — Rust workspace (Phase 1 skeleton).
-# See DESIGN.md for the architecture and trait-seam rationale.
+# Coinwatch — real-time Hyperliquid screener / mission-control.
+# Tauri + SvelteKit desktop app over a Rust workspace.
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "screener/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,25 +12,29 @@ license = "MIT"
 repository = "https://github.com/v3rbalgit/coinwatch"
 
 [workspace.dependencies]
-# Internal crates
-cw-core = { path = "crates/core", version = "0.1.0" }
-cw-storage = { path = "crates/storage", version = "0.1.0" }
-cw-providers = { path = "crates/providers", version = "0.1.0" }
-cw-features = { path = "crates/features", version = "0.1.0" }
-cw-strategy = { path = "crates/strategy", version = "0.1.0" }
-cw-backtest = { path = "crates/backtest", version = "0.1.0" }
-cw-eval = { path = "crates/eval", version = "0.1.0" }
-cw-harness = { path = "crates/harness", version = "0.1.0" }
+# Workspace crates (the Hyperliquid screener / mission-control product)
+domain = { path = "crates/domain", version = "0.1.0" }
+hl-feed = { path = "crates/hl-feed", version = "0.1.0" }
+indicators = { path = "crates/indicators", version = "0.1.0" }
+scanner = { path = "crates/scanner", version = "0.1.0" }
+storage = { path = "crates/storage", version = "0.1.0" }
 
 # Shared third-party
 thiserror = "2"
+async-trait = "0.1"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+strum = { version = "0.28", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rust_decimal = { version = "1", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-async-trait = "0.1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider", "gzip"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+dashmap = "6"
 
 [workspace.lints.rust]
 missing_docs = "warn"

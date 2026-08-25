@@ -6,6 +6,11 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+# Tauri's desktop tree pulls unmaintained transitive crates (GTK3 bindings, the
+# unic-* family, proc-macro-error) with no upstream upgrade path. Only flag
+# unmaintained advisories for our own workspace/direct deps; vulnerabilities are
+# still denied for everything.
+unmaintained = "workspace"
 
 [licenses]
 version = 2
@@ -17,6 +22,7 @@ allow = [
   "CC0-1.0",
   "CDLA-Permissive-2.0",
   "ISC",
+  "MPL-2.0",
   "Unicode-3.0",
   "Zlib",
 ]

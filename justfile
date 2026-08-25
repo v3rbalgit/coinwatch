@@ -17,9 +17,14 @@ lint:
 test:
   cargo test --locked --workspace
 
-# Ingest the Hyperliquid universe, or run offline research: `just run analyze`.
-run *args:
-  cargo run --locked -p cw-app -- {{args}}
+# Install frontend dependencies (run once, and after dependency changes).
+setup:
+  cd screener && pnpm install
+
+# Run the desktop app in dev (Vite on :1420 + the Rust app). Needs a display and
+# system WebKitGTK; run `just setup` first.
+run:
+  cd screener && pnpm tauri dev
 
 # Full local release gate; clippy subsumes cargo check.
 quality:
@@ -29,7 +34,3 @@ quality:
   RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps
   cargo deny check
   git diff --check
-
-# Run the criterion benchmarks.
-bench:
-  cargo bench -p cw-harness

@@ -1,0 +1,13 @@
+# generated / build output
+.svelte-kit
+build
+dist
+src/lib/wasm
+
+# rust / tauri build artifacts
+src-tauri/target
+src-tauri/gen
+
+# deps + lockfile
+node_modules
+pnpm-lock.yaml
