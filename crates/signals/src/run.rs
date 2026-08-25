@@ -1,16 +1,19 @@
 //! Store-backed signal runs: collect completed candle slices per coin and evaluate.
 //!
-//! The hot cache includes the still-forming trailing bar. Runs share its `Arc`
-//! buffers and expose only the completed prefix. A series is omitted while its
-//! expected current bar is missing or a gap is being reconciled, avoiding both
-//! repainting and stale-data matches.
+//! The hot cache includes the still-forming trailing bar. Runs expose only its
+//! completed prefix, sharing the `Arc` when it is deep enough and loading only a
+//! missing older prefix otherwise. A series is omitted while its expected current
+//! bar is missing or a gap is being reconciled, avoiding repainting and stale matches.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use domain::{Candle, Timeframe};
-use hl_feed::MarketStore;
+use hl_feed::{CandleHistory, MarketStore};
 
 use crate::definition::{DefinitionError, SignalDefinition};
-use crate::eval::{CoinData, EvalReport, evaluate, evaluate_validated};
+use crate::eval::{CoinData, EvalReport, evaluate_validated};
 
 /// Length of the completed prefix in an oldest-first candle series.
 fn completed_len(candles: &[Candle], timeframe: Timeframe, now: DateTime<Utc>) -> usize {
@@ -19,48 +22,68 @@ fn completed_len(candles: &[Candle], timeframe: Timeframe, now: DateTime<Utc>) -
         .partition_point(|candle| candle.open_time.timestamp_millis().saturating_add(timeframe.duration_ms()) <= now_ms)
 }
 
-/// Distinct timeframes referenced by a definition, ascending by duration.
-#[must_use]
-pub fn referenced_timeframes(definition: &SignalDefinition) -> Vec<Timeframe> {
-    let mut referenced = Vec::with_capacity(Timeframe::ALL.len());
-    for timeframe in Timeframe::ALL {
-        if definition.conditions.values().any(|condition| condition.timeframe == timeframe) {
-            referenced.push(timeframe);
-        }
+async fn hydrate_timeframe(
+    data: &mut CoinData,
+    history: &CandleHistory,
+    coin: &str,
+    timeframe: Timeframe,
+    required: usize,
+    candles: Arc<Vec<Candle>>,
+    now: DateTime<Utc>,
+) {
+    let completed = completed_len(&candles, timeframe, now);
+    if completed >= required {
+        data.insert_shared(timeframe, candles, completed);
+        return;
     }
-    referenced
+    let Some(first) = candles.first() else {
+        return;
+    };
+
+    let missing = required - completed;
+    match history
+        .load_before(coin, timeframe, first.open_time.timestamp_millis(), missing)
+        .await
+    {
+        Ok(mut older) => {
+            // History ends at the first hot bar; `current_candles` guarantees
+            // that the remaining hot prefix is aligned and contiguous.
+            let (completed_candles, _) = candles.split_at(completed);
+            older.extend_from_slice(completed_candles);
+            data.insert(timeframe, older);
+        }
+        Err(error) => data.mark_unavailable(timeframe, error.to_string()),
+    }
 }
 
-/// Collect completed candle prefixes for every timeframe a signal references.
-/// Missing cache entries remain absent and surface as
-/// [`crate::eval::OutcomeStatus::NoData`].
-#[must_use]
-pub fn collect_coin_data(
+async fn hydrate_coin_data(
     store: &MarketStore,
+    history: &CandleHistory,
     coin: &str,
-    definition: &SignalDefinition,
+    requirements: &BTreeMap<Timeframe, usize>,
     now: DateTime<Utc>,
 ) -> CoinData {
     let mut data = CoinData::default();
     let now_ms = now.timestamp_millis();
-    for timeframe in referenced_timeframes(definition) {
+    for (&timeframe, &required) in requirements {
         if let Some(candles) = store.current_candles(coin, timeframe, now_ms) {
-            let completed = completed_len(&candles, timeframe, now);
-            data.insert_shared(timeframe, candles, completed);
+            hydrate_timeframe(&mut data, history, coin, timeframe, required, candles, now).await;
         }
     }
     data
 }
 
-/// Validate and evaluate a signal on one coin using hot-cache completed bars.
-pub fn evaluate_coin(
+/// Validate and evaluate a signal on one coin using lazily hydrated completed bars.
+pub async fn evaluate_coin(
     store: &MarketStore,
+    history: &CandleHistory,
     definition: &SignalDefinition,
     coin: &str,
     now: DateTime<Utc>,
 ) -> Result<EvalReport, DefinitionError> {
-    let data = collect_coin_data(store, coin, definition, now);
-    evaluate(definition, coin, &data)
+    let requirements = definition.required_history()?;
+    let data = hydrate_coin_data(store, history, coin, &requirements, now).await;
+    evaluate_validated(definition, coin, &data)
 }
 
 /// Scope of coins one signal run covers.
@@ -73,30 +96,105 @@ pub enum RunScope {
 }
 
 /// Validate and evaluate a signal across a scope, one report per coin.
-pub fn run_signal(
+pub async fn run_signal(
     store: &MarketStore,
+    history: &CandleHistory,
     definition: &SignalDefinition,
     scope: &RunScope,
     now: DateTime<Utc>,
 ) -> Result<Vec<EvalReport>, DefinitionError> {
-    definition.validate()?;
-    let evaluate_one = |coin: &str| {
-        let data = collect_coin_data(store, coin, definition, now);
-        evaluate_validated(definition, coin, &data)
-    };
+    let requirements = definition.required_history()?;
+    let mut reports = Vec::new();
     match scope {
-        RunScope::Universe => store.universe().iter().map(|coin| evaluate_one(&coin.coin)).collect(),
-        RunScope::Coins(coins) => coins.iter().map(|coin| evaluate_one(coin)).collect(),
+        RunScope::Universe => {
+            let coins = store.universe();
+            reports.reserve(coins.len());
+            for coin in coins {
+                let data = hydrate_coin_data(store, history, &coin.coin, &requirements, now).await;
+                reports.push(evaluate_validated(definition, &coin.coin, &data)?);
+            }
+        }
+        RunScope::Coins(coins) => {
+            reports.reserve(coins.len());
+            for coin in coins {
+                let data = hydrate_coin_data(store, history, coin, &requirements, now).await;
+                reports.push(evaluate_validated(definition, coin, &data)?);
+            }
+        }
     }
+    Ok(reports)
 }
 
 #[cfg(test)]
 mod tests {
-    use chrono::{TimeZone, Utc};
-    use domain::{Candle, Timeframe};
-    use rust_decimal::Decimal;
+    use std::sync::{Arc, Mutex, PoisonError};
 
-    use super::completed_len;
+    use async_trait::async_trait;
+    use chrono::{DateTime, TimeZone, Utc};
+    use domain::{Candle, Timeframe};
+    use hl_feed::{CandleHistory, HyperliquidRest};
+    use indicators::Instance;
+    use rust_decimal::Decimal;
+    use storage::{CandleSeries, CandleStore, StoreError};
+
+    use super::{completed_len, hydrate_timeframe};
+    use crate::definition::{
+        ComparisonOp, Condition, DEFINITION_VERSION, Direction, Node, Operand, Predicate, SignalDefinition,
+    };
+    use crate::eval::{CoinData, OutcomeStatus, evaluate};
+
+    struct CachedStore {
+        candles: Vec<Candle>,
+        fail: bool,
+        requests: Mutex<Vec<(i64, usize)>>,
+    }
+
+    impl CachedStore {
+        fn new(candles: Vec<Candle>, fail: bool) -> Self {
+            Self {
+                candles,
+                fail,
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CandleStore for CachedStore {
+        async fn load_recent(&self, _limit: usize) -> Result<Vec<CandleSeries>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn save(&self, _coin: &str, _timeframe: Timeframe, _candles: &[Candle]) -> Result<(), StoreError> {
+            panic!("complete cached history must not be written")
+        }
+
+        async fn candles_before(
+            &self,
+            _coin: &str,
+            _timeframe: Timeframe,
+            before_ms: i64,
+            limit: usize,
+        ) -> Result<Vec<Candle>, StoreError> {
+            self.requests
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((before_ms, limit));
+            if self.fail {
+                return Err(StoreError::InvalidCandleRow(before_ms));
+            }
+            let mut candles: Vec<Candle> = self
+                .candles
+                .iter()
+                .rev()
+                .filter(|candle| candle.open_time.timestamp_millis() < before_ms)
+                .take(limit)
+                .cloned()
+                .collect();
+            candles.reverse();
+            Ok(candles)
+        }
+    }
 
     fn candle(hour: i64) -> Candle {
         Candle {
@@ -107,6 +205,46 @@ mod tests {
             close: Decimal::ONE,
             volume: Decimal::ZERO,
         }
+    }
+
+    fn definition(period: f64) -> SignalDefinition {
+        SignalDefinition {
+            version: DEFINITION_VERSION,
+            direction: Direction::Bullish,
+            root: Node::Condition { id: "trend".to_owned() },
+            conditions: [(
+                "trend".to_owned(),
+                Condition {
+                    timeframe: Timeframe::Hour1,
+                    indicator: Instance {
+                        id: "sma".to_owned(),
+                        params: [("period".to_owned(), period)].into_iter().collect(),
+                    },
+                    predicate: Predicate::Threshold {
+                        left: Operand::Output { key: "sma".to_owned() },
+                        op: ComparisonOp::GreaterThan,
+                        right: Operand::Constant { value: 0.0 },
+                    },
+                    within_bars: 0,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    fn history(store: Arc<CachedStore>) -> CandleHistory {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let rest = Arc::new(HyperliquidRest::new(reqwest::Client::new(), 1100));
+        CandleHistory::new(store, rest)
+    }
+
+    fn hot_candles() -> Arc<Vec<Candle>> {
+        Arc::new((5..=10).map(candle).collect())
+    }
+
+    fn during_forming_bar() -> DateTime<Utc> {
+        Utc.timestamp_opt(10 * 3_600 + 1_800, 0).single().expect("valid timestamp")
     }
 
     #[test]
@@ -121,5 +259,78 @@ mod tests {
         let candles = vec![candle(0), candle(1)];
         let now = Utc.timestamp_opt(2 * 3_600, 0).single().expect("valid timestamp");
         assert_eq!(completed_len(&candles, Timeframe::Hour1, now), 2);
+    }
+
+    #[tokio::test]
+    async fn deep_enough_hot_history_does_not_query_storage() {
+        let store = Arc::new(CachedStore::new(Vec::new(), true));
+        let history = history(store.clone());
+        let signal = definition(3.0);
+        let mut data = CoinData::default();
+
+        hydrate_timeframe(
+            &mut data,
+            &history,
+            "BTC",
+            Timeframe::Hour1,
+            3,
+            hot_candles(),
+            during_forming_bar(),
+        )
+        .await;
+        let report = evaluate(&signal, "BTC", &data).expect("valid shared-hot signal");
+
+        assert_eq!(report.conditions["trend"].status, OutcomeStatus::Satisfied);
+        assert!(store.requests.lock().unwrap_or_else(PoisonError::into_inner).is_empty());
+    }
+
+    #[tokio::test]
+    async fn hydrates_only_the_missing_prefix_before_the_hot_buffer() {
+        let store = Arc::new(CachedStore::new((0..5).map(candle).collect(), false));
+        let history = history(store.clone());
+        let signal = definition(8.0);
+        let mut data = CoinData::default();
+
+        hydrate_timeframe(
+            &mut data,
+            &history,
+            "BTC",
+            Timeframe::Hour1,
+            8,
+            hot_candles(),
+            during_forming_bar(),
+        )
+        .await;
+        let report = evaluate(&signal, "BTC", &data).expect("valid hydrated signal");
+
+        assert_eq!(report.conditions["trend"].status, OutcomeStatus::Satisfied);
+        let requests = store.requests.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(requests.as_slice(), &[(5 * Timeframe::Hour1.duration_ms(), 3)]);
+    }
+
+    #[tokio::test]
+    async fn history_failures_become_unavailable() {
+        let store = Arc::new(CachedStore::new(Vec::new(), true));
+        let history = history(store);
+        let signal = definition(8.0);
+        let mut data = CoinData::default();
+
+        hydrate_timeframe(
+            &mut data,
+            &history,
+            "BTC",
+            Timeframe::Hour1,
+            8,
+            hot_candles(),
+            during_forming_bar(),
+        )
+        .await;
+        let report = evaluate(&signal, "BTC", &data).expect("valid unavailable-history signal");
+
+        assert_eq!(report.conditions["trend"].status, OutcomeStatus::Unavailable);
+        assert!(
+            report.unavailable_data[&Timeframe::Hour1].contains("cached candle row"),
+            "the storage failure should remain visible"
+        );
     }
 }

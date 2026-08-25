@@ -2,7 +2,7 @@
 //!
 //! A [`SignalDefinition`] composes configured indicator conditions into a boolean
 //! tree. [`eval`] resolves each leaf on its own timeframe; [`run`] wires that pure
-//! evaluator onto completed candle prefixes from the hot market cache.
+//! evaluator onto completed hot-cache candles with lazy persisted-history hydration.
 
 pub mod definition;
 pub mod eval;
@@ -13,4 +13,4 @@ pub use definition::{
     KindFilter, Node, Operand, Predicate, PriceField, SignalDefinition,
 };
 pub use eval::{CoinData, ConditionOutcome, EvalReport, OutcomeStatus};
-pub use run::{RunScope, collect_coin_data, evaluate_coin, referenced_timeframes, run_signal};
+pub use run::{RunScope, evaluate_coin, run_signal};

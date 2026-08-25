@@ -3972,14 +3972,19 @@ dependencies = [
 name = "signals"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "domain",
  "hl-feed",
  "indicators",
+ "reqwest",
  "rust_decimal",
+ "rustls",
  "serde",
  "serde_json",
+ "storage",
  "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
