@@ -14,9 +14,20 @@ export const chartTheme = {
   histUp: "rgba(34, 197, 94, 0.5)",
   histDown: "rgba(239, 68, 68, 0.5)",
   guide: "#3a4150",
-} as const;
+  drawing: "#8ab4f8",
+  drawingFill: "rgba(138, 180, 248, 0.10)",
+  drawingHandleFill: "#e5e9ef",
+  drawingText: "#e5e9ef",
+} as const
+
+/** Translucent variant of a #rrggbb color (drawing fills derive from strokes). */
+export function withAlpha(hex: string, alpha: number): string {
+  const value = Number.parseInt(hex.slice(1), 16)
+  if (hex.length !== 7 || Number.isNaN(value)) return hex
+  return `rgba(${(value >> 16) & 255}, ${(value >> 8) & 255}, ${value & 255}, ${alpha})`
+}
 
 /** Format a price with magnitude-appropriate precision. */
 export function fmtPrice(n: number): string {
-  return n >= 100 ? n.toFixed(2) : n >= 1 ? n.toFixed(3) : n.toPrecision(4);
+  return n >= 100 ? n.toFixed(2) : n >= 1 ? n.toFixed(3) : n.toPrecision(4)
 }

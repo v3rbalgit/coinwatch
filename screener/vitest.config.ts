@@ -1,6 +1,6 @@
-import { fileURLToPath } from "node:url";
+import { fileURLToPath } from "node:url"
 
-import { defineConfig } from "vitest/config";
+import { defineConfig } from "vitest/config"
 
 // Standalone of the SvelteKit Vite config so tests run in plain Node without the
 // SvelteKit plugin; we only need the `$lib` alias.
@@ -11,4 +11,4 @@ export default defineConfig({
   test: {
     include: ["tests/**/*.test.ts"],
   },
-});
+})

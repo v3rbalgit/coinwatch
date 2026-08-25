@@ -1,69 +1,69 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
-  import { listen } from "@tauri-apps/api/event";
-  import { onMount } from "svelte";
+  import { invoke } from "@tauri-apps/api/core"
+  import { listen } from "@tauri-apps/api/event"
+  import { onMount } from "svelte"
 
-  import Badge from "$lib/components/ui/badge.svelte";
-  import Button from "$lib/components/ui/button.svelte";
+  import Badge from "$lib/components/ui/badge.svelte"
+  import Button from "$lib/components/ui/button.svelte"
 
   type Signal = {
-    coin: string;
-    timeframe: string;
-    source: string;
-    kind: string;
-    direction: string;
-    at: string;
-  };
+    coin: string
+    timeframe: string
+    source: string
+    kind: string
+    direction: string
+    at: string
+  }
 
-  let signals = $state<Signal[]>([]);
-  let scanning = $state(false);
-  let total = $state(0);
-  let done = $state(0);
-  let failures = $state(0);
+  let signals = $state<Signal[]>([])
+  let scanning = $state(false)
+  let total = $state(0)
+  let done = $state(0)
+  let failures = $state(0)
 
   function fmtTime(iso: string): string {
-    const date = new Date(iso);
-    return Number.isNaN(date.getTime()) ? iso : date.toLocaleString();
+    const date = new Date(iso)
+    return Number.isNaN(date.getTime()) ? iso : date.toLocaleString()
   }
 
   onMount(() => {
     const subs = [
-      listen<number>("scan:started", (event) => {
-        signals = [];
-        failures = 0;
-        total = event.payload;
-        done = 0;
-        scanning = true;
+      listen<number>("scan:started", event => {
+        signals = []
+        failures = 0
+        total = event.payload
+        done = 0
+        scanning = true
       }),
-      listen<Signal>("scan:signal", (event) => {
-        signals = [...signals, event.payload];
+      listen<Signal>("scan:signal", event => {
+        signals = [...signals, event.payload]
       }),
-      listen<number>("scan:progress", (event) => {
-        done = event.payload;
+      listen<number>("scan:progress", event => {
+        done = event.payload
       }),
       listen("scan:failure", () => {
-        failures += 1;
+        failures += 1
       }),
       listen("scan:done", () => {
-        scanning = false;
+        scanning = false
       }),
       listen("scan:error", () => {
-        scanning = false;
+        scanning = false
       }),
-    ];
+    ]
     return () => {
-      for (const sub of subs) void sub.then((off) => off());
-    };
-  });
+      for (const sub of subs) void sub.then(off => off())
+    }
+  })
 
   async function startScan() {
-    if (scanning) return;
-    scanning = true;
-    signals = [];
+    if (scanning) return
+    scanning = true
+    signals = []
     try {
-      await invoke("start_scan");
+      await invoke("start_scan")
     } catch {
-      scanning = false;
+      scanning = false
     }
   }
 </script>

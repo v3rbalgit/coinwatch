@@ -1,35 +1,36 @@
 <script lang="ts">
-  import { goto } from "$app/navigation";
-  import { page } from "$app/stores";
-  import { invoke } from "@tauri-apps/api/core";
-  import { listen } from "@tauri-apps/api/event";
-  import { ArrowLeft, LoaderCircle } from "@lucide/svelte";
-  import { onMount } from "svelte";
+  import { ArrowLeft, LoaderCircle } from "@lucide/svelte"
+  import { invoke } from "@tauri-apps/api/core"
+  import { listen } from "@tauri-apps/api/event"
+  import { onMount } from "svelte"
 
-  import Chart, { type Bar } from "$lib/chart/Chart.svelte";
-  import type { IndicatorInstance } from "$lib/chart/indicators";
-  import { fmtPrice } from "$lib/chart/theme";
-  import Button from "$lib/components/ui/button.svelte";
-  import CoinIcon from "$lib/components/ui/coin-icon.svelte";
-  import Skeleton from "$lib/components/ui/skeleton.svelte";
+  import { goto } from "$app/navigation"
+  import { page } from "$app/stores"
+  import Chart from "$lib/chart/Chart.svelte"
+  import type { IndicatorInstance } from "$lib/chart/indicators"
+  import { fmtPrice } from "$lib/chart/theme"
+  import type { Bar } from "$lib/chart/types"
+  import Button from "$lib/components/ui/button.svelte"
+  import CoinIcon from "$lib/components/ui/coin-icon.svelte"
+  import Skeleton from "$lib/components/ui/skeleton.svelte"
 
   type Row = {
-    coin: string;
-    price: number;
-    prev_day: number;
-    volume_usd: number;
-    open_interest_usd: number;
-    funding: number;
-  };
-  type CandleEvent = { coin: string; timeframe: string; candle: Bar };
+    coin: string
+    price: number
+    prev_day: number
+    volume_usd: number
+    open_interest_usd: number
+    funding: number
+  }
+  type CandleEvent = { coin: string; timeframe: string; candle: Bar }
 
-  const timeframes = ["1h", "4h", "1d", "1w"] as const;
-  const coin = $derived($page.params.coin ?? "");
-  let tf = $state<(typeof timeframes)[number]>("1h");
-  let bars = $state<Bar[]>([]);
-  let seed = $state(0);
-  let meta = $state<Row | null>(null);
-  let livePrice = $state<number | null>(null);
+  const timeframes = ["1h", "4h", "1d", "1w"] as const
+  const coin = $derived($page.params.coin ?? "")
+  let tf = $state<(typeof timeframes)[number]>("1h")
+  let bars = $state<Bar[]>([])
+  let seed = $state(0)
+  let meta = $state<Row | null>(null)
+  let livePrice = $state<number | null>(null)
   // Which indicators the chart shows; seeded with the scanner's signals, then the
   // user toggles the rest via the chart's picker.
   let indicatorInstances = $state<IndicatorInstance[]>([
@@ -37,131 +38,140 @@
     { id: "macd", params: {} },
     { id: "rsiDivergence", params: {} },
     { id: "macdDivergence", params: {} },
-  ]);
+  ])
 
   async function loadCandles() {
-    const [c, t] = [coin, tf];
-    const data = await invoke<Bar[]>("coin_candles", { coin: c, timeframe: t });
+    const [c, t] = [coin, tf]
+    const data = await invoke<Bar[]>("coin_candles", { coin: c, timeframe: t })
     // Ignore a stale response if the coin/timeframe changed while it was in flight.
     if (c === coin && t === tf) {
-      bars = data;
-      seed += 1;
+      bars = data
+      seed += 1
     }
   }
 
-  let loadingOlder = false;
-  let exhausted = false;
+  let loadingOlder = false
+  let exhausted = false
   // Page older history in on scroll-back; the backend serves the cache and fetches
   // from Hyperliquid + stores on a miss, so depth accumulates.
   async function loadOlder() {
-    const oldest = bars[0]?.time;
-    if (loadingOlder || exhausted || oldest === undefined) return;
-    loadingOlder = true;
-    const [c, t] = [coin, tf];
+    const oldest = bars[0]?.time
+    if (loadingOlder || exhausted || oldest === undefined) return
+    loadingOlder = true
+    const [c, t] = [coin, tf]
     try {
-      const older = await invoke<Bar[]>("coin_history", { coin: c, timeframe: t, beforeSeconds: oldest });
+      const older = await invoke<Bar[]>("coin_history", { coin: c, timeframe: t, beforeSeconds: oldest })
       if (c === coin && t === tf) {
-        const fresh = older.filter((bar) => bar.time < oldest);
-        if (fresh.length === 0) exhausted = true;
-        else bars = [...fresh, ...bars];
+        const fresh = older.filter(bar => bar.time < oldest)
+        if (fresh.length === 0) exhausted = true
+        else bars = [...fresh, ...bars]
       }
     } finally {
-      loadingOlder = false;
+      loadingOlder = false
     }
   }
   async function loadMeta() {
-    const rows = await invoke<Row[]>("screener_rows");
-    meta = rows.find((row) => row.coin === coin) ?? null;
+    const rows = await invoke<Row[]>("screener_rows")
+    meta = rows.find(row => row.coin === coin) ?? null
   }
 
   // The chart's visible indicators persist globally in SQLite.
   function persistInstances(next: IndicatorInstance[]) {
-    indicatorInstances = next;
-    invoke("set_setting", { key: "chart.indicators", value: JSON.stringify(next) }).catch((error) =>
-      console.error("failed to save chart indicators", error),
-    );
+    indicatorInstances = next
+    invoke("set_setting", { key: "chart.indicators", value: JSON.stringify(next) }).catch(error =>
+      console.error("failed to save chart indicators", error)
+    )
   }
 
+  const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null
+
   function parseInstances(value: unknown): IndicatorInstance[] | null {
-    if (!Array.isArray(value)) return null;
-    const result: IndicatorInstance[] = [];
+    if (!Array.isArray(value)) return null
+    const result: IndicatorInstance[] = []
     for (const item of value) {
-      if (typeof item !== "object" || item === null || !("id" in item) || typeof item.id !== "string") return null;
-      const params: Record<string, number> = {};
-      if ("params" in item && typeof item.params === "object" && item.params !== null) {
-        for (const [key, raw] of Object.entries(item.params)) {
-          if (typeof raw === "number") params[key] = raw;
+      if (!isRecord(item) || typeof item.id !== "string") return null
+      const params: Record<string, number> = {}
+      const rawParams = item.params
+      if (isRecord(rawParams)) {
+        for (const [key, raw] of Object.entries(rawParams)) {
+          if (typeof raw === "number") params[key] = raw
         }
       }
-      result.push({ id: item.id, params });
+      result.push({ id: item.id, params })
     }
-    return result;
+    return result
   }
 
   function mergeBar(candle: Bar) {
-    const last = bars.at(-1);
-    if (last && last.time === candle.time) bars = [...bars.slice(0, -1), candle];
-    else if (last && candle.time < last.time) return;
-    else bars = [...bars, candle];
+    const last = bars.at(-1)
+    if (last?.time === candle.time) bars = [...bars.slice(0, -1), candle]
+    else if (last && candle.time < last.time) return
+    else bars = [...bars, candle]
   }
 
   // Stream only the viewed coin's live candles from the backend.
   $effect(() => {
-    if (!coin) return;
-    invoke("set_active_coin", { coin });
+    if (!coin) return
+    void invoke("set_active_coin", { coin })
     return () => {
-      invoke("set_active_coin", { coin: null });
-    };
-  });
+      void invoke("set_active_coin", { coin: null })
+    }
+  })
 
   // Reseed the chart whenever the coin or timeframe changes.
   $effect(() => {
-    void coin;
-    void tf;
+    void coin
+    void tf
     if (coin) {
-      exhausted = false;
-      loadCandles();
+      exhausted = false
+      void loadCandles()
     }
-  });
+  })
 
   onMount(() => {
-    loadMeta();
+    void loadMeta()
     void invoke<string | null>("get_setting", { key: "chart.indicators" })
-      .then((saved) => {
-        const parsed = saved === null ? null : parseInstances(JSON.parse(saved));
+      .then(saved => {
+        const parsed = saved === null ? null : parseInstances(JSON.parse(saved))
         // An empty saved set is valid (the user turned everything off) — restore it as
         // empty rather than falling back to the seed default.
-        if (parsed) indicatorInstances = parsed;
+        if (parsed) indicatorInstances = parsed
       })
-      .catch((error) => console.error("failed to load chart indicators", error));
-    const reload = setInterval(loadMeta, 5000);
-    const unMid = listen<{ coin: string; price: number }>("mid", (event) => {
-      if (event.payload.coin !== coin) return;
-      livePrice = event.payload.price;
-      const last = bars.at(-1);
-      if (!last) return;
-      const close = event.payload.price;
+      .catch(error => console.error("failed to load chart indicators", error))
+    const reload = setInterval(loadMeta, 5000)
+    const unMid = listen<{ coin: string; price: number }>("mid", event => {
+      if (event.payload.coin !== coin) return
+      livePrice = event.payload.price
+      const last = bars.at(-1)
+      if (!last) return
+      const close = event.payload.price
       bars = [
         ...bars.slice(0, -1),
         { ...last, close, high: Math.max(last.high, close), low: Math.min(last.low, close) },
-      ];
-    });
-    const unCandle = listen<CandleEvent>("candle", (event) => {
-      if (event.payload.coin !== coin || event.payload.timeframe !== tf) return;
-      mergeBar(event.payload.candle);
-    });
+      ]
+    })
+    const unCandle = listen<CandleEvent>("candle", event => {
+      if (event.payload.coin !== coin || event.payload.timeframe !== tf) return
+      mergeBar(event.payload.candle)
+    })
     return () => {
-      clearInterval(reload);
-      void unMid.then((off) => off());
-      void unCandle.then((off) => off());
-    };
-  });
+      clearInterval(reload)
+      void unMid.then(off => off())
+      void unCandle.then(off => off())
+    }
+  })
 
-  const price = $derived(livePrice ?? meta?.price ?? 0);
-  const change = $derived(meta && meta.prev_day > 0 ? (price / meta.prev_day - 1) * 100 : 0);
-  const hasPrice = $derived(livePrice !== null || meta !== null);
+  const price = $derived(livePrice ?? meta?.price ?? 0)
+  const change = $derived(meta && meta.prev_day > 0 ? (price / meta.prev_day - 1) * 100 : 0)
+  const hasPrice = $derived(livePrice !== null || meta !== null)
   const fmtUsd = (n: number) =>
-    n >= 1e9 ? (n / 1e9).toFixed(2) + "B" : n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(0) + "k" : n.toFixed(0);
+    n >= 1e9
+      ? (n / 1e9).toFixed(2) + "B"
+      : n >= 1e6
+        ? (n / 1e6).toFixed(1) + "M"
+        : n >= 1e3
+          ? (n / 1e3).toFixed(0) + "k"
+          : n.toFixed(0)
 </script>
 
 <div class="flex h-full flex-col gap-3 p-4">
@@ -173,7 +183,7 @@
     <CoinIcon {coin} size={28} />
     <h1 class="text-lg font-semibold text-foreground">{coin}</h1>
     {#if hasPrice}
-      <span class="text-lg tabular-nums text-foreground">{fmtPrice(price)}</span>
+      <span class="text-lg text-foreground tabular-nums">{fmtPrice(price)}</span>
       <span
         class="tabular-nums {change > 0 ? 'text-green-500' : change < 0 ? 'text-red-500' : 'text-muted-foreground'}"
       >
@@ -199,11 +209,17 @@
 
   <div class="flex flex-shrink-0 items-center gap-6 text-xs text-muted-foreground">
     {#if meta}
-      <span>Vol <span class="tabular-nums text-foreground">{fmtUsd(meta.volume_usd)}</span></span>
-      <span>OI <span class="tabular-nums text-foreground">{fmtUsd(meta.open_interest_usd)}</span></span>
+      <span>Vol <span class="text-foreground tabular-nums">{fmtUsd(meta.volume_usd)}</span></span>
+      <span>OI <span class="text-foreground tabular-nums">{fmtUsd(meta.open_interest_usd)}</span></span>
       <span>
         Funding
-        <span class="tabular-nums {meta.funding > 0 ? 'text-green-500' : meta.funding < 0 ? 'text-red-500' : 'text-foreground'}">
+        <span
+          class="tabular-nums {meta.funding > 0
+            ? 'text-green-500'
+            : meta.funding < 0
+              ? 'text-red-500'
+              : 'text-foreground'}"
+        >
           {(meta.funding * 100).toFixed(4)}%
         </span>
       </span>
@@ -215,13 +231,7 @@
   </div>
 
   <div class="relative min-h-0 flex-1 overflow-hidden rounded-lg border border-border">
-    <Chart
-      {bars}
-      {seed}
-      instances={indicatorInstances}
-      onInstancesChange={persistInstances}
-      onLoadOlder={loadOlder}
-    />
+    <Chart {bars} {seed} instances={indicatorInstances} onInstancesChange={persistInstances} onLoadOlder={loadOlder} />
     {#if bars.length === 0}
       <div class="absolute inset-0 flex items-center justify-center gap-2 text-sm text-muted-foreground">
         <LoaderCircle class="size-4 animate-spin" />
