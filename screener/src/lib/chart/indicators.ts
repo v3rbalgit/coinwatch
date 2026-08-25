@@ -1,4 +1,8 @@
-import init, { analyzeSeries } from "$lib/wasm/indicators.js";
+import init, {
+  analyzeSeries,
+  computeIndicators as computeIndicatorsWasm,
+  indicatorDescriptors as indicatorDescriptorsWasm,
+} from "$lib/wasm/indicators.js";
 
 /** Indicator parameters (camelCase for the wasm boundary; mirrors the scanner's ScanConfig). */
 export type IndicatorConfig = {
@@ -55,4 +59,79 @@ export function loadIndicators(): Promise<void> {
 export function analyze(closes: Float64Array, config: IndicatorConfig): Analysis {
   const analysis: Analysis = analyzeSeries(closes, config);
   return analysis;
+}
+
+// ---- Indicator engine: the chart's instance-driven, toggleable overlays. ----
+
+/** Where an indicator draws. */
+export type IndicatorTarget = "overlay" | "pane";
+
+/** How one output series is plotted. */
+export type OutputKind = "line" | "histogram";
+
+/** A tunable indicator parameter (defaults now, editable in the future signal builder). */
+export type IndicatorParam = {
+  key: string;
+  label: string;
+  default: number;
+  min: number;
+  max: number;
+  step: number;
+};
+
+/** One plotted output of an indicator. */
+export type IndicatorOutput = {
+  key: string;
+  label: string;
+  kind: OutputKind;
+  color: string;
+};
+
+/** Metadata for one indicator: drives the toggle picker and the renderer. */
+export type IndicatorDescriptor = {
+  id: string;
+  label: string;
+  target: IndicatorTarget;
+  params: IndicatorParam[];
+  outputs: IndicatorOutput[];
+  guides: number[];
+  range: [number, number] | null;
+};
+
+/** A configured indicator to compute: an id plus its params. */
+export type IndicatorInstance = {
+  id: string;
+  params: Record<string, number>;
+};
+
+/** One computed output series (NaN where undefined), keyed to its {@link IndicatorOutput}. */
+export type OutputSeries = {
+  key: string;
+  values: number[];
+};
+
+/** The outputs of one computed instance, in descriptor order. */
+export type InstanceOutput = {
+  outputs: OutputSeries[];
+};
+
+/** The indicator registry (metadata for the toggle picker). `loadIndicators()` must have resolved. */
+export function indicatorDescriptors(): IndicatorDescriptor[] {
+  const descriptors: IndicatorDescriptor[] = indicatorDescriptorsWasm();
+  return descriptors;
+}
+
+/**
+ * Compute configured indicator instances over an OHLCV series (columns equal length).
+ * `loadIndicators()` must have resolved first.
+ */
+export function computeIndicators(
+  instances: IndicatorInstance[],
+  high: Float64Array,
+  low: Float64Array,
+  close: Float64Array,
+  volume: Float64Array,
+): InstanceOutput[] {
+  const outputs: InstanceOutput[] = computeIndicatorsWasm(instances, high, low, close, volume);
+  return outputs;
 }

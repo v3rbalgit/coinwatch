@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsValue;
 use wasm_bindgen::prelude::wasm_bindgen;
 
+mod engine;
+
 /// Indicator parameters (camelCase to match the JS caller).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -112,6 +114,28 @@ pub fn analyze_series(closes: &[f64], config: JsValue) -> Result<JsValue, JsValu
     let config: Config = serde_wasm_bindgen::from_value(config).map_err(|error| JsValue::from_str(&error.to_string()))?;
     let analysis = analyze(closes, &config);
     serde_wasm_bindgen::to_value(&analysis).map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+/// Wasm entry point: the indicator registry (metadata for the chart's toggle UI).
+#[wasm_bindgen(js_name = indicatorDescriptors)]
+pub fn indicator_descriptors() -> Result<JsValue, JsValue> {
+    serde_wasm_bindgen::to_value(&engine::descriptors()).map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+/// Wasm entry point: compute configured indicator instances over an OHLCV series.
+#[wasm_bindgen(js_name = computeIndicators)]
+pub fn compute_indicators(
+    instances: JsValue,
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    volume: &[f64],
+) -> Result<JsValue, JsValue> {
+    let instances: Vec<engine::Instance> =
+        serde_wasm_bindgen::from_value(instances).map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let data = engine::Ohlcv { high, low, close, volume };
+    let outputs = engine::compute(&instances, &data);
+    serde_wasm_bindgen::to_value(&outputs).map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
 #[cfg(test)]
