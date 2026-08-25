@@ -103,14 +103,14 @@ jobs:
       - name: Build indicator WebAssembly
         run: pnpm --dir screener run wasm
 
+      - name: Run Svelte checks
+        run: pnpm --dir screener check
+
       - name: Check formatting
         run: pnpm --dir screener exec prettier --check .
 
       - name: Run ESLint
         run: pnpm --dir screener exec eslint .
-
-      - name: Run Svelte checks
-        run: pnpm --dir screener check
 
       - name: Run frontend tests
         run: pnpm --dir screener exec vitest run
