@@ -1,5 +1,18 @@
 <script lang="ts">
-  import { GripVertical, Magnet, Minus, MoveUpRight, Rows3, Ruler, Square, Trash2, TrendingUp } from "@lucide/svelte"
+  import {
+    Check,
+    GripVertical,
+    Magnet,
+    Maximize2,
+    Minus,
+    MoveUpRight,
+    RotateCcw,
+    Rows3,
+    Ruler,
+    Square,
+    Trash2,
+    TrendingUp,
+  } from "@lucide/svelte"
   import {
     CandlestickSeries,
     ColorType,
@@ -27,6 +40,7 @@
     type IndicatorInstance,
     type InstanceOutput,
   } from "./indicators"
+  import type { ToolbarPosition } from "./settings"
   import { chartTheme, fmtPrice } from "./theme"
   import type { Bar } from "./types"
 
@@ -44,17 +58,29 @@
       { id: "macdDivergence", params: {} },
     ],
     drawings = [],
+    logScale,
+    magnet,
+    styleBarPosition,
     onLoadOlder,
     onInstancesChange,
     onDrawingsChange,
+    onLogScaleChange,
+    onMagnetChange,
+    onStyleBarPositionChange,
   }: {
     bars: Bar[]
     seed?: number
     instances?: IndicatorInstance[]
     drawings?: Drawing[]
+    logScale: boolean
+    magnet: boolean
+    styleBarPosition: ToolbarPosition
     onLoadOlder?: () => void
     onInstancesChange?: (instances: IndicatorInstance[]) => void
     onDrawingsChange?: (drawings: readonly Drawing[]) => void
+    onLogScaleChange: (enabled: boolean) => void
+    onMagnetChange: (enabled: boolean) => void
+    onStyleBarPositionChange: (position: ToolbarPosition) => void
   } = $props()
 
   const VISIBLE_BARS = 150
@@ -94,16 +120,21 @@
   let drawingInteraction: DrawingInteraction | undefined
   let activeTool = $state<DrawingTool | null>(null)
   let selectedDrawing = $state<Drawing | null>(null)
-  let magnet = $state(false)
   let hasDrawings = $state(false)
   const drawingPalette = [chartTheme.drawing, chartTheme.signal, chartTheme.rsi, chartTheme.up, chartTheme.down]
-  let styleBarPos = $state({ x: 16, y: 44 })
+  let styleBarPos = $state<ToolbarPosition>({ x: 0, y: 0 })
+  let styleBarEl = $state<HTMLDivElement>()
+  let contextMenu = $state<ToolbarPosition | null>(null)
+  let contextMenuEl = $state<HTMLDivElement>()
 
   type LegendData = { open: number; high: number; low: number; close: number; volume: number; change: number }
   type Readout = { label: string; value: number; color: string }
   let legend = $state<LegendData | null>(null)
   let readouts = $state<Readout[]>([])
-  let logScale = $state(false)
+
+  const CONTEXT_MENU_MARGIN = 4
+  const contextMenuItem =
+    "flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-foreground hover:bg-accent/70 disabled:opacity-40"
 
   const fmtVol = (value: number) =>
     value >= 1e9
@@ -171,6 +202,90 @@
     drawingInteraction?.deselect()
   }
 
+  function clearDrawings() {
+    drawingStore?.clearAll()
+    drawingInteraction?.deselect()
+  }
+
+  function clampToChart(position: ToolbarPosition, width: number, height: number, margin = 0): ToolbarPosition {
+    const rect = container.getBoundingClientRect()
+    return {
+      x: Math.max(margin, Math.min(position.x, Math.max(margin, rect.width - width - margin))),
+      y: Math.max(margin, Math.min(position.y, Math.max(margin, rect.height - height - margin))),
+    }
+  }
+
+  function toggleLogScale() {
+    onLogScaleChange(!logScale)
+  }
+
+  function toggleMagnet() {
+    onMagnetChange(!magnet)
+  }
+
+  function resetChartView() {
+    if (!chart || bars.length === 0) return
+    suppressLoadOlder = true
+    chart.timeScale().setVisibleLogicalRange({
+      from: Math.max(0, bars.length - VISIBLE_BARS),
+      to: bars.length + RIGHT_OFFSET,
+    })
+    chart.priceScale("right").applyOptions({ autoScale: true })
+  }
+
+  function fitAllData() {
+    if (!chart) return
+    suppressLoadOlder = true
+    chart.timeScale().fitContent()
+    chart.priceScale("right").applyOptions({ autoScale: true })
+  }
+
+  function closeChrome(): boolean {
+    if (contextMenu) {
+      contextMenu = null
+      container.focus()
+      return true
+    }
+    if (pickerOpen) {
+      pickerOpen = false
+      fxButton?.focus()
+      return true
+    }
+    return false
+  }
+
+  function runContextAction(action: () => void) {
+    contextMenu = null
+    action()
+    container.focus()
+  }
+
+  function onContextMenuKeyDown(event: KeyboardEvent) {
+    if (event.key === "Tab") {
+      contextMenu = null
+      return
+    }
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key) || !contextMenuEl) return
+    const items = Array.from(contextMenuEl.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'))
+    if (items.length === 0) return
+    const current = items.findIndex(item => item === document.activeElement)
+    let next: number
+    if (event.key === "ArrowDown") next = current < 0 ? 0 : (current + 1) % items.length
+    else if (event.key === "ArrowUp")
+      next = current < 0 ? items.length - 1 : (current - 1 + items.length) % items.length
+    else if (event.key === "Home") next = 0
+    else next = items.length - 1
+    event.preventDefault()
+    items[next]?.focus()
+  }
+
+  function openContextMenu(event: MouseEvent) {
+    event.preventDefault()
+    pickerOpen = false
+    const rect = container.getBoundingClientRect()
+    contextMenu = { x: event.clientX - rect.left, y: event.clientY - rect.top }
+  }
+
   // Drag the style bar by its handle; positions are relative to the chart area.
   function onStyleBarDragStart(event: PointerEvent) {
     event.preventDefault()
@@ -178,17 +293,21 @@
     const offsetX = event.clientX - rect.left - styleBarPos.x
     const offsetY = event.clientY - rect.top - styleBarPos.y
     const move = (moveEvent: PointerEvent) => {
-      styleBarPos = {
-        x: Math.max(0, Math.min(moveEvent.clientX - rect.left - offsetX, rect.width - 40)),
-        y: Math.max(0, Math.min(moveEvent.clientY - rect.top - offsetY, rect.height - 30)),
-      }
+      styleBarPos = clampToChart(
+        { x: moveEvent.clientX - rect.left - offsetX, y: moveEvent.clientY - rect.top - offsetY },
+        styleBarEl?.offsetWidth ?? 0,
+        styleBarEl?.offsetHeight ?? 0
+      )
     }
-    const up = () => {
+    const stop = () => {
       window.removeEventListener("pointermove", move)
-      window.removeEventListener("pointerup", up)
+      window.removeEventListener("pointerup", stop)
+      window.removeEventListener("pointercancel", stop)
+      onStyleBarPositionChange({ ...styleBarPos })
     }
     window.addEventListener("pointermove", move)
-    window.addEventListener("pointerup", up)
+    window.addEventListener("pointerup", stop)
+    window.addEventListener("pointercancel", stop)
   }
 
   // Each visible pane indicator's primary value at a bar, for the crosshair readout.
@@ -315,7 +434,10 @@
         onRequestText: () => {},
         onSelectionChange: id => (selectedDrawing = id ? (drawingStore?.byId(id) ?? null) : null),
         onToolHotkey: tool => (activeTool = activeTool === tool ? null : tool),
-        onToggleMagnet: () => (magnet = !magnet),
+        onToggleMagnet: toggleMagnet,
+        onToggleLogScale: toggleLogScale,
+        onResetView: resetChartView,
+        onEscape: closeChrome,
       },
       rootEl
     )
@@ -356,8 +478,24 @@
       wasmReady = true
     })
 
+    const resizeObserver = new ResizeObserver(() => {
+      if (styleBarEl) {
+        styleBarPos = clampToChart(styleBarPos, styleBarEl.offsetWidth, styleBarEl.offsetHeight)
+      }
+      if (contextMenu && contextMenuEl) {
+        contextMenu = clampToChart(
+          contextMenu,
+          contextMenuEl.offsetWidth,
+          contextMenuEl.offsetHeight,
+          CONTEXT_MENU_MARGIN
+        )
+      }
+    })
+    resizeObserver.observe(container)
+
     ready = true
     return () => {
+      resizeObserver.disconnect()
       drawingInteraction?.destroy()
       chart?.remove()
       chart = undefined
@@ -416,6 +554,15 @@
     drawingInteraction?.setMagnet(magnet)
   })
 
+  // Parent-owned position loads globally; clamp it to the current chart whenever
+  // the toolbar is rendered (or a resized chart changes its available area).
+  $effect(() => {
+    const requested = styleBarPosition
+    styleBarPos = ready
+      ? clampToChart(requested, styleBarEl?.offsetWidth ?? 0, styleBarEl?.offsetHeight ?? 0)
+      : { ...requested }
+  })
+
   // Load the parent-provided drawings into the store (the parent swaps them per coin).
   $effect(() => {
     if (!ready) return
@@ -430,6 +577,25 @@
       if (target instanceof Node && !pickerPanel?.contains(target) && !fxButton?.contains(target)) {
         pickerOpen = false
       }
+    }
+    window.addEventListener("pointerdown", onDown)
+    return () => window.removeEventListener("pointerdown", onDown)
+  })
+
+  $effect(() => {
+    const menu = contextMenu
+    const menuElement = contextMenuEl
+    if (!menu || !menuElement) return
+    const clamped = clampToChart(menu, menuElement.offsetWidth, menuElement.offsetHeight, CONTEXT_MENU_MARGIN)
+    if (clamped.x !== menu.x || clamped.y !== menu.y) contextMenu = clamped
+    menuElement.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus()
+  })
+
+  $effect(() => {
+    if (!contextMenu) return
+    const onDown = (event: PointerEvent) => {
+      const target = event.target
+      if (target instanceof Node && !contextMenuEl?.contains(target)) contextMenu = null
     }
     window.addEventListener("pointerdown", onDown)
     return () => window.removeEventListener("pointerdown", onDown)
@@ -581,8 +747,8 @@
       class="rounded py-1 text-[10px] font-medium {logScale
         ? 'bg-accent text-accent-foreground'
         : 'text-muted-foreground hover:bg-accent/50'}"
-      title="Logarithmic price scale"
-      onclick={() => (logScale = !logScale)}
+      title="Logarithmic price scale (l)"
+      onclick={toggleLogScale}
     >
       log
     </button>
@@ -624,7 +790,7 @@
         ? 'bg-accent text-accent-foreground'
         : 'text-muted-foreground hover:bg-accent/50'}"
       title="Magnet — snap to OHLC (m)"
-      onclick={() => (magnet = !magnet)}
+      onclick={toggleMagnet}
     >
       <Magnet class="size-3.5" />
     </button>
@@ -632,13 +798,20 @@
       class="flex justify-center rounded py-1.5 text-muted-foreground hover:bg-accent/50 disabled:opacity-30"
       title="Clear drawings"
       disabled={!hasDrawings}
-      onclick={() => drawingStore?.clearAll()}
+      onclick={clearDrawings}
     >
       <Trash2 class="size-3.5" />
     </button>
   </div>
   <div class="relative min-w-0 flex-1">
-    <div bind:this={container} class="h-full w-full {activeTool ? 'cursor-crosshair' : ''}"></div>
+    <div
+      bind:this={container}
+      class="h-full w-full {activeTool ? 'cursor-crosshair' : ''}"
+      role="application"
+      aria-label="Interactive price chart"
+      tabindex="-1"
+      oncontextmenu={openContextMenu}
+    ></div>
     {#if legend}
       <div
         class="pointer-events-none absolute top-2 left-2 z-10 flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-muted-foreground tabular-nums"
@@ -673,8 +846,64 @@
         {/each}
       </div>
     {/if}
+    {#if contextMenu}
+      <div
+        bind:this={contextMenuEl}
+        class="absolute z-30 w-52 rounded-md border border-border bg-background/95 p-1 shadow-xl backdrop-blur"
+        style="left: {contextMenu.x}px; top: {contextMenu.y}px"
+        role="menu"
+        aria-label="Chart menu"
+        tabindex="-1"
+        onkeydown={onContextMenuKeyDown}
+      >
+        <button class={contextMenuItem} role="menuitem" onclick={() => runContextAction(resetChartView)}>
+          <RotateCcw class="size-3.5" />
+          <span class="flex-1">Reset view</span>
+          <kbd class="text-[10px] text-muted-foreground">0</kbd>
+        </button>
+        <button class={contextMenuItem} role="menuitem" onclick={() => runContextAction(fitAllData)}>
+          <Maximize2 class="size-3.5" />
+          <span class="flex-1">Fit all loaded data</span>
+        </button>
+        <div class="my-1 h-px bg-border"></div>
+        <button class={contextMenuItem} role="menuitem" onclick={() => runContextAction(toggleLogScale)}>
+          {#if logScale}<Check class="size-3.5" />{:else}<span class="size-3.5"></span>{/if}
+          <span class="flex-1">Logarithmic scale</span>
+          <kbd class="text-[10px] text-muted-foreground">L</kbd>
+        </button>
+        <button class={contextMenuItem} role="menuitem" onclick={() => runContextAction(toggleMagnet)}>
+          {#if magnet}<Check class="size-3.5" />{:else}<span class="size-3.5"></span>{/if}
+          <span class="flex-1">Magnet</span>
+          <kbd class="text-[10px] text-muted-foreground">M</kbd>
+        </button>
+        {#if hasDrawings}
+          <div class="my-1 h-px bg-border"></div>
+        {/if}
+        {#if selectedDrawing}
+          <button
+            class="{contextMenuItem} text-red-400"
+            role="menuitem"
+            onclick={() => runContextAction(deleteSelected)}
+          >
+            <Trash2 class="size-3.5" />
+            <span>Delete selected drawing</span>
+          </button>
+        {/if}
+        {#if hasDrawings}
+          <button
+            class="{contextMenuItem} text-red-400"
+            role="menuitem"
+            onclick={() => runContextAction(clearDrawings)}
+          >
+            <Trash2 class="size-3.5" />
+            <span>Clear all drawings</span>
+          </button>
+        {/if}
+      </div>
+    {/if}
     {#if selectedDrawing}
       <div
+        bind:this={styleBarEl}
         class="absolute z-20 flex items-center gap-1 rounded-md border border-border bg-background/95 p-1 shadow-lg backdrop-blur"
         style="left: {styleBarPos.x}px; top: {styleBarPos.y}px"
       >

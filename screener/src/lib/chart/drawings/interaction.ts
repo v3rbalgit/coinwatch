@@ -17,6 +17,12 @@ export interface InteractionCallbacks {
   onToolHotkey?: (tool: DrawingTool) => void
   /** The magnet hotkey was pressed while the cursor was over the chart. */
   onToggleMagnet?: () => void
+  /** The log-scale hotkey was pressed while the cursor was over the chart. */
+  onToggleLogScale?: () => void
+  /** The reset-view hotkey was pressed while the cursor was over the chart. */
+  onResetView?: () => void
+  /** Chrome gets first refusal on Escape; true means it consumed the key. */
+  onEscape?: () => boolean
 }
 
 /** Single-key tool hotkeys, active while the cursor is over the chart. */
@@ -34,6 +40,8 @@ export const TOOL_HOTKEYS: Record<string, DrawingTool> = {
 }
 
 export const MAGNET_HOTKEY = "m"
+export const LOG_SCALE_HOTKEY = "l"
+export const RESET_VIEW_HOTKEY = "0"
 
 interface DragState {
   id: string
@@ -447,6 +455,10 @@ export class DrawingInteraction {
     }
 
     if (event.key === "Escape") {
+      if (this.callbacks.onEscape?.()) {
+        event.preventDefault()
+        return
+      }
       if (this.drag) {
         this.revertDrag()
       } else if (this.tool) {
@@ -468,6 +480,16 @@ export class DrawingInteraction {
     // Single-key hotkeys, only over the chart and never with modifiers.
     if (!this.pointerInside || event.ctrlKey || event.metaKey || event.altKey) return
     const key = event.key.toLowerCase()
+    if (key === RESET_VIEW_HOTKEY) {
+      event.preventDefault()
+      this.callbacks.onResetView?.()
+      return
+    }
+    if (key === LOG_SCALE_HOTKEY) {
+      event.preventDefault()
+      this.callbacks.onToggleLogScale?.()
+      return
+    }
     if (key === MAGNET_HOTKEY) {
       event.preventDefault()
       this.callbacks.onToggleMagnet?.()

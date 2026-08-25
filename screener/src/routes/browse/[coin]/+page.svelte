@@ -5,10 +5,25 @@
   import { onMount } from "svelte"
 
   import { goto } from "$app/navigation"
-  import { page } from "$app/stores"
+  import { page } from "$app/state"
   import Chart from "$lib/chart/Chart.svelte"
   import { parseDrawingsPayload, serializeDrawings, type Drawing } from "$lib/chart/drawings/types"
   import type { IndicatorInstance } from "$lib/chart/indicators"
+  import {
+    CHART_CHROME_SETTINGS_KEY,
+    CHART_TIMEFRAMES,
+    chartViewSettingsKey,
+    defaultChartChromeSettings,
+    defaultChartViewSettings,
+    parseChartChromeSettings,
+    parseChartViewSettings,
+    serializeChartChromeSettings,
+    serializeChartViewSettings,
+    type ChartChromeSettings,
+    type ChartTimeframe,
+    type ChartViewSettings,
+    type ToolbarPosition,
+  } from "$lib/chart/settings"
   import { fmtPrice } from "$lib/chart/theme"
   import type { Bar } from "$lib/chart/types"
   import Button from "$lib/components/ui/button.svelte"
@@ -25,9 +40,18 @@
   }
   type CandleEvent = { coin: string; timeframe: string; candle: Bar }
 
-  const timeframes = ["1h", "4h", "1d", "1w"] as const
-  const coin = $derived($page.params.coin ?? "")
-  let tf = $state<(typeof timeframes)[number]>("1h")
+  const initialViewSettings = defaultChartViewSettings()
+  const initialChromeSettings = defaultChartChromeSettings()
+  const coin = $derived(page.params.coin ?? "")
+  let tf = $state<ChartTimeframe>(initialViewSettings.timeframe)
+  let logScale = $state(initialViewSettings.logScale)
+  let magnet = $state(initialChromeSettings.magnet)
+  let styleBarPosition = $state<ToolbarPosition>({ ...initialChromeSettings.toolbarPosition })
+  let settingsCoin = $state("")
+  let viewLoadRevision = 0
+  let chromeRevision = 0
+  let viewSaveQueue = Promise.resolve()
+  let chromeSaveQueue = Promise.resolve()
   let bars = $state<Bar[]>([])
   let seed = $state(0)
   let meta = $state<Row | null>(null)
@@ -93,6 +117,61 @@
     )
   }
 
+  function persistViewSettings(settings: ChartViewSettings) {
+    if (!coin || settingsCoin !== coin) return
+    const key = chartViewSettingsKey(coin)
+    const value = serializeChartViewSettings(settings)
+    viewSaveQueue = viewSaveQueue
+      .then(() => invoke<void>("set_setting", { key, value }))
+      .catch(error => console.error("failed to save chart view settings", error))
+  }
+
+  function changeTimeframe(timeframe: ChartTimeframe) {
+    if (settingsCoin !== coin) return
+    tf = timeframe
+    persistViewSettings({ timeframe, logScale })
+  }
+
+  function changeLogScale(enabled: boolean) {
+    if (settingsCoin !== coin) return
+    logScale = enabled
+    persistViewSettings({ timeframe: tf, logScale: enabled })
+  }
+
+  function persistChromeSettings(settings: ChartChromeSettings) {
+    const value = serializeChartChromeSettings(settings)
+    chromeSaveQueue = chromeSaveQueue
+      .then(() => invoke<void>("set_setting", { key: CHART_CHROME_SETTINGS_KEY, value }))
+      .catch(error => console.error("failed to save chart chrome settings", error))
+  }
+
+  function changeMagnet(enabled: boolean) {
+    chromeRevision += 1
+    magnet = enabled
+    persistChromeSettings({ magnet: enabled, toolbarPosition: styleBarPosition })
+  }
+
+  function changeStyleBarPosition(position: ToolbarPosition) {
+    chromeRevision += 1
+    styleBarPosition = position
+    persistChromeSettings({ magnet, toolbarPosition: position })
+  }
+
+  async function loadViewSettings(active: string, revision: number) {
+    let settings = defaultChartViewSettings()
+    try {
+      await viewSaveQueue
+      const saved = await invoke<string | null>("get_setting", { key: chartViewSettingsKey(active) })
+      settings = parseChartViewSettings(saved)
+    } catch (error) {
+      console.error("failed to load chart view settings", error)
+    }
+    if (revision !== viewLoadRevision || active !== coin) return
+    tf = settings.timeframe
+    logScale = settings.logScale
+    settingsCoin = active
+  }
+
   const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null
 
   function parseInstances(value: unknown): IndicatorInstance[] | null {
@@ -128,11 +207,20 @@
     }
   })
 
-  // Reseed the chart whenever the coin or timeframe changes.
+  // Resolve the coin's view before loading candles, avoiding an unnecessary
+  // request at the default timeframe followed by a second request at the saved one.
   $effect(() => {
-    void coin
+    const active = coin
+    const revision = ++viewLoadRevision
+    settingsCoin = ""
+    bars = []
+    if (active) void loadViewSettings(active, revision)
+  })
+
+  // Reseed the chart whenever the resolved coin or timeframe changes.
+  $effect(() => {
     void tf
-    if (coin) {
+    if (coin && settingsCoin === coin) {
       exhausted = false
       void loadCandles()
     }
@@ -152,6 +240,15 @@
 
   onMount(() => {
     void loadMeta()
+    const chromeLoadRevision = chromeRevision
+    void invoke<string | null>("get_setting", { key: CHART_CHROME_SETTINGS_KEY })
+      .then(saved => {
+        if (chromeRevision !== chromeLoadRevision) return
+        const settings = parseChartChromeSettings(saved)
+        magnet = settings.magnet
+        styleBarPosition = settings.toolbarPosition
+      })
+      .catch(error => console.error("failed to load chart chrome settings", error))
     void invoke<string | null>("get_setting", { key: "chart.indicators" })
       .then(saved => {
         const parsed = saved === null ? null : parseInstances(JSON.parse(saved))
@@ -216,12 +313,13 @@
       <Skeleton class="h-5 w-14" />
     {/if}
     <div class="ml-auto flex items-center gap-1">
-      {#each timeframes as t (t)}
+      {#each CHART_TIMEFRAMES as t (t)}
         <button
-          class="rounded px-2.5 py-1 text-xs font-medium {tf === t
+          class="rounded px-2.5 py-1 text-xs font-medium disabled:opacity-40 {tf === t
             ? 'bg-accent text-accent-foreground'
             : 'text-muted-foreground hover:bg-accent/50'}"
-          onclick={() => (tf = t)}
+          disabled={settingsCoin !== coin}
+          onclick={() => changeTimeframe(t)}
         >
           {t}
         </button>
@@ -258,11 +356,17 @@
       {seed}
       instances={indicatorInstances}
       drawings={chartDrawings}
+      {logScale}
+      {magnet}
+      {styleBarPosition}
       onInstancesChange={persistInstances}
       onDrawingsChange={persistDrawings}
+      onLogScaleChange={changeLogScale}
+      onMagnetChange={changeMagnet}
+      onStyleBarPositionChange={changeStyleBarPosition}
       onLoadOlder={loadOlder}
     />
-    {#if bars.length === 0}
+    {#if settingsCoin !== coin || bars.length === 0}
       <div class="absolute inset-0 flex items-center justify-center gap-2 text-sm text-muted-foreground">
         <LoaderCircle class="size-4 animate-spin" />
         Loading chart…
