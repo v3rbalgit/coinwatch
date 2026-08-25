@@ -1,7 +1,8 @@
 //! Hyperliquid REST calls: candle backfill and the universe/metadata snapshot.
 //!
-//! These seed the cache once and refresh the slow-moving parts; the live updates
-//! come over the WebSocket in [`stream`](crate::stream).
+//! These seed every candle series, repair detected stream gaps, and reconcile any
+//! interval that has not advanced after a bar boundary. Configured live intervals
+//! normally update first over the WebSocket in [`stream`](crate::stream).
 
 use chrono::{DateTime, Utc};
 use domain::{Candle, Timeframe};
@@ -12,9 +13,10 @@ use crate::ratelimit::WeightLimiter;
 
 const INFO_URL: &str = "https://api.hyperliquid.xyz/info";
 const META_WEIGHT: u32 = 20;
+const CANDLE_BASE_WEIGHT: u32 = 20;
 
 fn candle_weight(limit: usize) -> u32 {
-    20 + u32::try_from(limit.div_ceil(60)).unwrap_or(200)
+    CANDLE_BASE_WEIGHT.saturating_add(u32::try_from(limit.max(1).div_ceil(60)).unwrap_or(u32::MAX))
 }
 
 /// Fetch up to `limit` most-recent candles for `coin` at `timeframe`, oldest-first,
@@ -27,8 +29,10 @@ pub(crate) async fn fetch_candles(
     limit: usize,
 ) -> Result<Vec<Candle>, FeedError> {
     let end = Utc::now().timestamp_millis();
-    let bars = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
-    let start = end - timeframe.duration_ms().saturating_mul(bars);
+    let preceding = i64::try_from(limit.max(1).saturating_sub(1)).unwrap_or(i64::MAX);
+    let start = timeframe
+        .bar_open_ms(end)
+        .saturating_sub(timeframe.duration_ms().saturating_mul(preceding));
     limiter.acquire(candle_weight(limit)).await;
     request_candles(client, coin, timeframe, start, end).await
 }
@@ -43,7 +47,7 @@ pub async fn fetch_candle_range(
     count: usize,
 ) -> Result<Vec<Candle>, FeedError> {
     let bars = i64::try_from(count.max(1)).unwrap_or(i64::MAX);
-    let start = end_ms - timeframe.duration_ms().saturating_mul(bars);
+    let start = end_ms.saturating_sub(timeframe.duration_ms().saturating_mul(bars));
     request_candles(client, coin, timeframe, start, end_ms).await
 }
 
@@ -208,7 +212,7 @@ struct AssetContext {
 mod tests {
     use domain::Timeframe;
 
-    use super::{WeightLimiter, fetch_candles, fetch_universe};
+    use super::{WeightLimiter, candle_weight, fetch_candles, fetch_universe};
 
     #[tokio::test]
     async fn fetches_live_btc_candles() {
@@ -218,12 +222,20 @@ mod tests {
         let candles = fetch_candles(&client, &limiter, "BTC", Timeframe::Hour1, 50)
             .await
             .expect("fetch BTC 1h candles");
-        assert!(!candles.is_empty(), "expected candles back");
+        assert_eq!(candles.len(), 50, "requested window should not include an extra overlap bar");
         for candle in &candles {
             assert!(candle.high >= candle.low, "high below low");
             assert!(candle.high >= candle.open && candle.high >= candle.close, "high not the max");
             assert!(candle.low <= candle.open && candle.low <= candle.close, "low not the min");
         }
+    }
+
+    #[test]
+    fn candle_weight_accounts_for_every_returned_row() {
+        assert_eq!(candle_weight(0), 21);
+        assert_eq!(candle_weight(60), 21);
+        assert_eq!(candle_weight(61), 22);
+        assert_eq!(candle_weight(usize::MAX), u32::MAX);
     }
 
     #[tokio::test]

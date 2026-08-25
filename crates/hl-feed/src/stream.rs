@@ -87,12 +87,17 @@ impl HyperliquidAdapter {
 async fn ws_loop(feed: MarketFeed, store: Arc<MarketStore>, intervals: Vec<Timeframe>) {
     let mut backoff = RECONNECT_BASE;
     loop {
-        match run_session(&feed, &store, &intervals).await {
+        let result = run_session(&feed, &store, &intervals).await;
+        let session_was_live = store.status().connection == ConnectionState::Live;
+        match result {
             Ok(()) => backoff = RECONNECT_BASE,
             Err(error) => {
                 tracing::warn!(%error, ?backoff, "websocket session ended, reconnecting");
                 backoff = (backoff * 2).min(RECONNECT_MAX);
             }
+        }
+        if session_was_live {
+            store.mark_streamed_for_reconciliation(&intervals);
         }
         store.set_connection(ConnectionState::Reconnecting);
         tokio::time::sleep(backoff).await;

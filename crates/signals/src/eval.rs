@@ -58,7 +58,7 @@ pub struct EvalReport {
 
 #[derive(Debug, Clone)]
 struct CompletedSeries {
-    candles: Arc<[Candle]>,
+    candles: Arc<Vec<Candle>>,
     completed_len: usize,
 }
 
@@ -84,13 +84,13 @@ impl CoinData {
         self.series.insert(
             timeframe,
             CompletedSeries {
-                candles: candles.into(),
+                candles: Arc::new(candles),
                 completed_len,
             },
         );
     }
 
-    pub(crate) fn insert_shared(&mut self, timeframe: Timeframe, candles: Arc<[Candle]>, completed_len: usize) {
+    pub(crate) fn insert_shared(&mut self, timeframe: Timeframe, candles: Arc<Vec<Candle>>, completed_len: usize) {
         let completed_len = completed_len.min(candles.len());
         self.series.insert(timeframe, CompletedSeries { candles, completed_len });
     }
