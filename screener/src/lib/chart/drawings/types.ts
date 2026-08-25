@@ -12,6 +12,7 @@ export const DRAWING_TOOLS = [
   "hline",
   "vline",
   "rect",
+  "priceRange",
   "fib",
   "fibext",
   "channel",
@@ -36,7 +37,7 @@ export interface DrawingStyle {
 export interface Drawing {
   id: string
   tool: DrawingTool
-  /** 1 anchor for hline/vline/text, 2 for trendline/ray/rect/fib. */
+  /** 1 anchor for hline/vline/text, 2 for line/rectangle/range/fib tools. */
   points: DrawingPoint[]
   /** Only for the text tool. */
   text?: string
@@ -59,6 +60,7 @@ export function pointsRequired(tool: DrawingTool): number {
     case "trendline":
     case "ray":
     case "rect":
+    case "priceRange":
     case "fib":
     case "brush":
       return 2

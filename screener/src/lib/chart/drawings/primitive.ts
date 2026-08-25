@@ -71,6 +71,26 @@ function handleEntries(item: { drawing: Drawing; px: Px[] }): { point: Px; index
 }
 const HANDLE_SIZE = 4
 const FONT = "10px ui-monospace, SFMono-Regular, Menlo, monospace"
+const RANGE_LABEL_HEIGHT = 32
+const RANGE_LABEL_PADDING_X = 6
+const RANGE_LABEL_MARGIN = 4
+const RANGE_ARROW_LENGTH = 9
+const RANGE_ARROW_ANGLE = Math.PI / 6
+const DURATION_UNITS: readonly { seconds: number; suffix: string }[] = [
+  { seconds: 604_800, suffix: "w" },
+  { seconds: 86_400, suffix: "d" },
+  { seconds: 3_600, suffix: "h" },
+  { seconds: 60, suffix: "m" },
+]
+
+function formatDuration(seconds: number): string {
+  const duration = Math.round(Math.abs(seconds))
+  if (duration === 0) return "0s"
+  const unit = DURATION_UNITS.find(candidate => duration >= candidate.seconds)
+  if (!unit) return `${duration}s`
+  const value = duration / unit.seconds
+  return `${Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1)}${unit.suffix}`
+}
 
 export type DrawingHit = { id: string; target: "body" | number }
 
@@ -257,6 +277,7 @@ export class DrawingsPrimitive implements ISeriesPrimitive {
       case "vline":
         return Math.abs(cursor.x - a.x) <= tolerance
       case "rect":
+      case "priceRange":
         return b !== undefined && inRect(cursor, a, b, tolerance)
       case "fib":
         return b !== undefined && inRect(cursor, a, b, tolerance)
@@ -315,6 +336,9 @@ export class DrawingsPrimitive implements ISeriesPrimitive {
           ctx.fillRect(a.x, a.y, b.x - a.x, b.y - a.y)
           ctx.strokeRect(a.x, a.y, b.x - a.x, b.y - a.y)
         }
+        break
+      case "priceRange":
+        if (b) this.drawPriceRange(ctx, item.drawing, a, b)
         break
       case "fib":
         if (b) this.drawFib(ctx, item.drawing, a, b)
@@ -380,6 +404,91 @@ export class DrawingsPrimitive implements ISeriesPrimitive {
     ctx.moveTo(a.x, a.y)
     ctx.lineTo(b.x, b.y)
     ctx.stroke()
+  }
+
+  private drawRangeVector(ctx: CanvasRenderingContext2D, a: Px, b: Px, color: string): void {
+    if (Math.hypot(b.x - a.x, b.y - a.y) < 1) return
+    const angle = Math.atan2(b.y - a.y, b.x - a.x)
+    ctx.save()
+    ctx.strokeStyle = color
+    ctx.setLineDash([5, 4])
+    this.strokeLine(ctx, a, b)
+    ctx.setLineDash([])
+    ctx.beginPath()
+    ctx.moveTo(b.x, b.y)
+    ctx.lineTo(
+      b.x - RANGE_ARROW_LENGTH * Math.cos(angle - RANGE_ARROW_ANGLE),
+      b.y - RANGE_ARROW_LENGTH * Math.sin(angle - RANGE_ARROW_ANGLE)
+    )
+    ctx.moveTo(b.x, b.y)
+    ctx.lineTo(
+      b.x - RANGE_ARROW_LENGTH * Math.cos(angle + RANGE_ARROW_ANGLE),
+      b.y - RANGE_ARROW_LENGTH * Math.sin(angle + RANGE_ARROW_ANGLE)
+    )
+    ctx.stroke()
+    ctx.restore()
+  }
+
+  private drawPriceRange(ctx: CanvasRenderingContext2D, drawing: Drawing, a: Px, b: Px): void {
+    const from = drawing.points[0]
+    const to = drawing.points[1]
+    const param = this.param
+    if (!from || !to || !param) return
+
+    const delta = to.price - from.price
+    const automaticColor = delta > 0 ? chartTheme.up : delta < 0 ? chartTheme.down : chartTheme.drawing
+    const color = drawing.style?.color ?? automaticColor
+    const left = Math.min(a.x, b.x)
+    const top = Math.min(a.y, b.y)
+    const width = Math.abs(b.x - a.x)
+    const height = Math.abs(b.y - a.y)
+
+    ctx.strokeStyle = color
+    ctx.fillStyle = withAlpha(color, 0.16)
+    ctx.fillRect(left, top, width, height)
+    ctx.strokeRect(left, top, width, height)
+    this.drawRangeVector(ctx, a, b, color)
+
+    const sign = delta > 0 ? "+" : delta < 0 ? "-" : ""
+    const formatter = param.series.priceFormatter()
+    const absoluteLabel = `${sign}${formatter.format(Math.abs(delta))}`
+    const percentage = from.price === 0 ? null : (delta / from.price) * 100
+    const percentageLabel = percentage === null ? "n/a" : `${sign}${Math.abs(percentage).toFixed(2)}%`
+    const movementLabel = `${absoluteLabel} (${percentageLabel})`
+
+    const elapsedSeconds = Math.abs(to.time - from.time)
+    const intervals = this.grid ? Math.round(elapsedSeconds / this.grid.intervalSec) : null
+    const intervalLabel = intervals === null ? null : `${intervals} ${intervals === 1 ? "bar" : "bars"}`
+    const durationLabel = formatDuration(elapsedSeconds)
+    const spanLabel = intervalLabel ? `${intervalLabel} · ${durationLabel}` : durationLabel
+
+    ctx.save()
+    ctx.setLineDash([])
+    ctx.lineWidth = 1
+    ctx.font = FONT
+    ctx.textAlign = "center"
+    ctx.textBaseline = "middle"
+    const labelWidth = Math.max(ctx.measureText(movementLabel).width, ctx.measureText(spanLabel).width)
+    const boxWidth = labelWidth + RANGE_LABEL_PADDING_X * 2
+    const centerX = left + width / 2
+    const centerY = top + height / 2
+    const labelX = Math.max(
+      RANGE_LABEL_MARGIN,
+      Math.min(centerX - boxWidth / 2, this.viewport.width - boxWidth - RANGE_LABEL_MARGIN)
+    )
+    const labelY = Math.max(
+      RANGE_LABEL_MARGIN,
+      Math.min(centerY - RANGE_LABEL_HEIGHT / 2, this.viewport.height - RANGE_LABEL_HEIGHT - RANGE_LABEL_MARGIN)
+    )
+
+    ctx.fillStyle = withAlpha(color, 0.92)
+    ctx.fillRect(labelX, labelY, boxWidth, RANGE_LABEL_HEIGHT)
+    ctx.strokeStyle = color
+    ctx.strokeRect(labelX, labelY, boxWidth, RANGE_LABEL_HEIGHT)
+    ctx.fillStyle = chartTheme.drawingHandleFill
+    ctx.fillText(movementLabel, labelX + boxWidth / 2, labelY + 10)
+    ctx.fillText(spanLabel, labelX + boxWidth / 2, labelY + 23)
+    ctx.restore()
   }
 
   private drawFib(ctx: CanvasRenderingContext2D, drawing: Drawing, a: Px, b: Px): void {

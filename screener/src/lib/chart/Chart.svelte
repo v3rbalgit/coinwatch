@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { AlignJustify, GripVertical, Magnet, Minus, MoveUpRight, Square, Trash2, TrendingUp } from "@lucide/svelte"
+  import { GripVertical, Magnet, Minus, MoveUpRight, Rows3, Ruler, Square, Trash2, TrendingUp } from "@lucide/svelte"
   import {
     CandlestickSeries,
     ColorType,
@@ -142,11 +142,29 @@
       activeTool === tool ? "bg-accent text-accent-foreground" : "text-muted-foreground hover:bg-accent/50"
     }`
 
+  function isDrawingColorSelected(color: string): boolean {
+    if (!selectedDrawing) return false
+    const fallback = selectedDrawing.tool === "priceRange" ? undefined : chartTheme.drawing
+    return (selectedDrawing.style?.color ?? fallback) === color
+  }
+
   function changeStyle(patch: Partial<DrawingStyle>) {
     if (!selectedDrawing || !drawingStore) return
     drawingStore.update(selectedDrawing.id, { style: { ...selectedDrawing.style, ...patch } })
     selectedDrawing = drawingStore.byId(selectedDrawing.id) ?? null
   }
+  function changeColor(color: string | undefined) {
+    if (!selectedDrawing || !drawingStore) return
+    const current = selectedDrawing.style
+    const style: DrawingStyle = {
+      ...(color !== undefined ? { color } : {}),
+      ...(current?.width !== undefined ? { width: current.width } : {}),
+      ...(current?.dashed !== undefined ? { dashed: current.dashed } : {}),
+    }
+    drawingStore.update(selectedDrawing.id, { style })
+    selectedDrawing = drawingStore.byId(selectedDrawing.id) ?? null
+  }
+
   function deleteSelected() {
     if (!selectedDrawing || !drawingStore) return
     drawingStore.remove(selectedDrawing.id)
@@ -594,8 +612,11 @@
     <button class={toolClass("rect")} title="Rectangle (r)" onclick={() => selectTool("rect")}>
       <Square class="size-3.5" />
     </button>
+    <button class={toolClass("priceRange")} title="Price range" onclick={() => selectTool("priceRange")}>
+      <Ruler class="size-3.5" />
+    </button>
     <button class={toolClass("fib")} title="Fibonacci retracement (f)" onclick={() => selectTool("fib")}>
-      <AlignJustify class="size-3.5" />
+      <Rows3 class="size-3.5" />
     </button>
     <div class="my-0.5 h-px w-full bg-border"></div>
     <button
@@ -665,14 +686,25 @@
           <GripVertical class="size-3.5" />
         </button>
         <div class="mx-0.5 h-5 w-px bg-border"></div>
+        {#if selectedDrawing.tool === "priceRange"}
+          <button
+            class="size-4 rounded-full border {selectedDrawing.style?.color === undefined
+              ? 'border-foreground'
+              : 'border-transparent'}"
+            style={`background: linear-gradient(135deg, ${chartTheme.up} 0 50%, ${chartTheme.down} 50% 100%)`}
+            aria-label="Automatic direction color"
+            title="Automatic direction color"
+            onclick={() => changeColor(undefined)}
+          ></button>
+        {/if}
         {#each drawingPalette as color (color)}
           <button
-            class="size-4 rounded-full border {(selectedDrawing?.style?.color ?? chartTheme.drawing) === color
+            class="size-4 rounded-full border {isDrawingColorSelected(color)
               ? 'border-foreground'
               : 'border-transparent'}"
             style="background-color: {color}"
             aria-label="Color"
-            onclick={() => changeStyle({ color })}
+            onclick={() => changeColor(color)}
           ></button>
         {/each}
         <div class="mx-0.5 h-5 w-px bg-border"></div>
