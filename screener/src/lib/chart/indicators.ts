@@ -67,6 +67,9 @@ export function analyze(closes: Float64Array, config: IndicatorConfig): Analysis
 /** Where an indicator draws. */
 export type IndicatorTarget = "overlay" | "pane"
 
+/** What an indicator instance produces. */
+export type IndicatorKind = "series" | "divergence"
+
 /** How one output series is plotted. */
 export type OutputKind = "line" | "histogram"
 
@@ -92,6 +95,7 @@ export type IndicatorOutput = {
 export type IndicatorDescriptor = {
   id: string
   label: string
+  kind: IndicatorKind
   target: IndicatorTarget
   params: IndicatorParam[]
   outputs: IndicatorOutput[]

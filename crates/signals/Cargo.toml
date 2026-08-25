@@ -1,0 +1,21 @@
+[package]
+name = "signals"
+description = "Signal definitions and evaluation over cached market candles."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+domain = { workspace = true }
+indicators = { workspace = true }
+hl-feed = { workspace = true }
+serde = { workspace = true }
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

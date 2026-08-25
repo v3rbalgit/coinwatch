@@ -1,11 +1,11 @@
 //! Candle timeframes the setup-finder scans.
 
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize};
 use strum::{EnumString, IntoStaticStr};
 
 /// A higher-timeframe interval the setup-finder scans. String forms are
 /// Hyperliquid's `candle` interval codes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, IntoStaticStr, EnumString, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, IntoStaticStr, EnumString, Serialize)]
 #[serde(into = "&'static str")]
 pub enum Timeframe {
     /// One hour.
@@ -22,7 +22,20 @@ pub enum Timeframe {
     Week1,
 }
 
+// Deserialization must accept the same interval codes `Serialize` emits (the
+// Hyperliquid codes, not variant names). Strum provides `FromStr` but no serde
+// integration in this version, so this bridge delegates to that generated parser.
+impl<'de> Deserialize<'de> for Timeframe {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let code = String::deserialize(deserializer)?;
+        code.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 impl Timeframe {
+    /// Every supported timeframe in ascending duration order.
+    pub const ALL: [Self; 4] = [Self::Hour1, Self::Hour4, Self::Day1, Self::Week1];
+
     /// Hyperliquid's interval code.
     #[must_use]
     pub fn as_hl(self) -> &'static str {
