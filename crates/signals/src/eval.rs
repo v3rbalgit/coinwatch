@@ -27,6 +27,8 @@ pub enum OutcomeStatus {
     NotSatisfied,
     /// No completed candle data for the condition's timeframe was available.
     NoData,
+    /// Required history could not be loaded because storage or the provider failed.
+    Unavailable,
     /// Some candles exist, but not enough to evaluate the complete requested window.
     InsufficientHistory {
         /// Exact completed-candle requirement.
@@ -61,6 +63,9 @@ pub struct EvalReport {
     /// propagate an unknown verdict and remain visible here rather than failing
     /// silently or satisfying negation.
     pub missing_data: Vec<Timeframe>,
+    /// History-load failures by timeframe. Their conditions have
+    /// [`OutcomeStatus::Unavailable`] and propagate unknown.
+    pub unavailable_data: BTreeMap<Timeframe, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,12 +87,14 @@ impl CompletedSeries {
 #[derive(Debug, Default, Clone)]
 pub struct CoinData {
     series: HashMap<Timeframe, CompletedSeries>,
+    unavailable: HashMap<Timeframe, String>,
 }
 
 impl CoinData {
     /// Insert an owned completed-bar series, oldest first.
     pub fn insert(&mut self, timeframe: Timeframe, candles: Vec<Candle>) {
         let completed_len = candles.len();
+        self.unavailable.remove(&timeframe);
         self.series.insert(
             timeframe,
             CompletedSeries {
@@ -99,7 +106,13 @@ impl CoinData {
 
     pub(crate) fn insert_shared(&mut self, timeframe: Timeframe, candles: Arc<Vec<Candle>>, completed_len: usize) {
         let completed_len = completed_len.min(candles.len());
+        self.unavailable.remove(&timeframe);
         self.series.insert(timeframe, CompletedSeries { candles, completed_len });
+    }
+
+    pub(crate) fn mark_unavailable(&mut self, timeframe: Timeframe, reason: String) {
+        self.series.remove(&timeframe);
+        self.unavailable.insert(timeframe, reason);
     }
 
     fn get(&self, timeframe: Timeframe) -> Option<&[Candle]> {
@@ -229,28 +242,37 @@ pub(crate) fn evaluate_validated(
 
     let mut prepared = HashMap::with_capacity(by_timeframe.len());
     let mut missing_data = Vec::with_capacity(by_timeframe.len());
+    let mut unavailable_data = BTreeMap::new();
     for (timeframe, conditions) in &by_timeframe {
-        match data.get(*timeframe) {
-            Some(candles) if !candles.is_empty() => {
-                prepared.insert(*timeframe, TimeframePrepared::build(candles, conditions));
-            }
-            _ => missing_data.push(*timeframe),
+        if let Some(reason) = data.unavailable.get(timeframe) {
+            unavailable_data.insert(*timeframe, reason.clone());
+        } else if let Some(candles) = data.get(*timeframe) {
+            prepared.insert(*timeframe, TimeframePrepared::build(candles, conditions));
+        } else {
+            missing_data.push(*timeframe);
         }
     }
 
     let mut outcomes = BTreeMap::new();
     for (id, condition) in &definition.conditions {
-        let outcome = match prepared.get(&condition.timeframe) {
-            Some(timeframe) => {
-                evaluate_condition(id, condition, timeframe).map_err(|source| DefinitionError::InvalidIndicator {
-                    condition: id.clone(),
-                    source,
-                })?
-            }
-            None => ConditionOutcome {
-                status: OutcomeStatus::NoData,
+        let outcome = if unavailable_data.contains_key(&condition.timeframe) {
+            ConditionOutcome {
+                status: OutcomeStatus::Unavailable,
                 last_true_bar: None,
-            },
+            }
+        } else {
+            match prepared.get(&condition.timeframe) {
+                Some(timeframe) => evaluate_condition(id, condition, timeframe).map_err(|source| {
+                    DefinitionError::InvalidIndicator {
+                        condition: id.clone(),
+                        source,
+                    }
+                })?,
+                None => ConditionOutcome {
+                    status: OutcomeStatus::NoData,
+                    last_true_bar: None,
+                },
+            }
         };
         outcomes.insert(id.clone(), outcome);
     }
@@ -273,6 +295,7 @@ pub(crate) fn evaluate_validated(
         triggered_at,
         conditions: outcomes,
         missing_data,
+        unavailable_data,
     })
 }
 
@@ -326,7 +349,8 @@ fn eval_node(node: &Node, outcomes: &BTreeMap<String, ConditionOutcome>) -> Trut
         Node::Condition { id } => match outcomes.get(id).map(|outcome| outcome.status) {
             Some(OutcomeStatus::Satisfied) => Truth::True,
             Some(OutcomeStatus::NotSatisfied) => Truth::False,
-            Some(OutcomeStatus::NoData | OutcomeStatus::InsufficientHistory { .. }) | None => Truth::Unknown,
+            Some(OutcomeStatus::NoData | OutcomeStatus::Unavailable | OutcomeStatus::InsufficientHistory { .. })
+            | None => Truth::Unknown,
         },
     }
 }
@@ -605,6 +629,49 @@ mod tests {
                 ..
             }) if parameter == "typo"
         ));
+    }
+
+    #[test]
+    fn unavailable_history_is_unknown_and_preserves_the_failure() {
+        let signal = definition(
+            vec![("history", sma_threshold(Timeframe::Hour1, 80.0, 0))],
+            Node::Not {
+                child: Box::new(Node::Condition {
+                    id: "history".to_owned(),
+                }),
+            },
+        );
+        let mut data = CoinData::default();
+        data.mark_unavailable(Timeframe::Hour1, "provider unavailable".to_owned());
+
+        let report = evaluate(&signal, "BTC", &data).expect("valid unavailable-history signal");
+        assert_eq!(report.conditions["history"].status, OutcomeStatus::Unavailable);
+        assert_eq!(
+            report.unavailable_data.get(&Timeframe::Hour1).map(String::as_str),
+            Some("provider unavailable")
+        );
+        assert!(report.missing_data.is_empty());
+        assert!(!report.satisfied, "unavailable history must not satisfy negation");
+    }
+
+    #[test]
+    fn known_empty_history_is_insufficient_not_missing() {
+        let signal = definition(
+            vec![("empty", sma_threshold(Timeframe::Hour1, 80.0, 0))],
+            Node::Condition { id: "empty".to_owned() },
+        );
+        let mut data = CoinData::default();
+        data.insert(Timeframe::Hour1, Vec::new());
+
+        let report = evaluate(&signal, "BTC", &data).expect("valid empty-history signal");
+        assert_eq!(
+            report.conditions["empty"].status,
+            OutcomeStatus::InsufficientHistory {
+                required: 1,
+                available: 0,
+            }
+        );
+        assert!(report.missing_data.is_empty());
     }
 
     #[test]
