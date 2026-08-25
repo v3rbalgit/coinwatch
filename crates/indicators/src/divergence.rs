@@ -1,9 +1,12 @@
 //! Divergence detection between price and an oscillator (RSI, MACD, ...).
 
+use serde::Serialize;
+use strum::Display;
+
 use crate::pivot::{PivotKind, pivots};
 
 /// Regular (reversal) versus hidden (continuation) divergence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Display)]
 pub enum DivergenceKind {
     /// Reversal: price extends a swing but the oscillator fails to confirm it.
     Regular,
@@ -12,7 +15,7 @@ pub enum DivergenceKind {
 }
 
 /// Which way the divergence points.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Display)]
 pub enum DivergenceDirection {
     /// Anchored on swing lows; expects upside.
     Bullish,

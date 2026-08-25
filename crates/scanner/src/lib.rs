@@ -11,9 +11,11 @@ use domain::{Candle, Timeframe};
 use hl_feed::MarketStore;
 use indicators::{DivergenceDirection, DivergenceKind, detect_divergences, macd, rsi};
 use rust_decimal::prelude::ToPrimitive;
+use serde::Serialize;
 
 /// Which oscillator produced a divergence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "UPPERCASE")]
 pub enum SignalSource {
     /// RSI divergence.
     Rsi,

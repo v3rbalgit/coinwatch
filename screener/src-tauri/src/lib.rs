@@ -67,8 +67,8 @@ struct MidPayload {
 /// The market engine status forwarded to the frontend as a `status` event.
 #[derive(Clone, Serialize)]
 struct StatusPayload {
-    connection: String,
-    phase: String,
+    connection: ConnectionState,
+    phase: SyncPhase,
     universe: usize,
     backfill_done: usize,
     backfill_total: usize,
@@ -79,19 +79,9 @@ struct StatusPayload {
 
 impl From<&MarketStatus> for StatusPayload {
     fn from(status: &MarketStatus) -> Self {
-        let connection = match status.connection {
-            ConnectionState::Connecting => "connecting",
-            ConnectionState::Live => "live",
-            ConnectionState::Reconnecting => "reconnecting",
-        };
-        let phase = match status.phase {
-            SyncPhase::LoadingUniverse => "loading",
-            SyncPhase::Backfilling => "backfilling",
-            SyncPhase::Live => "live",
-        };
         Self {
-            connection: connection.to_owned(),
-            phase: phase.to_owned(),
+            connection: status.connection,
+            phase: status.phase,
             universe: status.universe,
             backfill_done: status.backfill_done,
             backfill_total: status.backfill_total,
@@ -106,10 +96,10 @@ impl From<&MarketStatus> for StatusPayload {
 #[derive(Clone, Serialize)]
 struct SignalPayload {
     coin: String,
-    timeframe: String,
-    source: String,
-    kind: String,
-    direction: String,
+    timeframe: Timeframe,
+    source: SignalSource,
+    kind: DivergenceKind,
+    direction: DivergenceDirection,
     at: String,
 }
 
@@ -117,22 +107,10 @@ impl From<&Signal> for SignalPayload {
     fn from(signal: &Signal) -> Self {
         Self {
             coin: signal.coin.clone(),
-            timeframe: signal.timeframe.as_hl().to_owned(),
-            source: match signal.source {
-                SignalSource::Rsi => "RSI",
-                SignalSource::Macd => "MACD",
-            }
-            .to_owned(),
-            kind: match signal.kind {
-                DivergenceKind::Regular => "Regular",
-                DivergenceKind::Hidden => "Hidden",
-            }
-            .to_owned(),
-            direction: match signal.direction {
-                DivergenceDirection::Bullish => "Bullish",
-                DivergenceDirection::Bearish => "Bearish",
-            }
-            .to_owned(),
+            timeframe: signal.timeframe,
+            source: signal.source,
+            kind: signal.kind,
+            direction: signal.direction,
             at: signal.at.to_rfc3339(),
         }
     }

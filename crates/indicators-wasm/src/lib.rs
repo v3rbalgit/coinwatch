@@ -28,17 +28,28 @@ pub struct Config {
     pub max_gap: usize,
 }
 
+/// The oscillator a divergence was found on (serialized as `RSI` / `MACD`).
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum Source {
+    /// Relative Strength Index.
+    Rsi,
+    /// Moving-average convergence/divergence.
+    Macd,
+}
+
 /// A divergence with pivot indices into the input series; the caller maps the
-/// indices to bar times and prices.
+/// indices to bar times and prices. `source`/`kind`/`direction` serialize to their
+/// variant names (`RSI`/`MACD`, `Regular`/`Hidden`, `Bullish`/`Bearish`).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DivergenceOut {
-    /// Oscillator that diverged (`RSI` or `MACD`).
-    pub source: String,
-    /// `Regular` (reversal) or `Hidden` (continuation).
-    pub kind: String,
-    /// `Bullish` or `Bearish`.
-    pub direction: String,
+    /// Oscillator that diverged.
+    pub source: Source,
+    /// Reversal (`Regular`) or continuation (`Hidden`).
+    pub kind: DivergenceKind,
+    /// Bullish or bearish.
+    pub direction: DivergenceDirection,
     /// Index of the earlier pivot.
     pub prior_index: usize,
     /// Index of the later pivot.
@@ -65,20 +76,6 @@ fn nan_vec(series: &[Option<f64>]) -> Vec<f64> {
     series.iter().map(|value| value.unwrap_or(f64::NAN)).collect()
 }
 
-const fn kind_str(kind: DivergenceKind) -> &'static str {
-    match kind {
-        DivergenceKind::Regular => "Regular",
-        DivergenceKind::Hidden => "Hidden",
-    }
-}
-
-const fn direction_str(direction: DivergenceDirection) -> &'static str {
-    match direction {
-        DivergenceDirection::Bullish => "Bullish",
-        DivergenceDirection::Bearish => "Bearish",
-    }
-}
-
 /// Compute RSI/MACD series and RSI+MACD divergences over `closes`. Pure and
 /// framework-free — shared by the native test and the wasm export.
 #[must_use]
@@ -87,12 +84,12 @@ pub fn analyze(closes: &[f64], config: &Config) -> Analysis {
     let macd_out = macd(closes, config.macd_fast, config.macd_slow, config.macd_signal);
 
     let mut divergences = Vec::new();
-    for (source, oscillator) in [("RSI", &rsi_series), ("MACD", &macd_out.macd)] {
+    for (source, oscillator) in [(Source::Rsi, &rsi_series), (Source::Macd, &macd_out.macd)] {
         for divergence in detect_divergences(closes, oscillator, config.pivot_left, config.pivot_right, config.max_gap) {
             divergences.push(DivergenceOut {
-                source: source.to_owned(),
-                kind: kind_str(divergence.kind).to_owned(),
-                direction: direction_str(divergence.direction).to_owned(),
+                source,
+                kind: divergence.kind,
+                direction: divergence.direction,
                 prior_index: divergence.prior_index,
                 recent_index: divergence.recent_index,
             });

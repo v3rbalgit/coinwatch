@@ -1052,6 +1052,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "rust_decimal",
+ "serde",
  "strum",
 ]
 
@@ -2083,6 +2084,10 @@ dependencies = [
 [[package]]
 name = "indicators"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "strum",
+]
 
 [[package]]
 name = "indicators-wasm"
@@ -3530,6 +3535,7 @@ dependencies = [
  "hl-feed",
  "indicators",
  "rust_decimal",
+ "serde",
 ]
 
 [[package]]

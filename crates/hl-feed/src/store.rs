@@ -6,12 +6,14 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use chrono::TimeDelta;
 use dashmap::DashMap;
 use domain::{Candle, Timeframe};
+use serde::Serialize;
 use tokio::sync::watch;
 
 use crate::{CANDLE_WINDOW, UniverseCoin};
 
 /// WebSocket connection state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ConnectionState {
     /// Opening the first WebSocket connection.
     Connecting,
@@ -22,9 +24,11 @@ pub enum ConnectionState {
 }
 
 /// What the REST sync is doing right now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SyncPhase {
     /// Fetching the universe/metadata snapshot.
+    #[serde(rename = "loading")]
     LoadingUniverse,
     /// Backfilling candle history over REST.
     Backfilling,

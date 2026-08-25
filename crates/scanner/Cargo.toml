@@ -11,6 +11,7 @@ hl-feed = { workspace = true }
 indicators = { workspace = true }
 chrono = { workspace = true }
 rust_decimal = { workspace = true }
+serde = { workspace = true }
 
 [lints]
 workspace = true

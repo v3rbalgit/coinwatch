@@ -1,10 +1,12 @@
 //! Candle timeframes the setup-finder scans.
 
+use serde::Serialize;
 use strum::{EnumString, IntoStaticStr};
 
 /// A higher-timeframe interval the setup-finder scans. String forms are
 /// Hyperliquid's `candle` interval codes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, IntoStaticStr, EnumString)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, IntoStaticStr, EnumString, Serialize)]
+#[serde(into = "&'static str")]
 pub enum Timeframe {
     /// One hour.
     #[strum(serialize = "1h")]
