@@ -134,6 +134,15 @@ pub trait CandleStore: Send + Sync {
 
     /// Insert-or-replace one (coin, timeframe) series.
     async fn save(&self, coin: &str, timeframe: Timeframe, candles: &[Candle]) -> Result<(), StoreError>;
+
+    /// Load up to `limit` candles strictly before `before_ms`, oldest first.
+    async fn candles_before(
+        &self,
+        coin: &str,
+        timeframe: Timeframe,
+        before_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<Candle>, StoreError>;
 }
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
@@ -354,10 +363,30 @@ impl SqliteStore {
             .await?;
         Ok(())
     }
+}
 
-    /// Up to `limit` cached candles for a (coin, timeframe) with open time before
-    /// `before_ms`, oldest-first — for lazily paging chart history.
-    pub async fn candles_before(
+fn map_signal_write_error(error: sqlx::Error, name: &str) -> StoreError {
+    if error.as_database_error().is_some_and(|database| database.is_unique_violation()) {
+        StoreError::DuplicateSignalName(name.to_owned())
+    } else {
+        StoreError::Database(error)
+    }
+}
+
+fn map_preset_write_error(error: sqlx::Error, indicator_id: &str, name: &str) -> StoreError {
+    if error.as_database_error().is_some_and(|database| database.is_unique_violation()) {
+        StoreError::DuplicatePresetName {
+            indicator_id: indicator_id.to_owned(),
+            name: name.to_owned(),
+        }
+    } else {
+        StoreError::Database(error)
+    }
+}
+
+#[async_trait]
+impl CandleStore for SqliteStore {
+    async fn candles_before(
         &self,
         coin: &str,
         timeframe: Timeframe,
@@ -382,29 +411,7 @@ impl SqliteStore {
         candles.reverse();
         Ok(candles)
     }
-}
 
-fn map_signal_write_error(error: sqlx::Error, name: &str) -> StoreError {
-    if error.as_database_error().is_some_and(|database| database.is_unique_violation()) {
-        StoreError::DuplicateSignalName(name.to_owned())
-    } else {
-        StoreError::Database(error)
-    }
-}
-
-fn map_preset_write_error(error: sqlx::Error, indicator_id: &str, name: &str) -> StoreError {
-    if error.as_database_error().is_some_and(|database| database.is_unique_violation()) {
-        StoreError::DuplicatePresetName {
-            indicator_id: indicator_id.to_owned(),
-            name: name.to_owned(),
-        }
-    } else {
-        StoreError::Database(error)
-    }
-}
-
-#[async_trait]
-impl CandleStore for SqliteStore {
     async fn load_recent(&self, limit: usize) -> Result<Vec<CandleSeries>, StoreError> {
         if limit == 0 {
             return Ok(Vec::new());

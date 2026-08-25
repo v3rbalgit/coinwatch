@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use domain::{Candle, Timeframe};
 use hl_feed::{
-    fetch_candle_range, spawn_sync, ConnectionState, HyperliquidAdapter, MarketEvent, MarketStatus, MarketStore,
-    SyncConfig, SyncPhase,
+    spawn_sync, CandleHistory, ConnectionState, HyperliquidAdapter, HyperliquidRest, MarketEvent, MarketStatus,
+    MarketStore, SyncConfig, SyncPhase,
 };
 use indicators::{DivergenceDirection, DivergenceKind};
 use rust_decimal::prelude::ToPrimitive;
@@ -183,8 +183,7 @@ const CHART_PAGE: usize = 300;
 /// stores the result, so scroll-back depth accumulates.
 #[tauri::command]
 async fn coin_history(
-    store: tauri::State<'_, Arc<SqliteStore>>,
-    client: tauri::State<'_, reqwest::Client>,
+    history: tauri::State<'_, Arc<CandleHistory>>,
     coin: String,
     timeframe: String,
     before_seconds: i64,
@@ -192,31 +191,14 @@ async fn coin_history(
     let Some(timeframe) = Timeframe::from_hl(&timeframe) else {
         return Ok(Vec::new());
     };
-    let before_ms = before_seconds.saturating_mul(1000);
-
-    let cached = store
-        .candles_before(&coin, timeframe, before_ms, CHART_PAGE)
+    let before_ms = before_seconds
+        .checked_mul(1000)
+        .ok_or_else(|| "history boundary is outside the supported timestamp range".to_owned())?;
+    let candles = history
+        .load_before(&coin, timeframe, before_ms, CHART_PAGE)
         .await
         .map_err(|error| error.to_string())?;
-    if cached.len() >= CHART_PAGE {
-        return Ok(cached.iter().map(CandlePayload::from).collect());
-    }
-
-    // The cache doesn't reach that far back; fetch from Hyperliquid and store it.
-    match fetch_candle_range(client.inner(), &coin, timeframe, before_ms, CHART_PAGE).await {
-        Ok(fetched) if !fetched.is_empty() => {
-            if let Err(error) = store.save(&coin, timeframe, &fetched).await {
-                tracing::warn!(coin = %coin, %error, "failed to cache paged candles");
-            }
-            let merged = store
-                .candles_before(&coin, timeframe, before_ms, CHART_PAGE)
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok(merged.iter().map(CandlePayload::from).collect())
-        }
-        Ok(_) => Ok(cached.iter().map(CandlePayload::from).collect()),
-        Err(error) => Err(error.to_string()),
-    }
+    Ok(candles.iter().map(CandlePayload::from).collect())
 }
 
 /// Read a persisted UI setting (an opaque string), if set.
@@ -366,10 +348,10 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(store)
         .setup(move |app| {
-            // One shared HTTP client: managed for the history-paging command and reused
-            // by the logo cache task (Client clones share one connection pool).
+            // Client clones share one pool; Hyperliquid requests add the shared
+            // weight limiter while logo downloads use the same HTTP transport directly.
             let http = reqwest::Client::new();
-            app.manage(http.clone());
+            let rest = Arc::new(HyperliquidRest::new(http.clone(), sync_config.weight_budget_per_min));
 
             // The local database holds candles + watchlists. Open it synchronously so
             // the list commands have their managed state before the UI can call them.
@@ -380,11 +362,14 @@ pub fn run() {
             match tauri::async_runtime::block_on(SqliteStore::open(&db_path)) {
                 Ok(store) => {
                     let store = Arc::new(store);
+                    let persistence: Arc<dyn CandleStore> = store.clone();
+                    let history = Arc::new(CandleHistory::new(Arc::clone(&persistence), Arc::clone(&rest)));
                     app.manage(Arc::clone(&store));
+                    app.manage(history);
                     let logo_db = Arc::clone(&store);
                     // Keep the hot cache warm from Hyperliquid — the whole tradable universe.
                     tauri::async_runtime::spawn(async move {
-                        let _sync = spawn_sync(sync_store, sync_config, store);
+                        let _sync = spawn_sync(sync_store, sync_config, persistence, rest);
                     });
                     // Cache coin logos locally so they load instantly and offline.
                     tauri::async_runtime::spawn(cache_logos(logo_market_store, logo_db, http));

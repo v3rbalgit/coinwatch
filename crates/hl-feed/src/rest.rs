@@ -14,41 +14,104 @@ use crate::ratelimit::WeightLimiter;
 const INFO_URL: &str = "https://api.hyperliquid.xyz/info";
 const META_WEIGHT: u32 = 20;
 const CANDLE_BASE_WEIGHT: u32 = 20;
+// Hyperliquid caps time-range responses at 500 rows.
+pub(crate) const MAX_CANDLE_PAGE: usize = 500;
+
+/// Shared Hyperliquid REST client and process-wide request-weight budget.
+pub struct HyperliquidRest {
+    client: reqwest::Client,
+    limiter: WeightLimiter,
+}
+
+impl HyperliquidRest {
+    /// Wrap a reusable HTTP client with the configured rolling-minute weight budget.
+    #[must_use]
+    pub const fn new(client: reqwest::Client, weight_budget_per_min: u32) -> Self {
+        Self {
+            client,
+            limiter: WeightLimiter::new(weight_budget_per_min),
+        }
+    }
+
+    pub(crate) async fn recent_candles(
+        &self,
+        coin: &str,
+        timeframe: Timeframe,
+        limit: usize,
+    ) -> Result<Vec<Candle>, FeedError> {
+        let limit = limit.clamp(1, MAX_CANDLE_PAGE);
+        let end = Utc::now().timestamp_millis();
+        let preceding = i64::try_from(limit - 1).unwrap_or(i64::MAX);
+        let start = timeframe
+            .bar_open_ms(end)
+            .saturating_sub(timeframe.duration_ms().saturating_mul(preceding));
+        self.limiter.acquire(candle_weight(limit)).await;
+        request_candles(&self.client, coin, timeframe, start, end).await
+    }
+
+    pub(crate) async fn candles_before(
+        &self,
+        coin: &str,
+        timeframe: Timeframe,
+        before_ms: i64,
+        count: usize,
+    ) -> Result<Vec<Candle>, FeedError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let count = count.min(MAX_CANDLE_PAGE);
+        let duration = timeframe.duration_ms();
+        let end = before_ms.checked_sub(duration).ok_or(FeedError::CandleRange)?;
+        let preceding = i64::try_from(count - 1).map_err(|_| FeedError::CandleRange)?;
+        let span = duration.checked_mul(preceding).ok_or(FeedError::CandleRange)?;
+        let start = end.checked_sub(span).ok_or(FeedError::CandleRange)?;
+        self.limiter.acquire(candle_weight(count)).await;
+        request_candles(&self.client, coin, timeframe, start, end).await
+    }
+
+    pub(crate) async fn universe(&self, limit: usize, min_day_volume_usd: f64) -> Result<Vec<UniverseCoin>, FeedError> {
+        self.limiter.acquire(META_WEIGHT).await;
+        let (meta, contexts): (Meta, Vec<AssetContext>) = self
+            .client
+            .post(INFO_URL)
+            .json(&serde_json::json!({ "type": "metaAndAssetCtxs" }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let mut coins: Vec<UniverseCoin> = meta
+            .universe
+            .into_iter()
+            .zip(contexts)
+            .filter_map(|(entry, context)| {
+                if entry.is_delisted {
+                    return None;
+                }
+                let day_volume_usd = value_to_f64(&context.day_ntl_vlm)?;
+                if day_volume_usd < min_day_volume_usd {
+                    return None;
+                }
+                Some(UniverseCoin {
+                    coin: entry.name,
+                    day_volume_usd,
+                    mark_px: context.mark_px.as_ref().and_then(value_to_f64),
+                    prev_day_px: context.prev_day_px.as_ref().and_then(value_to_f64),
+                    funding: context.funding.as_ref().and_then(value_to_f64),
+                    open_interest: context.open_interest.as_ref().and_then(value_to_f64),
+                })
+            })
+            .collect();
+
+        coins.sort_by(|a, b| b.day_volume_usd.total_cmp(&a.day_volume_usd));
+        coins.truncate(limit);
+        Ok(coins)
+    }
+}
 
 fn candle_weight(limit: usize) -> u32 {
     CANDLE_BASE_WEIGHT.saturating_add(u32::try_from(limit.max(1).div_ceil(60)).unwrap_or(u32::MAX))
-}
-
-/// Fetch up to `limit` most-recent candles for `coin` at `timeframe`, oldest-first,
-/// reusing the caller's `client`. Requires a process-wide rustls provider.
-pub(crate) async fn fetch_candles(
-    client: &reqwest::Client,
-    limiter: &WeightLimiter,
-    coin: &str,
-    timeframe: Timeframe,
-    limit: usize,
-) -> Result<Vec<Candle>, FeedError> {
-    let end = Utc::now().timestamp_millis();
-    let preceding = i64::try_from(limit.max(1).saturating_sub(1)).unwrap_or(i64::MAX);
-    let start = timeframe
-        .bar_open_ms(end)
-        .saturating_sub(timeframe.duration_ms().saturating_mul(preceding));
-    limiter.acquire(candle_weight(limit)).await;
-    request_candles(client, coin, timeframe, start, end).await
-}
-
-/// Fetch `count` candles for `coin` at `timeframe` ending at `end_ms`, oldest-first —
-/// for on-demand history paging on the detail chart (called rarely, so unmetered).
-pub async fn fetch_candle_range(
-    client: &reqwest::Client,
-    coin: &str,
-    timeframe: Timeframe,
-    end_ms: i64,
-    count: usize,
-) -> Result<Vec<Candle>, FeedError> {
-    let bars = i64::try_from(count.max(1)).unwrap_or(i64::MAX);
-    let start = end_ms.saturating_sub(timeframe.duration_ms().saturating_mul(bars));
-    request_candles(client, coin, timeframe, start, end_ms).await
 }
 
 /// Post a `candleSnapshot` for `[start, end]` and parse the oldest-first candles.
@@ -128,52 +191,6 @@ pub struct UniverseCoin {
     pub open_interest: Option<f64>,
 }
 
-/// Fetch the perp universe ranked by day volume (descending), keeping non-delisted
-/// coins with at least `min_day_volume_usd` and capping at `limit`.
-pub(crate) async fn fetch_universe(
-    client: &reqwest::Client,
-    limiter: &WeightLimiter,
-    limit: usize,
-    min_day_volume_usd: f64,
-) -> Result<Vec<UniverseCoin>, FeedError> {
-    limiter.acquire(META_WEIGHT).await;
-    let (meta, contexts): (Meta, Vec<AssetContext>) = client
-        .post(INFO_URL)
-        .json(&serde_json::json!({ "type": "metaAndAssetCtxs" }))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-
-    let mut coins: Vec<UniverseCoin> = meta
-        .universe
-        .into_iter()
-        .zip(contexts)
-        .filter_map(|(entry, context)| {
-            if entry.is_delisted {
-                return None;
-            }
-            let day_volume_usd = value_to_f64(&context.day_ntl_vlm)?;
-            if day_volume_usd < min_day_volume_usd {
-                return None;
-            }
-            Some(UniverseCoin {
-                coin: entry.name,
-                day_volume_usd,
-                mark_px: context.mark_px.as_ref().and_then(value_to_f64),
-                prev_day_px: context.prev_day_px.as_ref().and_then(value_to_f64),
-                funding: context.funding.as_ref().and_then(value_to_f64),
-                open_interest: context.open_interest.as_ref().and_then(value_to_f64),
-            })
-        })
-        .collect();
-
-    coins.sort_by(|a, b| b.day_volume_usd.total_cmp(&a.day_volume_usd));
-    coins.truncate(limit);
-    Ok(coins)
-}
-
 /// Hyperliquid reports volumes as JSON strings; tolerate a bare number too.
 fn value_to_f64(value: &serde_json::Value) -> Option<f64> {
     match value {
@@ -212,14 +229,14 @@ struct AssetContext {
 mod tests {
     use domain::Timeframe;
 
-    use super::{WeightLimiter, candle_weight, fetch_candles, fetch_universe};
+    use super::{HyperliquidRest, candle_weight};
 
     #[tokio::test]
     async fn fetches_live_btc_candles() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = reqwest::Client::new();
-        let limiter = WeightLimiter::new(1100);
-        let candles = fetch_candles(&client, &limiter, "BTC", Timeframe::Hour1, 50)
+        let rest = HyperliquidRest::new(reqwest::Client::new(), 1100);
+        let candles = rest
+            .recent_candles("BTC", Timeframe::Hour1, 50)
             .await
             .expect("fetch BTC 1h candles");
         assert_eq!(candles.len(), 50, "requested window should not include an extra overlap bar");
@@ -241,11 +258,8 @@ mod tests {
     #[tokio::test]
     async fn fetches_ranked_universe() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = reqwest::Client::new();
-        let limiter = WeightLimiter::new(1100);
-        let coins = fetch_universe(&client, &limiter, 20, 1_000_000.0)
-            .await
-            .expect("fetch universe");
+        let rest = HyperliquidRest::new(reqwest::Client::new(), 1100);
+        let coins = rest.universe(20, 1_000_000.0).await.expect("fetch universe");
         assert!(!coins.is_empty(), "expected some coins");
         assert!(
             coins
