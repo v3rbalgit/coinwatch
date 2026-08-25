@@ -18,8 +18,16 @@ pub fn psar(high: &[f64], low: &[f64], step: f64, max_af: f64) -> Vec<Option<f64
 
     // Seed trend, extreme point, and SAR from the first two bars.
     let mut uptrend = second_high >= first_high;
-    let mut extreme = if uptrend { first_high.max(second_high) } else { first_low.min(second_low) };
-    let mut sar = if uptrend { first_low.min(second_low) } else { first_high.max(second_high) };
+    let mut extreme = if uptrend {
+        first_high.max(second_high)
+    } else {
+        first_low.min(second_low)
+    };
+    let mut sar = if uptrend {
+        first_low.min(second_low)
+    } else {
+        first_high.max(second_high)
+    };
     let mut af = step;
     if let Some(cell) = out.get_mut(1) {
         *cell = Some(sar);

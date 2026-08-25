@@ -26,7 +26,11 @@ pub fn cci(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Vec<Optio
         let Some(&price) = typical.get(slot) else {
             break;
         };
-        let value = if mean_deviation > 0.0 { (price - mean) / (0.015 * mean_deviation) } else { 0.0 };
+        let value = if mean_deviation > 0.0 {
+            (price - mean) / (0.015 * mean_deviation)
+        } else {
+            0.0
+        };
         if let Some(cell) = out.get_mut(slot) {
             *cell = Some(value);
         }

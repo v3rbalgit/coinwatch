@@ -18,7 +18,11 @@ pub fn williams_r(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Ve
         let highest = highs.iter().copied().fold(f64::MIN, f64::max);
         let lowest = lows.iter().copied().fold(f64::MAX, f64::min);
         let range = highest - lowest;
-        let value = if range > 0.0 { -100.0 * (highest - close) / range } else { -50.0 };
+        let value = if range > 0.0 {
+            -100.0 * (highest - close) / range
+        } else {
+            -50.0
+        };
         if let Some(cell) = out.get_mut(slot) {
             *cell = Some(value);
         }

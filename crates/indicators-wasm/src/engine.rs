@@ -149,7 +149,10 @@ fn nan(series: &[Option<f64>]) -> Vec<f64> {
 }
 
 fn out(key: &str, series: &[Option<f64>]) -> OutputSeries {
-    OutputSeries { key: key.to_owned(), values: nan(series) }
+    OutputSeries {
+        key: key.to_owned(),
+        values: nan(series),
+    }
 }
 
 fn get(params: &HashMap<String, f64>, key: &str, default: f64) -> f64 {
@@ -158,7 +161,11 @@ fn get(params: &HashMap<String, f64>, key: &str, default: f64) -> f64 {
 
 fn period(params: &HashMap<String, f64>, key: &str, default: f64) -> usize {
     let value = get(params, key, default).max(1.0);
-    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "periods are small positive integers")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "periods are small positive integers"
+    )]
     let period = value as usize;
     period
 }
@@ -172,7 +179,8 @@ fn compute_one(instance: &Instance, data: &Ohlcv) -> Vec<OutputSeries> {
         "ema" => vec![out("ema", &ema(close, period(params, "period", 20.0)))],
         "wma" => vec![out("wma", &wma(close, period(params, "period", 20.0)))],
         "bollinger" => {
-            let Bollinger { middle, upper, lower } = bollinger(close, period(params, "period", 20.0), get(params, "mult", 2.0));
+            let Bollinger { middle, upper, lower } =
+                bollinger(close, period(params, "period", 20.0), get(params, "mult", 2.0));
             vec![out("upper", &upper), out("middle", &middle), out("lower", &lower)]
         }
         "vwap" => vec![out("vwap", &vwap(high, low, close, volume))],
@@ -181,13 +189,21 @@ fn compute_one(instance: &Instance, data: &Ohlcv) -> Vec<OutputSeries> {
             vec![out("upper", &upper), out("middle", &middle), out("lower", &lower)]
         }
         "supertrend" => {
-            let Supertrend { line, .. } = supertrend(high, low, close, period(params, "period", 10.0), get(params, "mult", 3.0));
+            let Supertrend { line, .. } =
+                supertrend(high, low, close, period(params, "period", 10.0), get(params, "mult", 3.0));
             vec![out("supertrend", &line)]
         }
-        "psar" => vec![out("psar", &psar(high, low, get(params, "step", 0.02), get(params, "max", 0.2)))],
+        "psar" => vec![out(
+            "psar",
+            &psar(high, low, get(params, "step", 0.02), get(params, "max", 0.2)),
+        )],
         "rsi" => vec![out("rsi", &rsi(close, period(params, "period", 14.0)))],
         "macd" => {
-            let Macd { macd: line, signal, histogram } = macd(
+            let Macd {
+                macd: line,
+                signal,
+                histogram,
+            } = macd(
                 close,
                 period(params, "fast", 12.0),
                 period(params, "slow", 26.0),
@@ -200,11 +216,21 @@ fn compute_one(instance: &Instance, data: &Ohlcv) -> Vec<OutputSeries> {
                 stochastic(high, low, close, period(params, "period", 14.0), period(params, "smoothD", 3.0));
             vec![out("k", &k), out("d", &d)]
         }
-        "williams" => vec![out("williams", &williams_r(high, low, close, period(params, "period", 14.0)))],
+        "williams" => vec![out(
+            "williams",
+            &williams_r(high, low, close, period(params, "period", 14.0)),
+        )],
         "cci" => vec![out("cci", &cci(high, low, close, period(params, "period", 20.0)))],
-        "mfi" => vec![out("mfi", &mfi(high, low, close, volume, period(params, "period", 14.0)))],
+        "mfi" => vec![out(
+            "mfi",
+            &mfi(high, low, close, volume, period(params, "period", 14.0)),
+        )],
         "adx" => {
-            let Adx { adx: line, plus_di, minus_di } = adx(high, low, close, period(params, "period", 14.0));
+            let Adx {
+                adx: line,
+                plus_di,
+                minus_di,
+            } = adx(high, low, close, period(params, "period", 14.0));
             vec![out("adx", &line), out("plusDi", &plus_di), out("minusDi", &minus_di)]
         }
         "atr" => vec![out("atr", &atr(high, low, close, period(params, "period", 14.0)))],
@@ -222,7 +248,13 @@ fn compute_divergences(instance: &Instance, data: &Ohlcv) -> Vec<DivergenceSpan>
     let oscillator = match instance.id.as_str() {
         "rsiDivergence" => rsi(close, period(params, "period", 14.0)),
         "macdDivergence" => {
-            macd(close, period(params, "fast", 12.0), period(params, "slow", 26.0), period(params, "signal", 9.0)).macd
+            macd(
+                close,
+                period(params, "fast", 12.0),
+                period(params, "slow", 26.0),
+                period(params, "signal", 9.0),
+            )
+            .macd
         }
         _ => return Vec::new(),
     };
@@ -256,15 +288,35 @@ pub fn compute(instances: &[Instance], data: &Ohlcv) -> Vec<InstanceOutput> {
 }
 
 fn param(key: &str, label: &str, default: f64, min: f64, max: f64, step: f64) -> Param {
-    Param { key: key.to_owned(), label: label.to_owned(), default, min, max, step }
+    Param {
+        key: key.to_owned(),
+        label: label.to_owned(),
+        default,
+        min,
+        max,
+        step,
+    }
 }
 
 fn line(key: &str, label: &str, color: &str) -> Output {
-    Output { key: key.to_owned(), label: label.to_owned(), kind: OutputKind::Line, color: color.to_owned() }
+    Output {
+        key: key.to_owned(),
+        label: label.to_owned(),
+        kind: OutputKind::Line,
+        color: color.to_owned(),
+    }
 }
 
 fn descriptor(id: &str, label: &str, target: Target, params: Vec<Param>, outputs: Vec<Output>) -> Descriptor {
-    Descriptor { id: id.to_owned(), label: label.to_owned(), target, params, outputs, guides: Vec::new(), range: None }
+    Descriptor {
+        id: id.to_owned(),
+        label: label.to_owned(),
+        target,
+        params,
+        outputs,
+        guides: Vec::new(),
+        range: None,
+    }
 }
 
 /// The registry of indicators the chart can toggle, with conventional defaults.
@@ -272,9 +324,27 @@ fn descriptor(id: &str, label: &str, target: Target, params: Vec<Param>, outputs
 pub fn descriptors() -> Vec<Descriptor> {
     let period = |default: f64| param("period", "Period", default, 1.0, 500.0, 1.0);
     vec![
-        descriptor("sma", "SMA", Target::Overlay, vec![period(20.0)], vec![line("sma", "SMA", "#3b82f6")]),
-        descriptor("ema", "EMA", Target::Overlay, vec![period(20.0)], vec![line("ema", "EMA", "#f59e0b")]),
-        descriptor("wma", "WMA", Target::Overlay, vec![period(20.0)], vec![line("wma", "WMA", "#a855f7")]),
+        descriptor(
+            "sma",
+            "SMA",
+            Target::Overlay,
+            vec![period(20.0)],
+            vec![line("sma", "SMA", "#3b82f6")],
+        ),
+        descriptor(
+            "ema",
+            "EMA",
+            Target::Overlay,
+            vec![period(20.0)],
+            vec![line("ema", "EMA", "#f59e0b")],
+        ),
+        descriptor(
+            "wma",
+            "WMA",
+            Target::Overlay,
+            vec![period(20.0)],
+            vec![line("wma", "WMA", "#a855f7")],
+        ),
         descriptor(
             "bollinger",
             "Bollinger Bands",
@@ -286,7 +356,13 @@ pub fn descriptors() -> Vec<Descriptor> {
                 line("lower", "Lower", "#6b7280"),
             ],
         ),
-        descriptor("vwap", "VWAP", Target::Overlay, Vec::new(), vec![line("vwap", "VWAP", "#eab308")]),
+        descriptor(
+            "vwap",
+            "VWAP",
+            Target::Overlay,
+            Vec::new(),
+            vec![line("vwap", "VWAP", "#eab308")],
+        ),
         descriptor(
             "donchian",
             "Donchian Channel",
@@ -302,20 +378,32 @@ pub fn descriptors() -> Vec<Descriptor> {
             "supertrend",
             "Supertrend",
             Target::Overlay,
-            vec![param("period", "ATR period", 10.0, 1.0, 100.0, 1.0), param("mult", "Multiplier", 3.0, 0.5, 10.0, 0.1)],
+            vec![
+                param("period", "ATR period", 10.0, 1.0, 100.0, 1.0),
+                param("mult", "Multiplier", 3.0, 0.5, 10.0, 0.1),
+            ],
             vec![line("supertrend", "Supertrend", "#22c55e")],
         ),
         descriptor(
             "psar",
             "Parabolic SAR",
             Target::Overlay,
-            vec![param("step", "Step", 0.02, 0.01, 0.2, 0.01), param("max", "Max step", 0.2, 0.05, 1.0, 0.05)],
+            vec![
+                param("step", "Step", 0.02, 0.01, 0.2, 0.01),
+                param("max", "Max step", 0.2, 0.05, 1.0, 0.05),
+            ],
             vec![line("psar", "PSAR", "#e879f9")],
         ),
         Descriptor {
             guides: vec![30.0, 70.0],
             range: Some([0.0, 100.0]),
-            ..descriptor("rsi", "RSI", Target::Pane, vec![period(14.0)], vec![line("rsi", "RSI", "#c084fc")])
+            ..descriptor(
+                "rsi",
+                "RSI",
+                Target::Pane,
+                vec![period(14.0)],
+                vec![line("rsi", "RSI", "#c084fc")],
+            )
         },
         {
             let mut macd = descriptor(
@@ -352,16 +440,34 @@ pub fn descriptors() -> Vec<Descriptor> {
         Descriptor {
             guides: vec![-20.0, -80.0],
             range: Some([-100.0, 0.0]),
-            ..descriptor("williams", "Williams %R", Target::Pane, vec![period(14.0)], vec![line("williams", "%R", "#c084fc")])
+            ..descriptor(
+                "williams",
+                "Williams %R",
+                Target::Pane,
+                vec![period(14.0)],
+                vec![line("williams", "%R", "#c084fc")],
+            )
         },
         Descriptor {
             guides: vec![-100.0, 100.0],
-            ..descriptor("cci", "CCI", Target::Pane, vec![period(20.0)], vec![line("cci", "CCI", "#c084fc")])
+            ..descriptor(
+                "cci",
+                "CCI",
+                Target::Pane,
+                vec![period(20.0)],
+                vec![line("cci", "CCI", "#c084fc")],
+            )
         },
         Descriptor {
             guides: vec![20.0, 80.0],
             range: Some([0.0, 100.0]),
-            ..descriptor("mfi", "MFI", Target::Pane, vec![period(14.0)], vec![line("mfi", "MFI", "#22c55e")])
+            ..descriptor(
+                "mfi",
+                "MFI",
+                Target::Pane,
+                vec![period(14.0)],
+                vec![line("mfi", "MFI", "#22c55e")],
+            )
         },
         Descriptor {
             range: Some([0.0, 100.0]),
@@ -377,7 +483,13 @@ pub fn descriptors() -> Vec<Descriptor> {
                 ],
             )
         },
-        descriptor("atr", "ATR", Target::Pane, vec![period(14.0)], vec![line("atr", "ATR", "#f59e0b")]),
+        descriptor(
+            "atr",
+            "ATR",
+            Target::Pane,
+            vec![period(14.0)],
+            vec![line("atr", "ATR", "#f59e0b")],
+        ),
         descriptor("obv", "OBV", Target::Pane, Vec::new(), vec![line("obv", "OBV", "#22c55e")]),
         descriptor(
             "rsiDivergence",
@@ -421,7 +533,18 @@ mod tests {
     fn descriptors_cover_every_indicator() {
         let ids: Vec<String> = descriptors().into_iter().map(|descriptor| descriptor.id).collect();
         assert_eq!(ids.len(), 19);
-        for id in ["sma", "bollinger", "vwap", "supertrend", "psar", "rsi", "macd", "obv", "rsiDivergence", "macdDivergence"] {
+        for id in [
+            "sma",
+            "bollinger",
+            "vwap",
+            "supertrend",
+            "psar",
+            "rsi",
+            "macd",
+            "obv",
+            "rsiDivergence",
+            "macdDivergence",
+        ] {
             assert!(ids.iter().any(|candidate| candidate == id), "missing descriptor {id}");
         }
     }
@@ -429,11 +552,20 @@ mod tests {
     #[test]
     fn every_descriptor_computes_full_length_outputs() {
         let values = series();
-        let data = Ohlcv { high: &values, low: &values, close: &values, volume: &values };
+        let data = Ohlcv {
+            high: &values,
+            low: &values,
+            close: &values,
+            volume: &values,
+        };
         for descriptor in descriptors() {
             let instance = Instance {
                 id: descriptor.id.clone(),
-                params: descriptor.params.iter().map(|param| (param.key.clone(), param.default)).collect(),
+                params: descriptor
+                    .params
+                    .iter()
+                    .map(|param| (param.key.clone(), param.default))
+                    .collect(),
             };
             let computed = compute(&[instance], &data);
             let outputs = &computed.first().expect("one instance").outputs;
@@ -447,8 +579,19 @@ mod tests {
     #[test]
     fn unknown_id_yields_no_outputs() {
         let values = series();
-        let data = Ohlcv { high: &values, low: &values, close: &values, volume: &values };
-        let computed = compute(&[Instance { id: "nope".to_owned(), params: HashMap::new() }], &data);
+        let data = Ohlcv {
+            high: &values,
+            low: &values,
+            close: &values,
+            volume: &values,
+        };
+        let computed = compute(
+            &[Instance {
+                id: "nope".to_owned(),
+                params: HashMap::new(),
+            }],
+            &data,
+        );
         let output = computed.first().expect("one instance");
         assert!(output.outputs.is_empty() && output.divergences.is_empty());
     }
@@ -456,10 +599,22 @@ mod tests {
     #[test]
     fn rsi_divergence_matches_detect_divergences_and_has_no_series() {
         use indicators::{detect_divergences, rsi};
-        let close: Vec<f64> =
-            (0..120).map(|index| 100.0 + (f64::from(index) / 7.0).sin() * 15.0 - f64::from(index) * 0.05).collect();
-        let data = Ohlcv { high: &close, low: &close, close: &close, volume: &close };
-        let computed = compute(&[Instance { id: "rsiDivergence".to_owned(), params: HashMap::new() }], &data);
+        let close: Vec<f64> = (0..120)
+            .map(|index| 100.0 + (f64::from(index) / 7.0).sin() * 15.0 - f64::from(index) * 0.05)
+            .collect();
+        let data = Ohlcv {
+            high: &close,
+            low: &close,
+            close: &close,
+            volume: &close,
+        };
+        let computed = compute(
+            &[Instance {
+                id: "rsiDivergence".to_owned(),
+                params: HashMap::new(),
+            }],
+            &data,
+        );
         let output = computed.first().expect("one instance");
         assert!(output.outputs.is_empty(), "a divergence indicator has no series outputs");
         let expected = detect_divergences(&close, &rsi(&close, 14), 5, 5, 60);

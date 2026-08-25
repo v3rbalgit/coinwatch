@@ -39,8 +39,16 @@ pub fn supertrend(high: &[f64], low: &[f64], close: &[f64], period: usize, mult:
         let basic_lower = mid - mult * atr;
 
         let (upper, lower, up) = if initialized {
-            let upper = if basic_upper < prev_upper || prev_close > prev_upper { basic_upper } else { prev_upper };
-            let lower = if basic_lower > prev_lower || prev_close < prev_lower { basic_lower } else { prev_lower };
+            let upper = if basic_upper < prev_upper || prev_close > prev_upper {
+                basic_upper
+            } else {
+                prev_upper
+            };
+            let lower = if basic_lower > prev_lower || prev_close < prev_lower {
+                basic_lower
+            } else {
+                prev_lower
+            };
             // Stay in trend until price breaks the active band, then flip.
             let up = if prev_up { *close >= lower } else { *close > upper };
             (upper, lower, up)

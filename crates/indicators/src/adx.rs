@@ -61,8 +61,16 @@ pub fn adx(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Adx {
             smoothed_minus = smoothed_minus - smoothed_minus / period_f + minus;
         }
         let bar = offset + 1;
-        let plus_di = if smoothed_tr > 0.0 { 100.0 * smoothed_plus / smoothed_tr } else { 0.0 };
-        let minus_di = if smoothed_tr > 0.0 { 100.0 * smoothed_minus / smoothed_tr } else { 0.0 };
+        let plus_di = if smoothed_tr > 0.0 {
+            100.0 * smoothed_plus / smoothed_tr
+        } else {
+            0.0
+        };
+        let minus_di = if smoothed_tr > 0.0 {
+            100.0 * smoothed_minus / smoothed_tr
+        } else {
+            0.0
+        };
         if let Some(cell) = result.plus_di.get_mut(bar) {
             *cell = Some(plus_di);
         }
@@ -70,7 +78,11 @@ pub fn adx(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Adx {
             *cell = Some(minus_di);
         }
         let di_sum = plus_di + minus_di;
-        dxs.push(if di_sum > 0.0 { 100.0 * (plus_di - minus_di).abs() / di_sum } else { 0.0 });
+        dxs.push(if di_sum > 0.0 {
+            100.0 * (plus_di - minus_di).abs() / di_sum
+        } else {
+            0.0
+        });
     }
 
     // ADX = Wilder average of DX. First DX is at bar `period`, so the first ADX

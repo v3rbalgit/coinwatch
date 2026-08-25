@@ -11,7 +11,11 @@ pub fn wma(values: &[f64], period: usize) -> Vec<Option<f64>> {
     }
     let weight_total = (period * (period + 1) / 2) as f64;
     for (index, window) in values.windows(period).enumerate() {
-        let weighted: f64 = window.iter().enumerate().map(|(offset, value)| (offset + 1) as f64 * value).sum();
+        let weighted: f64 = window
+            .iter()
+            .enumerate()
+            .map(|(offset, value)| (offset + 1) as f64 * value)
+            .sum();
         if let Some(slot) = out.get_mut(index + period - 1) {
             *slot = Some(weighted / weight_total);
         }

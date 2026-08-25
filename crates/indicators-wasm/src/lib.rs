@@ -87,7 +87,8 @@ pub fn analyze(closes: &[f64], config: &Config) -> Analysis {
 
     let mut divergences = Vec::new();
     for (source, oscillator) in [(Source::Rsi, &rsi_series), (Source::Macd, &macd_out.macd)] {
-        for divergence in detect_divergences(closes, oscillator, config.pivot_left, config.pivot_right, config.max_gap) {
+        for divergence in detect_divergences(closes, oscillator, config.pivot_left, config.pivot_right, config.max_gap)
+        {
             divergences.push(DivergenceOut {
                 source,
                 kind: divergence.kind,
@@ -111,7 +112,8 @@ pub fn analyze(closes: &[f64], config: &Config) -> Analysis {
 /// plain JS object (indicator arrays use `NaN` for undefined bars).
 #[wasm_bindgen(js_name = analyzeSeries)]
 pub fn analyze_series(closes: &[f64], config: JsValue) -> Result<JsValue, JsValue> {
-    let config: Config = serde_wasm_bindgen::from_value(config).map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let config: Config =
+        serde_wasm_bindgen::from_value(config).map_err(|error| JsValue::from_str(&error.to_string()))?;
     let analysis = analyze(closes, &config);
     serde_wasm_bindgen::to_value(&analysis).map_err(|error| JsValue::from_str(&error.to_string()))
 }
@@ -133,7 +135,12 @@ pub fn compute_indicators(
 ) -> Result<JsValue, JsValue> {
     let instances: Vec<engine::Instance> =
         serde_wasm_bindgen::from_value(instances).map_err(|error| JsValue::from_str(&error.to_string()))?;
-    let data = engine::Ohlcv { high, low, close, volume };
+    let data = engine::Ohlcv {
+        high,
+        low,
+        close,
+        volume,
+    };
     let outputs = engine::compute(&instances, &data);
     serde_wasm_bindgen::to_value(&outputs).map_err(|error| JsValue::from_str(&error.to_string()))
 }
@@ -166,6 +173,9 @@ mod tests {
     #[test]
     fn clean_trend_has_no_divergence() {
         let closes: Vec<f64> = (1..=200).map(f64::from).collect();
-        assert!(analyze(&closes, &config()).divergences.is_empty(), "a monotonic trend must not diverge");
+        assert!(
+            analyze(&closes, &config()).divergences.is_empty(),
+            "a monotonic trend must not diverge"
+        );
     }
 }

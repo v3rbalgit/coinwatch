@@ -34,7 +34,11 @@ pub fn stochastic(high: &[f64], low: &[f64], close: &[f64], period: usize, smoot
         let highest = highs.iter().copied().fold(f64::MIN, f64::max);
         let lowest = lows.iter().copied().fold(f64::MAX, f64::min);
         let range = highest - lowest;
-        let value = if range > 0.0 { 100.0 * (close - lowest) / range } else { 50.0 };
+        let value = if range > 0.0 {
+            100.0 * (close - lowest) / range
+        } else {
+            50.0
+        };
         k_dense.push(value);
         if let Some(cell) = result.k.get_mut(slot) {
             *cell = Some(value);

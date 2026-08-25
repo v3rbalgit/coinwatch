@@ -71,7 +71,11 @@ mod tests {
     fn mfi_saturates_high_on_a_steady_advance() {
         let price: Vec<f64> = (1..=20).map(f64::from).collect();
         let volume = [100.0; 20];
-        let last = mfi(&price, &price, &price, &volume, 5).into_iter().flatten().last().expect("mfi");
+        let last = mfi(&price, &price, &price, &volume, 5)
+            .into_iter()
+            .flatten()
+            .last()
+            .expect("mfi");
         assert!((last - 100.0).abs() < 1e-9, "a pure advance should give MFI 100, got {last}");
     }
 

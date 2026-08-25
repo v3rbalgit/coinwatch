@@ -16,7 +16,9 @@ pub fn vwap(high: &[f64], low: &[f64], close: &[f64], volume: &[f64]) -> Vec<Opt
         let typical = (high + low + close) / 3.0;
         cumulative_pv += typical * volume;
         cumulative_volume += volume;
-        if cumulative_volume > 0.0 && let Some(slot) = out.get_mut(index) {
+        if cumulative_volume > 0.0
+            && let Some(slot) = out.get_mut(index)
+        {
             *slot = Some(cumulative_pv / cumulative_volume);
         }
     }
