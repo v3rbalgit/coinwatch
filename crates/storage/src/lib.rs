@@ -1,6 +1,9 @@
-//! SQLite-backed local store: candle persistence (the [`CandleStore`] port) plus
-//! user watchlists. OHLCV values are text for exact [`Decimal`] precision; open
-//! times are epoch milliseconds. The same store can back onto Postgres later.
+//! SQLite-backed local store: candle persistence (the [`CandleStore`] port),
+//! watchlists, saved signals, indicator presets, logos, and UI settings.
+//!
+//! OHLCV values are text for exact [`rust_decimal::Decimal`] precision; open times are epoch
+//! milliseconds. Signal definitions and preset params remain opaque JSON here so
+//! storage stays independent of the product model that validates them.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -8,9 +11,9 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use chrono::DateTime;
 use domain::{Candle, Timeframe};
-use rust_decimal::Decimal;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteRow};
-use sqlx::{Row, SqlitePool};
+use sqlx::SqlitePool;
+use sqlx::migrate::Migrator;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 
 /// A persisted candle series for one (coin, timeframe), oldest candle first.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,12 +35,94 @@ pub struct ListView {
     pub coins: Vec<String>,
 }
 
+/// One saved signal catalog entry. `definition` is validated JSON owned by the
+/// signals layer, kept opaque here to avoid reversing the crate dependency graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalRecord {
+    /// Stable id used by future alerts and references.
+    pub id: String,
+    /// Unique user-facing name.
+    pub name: String,
+    /// Serialized signal definition.
+    pub definition: String,
+}
+
+/// One named parameter preset for an indicator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndicatorPresetRecord {
+    /// Stable preset id.
+    pub id: String,
+    /// Indicator descriptor id whose params this preset configures.
+    pub indicator_id: String,
+    /// Name unique within that indicator.
+    pub name: String,
+    /// Serialized parameter map.
+    pub params: String,
+}
+
+struct CandleGroupRow {
+    coin: String,
+    timeframe: String,
+}
+
+struct CandleRow {
+    open_time: i64,
+    open: String,
+    high: String,
+    low: String,
+    close: String,
+    volume: String,
+}
+
 /// A store-backend failure.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     /// The database rejected the operation.
     #[error(transparent)]
     Database(#[from] sqlx::Error),
+    /// A schema migration failed.
+    #[error(transparent)]
+    Migration(#[from] sqlx::migrate::MigrateError),
+    /// Another signal already owns the requested catalog name.
+    #[error("a signal named '{0}' already exists")]
+    DuplicateSignalName(String),
+    /// Another preset for the same indicator already owns the requested name.
+    #[error("a preset named '{name}' already exists for indicator '{indicator_id}'")]
+    DuplicatePresetName {
+        /// Indicator descriptor id.
+        indicator_id: String,
+        /// Conflicting preset name.
+        name: String,
+    },
+    /// SQLite opened the file but its integrity check failed. The file is left in
+    /// place so user data can be recovered explicitly.
+    #[error("database at '{}' failed its integrity check", .0.display())]
+    Integrity(PathBuf),
+    /// A cached candle row contains an invalid timestamp or decimal value.
+    #[error("cached candle row at {0} contains invalid data")]
+    InvalidCandleRow(i64),
+}
+
+impl TryFrom<CandleRow> for Candle {
+    type Error = StoreError;
+
+    fn try_from(row: CandleRow) -> Result<Self, Self::Error> {
+        let open_time =
+            DateTime::from_timestamp_millis(row.open_time).ok_or(StoreError::InvalidCandleRow(row.open_time))?;
+        let open = row.open.parse().map_err(|_| StoreError::InvalidCandleRow(row.open_time))?;
+        let high = row.high.parse().map_err(|_| StoreError::InvalidCandleRow(row.open_time))?;
+        let low = row.low.parse().map_err(|_| StoreError::InvalidCandleRow(row.open_time))?;
+        let close = row.close.parse().map_err(|_| StoreError::InvalidCandleRow(row.open_time))?;
+        let volume = row.volume.parse().map_err(|_| StoreError::InvalidCandleRow(row.open_time))?;
+        Ok(Self {
+            open_time,
+            open,
+            high,
+            low,
+            close,
+            volume,
+        })
+    }
 }
 
 /// A durable candle cache the sync seeds from on startup and writes through.
@@ -51,27 +136,7 @@ pub trait CandleStore: Send + Sync {
     async fn save(&self, coin: &str, timeframe: Timeframe, candles: &[Candle]) -> Result<(), StoreError>;
 }
 
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS candles (
-    coin      TEXT    NOT NULL,
-    timeframe TEXT    NOT NULL,
-    open_time INTEGER NOT NULL,
-    open      TEXT    NOT NULL,
-    high      TEXT    NOT NULL,
-    low       TEXT    NOT NULL,
-    close     TEXT    NOT NULL,
-    volume    TEXT    NOT NULL,
-    PRIMARY KEY (coin, timeframe, open_time)
-) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS lists (name TEXT PRIMARY KEY) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS list_members (
-    list TEXT NOT NULL,
-    coin TEXT NOT NULL,
-    PRIMARY KEY (list, coin)
-) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS logos (coin TEXT PRIMARY KEY, svg TEXT NOT NULL) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
-";
+static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 /// The local SQLite store.
 pub struct SqliteStore {
@@ -79,20 +144,18 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
-    /// Open (creating if missing) the database at `path`. A corrupt file is
-    /// discarded and recreated — candles are regenerable and lists are cheap.
+    /// Open (creating if missing) the database at `path`.
+    ///
+    /// A corrupt file is never deleted automatically: the database now contains
+    /// durable user-authored state, so preserving it for recovery is safer than
+    /// silently recreating an empty store.
     pub async fn open(path: &Path) -> Result<Self, StoreError> {
-        if let Ok(store) = Self::connect(path).await {
-            if store.is_healthy().await {
-                return Ok(store);
-            }
-            drop(store);
-            tracing::warn!(path = %path.display(), "local database failed its integrity check; recreating");
-        } else {
-            tracing::warn!(path = %path.display(), "local database could not be opened; recreating");
+        let store = Self::connect(path).await?;
+        if !store.is_healthy().await? {
+            return Err(StoreError::Integrity(path.to_owned()));
         }
-        remove_db_files(path);
-        Self::connect(path).await
+        MIGRATOR.run(&store.pool).await?;
+        Ok(store)
     }
 
     async fn connect(path: &Path) -> Result<Self, StoreError> {
@@ -101,23 +164,20 @@ impl SqliteStore {
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal);
         let pool = SqlitePool::connect_with(options).await?;
-        sqlx::raw_sql(SCHEMA).execute(&pool).await?;
         Ok(Self { pool })
     }
 
-    async fn is_healthy(&self) -> bool {
-        matches!(
-            sqlx::query_scalar::<_, String>("PRAGMA integrity_check").fetch_one(&self.pool).await,
-            Ok(result) if result == "ok"
-        )
+    async fn is_healthy(&self) -> Result<bool, StoreError> {
+        let result = sqlx::query_scalar!("PRAGMA integrity_check").fetch_one(&self.pool).await?;
+        Ok(result.as_deref() == Some("ok"))
     }
 
     /// Every watchlist with its coins, sorted by name then coin.
     pub async fn lists(&self) -> Result<Vec<ListView>, StoreError> {
-        let names: Vec<String> = sqlx::query_scalar("SELECT name FROM lists ORDER BY name")
+        let names = sqlx::query_scalar!("SELECT name FROM lists ORDER BY name")
             .fetch_all(&self.pool)
             .await?;
-        let members: Vec<(String, String)> = sqlx::query_as("SELECT list, coin FROM list_members ORDER BY coin")
+        let members = sqlx::query!("SELECT list, coin FROM list_members ORDER BY coin")
             .fetch_all(&self.pool)
             .await?;
 
@@ -128,9 +188,9 @@ impl SqliteStore {
                 coins: Vec::new(),
             })
             .collect();
-        for (list, coin) in members {
-            if let Some(view) = views.iter_mut().find(|view| view.name == list) {
-                view.coins.push(coin);
+        for member in members {
+            if let Some(view) = views.iter_mut().find(|view| view.name == member.list) {
+                view.coins.push(member.coin);
             }
         }
         Ok(views)
@@ -138,8 +198,7 @@ impl SqliteStore {
 
     /// Create an empty list (a no-op if it already exists).
     pub async fn create_list(&self, name: &str) -> Result<(), StoreError> {
-        sqlx::query("INSERT OR IGNORE INTO lists (name) VALUES (?)")
-            .bind(name)
+        sqlx::query!("INSERT OR IGNORE INTO lists (name) VALUES (?)", name)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -148,14 +207,10 @@ impl SqliteStore {
     /// Delete a list and its members.
     pub async fn delete_list(&self, name: &str) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM list_members WHERE list = ?")
-            .bind(name)
+        sqlx::query!("DELETE FROM list_members WHERE list = ?", name)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("DELETE FROM lists WHERE name = ?")
-            .bind(name)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query!("DELETE FROM lists WHERE name = ?", name).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -163,13 +218,10 @@ impl SqliteStore {
     /// Add a coin to a list, creating the list if it does not exist.
     pub async fn add_to_list(&self, list: &str, coin: &str) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("INSERT OR IGNORE INTO lists (name) VALUES (?)")
-            .bind(list)
+        sqlx::query!("INSERT OR IGNORE INTO lists (name) VALUES (?)", list)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("INSERT OR IGNORE INTO list_members (list, coin) VALUES (?, ?)")
-            .bind(list)
-            .bind(coin)
+        sqlx::query!("INSERT OR IGNORE INTO list_members (list, coin) VALUES (?, ?)", list, coin)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -178,9 +230,7 @@ impl SqliteStore {
 
     /// Remove a coin from a list.
     pub async fn remove_from_list(&self, list: &str, coin: &str) -> Result<(), StoreError> {
-        sqlx::query("DELETE FROM list_members WHERE list = ? AND coin = ?")
-            .bind(list)
-            .bind(coin)
+        sqlx::query!("DELETE FROM list_members WHERE list = ? AND coin = ?", list, coin)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -188,20 +238,19 @@ impl SqliteStore {
 
     /// Every cached (coin, svg) logo.
     pub async fn logos(&self) -> Result<Vec<(String, String)>, StoreError> {
-        Ok(sqlx::query_as("SELECT coin, svg FROM logos").fetch_all(&self.pool).await?)
+        let rows = sqlx::query!("SELECT coin, svg FROM logos").fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|row| (row.coin, row.svg)).collect())
     }
 
     /// Coins whose logo is already cached.
     pub async fn logo_coins(&self) -> Result<HashSet<String>, StoreError> {
-        let coins: Vec<String> = sqlx::query_scalar("SELECT coin FROM logos").fetch_all(&self.pool).await?;
+        let coins = sqlx::query_scalar!("SELECT coin FROM logos").fetch_all(&self.pool).await?;
         Ok(coins.into_iter().collect())
     }
 
     /// Cache a coin's SVG logo.
     pub async fn cache_logo(&self, coin: &str, svg: &str) -> Result<(), StoreError> {
-        sqlx::query("INSERT OR REPLACE INTO logos (coin, svg) VALUES (?, ?)")
-            .bind(coin)
-            .bind(svg)
+        sqlx::query!("INSERT OR REPLACE INTO logos (coin, svg) VALUES (?, ?)", coin, svg)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -209,17 +258,98 @@ impl SqliteStore {
 
     /// Read a persisted UI/app setting (an opaque string — JSON or scalar), if set.
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>, StoreError> {
-        Ok(sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
-            .bind(key)
+        Ok(sqlx::query_scalar!("SELECT value FROM settings WHERE key = ?", key)
             .fetch_optional(&self.pool)
             .await?)
     }
 
     /// Insert-or-replace a persisted UI/app setting.
     pub async fn set_setting(&self, key: &str, value: &str) -> Result<(), StoreError> {
-        sqlx::query("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
-            .bind(key)
-            .bind(value)
+        sqlx::query!("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", key, value)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Every saved signal, sorted by name (case-insensitive) then id.
+    pub async fn signals(&self) -> Result<Vec<SignalRecord>, StoreError> {
+        Ok(sqlx::query_as!(
+            SignalRecord,
+            "SELECT id, name, definition FROM signals ORDER BY name COLLATE NOCASE, id"
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// One saved signal by stable id.
+    pub async fn signal(&self, id: &str) -> Result<Option<SignalRecord>, StoreError> {
+        Ok(
+            sqlx::query_as!(SignalRecord, "SELECT id, name, definition FROM signals WHERE id = ?", id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    /// Insert a signal or update the row with the same id. Names remain unique
+    /// across the catalog; a conflict returns [`StoreError::DuplicateSignalName`].
+    pub async fn save_signal(&self, id: &str, name: &str, definition: &str) -> Result<(), StoreError> {
+        sqlx::query!(
+            "INSERT INTO signals (id, name, definition) VALUES (?, ?, ?) \
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name, definition = excluded.definition",
+            id,
+            name,
+            definition,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|error| map_signal_write_error(error, name))?;
+        Ok(())
+    }
+
+    /// Delete a saved signal by id (a no-op if it does not exist).
+    pub async fn delete_signal(&self, id: &str) -> Result<(), StoreError> {
+        sqlx::query!("DELETE FROM signals WHERE id = ?", id).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Every indicator preset, sorted by indicator then name (case-insensitive).
+    pub async fn indicator_presets(&self) -> Result<Vec<IndicatorPresetRecord>, StoreError> {
+        Ok(sqlx::query_as!(
+            IndicatorPresetRecord,
+            "SELECT id, indicator_id, name, params FROM indicator_presets \
+             ORDER BY indicator_id, name COLLATE NOCASE, id"
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Insert a preset or update the row with the same id. Names are unique only
+    /// within one indicator.
+    pub async fn save_indicator_preset(
+        &self,
+        id: &str,
+        indicator_id: &str,
+        name: &str,
+        params: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query!(
+            "INSERT INTO indicator_presets (id, indicator_id, name, params) VALUES (?, ?, ?, ?) \
+             ON CONFLICT(id) DO UPDATE SET \
+                 indicator_id = excluded.indicator_id, name = excluded.name, params = excluded.params",
+            id,
+            indicator_id,
+            name,
+            params,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|error| map_preset_write_error(error, indicator_id, name))?;
+        Ok(())
+    }
+
+    /// Delete an indicator preset by id (a no-op if it does not exist).
+    pub async fn delete_indicator_preset(&self, id: &str) -> Result<(), StoreError> {
+        sqlx::query!("DELETE FROM indicator_presets WHERE id = ?", id)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -235,35 +365,41 @@ impl SqliteStore {
         limit: usize,
     ) -> Result<Vec<Candle>, StoreError> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows = sqlx::query(
+        let rows = sqlx::query_as!(
+            CandleRow,
             "SELECT open_time, open, high, low, close, volume FROM candles \
              WHERE coin = ? AND timeframe = ? AND open_time < ? \
              ORDER BY open_time DESC LIMIT ?",
+            coin,
+            timeframe.as_hl(),
+            before_ms,
+            limit,
         )
-        .bind(coin)
-        .bind(timeframe.as_hl())
-        .bind(before_ms)
-        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
 
-        let mut candles = Vec::with_capacity(rows.len());
-        for row in &rows {
-            if let Some(candle) = row_to_candle(row)? {
-                candles.push(candle);
-            }
-        }
+        let mut candles = rows.into_iter().map(Candle::try_from).collect::<Result<Vec<_>, _>>()?;
         candles.reverse();
         Ok(candles)
     }
 }
 
-/// Delete a SQLite database file and its WAL/SHM sidecars.
-fn remove_db_files(path: &Path) {
-    for suffix in ["", "-wal", "-shm"] {
-        let mut file = path.as_os_str().to_owned();
-        file.push(suffix);
-        let _ = std::fs::remove_file(PathBuf::from(file));
+fn map_signal_write_error(error: sqlx::Error, name: &str) -> StoreError {
+    if error.as_database_error().is_some_and(|database| database.is_unique_violation()) {
+        StoreError::DuplicateSignalName(name.to_owned())
+    } else {
+        StoreError::Database(error)
+    }
+}
+
+fn map_preset_write_error(error: sqlx::Error, indicator_id: &str, name: &str) -> StoreError {
+    if error.as_database_error().is_some_and(|database| database.is_unique_violation()) {
+        StoreError::DuplicatePresetName {
+            indicator_id: indicator_id.to_owned(),
+            name: name.to_owned(),
+        }
+    } else {
+        StoreError::Database(error)
     }
 }
 
@@ -274,38 +410,35 @@ impl CandleStore for SqliteStore {
             return Ok(Vec::new());
         }
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let groups = sqlx::query("SELECT DISTINCT coin, timeframe FROM candles ORDER BY coin, timeframe")
-            .fetch_all(&self.pool)
-            .await?;
+        let groups = sqlx::query_as!(
+            CandleGroupRow,
+            "SELECT DISTINCT coin, timeframe FROM candles ORDER BY coin, timeframe"
+        )
+        .fetch_all(&self.pool)
+        .await?;
         let mut series = Vec::with_capacity(groups.len());
 
         // Small primary-key range reads avoid both ranking the accumulated cache and
         // materializing every series' SQLx rows at once during startup.
-        for group in &groups {
-            let coin: &str = group.try_get("coin")?;
-            let interval: &str = group.try_get("timeframe")?;
-            let Some(timeframe) = Timeframe::from_hl(interval) else {
+        for group in groups {
+            let Some(timeframe) = Timeframe::from_hl(&group.timeframe) else {
                 continue;
             };
-            let rows = sqlx::query(
+            let rows = sqlx::query_as!(
+                CandleRow,
                 "SELECT open_time, open, high, low, close, volume FROM candles \
                  WHERE coin = ? AND timeframe = ? ORDER BY open_time DESC LIMIT ?",
+                group.coin,
+                group.timeframe,
+                limit,
             )
-            .bind(coin)
-            .bind(interval)
-            .bind(limit)
             .fetch_all(&self.pool)
             .await?;
-            let mut candles = Vec::with_capacity(rows.len());
-            for row in &rows {
-                if let Some(candle) = row_to_candle(row)? {
-                    candles.push(candle);
-                }
-            }
+            let mut candles = rows.into_iter().map(Candle::try_from).collect::<Result<Vec<_>, _>>()?;
             candles.reverse();
             if !candles.is_empty() {
                 series.push(CandleSeries {
-                    coin: coin.to_owned(),
+                    coin: group.coin,
                     timeframe,
                     candles,
                 });
@@ -317,19 +450,25 @@ impl CandleStore for SqliteStore {
     async fn save(&self, coin: &str, timeframe: Timeframe, candles: &[Candle]) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
         for candle in candles {
-            sqlx::query(
+            let open_time = candle.open_time.timestamp_millis();
+            let open = candle.open.to_string();
+            let high = candle.high.to_string();
+            let low = candle.low.to_string();
+            let close = candle.close.to_string();
+            let volume = candle.volume.to_string();
+            sqlx::query!(
                 "INSERT OR REPLACE INTO candles \
                  (coin, timeframe, open_time, open, high, low, close, volume) \
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                coin,
+                timeframe.as_hl(),
+                open_time,
+                open,
+                high,
+                low,
+                close,
+                volume,
             )
-            .bind(coin)
-            .bind(timeframe.as_hl())
-            .bind(candle.open_time.timestamp_millis())
-            .bind(candle.open.to_string())
-            .bind(candle.high.to_string())
-            .bind(candle.low.to_string())
-            .bind(candle.close.to_string())
-            .bind(candle.volume.to_string())
             .execute(&mut *tx)
             .await?;
         }
@@ -338,41 +477,12 @@ impl CandleStore for SqliteStore {
     }
 }
 
-/// Read one row into a candle; a malformed timestamp or decimal skips the row.
-fn row_to_candle(row: &SqliteRow) -> Result<Option<Candle>, StoreError> {
-    let open_ms: i64 = row.try_get("open_time")?;
-    let open: &str = row.try_get("open")?;
-    let high: &str = row.try_get("high")?;
-    let low: &str = row.try_get("low")?;
-    let close: &str = row.try_get("close")?;
-    let volume: &str = row.try_get("volume")?;
-
-    let (Some(open_time), Ok(open), Ok(high), Ok(low), Ok(close), Ok(volume)) = (
-        DateTime::from_timestamp_millis(open_ms),
-        open.parse::<Decimal>(),
-        high.parse::<Decimal>(),
-        low.parse::<Decimal>(),
-        close.parse::<Decimal>(),
-        volume.parse::<Decimal>(),
-    ) else {
-        return Ok(None);
-    };
-    Ok(Some(Candle {
-        open_time,
-        open,
-        high,
-        low,
-        close,
-        volume,
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
     use domain::{Candle, Timeframe};
 
-    use super::{CandleSeries, CandleStore, SqliteStore};
+    use super::{CandleRow, CandleSeries, CandleStore, IndicatorPresetRecord, SignalRecord, SqliteStore, StoreError};
 
     fn candle(hour: i64, open: &str, high: &str, low: &str, close: &str, volume: &str) -> Candle {
         Candle {
@@ -383,6 +493,19 @@ mod tests {
             close: close.parse().expect("close"),
             volume: volume.parse().expect("volume"),
         }
+    }
+
+    #[test]
+    fn malformed_candle_rows_are_explicit_errors() {
+        let row = CandleRow {
+            open_time: 0,
+            open: "not-a-decimal".to_owned(),
+            high: "1".to_owned(),
+            low: "1".to_owned(),
+            close: "1".to_owned(),
+            volume: "0".to_owned(),
+        };
+        assert!(matches!(Candle::try_from(row), Err(StoreError::InvalidCandleRow(0))));
     }
 
     #[tokio::test]
@@ -454,17 +577,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recreates_a_corrupt_database() {
+    async fn preserves_a_corrupt_database_for_recovery() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("cw.db");
-        std::fs::write(&path, b"this is not a sqlite database").expect("write garbage");
+        let original = b"this is not a sqlite database";
+        std::fs::write(&path, original).expect("write garbage");
 
-        let store = SqliteStore::open(&path).await.expect("open recovers from corruption");
-        store
-            .save("BTC", Timeframe::Hour1, &[candle(1, "1", "1", "1", "1", "0")])
-            .await
-            .expect("save");
-        assert_eq!(store.load_recent(100).await.expect("load").len(), 1);
+        assert!(SqliteStore::open(&path).await.is_err());
+        assert_eq!(std::fs::read(&path).expect("read preserved database"), original);
     }
 
     #[tokio::test]
@@ -519,6 +639,102 @@ mod tests {
             store.get_setting("chart.indicators").await.expect("get"),
             Some("[{\"id\":\"macd\"}]".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn signals_round_trip_update_and_delete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(&dir.path().join("cw.db")).await.expect("open");
+        assert!(store.signals().await.expect("empty catalog").is_empty());
+
+        store
+            .save_signal("signal-b", "Zeta", r#"{"version":1}"#)
+            .await
+            .expect("save zeta");
+        store
+            .save_signal("signal-a", "Alpha", r#"{"version":1}"#)
+            .await
+            .expect("save alpha");
+        assert_eq!(
+            store.signals().await.expect("list signals"),
+            vec![
+                SignalRecord {
+                    id: "signal-a".to_owned(),
+                    name: "Alpha".to_owned(),
+                    definition: r#"{"version":1}"#.to_owned(),
+                },
+                SignalRecord {
+                    id: "signal-b".to_owned(),
+                    name: "Zeta".to_owned(),
+                    definition: r#"{"version":1}"#.to_owned(),
+                },
+            ]
+        );
+
+        store
+            .save_signal("signal-b", "Beta", r#"{"version":2}"#)
+            .await
+            .expect("update signal");
+        assert_eq!(
+            store.signal("signal-b").await.expect("get signal"),
+            Some(SignalRecord {
+                id: "signal-b".to_owned(),
+                name: "Beta".to_owned(),
+                definition: r#"{"version":2}"#.to_owned(),
+            })
+        );
+
+        let duplicate = store.save_signal("signal-c", "alpha", "{}").await;
+        assert!(matches!(duplicate, Err(StoreError::DuplicateSignalName(name)) if name == "alpha"));
+
+        store.delete_signal("signal-a").await.expect("delete signal");
+        assert_eq!(store.signals().await.expect("list after delete").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn indicator_presets_are_unique_per_indicator() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(&dir.path().join("cw.db")).await.expect("open");
+
+        store
+            .save_indicator_preset("rsi-fast", "rsi", "Fast", r#"{"period":7}"#)
+            .await
+            .expect("save RSI");
+        store
+            .save_indicator_preset("ema-fast", "ema", "Fast", r#"{"period":10}"#)
+            .await
+            .expect("save EMA");
+        assert_eq!(
+            store.indicator_presets().await.expect("list presets"),
+            vec![
+                IndicatorPresetRecord {
+                    id: "ema-fast".to_owned(),
+                    indicator_id: "ema".to_owned(),
+                    name: "Fast".to_owned(),
+                    params: r#"{"period":10}"#.to_owned(),
+                },
+                IndicatorPresetRecord {
+                    id: "rsi-fast".to_owned(),
+                    indicator_id: "rsi".to_owned(),
+                    name: "Fast".to_owned(),
+                    params: r#"{"period":7}"#.to_owned(),
+                },
+            ]
+        );
+
+        store
+            .save_indicator_preset("rsi-fast", "rsi", "Quick", r#"{"period":5}"#)
+            .await
+            .expect("update preset");
+        let duplicate = store.save_indicator_preset("rsi-other", "rsi", "quick", "{}").await;
+        assert!(matches!(
+            duplicate,
+            Err(StoreError::DuplicatePresetName { indicator_id, name })
+                if indicator_id == "rsi" && name == "quick"
+        ));
+
+        store.delete_indicator_preset("rsi-fast").await.expect("delete preset");
+        assert_eq!(store.indicator_presets().await.expect("list after delete").len(), 1);
     }
 
     #[tokio::test]

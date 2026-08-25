@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM lists WHERE name = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "03af4eee31a34a4f4a962d8bca9fb7e079d0a9aff1fad85c08e4c5a3c50ce4ea"
+}

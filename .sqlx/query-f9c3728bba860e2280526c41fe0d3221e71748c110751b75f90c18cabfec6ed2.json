@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO indicator_presets (id, indicator_id, name, params) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET indicator_id = excluded.indicator_id, name = excluded.name, params = excluded.params",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "f9c3728bba860e2280526c41fe0d3221e71748c110751b75f90c18cabfec6ed2"
+}

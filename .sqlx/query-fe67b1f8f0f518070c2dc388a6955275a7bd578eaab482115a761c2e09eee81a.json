@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM list_members WHERE list = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "fe67b1f8f0f518070c2dc388a6955275a7bd578eaab482115a761c2e09eee81a"
+}

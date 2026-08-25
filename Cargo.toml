@@ -23,7 +23,7 @@ storage = { path = "crates/storage", version = "0.1.0" }
 # Shared third-party
 thiserror = "2"
 async-trait = "0.1"
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 strum = { version = "0.28", features = ["derive"] }
