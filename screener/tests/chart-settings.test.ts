@@ -5,6 +5,7 @@ import {
   defaultChartViewSettings,
   parseChartChromeSettings,
   parseChartViewSettings,
+  PRICE_PANE_LAYOUT_ID,
   serializeChartChromeSettings,
   serializeChartViewSettings,
   type ChartChromeSettings,
@@ -30,9 +31,35 @@ describe("chart settings", () => {
   })
 
   it("round-trips global chrome settings", () => {
-    const settings: ChartChromeSettings = { magnet: true, toolbarPosition: { x: 120, y: 80 } }
+    const settings: ChartChromeSettings = {
+      magnet: true,
+      toolbarPosition: { x: 120, y: 80 },
+      paneLayout: [
+        { id: PRICE_PANE_LAYOUT_ID, stretchFactor: 2.5 },
+        { id: "rsi", stretchFactor: 0.5 },
+      ],
+    }
 
     expect(parseChartChromeSettings(serializeChartChromeSettings(settings))).toEqual(settings)
+  })
+
+  it("migrates legacy chrome settings without losing existing preferences", () => {
+    expect(
+      parseChartChromeSettings(JSON.stringify({ version: 1, magnet: true, toolbarPosition: { x: 120, y: 80 } }))
+    ).toEqual({ magnet: true, toolbarPosition: { x: 120, y: 80 }, paneLayout: [] })
+  })
+
+  it("falls back when pane layout entries are invalid", () => {
+    expect(
+      parseChartChromeSettings(
+        JSON.stringify({
+          version: 2,
+          magnet: true,
+          toolbarPosition: { x: 120, y: 80 },
+          paneLayout: [{ id: "rsi", stretchFactor: 0 }],
+        })
+      )
+    ).toEqual(defaultChartChromeSettings())
   })
 
   it("falls back when the toolbar position is invalid", () => {

@@ -40,7 +40,7 @@
     type IndicatorInstance,
     type InstanceOutput,
   } from "./indicators"
-  import type { ToolbarPosition } from "./settings"
+  import { PRICE_PANE_LAYOUT_ID, type PaneLayoutEntry, type ToolbarPosition } from "./settings"
   import { chartTheme, fmtPrice } from "./theme"
   import type { Bar } from "./types"
 
@@ -61,12 +61,14 @@
     logScale,
     magnet,
     styleBarPosition,
+    paneLayout,
     onLoadOlder,
     onInstancesChange,
     onDrawingsChange,
     onLogScaleChange,
     onMagnetChange,
     onStyleBarPositionChange,
+    onPaneLayoutChange,
   }: {
     bars: Bar[]
     seed?: number
@@ -75,18 +77,23 @@
     logScale: boolean
     magnet: boolean
     styleBarPosition: ToolbarPosition
+    paneLayout: PaneLayoutEntry[]
     onLoadOlder?: () => void
     onInstancesChange?: (instances: IndicatorInstance[]) => void
     onDrawingsChange?: (drawings: readonly Drawing[]) => void
     onLogScaleChange: (enabled: boolean) => void
     onMagnetChange: (enabled: boolean) => void
     onStyleBarPositionChange: (position: ToolbarPosition) => void
+    onPaneLayoutChange: (layout: PaneLayoutEntry[]) => void
   } = $props()
 
   const VISIBLE_BARS = 150
   const RIGHT_OFFSET = 6
   const LOAD_OLDER_THRESHOLD = 10
   const BASE_PANES = 1 // price pane; indicator panes are appended after it
+  const PRICE_PANE_STRETCH = 3
+  const INDICATOR_PANE_STRETCH = 1
+  const PANE_STRETCH_EPSILON = 1e-6
 
   let container: HTMLDivElement
   let chart: IChartApi | undefined
@@ -126,6 +133,7 @@
   let styleBarEl = $state<HTMLDivElement>()
   let contextMenu = $state<ToolbarPosition | null>(null)
   let contextMenuEl = $state<HTMLDivElement>()
+  let renderedPaneIds = $state<string[]>([PRICE_PANE_LAYOUT_ID])
 
   type LegendData = { open: number; high: number; low: number; close: number; volume: number; change: number }
   type Readout = { label: string; value: number; color: string }
@@ -205,6 +213,48 @@
   function clearDrawings() {
     drawingStore?.clearAll()
     drawingInteraction?.deselect()
+  }
+
+  function paneLayoutsEqual(left: readonly PaneLayoutEntry[], right: readonly PaneLayoutEntry[]): boolean {
+    return (
+      left.length === right.length &&
+      left.every(
+        (entry, index) =>
+          entry.id === right[index]?.id &&
+          Math.abs(entry.stretchFactor - (right[index]?.stretchFactor ?? 0)) < PANE_STRETCH_EPSILON
+      )
+    )
+  }
+
+  function applyPaneLayout(activeChart: IChartApi, paneIds: readonly string[], layout: readonly PaneLayoutEntry[]) {
+    activeChart.panes().forEach((pane, index) => {
+      const id = paneIds[index]
+      if (id === undefined) return
+      const saved = layout.find(entry => entry.id === id)
+      pane.setStretchFactor(
+        saved?.stretchFactor ?? (id === PRICE_PANE_LAYOUT_ID ? PRICE_PANE_STRETCH : INDICATOR_PANE_STRETCH)
+      )
+    })
+  }
+
+  function capturePaneLayout() {
+    if (!chart) return
+    const panes = chart.panes()
+    if (panes.length !== renderedPaneIds.length) return
+    const visible: PaneLayoutEntry[] = []
+    for (const [index, pane] of panes.entries()) {
+      const id = renderedPaneIds[index]
+      const stretchFactor = pane.getStretchFactor()
+      if (id === undefined || !Number.isFinite(stretchFactor) || stretchFactor <= 0) return
+      visible.push({ id, stretchFactor })
+    }
+    const visibleById = new Map(visible.map(entry => [entry.id, entry]))
+    const next = paneLayout.map(entry => visibleById.get(entry.id) ?? { ...entry })
+    const savedIds = new Set(paneLayout.map(entry => entry.id))
+    for (const entry of visible) {
+      if (!savedIds.has(entry.id)) next.push(entry)
+    }
+    if (!paneLayoutsEqual(next, paneLayout)) onPaneLayoutChange(next)
   }
 
   function clampToChart(position: ToolbarPosition, width: number, height: number, margin = 0): ToolbarPosition {
@@ -493,8 +543,27 @@
     })
     resizeObserver.observe(container)
 
+    let panePointerActive = false
+    let paneCaptureFrame = 0
+    const onPanePointerDown = () => {
+      panePointerActive = true
+    }
+    const onPanePointerEnd = () => {
+      if (!panePointerActive) return
+      panePointerActive = false
+      cancelAnimationFrame(paneCaptureFrame)
+      paneCaptureFrame = requestAnimationFrame(capturePaneLayout)
+    }
+    rootEl.addEventListener("pointerdown", onPanePointerDown)
+    window.addEventListener("pointerup", onPanePointerEnd)
+    window.addEventListener("pointercancel", onPanePointerEnd)
+
     ready = true
     return () => {
+      cancelAnimationFrame(paneCaptureFrame)
+      rootEl.removeEventListener("pointerdown", onPanePointerDown)
+      window.removeEventListener("pointerup", onPanePointerEnd)
+      window.removeEventListener("pointercancel", onPanePointerEnd)
       resizeObserver.disconnect()
       drawingInteraction?.destroy()
       chart?.remove()
@@ -563,6 +632,13 @@
       : { ...requested }
   })
 
+  $effect(() => {
+    const layout = paneLayout
+    const paneIds = renderedPaneIds
+    if (!ready || !chart) return
+    applyPaneLayout(chart, paneIds, layout)
+  })
+
   // Load the parent-provided drawings into the store (the parent swaps them per coin).
   $effect(() => {
     if (!ready) return
@@ -621,10 +697,15 @@
       rendered = []
       while (activeChart.panes().length > BASE_PANES) activeChart.removePane(activeChart.panes().length - 1)
       let nextPane = BASE_PANES
+      const paneIds = [PRICE_PANE_LAYOUT_ID]
       for (const instance of chosen) {
         const descriptor = descriptorsById.get(instance.id)
         if (!descriptor) continue
-        const paneIndex = descriptor.target === "overlay" ? 0 : nextPane++
+        let paneIndex = 0
+        if (descriptor.target === "pane") {
+          paneIndex = nextPane++
+          paneIds.push(instance.id)
+        }
         const range = descriptor.range
         const scale = range
           ? { autoscaleInfoProvider: () => ({ priceRange: { minValue: range[0], maxValue: range[1] } }) }
@@ -676,7 +757,8 @@
         }
         rendered.push({ series, spanLines: [], spanKey: "" })
       }
-      activeChart.panes().forEach((pane, index) => pane.setStretchFactor(index === 0 ? 3 : 1))
+      renderedPaneIds = paneIds
+      applyPaneLayout(activeChart, paneIds, paneLayout)
       plottedRenderKey = key
       plottedRenderSeed = -1
     }

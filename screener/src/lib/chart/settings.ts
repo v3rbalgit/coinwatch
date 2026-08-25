@@ -2,6 +2,7 @@ export type ChartTimeframe = "1h" | "4h" | "1d" | "1w"
 
 export const CHART_TIMEFRAMES: readonly ChartTimeframe[] = ["1h", "4h", "1d", "1w"]
 export const CHART_CHROME_SETTINGS_KEY = "chart.chrome"
+export const PRICE_PANE_LAYOUT_ID = "price"
 
 export interface ToolbarPosition {
   x: number
@@ -13,12 +14,20 @@ export interface ChartViewSettings {
   logScale: boolean
 }
 
+export interface PaneLayoutEntry {
+  id: string
+  stretchFactor: number
+}
+
 export interface ChartChromeSettings {
   magnet: boolean
   toolbarPosition: ToolbarPosition
+  paneLayout: PaneLayoutEntry[]
 }
 
-const SETTINGS_VERSION = 1
+const VIEW_SETTINGS_VERSION = 1
+const LEGACY_CHROME_SETTINGS_VERSION = 1
+const CHROME_SETTINGS_VERSION = 2
 const DEFAULT_TIMEFRAME: ChartTimeframe = "1h"
 const DEFAULT_TOOLBAR_POSITION: ToolbarPosition = { x: 16, y: 44 }
 
@@ -27,7 +36,7 @@ export function defaultChartViewSettings(): ChartViewSettings {
 }
 
 export function defaultChartChromeSettings(): ChartChromeSettings {
-  return { magnet: false, toolbarPosition: { ...DEFAULT_TOOLBAR_POSITION } }
+  return { magnet: false, toolbarPosition: { ...DEFAULT_TOOLBAR_POSITION }, paneLayout: [] }
 }
 
 export function chartViewSettingsKey(coin: string): string {
@@ -51,7 +60,7 @@ export function parseChartViewSettings(raw: string | null): ChartViewSettings {
     typeof value !== "object" ||
     value === null ||
     !("version" in value) ||
-    value.version !== SETTINGS_VERSION ||
+    value.version !== VIEW_SETTINGS_VERSION ||
     !("timeframe" in value) ||
     typeof value.timeframe !== "string" ||
     !isChartTimeframe(value.timeframe) ||
@@ -64,7 +73,7 @@ export function parseChartViewSettings(raw: string | null): ChartViewSettings {
 }
 
 export function serializeChartViewSettings(settings: ChartViewSettings): string {
-  return JSON.stringify({ version: SETTINGS_VERSION, ...settings })
+  return JSON.stringify({ version: VIEW_SETTINGS_VERSION, ...settings })
 }
 
 export function parseChartChromeSettings(raw: string | null): ChartChromeSettings {
@@ -80,7 +89,7 @@ export function parseChartChromeSettings(raw: string | null): ChartChromeSetting
     typeof value !== "object" ||
     value === null ||
     !("version" in value) ||
-    value.version !== SETTINGS_VERSION ||
+    (value.version !== LEGACY_CHROME_SETTINGS_VERSION && value.version !== CHROME_SETTINGS_VERSION) ||
     !("magnet" in value) ||
     typeof value.magnet !== "boolean" ||
     !("toolbarPosition" in value)
@@ -102,9 +111,37 @@ export function parseChartChromeSettings(raw: string | null): ChartChromeSetting
   ) {
     return defaultChartChromeSettings()
   }
-  return { magnet: value.magnet, toolbarPosition: { x: position.x, y: position.y } }
+  const toolbarPosition = { x: position.x, y: position.y }
+  if (value.version === LEGACY_CHROME_SETTINGS_VERSION) {
+    return { magnet: value.magnet, toolbarPosition, paneLayout: [] }
+  }
+  if (!("paneLayout" in value) || !Array.isArray(value.paneLayout)) {
+    return defaultChartChromeSettings()
+  }
+  const paneLayout: PaneLayoutEntry[] = []
+  const paneIds = new Set<string>()
+  for (const rawEntry of value.paneLayout) {
+    const entry: unknown = rawEntry
+    if (
+      typeof entry !== "object" ||
+      entry === null ||
+      !("id" in entry) ||
+      typeof entry.id !== "string" ||
+      entry.id.length === 0 ||
+      paneIds.has(entry.id) ||
+      !("stretchFactor" in entry) ||
+      typeof entry.stretchFactor !== "number" ||
+      !Number.isFinite(entry.stretchFactor) ||
+      entry.stretchFactor <= 0
+    ) {
+      return defaultChartChromeSettings()
+    }
+    paneIds.add(entry.id)
+    paneLayout.push({ id: entry.id, stretchFactor: entry.stretchFactor })
+  }
+  return { magnet: value.magnet, toolbarPosition, paneLayout }
 }
 
 export function serializeChartChromeSettings(settings: ChartChromeSettings): string {
-  return JSON.stringify({ version: SETTINGS_VERSION, ...settings })
+  return JSON.stringify({ version: CHROME_SETTINGS_VERSION, ...settings })
 }

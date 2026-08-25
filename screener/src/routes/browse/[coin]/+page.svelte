@@ -22,6 +22,7 @@
     type ChartChromeSettings,
     type ChartTimeframe,
     type ChartViewSettings,
+    type PaneLayoutEntry,
     type ToolbarPosition,
   } from "$lib/chart/settings"
   import { fmtPrice } from "$lib/chart/theme"
@@ -47,6 +48,7 @@
   let logScale = $state(initialViewSettings.logScale)
   let magnet = $state(initialChromeSettings.magnet)
   let styleBarPosition = $state<ToolbarPosition>({ ...initialChromeSettings.toolbarPosition })
+  let paneLayout = $state<PaneLayoutEntry[]>(initialChromeSettings.paneLayout.map(entry => ({ ...entry })))
   let settingsCoin = $state("")
   let viewLoadRevision = 0
   let chromeRevision = 0
@@ -148,13 +150,19 @@
   function changeMagnet(enabled: boolean) {
     chromeRevision += 1
     magnet = enabled
-    persistChromeSettings({ magnet: enabled, toolbarPosition: styleBarPosition })
+    persistChromeSettings({ magnet: enabled, toolbarPosition: styleBarPosition, paneLayout })
   }
 
   function changeStyleBarPosition(position: ToolbarPosition) {
     chromeRevision += 1
     styleBarPosition = position
-    persistChromeSettings({ magnet, toolbarPosition: position })
+    persistChromeSettings({ magnet, toolbarPosition: position, paneLayout })
+  }
+
+  function changePaneLayout(next: PaneLayoutEntry[]) {
+    chromeRevision += 1
+    paneLayout = next
+    persistChromeSettings({ magnet, toolbarPosition: styleBarPosition, paneLayout: next })
   }
 
   async function loadViewSettings(active: string, revision: number) {
@@ -247,6 +255,7 @@
         const settings = parseChartChromeSettings(saved)
         magnet = settings.magnet
         styleBarPosition = settings.toolbarPosition
+        paneLayout = settings.paneLayout
       })
       .catch(error => console.error("failed to load chart chrome settings", error))
     void invoke<string | null>("get_setting", { key: "chart.indicators" })
@@ -359,11 +368,13 @@
       {logScale}
       {magnet}
       {styleBarPosition}
+      {paneLayout}
       onInstancesChange={persistInstances}
       onDrawingsChange={persistDrawings}
       onLogScaleChange={changeLogScale}
       onMagnetChange={changeMagnet}
       onStyleBarPositionChange={changeStyleBarPosition}
+      onPaneLayoutChange={changePaneLayout}
       onLoadOlder={loadOlder}
     />
     {#if settingsCoin !== coin || bars.length === 0}
