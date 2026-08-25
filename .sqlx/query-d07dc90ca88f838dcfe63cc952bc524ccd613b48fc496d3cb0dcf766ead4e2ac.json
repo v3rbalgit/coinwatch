@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT coin, svg FROM logos",
+  "describe": {
+    "columns": [
+      {
+        "name": "coin",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "logos",
+            "name": "coin"
+          }
+        }
+      },
+      {
+        "name": "svg",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "logos",
+            "name": "svg"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "d07dc90ca88f838dcfe63cc952bc524ccd613b48fc496d3cb0dcf766ead4e2ac"
+}

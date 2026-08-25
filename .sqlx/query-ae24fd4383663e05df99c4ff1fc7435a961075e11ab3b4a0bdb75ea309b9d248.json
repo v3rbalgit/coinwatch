@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO signals (id, name, definition) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, definition = excluded.definition",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "ae24fd4383663e05df99c4ff1fc7435a961075e11ab3b4a0bdb75ea309b9d248"
+}

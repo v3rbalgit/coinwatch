@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT DISTINCT coin, timeframe FROM candles ORDER BY coin, timeframe",
+  "describe": {
+    "columns": [
+      {
+        "name": "coin",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "candles",
+            "name": "coin"
+          }
+        }
+      },
+      {
+        "name": "timeframe",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "candles",
+            "name": "timeframe"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "95d92dc00c091cdf466e6e717900274e3a6c4975d5548a4bd56b225de5d7bde0"
+}

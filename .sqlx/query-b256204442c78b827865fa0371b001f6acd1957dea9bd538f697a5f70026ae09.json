@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT list, coin FROM list_members ORDER BY coin",
+  "describe": {
+    "columns": [
+      {
+        "name": "list",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "list_members",
+            "name": "list"
+          }
+        }
+      },
+      {
+        "name": "coin",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "list_members",
+            "name": "coin"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "b256204442c78b827865fa0371b001f6acd1957dea9bd538f697a5f70026ae09"
+}

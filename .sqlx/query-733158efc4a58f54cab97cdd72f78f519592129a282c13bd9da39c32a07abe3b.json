@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT coin FROM logos",
+  "describe": {
+    "columns": [
+      {
+        "name": "coin",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "logos",
+            "name": "coin"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "733158efc4a58f54cab97cdd72f78f519592129a282c13bd9da39c32a07abe3b"
+}

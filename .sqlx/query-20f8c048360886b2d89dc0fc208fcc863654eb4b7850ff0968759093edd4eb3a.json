@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM indicator_presets WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "20f8c048360886b2d89dc0fc208fcc863654eb4b7850ff0968759093edd4eb3a"
+}

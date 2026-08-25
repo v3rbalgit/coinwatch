@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM list_members WHERE list = ? AND coin = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "2f2337362bbd78b9e9eca4acd975d76cba5001c11afcdef317fee6f9a0749bf5"
+}

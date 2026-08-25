@@ -1,0 +1,86 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT open_time, open, high, low, close, volume FROM candles WHERE coin = ? AND timeframe = ? ORDER BY open_time DESC LIMIT ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "open_time",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "candles",
+            "name": "open_time"
+          }
+        }
+      },
+      {
+        "name": "open",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "candles",
+            "name": "open"
+          }
+        }
+      },
+      {
+        "name": "high",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "candles",
+            "name": "high"
+          }
+        }
+      },
+      {
+        "name": "low",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "candles",
+            "name": "low"
+          }
+        }
+      },
+      {
+        "name": "close",
+        "ordinal": 4,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "candles",
+            "name": "close"
+          }
+        }
+      },
+      {
+        "name": "volume",
+        "ordinal": 5,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "candles",
+            "name": "volume"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "d434093f1e9b307ff90432aab1eaa24debf58e95a0487089e95fed3413183305"
+}

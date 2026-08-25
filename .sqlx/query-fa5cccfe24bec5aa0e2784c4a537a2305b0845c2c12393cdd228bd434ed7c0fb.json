@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR REPLACE INTO logos (coin, svg) VALUES (?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "fa5cccfe24bec5aa0e2784c4a537a2305b0845c2c12393cdd228bd434ed7c0fb"
+}

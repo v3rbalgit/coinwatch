@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT name FROM lists ORDER BY name",
+  "describe": {
+    "columns": [
+      {
+        "name": "name",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "lists",
+            "name": "name"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0426eaea37a0344a65937eaada79202960cbd0e0fa9f1a57d3bffda89a7b5509"
+}
