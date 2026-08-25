@@ -364,6 +364,7 @@
     const computed = computeIndicators(chosen, high, low, close, volume);
     latestComputed = computed;
     latestChosen = chosen;
+    if (!hovering) readouts = readoutsFor(bars.length - 1);
     const firstTime = bars[0].time;
     const reseed = seed !== plottedRenderSeed || firstTime < plottedRenderFirstTime;
     rendered.forEach((item, index) => {
@@ -440,7 +441,7 @@
     <div bind:this={container} class="h-full w-full"></div>
     {#if legend}
       <div
-        class="pointer-events-none absolute left-2 top-2 flex flex-wrap gap-x-3 gap-y-0.5 text-xs tabular-nums text-muted-foreground"
+        class="pointer-events-none absolute left-2 top-2 z-10 flex flex-wrap gap-x-3 gap-y-0.5 text-xs tabular-nums text-muted-foreground"
       >
         <span>O <span class="text-foreground">{fmtPrice(legend.open)}</span></span>
         <span>H <span class="text-foreground">{fmtPrice(legend.high)}</span></span>

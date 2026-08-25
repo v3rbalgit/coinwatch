@@ -77,7 +77,9 @@
   // The chart's visible indicators persist globally in SQLite.
   function persistInstances(next: IndicatorInstance[]) {
     indicatorInstances = next;
-    void invoke("set_setting", { key: "chart.indicators", value: JSON.stringify(next) });
+    invoke("set_setting", { key: "chart.indicators", value: JSON.stringify(next) }).catch((error) =>
+      console.error("failed to save chart indicators", error),
+    );
   }
 
   function parseInstances(value: unknown): IndicatorInstance[] | null {
@@ -127,7 +129,9 @@
     void invoke<string | null>("get_setting", { key: "chart.indicators" })
       .then((saved) => {
         const parsed = saved === null ? null : parseInstances(JSON.parse(saved));
-        if (parsed && parsed.length > 0) indicatorInstances = parsed;
+        // An empty saved set is valid (the user turned everything off) — restore it as
+        // empty rather than falling back to the seed default.
+        if (parsed) indicatorInstances = parsed;
       })
       .catch((error) => console.error("failed to load chart indicators", error));
     const reload = setInterval(loadMeta, 5000);
