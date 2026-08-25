@@ -74,6 +74,28 @@
     meta = rows.find((row) => row.coin === coin) ?? null;
   }
 
+  // The chart's visible indicators persist globally in SQLite.
+  function persistInstances(next: IndicatorInstance[]) {
+    indicatorInstances = next;
+    void invoke("set_setting", { key: "chart.indicators", value: JSON.stringify(next) });
+  }
+
+  function parseInstances(value: unknown): IndicatorInstance[] | null {
+    if (!Array.isArray(value)) return null;
+    const result: IndicatorInstance[] = [];
+    for (const item of value) {
+      if (typeof item !== "object" || item === null || !("id" in item) || typeof item.id !== "string") return null;
+      const params: Record<string, number> = {};
+      if ("params" in item && typeof item.params === "object" && item.params !== null) {
+        for (const [key, raw] of Object.entries(item.params)) {
+          if (typeof raw === "number") params[key] = raw;
+        }
+      }
+      result.push({ id: item.id, params });
+    }
+    return result;
+  }
+
   function mergeBar(candle: Bar) {
     const last = bars.at(-1);
     if (last && last.time === candle.time) bars = [...bars.slice(0, -1), candle];
@@ -102,6 +124,12 @@
 
   onMount(() => {
     loadMeta();
+    void invoke<string | null>("get_setting", { key: "chart.indicators" })
+      .then((saved) => {
+        const parsed = saved === null ? null : parseInstances(JSON.parse(saved));
+        if (parsed && parsed.length > 0) indicatorInstances = parsed;
+      })
+      .catch((error) => console.error("failed to load chart indicators", error));
     const reload = setInterval(loadMeta, 5000);
     const unMid = listen<{ coin: string; price: number }>("mid", (event) => {
       if (event.payload.coin !== coin) return;
@@ -187,7 +215,7 @@
       {bars}
       {seed}
       instances={indicatorInstances}
-      onInstancesChange={(next) => (indicatorInstances = next)}
+      onInstancesChange={persistInstances}
       onLoadOlder={loadOlder}
     />
     {#if bars.length === 0}

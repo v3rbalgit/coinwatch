@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS list_members (
     PRIMARY KEY (list, coin)
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS logos (coin TEXT PRIMARY KEY, svg TEXT NOT NULL) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
 ";
 
 /// The local SQLite store.
@@ -201,6 +202,21 @@ impl SqliteStore {
         sqlx::query("INSERT OR REPLACE INTO logos (coin, svg) VALUES (?, ?)")
             .bind(coin)
             .bind(svg)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Read a persisted UI/app setting (an opaque string — JSON or scalar), if set.
+    pub async fn get_setting(&self, key: &str) -> Result<Option<String>, StoreError> {
+        Ok(sqlx::query_scalar("SELECT value FROM settings WHERE key = ?").bind(key).fetch_optional(&self.pool).await?)
+    }
+
+    /// Insert-or-replace a persisted UI/app setting.
+    pub async fn set_setting(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        sqlx::query("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+            .bind(key)
+            .bind(value)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -427,6 +443,19 @@ mod tests {
         assert_eq!(
             store.logos().await.expect("logos"),
             vec![("BTC".to_owned(), "<svg-updated/>".to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(&dir.path().join("cw.db")).await.expect("open");
+        assert_eq!(store.get_setting("chart.indicators").await.expect("get"), None);
+        store.set_setting("chart.indicators", "[{\"id\":\"rsi\"}]").await.expect("set");
+        store.set_setting("chart.indicators", "[{\"id\":\"macd\"}]").await.expect("update");
+        assert_eq!(
+            store.get_setting("chart.indicators").await.expect("get"),
+            Some("[{\"id\":\"macd\"}]".to_owned())
         );
     }
 

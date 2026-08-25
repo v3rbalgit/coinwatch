@@ -219,6 +219,18 @@ async fn coin_history(
     }
 }
 
+/// Read a persisted UI setting (an opaque string), if set.
+#[tauri::command]
+async fn get_setting(store: tauri::State<'_, Arc<SqliteStore>>, key: String) -> Result<Option<String>, String> {
+    store.get_setting(&key).await.map_err(|error| error.to_string())
+}
+
+/// Persist a UI setting (insert-or-replace).
+#[tauri::command]
+async fn set_setting(store: tauri::State<'_, Arc<SqliteStore>>, key: String, value: String) -> Result<(), String> {
+    store.set_setting(&key, &value).await.map_err(|error| error.to_string())
+}
+
 /// A live candle update for the active coin, pushed to the detail chart.
 #[derive(Clone, Serialize)]
 struct CandleEventPayload {
@@ -440,6 +452,8 @@ pub fn run() {
             logos,
             coin_candles,
             coin_history,
+            get_setting,
+            set_setting,
             set_active_coin
         ])
         .run(tauri::generate_context!())
