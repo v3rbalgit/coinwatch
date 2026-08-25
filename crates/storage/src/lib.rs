@@ -209,7 +209,10 @@ impl SqliteStore {
 
     /// Read a persisted UI/app setting (an opaque string — JSON or scalar), if set.
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>, StoreError> {
-        Ok(sqlx::query_scalar("SELECT value FROM settings WHERE key = ?").bind(key).fetch_optional(&self.pool).await?)
+        Ok(sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?)
     }
 
     /// Insert-or-replace a persisted UI/app setting.
@@ -267,32 +270,45 @@ fn remove_db_files(path: &Path) {
 #[async_trait]
 impl CandleStore for SqliteStore {
     async fn load_recent(&self, limit: usize) -> Result<Vec<CandleSeries>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows = sqlx::query(
-            "SELECT coin, timeframe, open_time, open, high, low, close, volume FROM ( \
-                 SELECT coin, timeframe, open_time, open, high, low, close, volume, \
-                        ROW_NUMBER() OVER (PARTITION BY coin, timeframe ORDER BY open_time DESC) AS rn \
-                 FROM candles \
-             ) WHERE rn <= ? ORDER BY coin, timeframe, open_time",
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let groups = sqlx::query("SELECT DISTINCT coin, timeframe FROM candles ORDER BY coin, timeframe")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut series = Vec::with_capacity(groups.len());
 
-        let mut series: Vec<CandleSeries> = Vec::new();
-        for row in &rows {
-            let coin: String = row.try_get("coin")?;
-            let interval: String = row.try_get("timeframe")?;
-            let (Some(timeframe), Some(candle)) = (Timeframe::from_hl(&interval), row_to_candle(row)?) else {
+        // Small primary-key range reads avoid both ranking the accumulated cache and
+        // materializing every series' SQLx rows at once during startup.
+        for group in &groups {
+            let coin: &str = group.try_get("coin")?;
+            let interval: &str = group.try_get("timeframe")?;
+            let Some(timeframe) = Timeframe::from_hl(interval) else {
                 continue;
             };
-            match series.last_mut() {
-                Some(last) if last.coin == coin && last.timeframe == timeframe => last.candles.push(candle),
-                _ => series.push(CandleSeries {
-                    coin,
+            let rows = sqlx::query(
+                "SELECT open_time, open, high, low, close, volume FROM candles \
+                 WHERE coin = ? AND timeframe = ? ORDER BY open_time DESC LIMIT ?",
+            )
+            .bind(coin)
+            .bind(interval)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+            let mut candles = Vec::with_capacity(rows.len());
+            for row in &rows {
+                if let Some(candle) = row_to_candle(row)? {
+                    candles.push(candle);
+                }
+            }
+            candles.reverse();
+            if !candles.is_empty() {
+                series.push(CandleSeries {
+                    coin: coin.to_owned(),
                     timeframe,
-                    candles: vec![candle],
-                }),
+                    candles,
+                });
             }
         }
         Ok(series)
@@ -325,11 +341,11 @@ impl CandleStore for SqliteStore {
 /// Read one row into a candle; a malformed timestamp or decimal skips the row.
 fn row_to_candle(row: &SqliteRow) -> Result<Option<Candle>, StoreError> {
     let open_ms: i64 = row.try_get("open_time")?;
-    let open: String = row.try_get("open")?;
-    let high: String = row.try_get("high")?;
-    let low: String = row.try_get("low")?;
-    let close: String = row.try_get("close")?;
-    let volume: String = row.try_get("volume")?;
+    let open: &str = row.try_get("open")?;
+    let high: &str = row.try_get("high")?;
+    let low: &str = row.try_get("low")?;
+    let close: &str = row.try_get("close")?;
+    let volume: &str = row.try_get("volume")?;
 
     let (Some(open_time), Ok(open), Ok(high), Ok(low), Ok(close), Ok(volume)) = (
         DateTime::from_timestamp_millis(open_ms),
@@ -395,6 +411,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_recent_limits_each_series_oldest_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cw.db");
+        let store = SqliteStore::open(&path).await.expect("open");
+        let btc_hourly = (1..=4)
+            .map(|hour| candle(hour, "100", "101", "99", "100", "10"))
+            .collect::<Vec<_>>();
+        let btc_four_hour = (1..=3)
+            .map(|hour| candle(hour, "200", "201", "199", "200", "20"))
+            .collect::<Vec<_>>();
+        let eth_hourly = vec![candle(1, "300", "301", "299", "300", "30")];
+        store.save("BTC", Timeframe::Hour1, &btc_hourly).await.expect("save hourly BTC");
+        store
+            .save("BTC", Timeframe::Hour4, &btc_four_hour)
+            .await
+            .expect("save four-hour BTC");
+        store.save("ETH", Timeframe::Hour1, &eth_hourly).await.expect("save hourly ETH");
+
+        let loaded = store.load_recent(2).await.expect("load");
+        assert_eq!(
+            loaded,
+            vec![
+                CandleSeries {
+                    coin: "BTC".to_owned(),
+                    timeframe: Timeframe::Hour1,
+                    candles: btc_hourly[2..].to_vec(),
+                },
+                CandleSeries {
+                    coin: "BTC".to_owned(),
+                    timeframe: Timeframe::Hour4,
+                    candles: btc_four_hour[1..].to_vec(),
+                },
+                CandleSeries {
+                    coin: "ETH".to_owned(),
+                    timeframe: Timeframe::Hour1,
+                    candles: eth_hourly,
+                },
+            ]
+        );
+        assert!(store.load_recent(0).await.expect("load zero").is_empty());
+    }
+
+    #[tokio::test]
     async fn recreates_a_corrupt_database() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("cw.db");
@@ -452,7 +511,10 @@ mod tests {
         let store = SqliteStore::open(&dir.path().join("cw.db")).await.expect("open");
         assert_eq!(store.get_setting("chart.indicators").await.expect("get"), None);
         store.set_setting("chart.indicators", "[{\"id\":\"rsi\"}]").await.expect("set");
-        store.set_setting("chart.indicators", "[{\"id\":\"macd\"}]").await.expect("update");
+        store
+            .set_setting("chart.indicators", "[{\"id\":\"macd\"}]")
+            .await
+            .expect("update");
         assert_eq!(
             store.get_setting("chart.indicators").await.expect("get"),
             Some("[{\"id\":\"macd\"}]".to_owned())
@@ -470,7 +532,13 @@ mod tests {
         let page = store.candles_before("BTC", Timeframe::Hour1, before, 3).await.expect("page");
 
         assert_eq!(page.len(), 3);
-        assert_eq!(page.first().map(|bar| bar.open_time), Some(candle(3, "1", "1", "1", "1", "0").open_time));
-        assert_eq!(page.last().map(|bar| bar.open_time), Some(candle(5, "1", "1", "1", "1", "0").open_time));
+        assert_eq!(
+            page.first().map(|bar| bar.open_time),
+            Some(candle(3, "1", "1", "1", "1", "0").open_time)
+        );
+        assert_eq!(
+            page.last().map(|bar| bar.open_time),
+            Some(candle(5, "1", "1", "1", "1", "0").open_time)
+        );
     }
 }
