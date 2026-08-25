@@ -1,0 +1,53 @@
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Bratislava
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    groups:
+      rust-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    commit-message:
+      prefix: chore(deps)
+
+  - package-ecosystem: npm
+    directory: /screener
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:15"
+      timezone: Europe/Bratislava
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    groups:
+      frontend-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    commit-message:
+      prefix: chore(deps)
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:30"
+      timezone: Europe/Bratislava
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    groups:
+      actions-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    commit-message:
+      prefix: chore(deps)
