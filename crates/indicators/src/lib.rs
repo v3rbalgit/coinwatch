@@ -32,8 +32,8 @@ pub use cci::cci;
 pub use divergence::{Divergence, DivergenceDirection, DivergenceKind, detect_divergences};
 pub use donchian::{Donchian, donchian};
 pub use engine::{
-    Descriptor, DescriptorKind, Instance, InstanceOutput, Ohlcv, Output, OutputKind, OutputSeries, Param, Target,
-    compute, descriptors,
+    Descriptor, DescriptorKind, DivergenceInput, Instance, InstanceError, InstanceOutput, Ohlcv, Output, OutputKind,
+    OutputSeries, Param, Target, compute, descriptors, divergence_input, series_input_requirement, validate_instance,
 };
 pub use macd::{Macd, ema, macd};
 pub use mfi::mfi;

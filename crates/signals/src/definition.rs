@@ -8,14 +8,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use domain::Timeframe;
-use indicators::{Descriptor, DescriptorKind, DivergenceDirection, DivergenceKind, Instance, descriptors};
+use indicators::{
+    DescriptorKind, DivergenceDirection, DivergenceKind, Instance, InstanceError, divergence_input,
+    series_input_requirement, validate_instance,
+};
 use serde::{Deserialize, Serialize};
 
 /// Current schema version of serialized signal definitions.
 pub const DEFINITION_VERSION: u32 = 1;
 
-/// Sanity bound for user-entered freshness windows. Evaluation remains bounded by
-/// the hot cache, but rejecting absurd values catches corrupted definitions early.
+/// Sanity bound preventing corrupted definitions from requesting unbounded work.
+/// Valid requirements within this bound may be loaded beyond the hot cache.
 const MAX_WITHIN_BARS: u32 = 10_000;
 
 /// A definition validation failure.
@@ -47,25 +50,18 @@ pub enum DefinitionError {
         /// Maximum accepted `withinBars` value.
         maximum: u32,
     },
-    /// An indicator parameter is NaN or infinite.
-    #[error("condition '{condition}' has a non-finite '{parameter}' parameter")]
-    NonFiniteParameter {
+    /// The configured indicator id or one of its parameters is invalid.
+    #[error("condition '{condition}' has an invalid indicator configuration: {source}")]
+    InvalidIndicator {
         /// Condition id.
         condition: String,
-        /// Parameter key.
-        parameter: String,
+        /// Descriptor validation failure.
+        #[source]
+        source: InstanceError,
     },
     /// A predicate constant is NaN or infinite.
     #[error("condition '{0}' has a non-finite constant")]
     NonFiniteConstant(String),
-    /// The indicator id does not exist in the registry.
-    #[error("condition '{condition}' references unknown indicator '{indicator}'")]
-    UnknownIndicator {
-        /// Condition id.
-        condition: String,
-        /// Indicator id.
-        indicator: String,
-    },
     /// A divergence predicate was assigned to a numeric-series indicator.
     #[error("condition '{condition}' uses a divergence predicate on series indicator '{indicator}'")]
     DivergenceRequiresDivergenceIndicator {
@@ -271,6 +267,58 @@ pub struct Condition {
     pub within_bars: u32,
 }
 
+pub(crate) struct ConditionRequirement {
+    pub(crate) completed_bars: usize,
+    pub(crate) confirmation_bars: usize,
+}
+
+impl Condition {
+    pub(crate) fn requirement(&self) -> Result<ConditionRequirement, InstanceError> {
+        let freshness = self.within_bars as usize;
+        match &self.predicate {
+            Predicate::Threshold { left, right, .. } => Ok(ConditionRequirement {
+                completed_bars: operand_requirement(&self.indicator, left)?
+                    .max(operand_requirement(&self.indicator, right)?)
+                    + freshness,
+                confirmation_bars: 0,
+            }),
+            Predicate::Cross { left, right, .. } => Ok(ConditionRequirement {
+                completed_bars: operand_requirement(&self.indicator, left)?
+                    .max(operand_requirement(&self.indicator, right)?)
+                    + freshness
+                    + 1,
+                confirmation_bars: 0,
+            }),
+            Predicate::Divergence { .. } => {
+                let input = divergence_input(&self.indicator)?;
+                // The recent pivot is known after its right-hand confirmation;
+                // its prior same-kind pivot may be `max_gap` bars earlier, and
+                // that pivot needs both left context and a defined oscillator.
+                Ok(ConditionRequirement {
+                    completed_bars: freshness
+                        + input.pivot_right
+                        + input.max_gap
+                        + input.pivot_left.max(input.oscillator - 1)
+                        + 1,
+                    confirmation_bars: input.pivot_right,
+                })
+            }
+        }
+    }
+
+    /// Completed candles needed to evaluate the full freshness window.
+    pub fn required_completed_bars(&self) -> Result<usize, InstanceError> {
+        self.requirement().map(|requirement| requirement.completed_bars)
+    }
+}
+
+fn operand_requirement(instance: &Instance, operand: &Operand) -> Result<usize, InstanceError> {
+    match operand {
+        Operand::Output { key } => series_input_requirement(instance, key),
+        Operand::Field { .. } | Operand::Constant { .. } => Ok(1),
+    }
+}
+
 /// Boolean composition tree over condition ids.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
@@ -327,9 +375,8 @@ impl SignalDefinition {
             return Err(DefinitionError::NoConditions);
         }
 
-        let registry = descriptors();
         for (id, condition) in &self.conditions {
-            validate_condition(id, condition, registry)?;
+            validate_condition(id, condition)?;
         }
 
         let mut referenced = BTreeSet::new();
@@ -338,6 +385,26 @@ impl SignalDefinition {
             return Err(DefinitionError::UnreferencedCondition(id.clone()));
         }
         Ok(())
+    }
+
+    /// Maximum completed-candle requirement per referenced timeframe.
+    pub fn required_history(&self) -> Result<BTreeMap<Timeframe, usize>, DefinitionError> {
+        self.validate()?;
+        let mut requirements = BTreeMap::new();
+        for (id, condition) in &self.conditions {
+            let required = condition
+                .requirement()
+                .map_err(|source| DefinitionError::InvalidIndicator {
+                    condition: id.clone(),
+                    source,
+                })?
+                .completed_bars;
+            requirements
+                .entry(condition.timeframe)
+                .and_modify(|current: &mut usize| *current = (*current).max(required))
+                .or_insert(required);
+        }
+        Ok(requirements)
     }
 }
 
@@ -375,20 +442,12 @@ fn validate_node(
     Ok(())
 }
 
-fn validate_condition(id: &str, condition: &Condition, registry: &[Descriptor]) -> Result<(), DefinitionError> {
+fn validate_condition(id: &str, condition: &Condition) -> Result<(), DefinitionError> {
     if condition.within_bars > MAX_WITHIN_BARS {
         return Err(DefinitionError::FreshnessTooLarge {
             condition: id.to_owned(),
             maximum: MAX_WITHIN_BARS,
         });
-    }
-    for (parameter, value) in &condition.indicator.params {
-        if !value.is_finite() {
-            return Err(DefinitionError::NonFiniteParameter {
-                condition: id.to_owned(),
-                parameter: parameter.clone(),
-            });
-        }
     }
     for operand in predicate_operands(&condition.predicate).into_iter().flatten() {
         if let Operand::Constant { value } = operand
@@ -398,12 +457,10 @@ fn validate_condition(id: &str, condition: &Condition, registry: &[Descriptor]) 
         }
     }
 
-    let Some(descriptor) = registry.iter().find(|candidate| candidate.id == condition.indicator.id) else {
-        return Err(DefinitionError::UnknownIndicator {
-            condition: id.to_owned(),
-            indicator: condition.indicator.id.clone(),
-        });
-    };
+    let descriptor = validate_instance(&condition.indicator).map_err(|source| DefinitionError::InvalidIndicator {
+        condition: id.to_owned(),
+        source,
+    })?;
 
     match &condition.predicate {
         Predicate::Divergence { .. } => {
@@ -452,12 +509,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     use domain::Timeframe;
-    use indicators::Instance;
+    use indicators::{Instance, InstanceError};
     use serde_json::json;
 
     use super::{
-        ComparisonOp, Condition, DEFINITION_VERSION, DefinitionError, Direction, DirectionFilter, KindFilter, Node,
-        Operand, Predicate, SignalDefinition,
+        ComparisonOp, Condition, CrossDirection, DEFINITION_VERSION, DefinitionError, Direction, DirectionFilter,
+        KindFilter, Node, Operand, Predicate, SignalDefinition,
     };
 
     fn threshold() -> Condition {
@@ -489,6 +546,94 @@ mod tests {
     fn validates_a_well_formed_definition() {
         let signal = definition(Node::Condition { id: "hot".to_owned() });
         assert!(signal.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_indicator_parameters_outside_descriptor_contracts() {
+        let mut unknown = definition(Node::Condition { id: "hot".to_owned() });
+        unknown
+            .conditions
+            .get_mut("hot")
+            .expect("fixture condition")
+            .indicator
+            .params
+            .insert("typo".to_owned(), 20.0);
+        assert!(matches!(
+            unknown.validate(),
+            Err(DefinitionError::InvalidIndicator {
+                source: InstanceError::UnknownParameter { parameter, .. },
+                ..
+            }) if parameter == "typo"
+        ));
+
+        let mut fractional = definition(Node::Condition { id: "hot".to_owned() });
+        fractional
+            .conditions
+            .get_mut("hot")
+            .expect("fixture condition")
+            .indicator
+            .params
+            .insert("period".to_owned(), 20.5);
+        assert!(matches!(
+            fractional.validate(),
+            Err(DefinitionError::InvalidIndicator {
+                source: InstanceError::ParameterOffStep { parameter, .. },
+                ..
+            }) if parameter == "period"
+        ));
+    }
+
+    #[test]
+    fn calculates_exact_history_per_condition_and_timeframe() {
+        let mut threshold = threshold();
+        threshold.within_bars = 3;
+        assert_eq!(threshold.required_completed_bars().expect("threshold history"), 23);
+
+        let mut cross = threshold.clone();
+        cross.predicate = Predicate::Cross {
+            left: Operand::Output { key: "sma".to_owned() },
+            right: Operand::Constant { value: 80.0 },
+            direction: CrossDirection::Over,
+        };
+        assert_eq!(cross.required_completed_bars().expect("cross history"), 24);
+
+        let divergence = Condition {
+            timeframe: Timeframe::Day1,
+            indicator: Instance {
+                id: "rsiDivergence".to_owned(),
+                params: BTreeMap::new(),
+            },
+            predicate: Predicate::Divergence {
+                kind: KindFilter::Any,
+                direction: DirectionFilter::Any,
+            },
+            within_bars: 3,
+        };
+        assert_eq!(divergence.required_completed_bars().expect("divergence history"), 83);
+
+        let signal = SignalDefinition {
+            version: DEFINITION_VERSION,
+            direction: Direction::Bullish,
+            root: Node::All {
+                children: vec![
+                    Node::Condition {
+                        id: "threshold".to_owned(),
+                    },
+                    Node::Condition {
+                        id: "divergence".to_owned(),
+                    },
+                ],
+            },
+            conditions: [
+                ("threshold".to_owned(), threshold),
+                ("divergence".to_owned(), divergence),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let requirements = signal.required_history().expect("valid requirements");
+        assert_eq!(requirements.get(&Timeframe::Hour1), Some(&23));
+        assert_eq!(requirements.get(&Timeframe::Day1), Some(&83));
     }
 
     #[test]

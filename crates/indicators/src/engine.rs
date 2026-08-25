@@ -10,6 +10,8 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
+use strum::{AsRefStr, EnumCount, EnumString};
+use thiserror::Error;
 
 use crate::{
     Adx, Bollinger, DivergenceDirection, DivergenceKind, Donchian, Macd, Stochastic, Supertrend, adx, atr, bollinger,
@@ -35,6 +37,30 @@ pub enum DescriptorKind {
     Series,
     /// Divergence spans between price and an oscillator.
     Divergence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, AsRefStr, EnumCount, EnumString)]
+#[strum(serialize_all = "camelCase")]
+enum IndicatorId {
+    Sma,
+    Ema,
+    Wma,
+    Bollinger,
+    Vwap,
+    Donchian,
+    Supertrend,
+    Psar,
+    Rsi,
+    Macd,
+    Stochastic,
+    Williams,
+    Cci,
+    Mfi,
+    Adx,
+    Atr,
+    Obv,
+    RsiDivergence,
+    MacdDivergence,
 }
 
 /// How one output series is plotted.
@@ -108,6 +134,80 @@ pub struct Instance {
     pub params: BTreeMap<String, f64>,
 }
 
+/// Why a configured indicator instance is invalid.
+#[derive(Debug, Error)]
+pub enum InstanceError {
+    /// The instance id is absent from the descriptor registry.
+    #[error("unknown indicator '{0}'")]
+    UnknownIndicator(String),
+    /// A supplied parameter is absent from the indicator descriptor.
+    #[error("indicator '{indicator}' has no '{parameter}' parameter")]
+    UnknownParameter {
+        /// Indicator id.
+        indicator: String,
+        /// Unknown parameter key.
+        parameter: String,
+    },
+    /// A parameter is NaN or infinite.
+    #[error("indicator '{indicator}' has a non-finite '{parameter}' parameter")]
+    NonFiniteParameter {
+        /// Indicator id.
+        indicator: String,
+        /// Parameter key.
+        parameter: String,
+    },
+    /// A parameter lies outside its inclusive descriptor bounds.
+    #[error("indicator '{indicator}' parameter '{parameter}' value {value} is outside {min}..={max}")]
+    ParameterOutOfRange {
+        /// Indicator id.
+        indicator: String,
+        /// Parameter key.
+        parameter: String,
+        /// Supplied value.
+        value: f64,
+        /// Inclusive minimum.
+        min: f64,
+        /// Inclusive maximum.
+        max: f64,
+    },
+    /// A parameter does not lie on the descriptor's step grid.
+    #[error("indicator '{indicator}' parameter '{parameter}' value {value} is not aligned to step {step}")]
+    ParameterOffStep {
+        /// Indicator id.
+        indicator: String,
+        /// Parameter key.
+        parameter: String,
+        /// Supplied value.
+        value: f64,
+        /// Grid step.
+        step: f64,
+    },
+    /// A requested series output is absent from the descriptor.
+    #[error("indicator '{indicator}' has no '{output}' output")]
+    UnknownOutput {
+        /// Indicator id.
+        indicator: String,
+        /// Unknown output key.
+        output: String,
+    },
+    /// Divergence metadata was requested from a numeric-series indicator.
+    #[error("indicator '{0}' does not produce divergences")]
+    NotDivergence(String),
+}
+
+/// Inputs needed to search for a divergence over a completed-bar freshness window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DivergenceInput {
+    /// Candles required for the oscillator's first defined value.
+    pub oscillator: usize,
+    /// Bars left of a pivot center.
+    pub pivot_left: usize,
+    /// Bars right of a pivot center before confirmation.
+    pub pivot_right: usize,
+    /// Maximum distance between consecutive same-kind pivots.
+    pub max_gap: usize,
+}
+
 /// One computed output series, aligned index-for-index with the input (`NaN` where
 /// undefined), keyed to the matching [`Output`].
 #[derive(Debug, Clone, Serialize)]
@@ -177,33 +277,36 @@ fn period(params: &BTreeMap<String, f64>, key: &str, default: f64) -> usize {
 
 /// Compute one instance's output series over `data`. Unknown ids yield no outputs.
 fn compute_one(instance: &Instance, data: &Ohlcv) -> Vec<OutputSeries> {
+    let Ok(indicator) = instance.id.parse::<IndicatorId>() else {
+        return Vec::new();
+    };
     let params = &instance.params;
     let (high, low, close, volume) = (data.high, data.low, data.close, data.volume);
-    match instance.id.as_str() {
-        "sma" => vec![out("sma", &sma(close, period(params, "period", 20.0)))],
-        "ema" => vec![out("ema", &ema(close, period(params, "period", 20.0)))],
-        "wma" => vec![out("wma", &wma(close, period(params, "period", 20.0)))],
-        "bollinger" => {
+    match indicator {
+        IndicatorId::Sma => vec![out("sma", &sma(close, period(params, "period", 20.0)))],
+        IndicatorId::Ema => vec![out("ema", &ema(close, period(params, "period", 20.0)))],
+        IndicatorId::Wma => vec![out("wma", &wma(close, period(params, "period", 20.0)))],
+        IndicatorId::Bollinger => {
             let Bollinger { middle, upper, lower } =
                 bollinger(close, period(params, "period", 20.0), get(params, "mult", 2.0));
             vec![out("upper", &upper), out("middle", &middle), out("lower", &lower)]
         }
-        "vwap" => vec![out("vwap", &vwap(high, low, close, volume))],
-        "donchian" => {
+        IndicatorId::Vwap => vec![out("vwap", &vwap(high, low, close, volume))],
+        IndicatorId::Donchian => {
             let Donchian { upper, middle, lower } = donchian(high, low, period(params, "period", 20.0));
             vec![out("upper", &upper), out("middle", &middle), out("lower", &lower)]
         }
-        "supertrend" => {
+        IndicatorId::Supertrend => {
             let Supertrend { line, .. } =
                 supertrend(high, low, close, period(params, "period", 10.0), get(params, "mult", 3.0));
             vec![out("supertrend", &line)]
         }
-        "psar" => vec![out(
+        IndicatorId::Psar => vec![out(
             "psar",
             &psar(high, low, get(params, "step", 0.02), get(params, "max", 0.2)),
         )],
-        "rsi" => vec![out("rsi", &rsi(close, period(params, "period", 14.0)))],
-        "macd" => {
+        IndicatorId::Rsi => vec![out("rsi", &rsi(close, period(params, "period", 14.0)))],
+        IndicatorId::Macd => {
             let Macd {
                 macd: line,
                 signal,
@@ -216,21 +319,21 @@ fn compute_one(instance: &Instance, data: &Ohlcv) -> Vec<OutputSeries> {
             );
             vec![out("macd", &line), out("signal", &signal), out("histogram", &histogram)]
         }
-        "stochastic" => {
+        IndicatorId::Stochastic => {
             let Stochastic { k, d } =
                 stochastic(high, low, close, period(params, "period", 14.0), period(params, "smoothD", 3.0));
             vec![out("k", &k), out("d", &d)]
         }
-        "williams" => vec![out(
+        IndicatorId::Williams => vec![out(
             "williams",
             &williams_r(high, low, close, period(params, "period", 14.0)),
         )],
-        "cci" => vec![out("cci", &cci(high, low, close, period(params, "period", 20.0)))],
-        "mfi" => vec![out(
+        IndicatorId::Cci => vec![out("cci", &cci(high, low, close, period(params, "period", 20.0)))],
+        IndicatorId::Mfi => vec![out(
             "mfi",
             &mfi(high, low, close, volume, period(params, "period", 14.0)),
         )],
-        "adx" => {
+        IndicatorId::Adx => {
             let Adx {
                 adx: line,
                 plus_di,
@@ -238,9 +341,9 @@ fn compute_one(instance: &Instance, data: &Ohlcv) -> Vec<OutputSeries> {
             } = adx(high, low, close, period(params, "period", 14.0));
             vec![out("adx", &line), out("plusDi", &plus_di), out("minusDi", &minus_di)]
         }
-        "atr" => vec![out("atr", &atr(high, low, close, period(params, "period", 14.0)))],
-        "obv" => vec![out("obv", &obv(close, volume))],
-        _ => Vec::new(),
+        IndicatorId::Atr => vec![out("atr", &atr(high, low, close, period(params, "period", 14.0)))],
+        IndicatorId::Obv => vec![out("obv", &obv(close, volume))],
+        IndicatorId::RsiDivergence | IndicatorId::MacdDivergence => Vec::new(),
     }
 }
 
@@ -248,11 +351,14 @@ fn compute_one(instance: &Instance, data: &Ohlcv) -> Vec<OutputSeries> {
 /// compared against the instance's oscillator using its pivot/gap params (defaults
 /// mirror the divergence detector's conventional settings).
 fn compute_divergences(instance: &Instance, data: &Ohlcv) -> Vec<DivergenceSpan> {
+    let Ok(indicator) = instance.id.parse::<IndicatorId>() else {
+        return Vec::new();
+    };
     let params = &instance.params;
     let close = data.close;
-    let oscillator = match instance.id.as_str() {
-        "rsiDivergence" => rsi(close, period(params, "period", 14.0)),
-        "macdDivergence" => {
+    let oscillator = match indicator {
+        IndicatorId::RsiDivergence => rsi(close, period(params, "period", 14.0)),
+        IndicatorId::MacdDivergence => {
             macd(
                 close,
                 period(params, "fast", 12.0),
@@ -261,7 +367,23 @@ fn compute_divergences(instance: &Instance, data: &Ohlcv) -> Vec<DivergenceSpan>
             )
             .macd
         }
-        _ => return Vec::new(),
+        IndicatorId::Sma
+        | IndicatorId::Ema
+        | IndicatorId::Wma
+        | IndicatorId::Bollinger
+        | IndicatorId::Vwap
+        | IndicatorId::Donchian
+        | IndicatorId::Supertrend
+        | IndicatorId::Psar
+        | IndicatorId::Rsi
+        | IndicatorId::Macd
+        | IndicatorId::Stochastic
+        | IndicatorId::Williams
+        | IndicatorId::Cci
+        | IndicatorId::Mfi
+        | IndicatorId::Adx
+        | IndicatorId::Atr
+        | IndicatorId::Obv => return Vec::new(),
     };
     detect_divergences(
         close,
@@ -312,9 +434,9 @@ fn line(key: &str, label: &str, color: &str) -> Output {
     }
 }
 
-fn descriptor(id: &str, label: &str, target: Target, params: Vec<Param>, outputs: Vec<Output>) -> Descriptor {
+fn descriptor(id: IndicatorId, label: &str, target: Target, params: Vec<Param>, outputs: Vec<Output>) -> Descriptor {
     Descriptor {
-        id: id.to_owned(),
+        id: id.as_ref().to_owned(),
         label: label.to_owned(),
         kind: DescriptorKind::Series,
         target,
@@ -336,32 +458,195 @@ pub fn descriptors() -> &'static [Descriptor] {
     DESCRIPTORS.get_or_init(build_descriptors)
 }
 
+fn step_aligned(value: f64, parameter: &Param) -> bool {
+    let steps = (value - parameter.min) / parameter.step;
+    let nearest = steps.round();
+    let scale = steps.abs().max(nearest.abs()).max(1.0);
+    (steps - nearest).abs() <= f64::EPSILON * scale
+}
+
+fn validated_instance(instance: &Instance) -> Result<(IndicatorId, &'static Descriptor), InstanceError> {
+    let indicator = instance
+        .id
+        .parse::<IndicatorId>()
+        .map_err(|_| InstanceError::UnknownIndicator(instance.id.clone()))?;
+    let descriptor = descriptors()
+        .iter()
+        .find(|descriptor| descriptor.id == indicator.as_ref())
+        .ok_or_else(|| InstanceError::UnknownIndicator(instance.id.clone()))?;
+
+    for (key, &value) in &instance.params {
+        let parameter = descriptor
+            .params
+            .iter()
+            .find(|parameter| parameter.key == *key)
+            .ok_or_else(|| InstanceError::UnknownParameter {
+                indicator: instance.id.clone(),
+                parameter: key.clone(),
+            })?;
+        if !value.is_finite() {
+            return Err(InstanceError::NonFiniteParameter {
+                indicator: instance.id.clone(),
+                parameter: key.clone(),
+            });
+        }
+        if value < parameter.min || value > parameter.max {
+            return Err(InstanceError::ParameterOutOfRange {
+                indicator: instance.id.clone(),
+                parameter: key.clone(),
+                value,
+                min: parameter.min,
+                max: parameter.max,
+            });
+        }
+        if !step_aligned(value, parameter) {
+            return Err(InstanceError::ParameterOffStep {
+                indicator: instance.id.clone(),
+                parameter: key.clone(),
+                value,
+                step: parameter.step,
+            });
+        }
+    }
+    Ok((indicator, descriptor))
+}
+
+/// Validate an instance against its descriptor.
+///
+/// Missing parameters are valid and use descriptor defaults. Supplied parameters
+/// must be known, finite, within inclusive bounds, and aligned to the step grid.
+pub fn validate_instance(instance: &Instance) -> Result<&'static Descriptor, InstanceError> {
+    validated_instance(instance).map(|(_, descriptor)| descriptor)
+}
+
+fn resolved_period(instance: &Instance, descriptor: &Descriptor, key: &str) -> Result<usize, InstanceError> {
+    let parameter = descriptor.params.iter().find(|parameter| parameter.key == key).ok_or_else(|| {
+        InstanceError::UnknownParameter {
+            indicator: instance.id.clone(),
+            parameter: key.to_owned(),
+        }
+    })?;
+    Ok(instance.params.get(key).copied().unwrap_or(parameter.default) as usize)
+}
+
+fn unknown_output(instance: &Instance, output: &str) -> InstanceError {
+    InstanceError::UnknownOutput {
+        indicator: instance.id.clone(),
+        output: output.to_owned(),
+    }
+}
+
+/// Minimum candles needed for the selected numeric output's first defined value.
+/// Recursive and cumulative indicators seed from the first supplied candle; this
+/// reports availability, not convergence against an earlier market history.
+pub fn series_input_requirement(instance: &Instance, output: &str) -> Result<usize, InstanceError> {
+    let (indicator, descriptor) = validated_instance(instance)?;
+    if !descriptor.outputs.iter().any(|candidate| candidate.key == output) {
+        return Err(unknown_output(instance, output));
+    }
+
+    match indicator {
+        IndicatorId::Sma
+        | IndicatorId::Ema
+        | IndicatorId::Wma
+        | IndicatorId::Bollinger
+        | IndicatorId::Donchian
+        | IndicatorId::Supertrend
+        | IndicatorId::Williams
+        | IndicatorId::Cci
+        | IndicatorId::Atr => resolved_period(instance, descriptor, "period"),
+        IndicatorId::Vwap | IndicatorId::Obv => Ok(1),
+        IndicatorId::Psar => Ok(2),
+        IndicatorId::Rsi | IndicatorId::Mfi => Ok(resolved_period(instance, descriptor, "period")? + 1),
+        IndicatorId::Macd => {
+            let base =
+                resolved_period(instance, descriptor, "fast")?.max(resolved_period(instance, descriptor, "slow")?);
+            match output {
+                "macd" => Ok(base),
+                "signal" | "histogram" => Ok(base + resolved_period(instance, descriptor, "signal")? - 1),
+                _ => Err(unknown_output(instance, output)),
+            }
+        }
+        IndicatorId::Stochastic => {
+            let period = resolved_period(instance, descriptor, "period")?;
+            match output {
+                "k" => Ok(period),
+                "d" => Ok(period + resolved_period(instance, descriptor, "smoothD")? - 1),
+                _ => Err(unknown_output(instance, output)),
+            }
+        }
+        IndicatorId::Adx => {
+            let period = resolved_period(instance, descriptor, "period")?;
+            match output {
+                "adx" => Ok(2 * period),
+                "plusDi" | "minusDi" => Ok(period + 1),
+                _ => Err(unknown_output(instance, output)),
+            }
+        }
+        IndicatorId::RsiDivergence | IndicatorId::MacdDivergence => Err(unknown_output(instance, output)),
+    }
+}
+
+/// Parameters needed to derive an exact divergence-condition history requirement.
+pub fn divergence_input(instance: &Instance) -> Result<DivergenceInput, InstanceError> {
+    let (indicator, descriptor) = validated_instance(instance)?;
+    let oscillator = match indicator {
+        IndicatorId::RsiDivergence => resolved_period(instance, descriptor, "period")? + 1,
+        IndicatorId::MacdDivergence => {
+            resolved_period(instance, descriptor, "fast")?.max(resolved_period(instance, descriptor, "slow")?)
+        }
+        IndicatorId::Sma
+        | IndicatorId::Ema
+        | IndicatorId::Wma
+        | IndicatorId::Bollinger
+        | IndicatorId::Vwap
+        | IndicatorId::Donchian
+        | IndicatorId::Supertrend
+        | IndicatorId::Psar
+        | IndicatorId::Rsi
+        | IndicatorId::Macd
+        | IndicatorId::Stochastic
+        | IndicatorId::Williams
+        | IndicatorId::Cci
+        | IndicatorId::Mfi
+        | IndicatorId::Adx
+        | IndicatorId::Atr
+        | IndicatorId::Obv => return Err(InstanceError::NotDivergence(instance.id.clone())),
+    };
+    Ok(DivergenceInput {
+        oscillator,
+        pivot_left: resolved_period(instance, descriptor, "pivotLeft")?,
+        pivot_right: resolved_period(instance, descriptor, "pivotRight")?,
+        max_gap: resolved_period(instance, descriptor, "maxGap")?,
+    })
+}
+
 fn build_descriptors() -> Vec<Descriptor> {
     let period = |default: f64| param("period", "Period", default, 1.0, 500.0, 1.0);
     vec![
         descriptor(
-            "sma",
+            IndicatorId::Sma,
             "SMA",
             Target::Overlay,
             vec![period(20.0)],
             vec![line("sma", "SMA", "#3b82f6")],
         ),
         descriptor(
-            "ema",
+            IndicatorId::Ema,
             "EMA",
             Target::Overlay,
             vec![period(20.0)],
             vec![line("ema", "EMA", "#f59e0b")],
         ),
         descriptor(
-            "wma",
+            IndicatorId::Wma,
             "WMA",
             Target::Overlay,
             vec![period(20.0)],
             vec![line("wma", "WMA", "#a855f7")],
         ),
         descriptor(
-            "bollinger",
+            IndicatorId::Bollinger,
             "Bollinger Bands",
             Target::Overlay,
             vec![period(20.0), param("mult", "Std. dev", 2.0, 0.5, 5.0, 0.1)],
@@ -372,14 +657,14 @@ fn build_descriptors() -> Vec<Descriptor> {
             ],
         ),
         descriptor(
-            "vwap",
+            IndicatorId::Vwap,
             "VWAP",
             Target::Overlay,
             Vec::new(),
             vec![line("vwap", "VWAP", "#eab308")],
         ),
         descriptor(
-            "donchian",
+            IndicatorId::Donchian,
             "Donchian Channel",
             Target::Overlay,
             vec![period(20.0)],
@@ -390,7 +675,7 @@ fn build_descriptors() -> Vec<Descriptor> {
             ],
         ),
         descriptor(
-            "supertrend",
+            IndicatorId::Supertrend,
             "Supertrend",
             Target::Overlay,
             vec![
@@ -400,7 +685,7 @@ fn build_descriptors() -> Vec<Descriptor> {
             vec![line("supertrend", "Supertrend", "#22c55e")],
         ),
         descriptor(
-            "psar",
+            IndicatorId::Psar,
             "Parabolic SAR",
             Target::Overlay,
             vec![
@@ -413,7 +698,7 @@ fn build_descriptors() -> Vec<Descriptor> {
             guides: vec![30.0, 70.0],
             range: Some([0.0, 100.0]),
             ..descriptor(
-                "rsi",
+                IndicatorId::Rsi,
                 "RSI",
                 Target::Pane,
                 vec![period(14.0)],
@@ -422,7 +707,7 @@ fn build_descriptors() -> Vec<Descriptor> {
         },
         {
             let mut macd_descriptor = descriptor(
-                "macd",
+                IndicatorId::Macd,
                 "MACD",
                 Target::Pane,
                 vec![
@@ -445,7 +730,7 @@ fn build_descriptors() -> Vec<Descriptor> {
             guides: vec![20.0, 80.0],
             range: Some([0.0, 100.0]),
             ..descriptor(
-                "stochastic",
+                IndicatorId::Stochastic,
                 "Stochastic",
                 Target::Pane,
                 vec![period(14.0), param("smoothD", "%D smoothing", 3.0, 1.0, 50.0, 1.0)],
@@ -456,7 +741,7 @@ fn build_descriptors() -> Vec<Descriptor> {
             guides: vec![-20.0, -80.0],
             range: Some([-100.0, 0.0]),
             ..descriptor(
-                "williams",
+                IndicatorId::Williams,
                 "Williams %R",
                 Target::Pane,
                 vec![period(14.0)],
@@ -466,7 +751,7 @@ fn build_descriptors() -> Vec<Descriptor> {
         Descriptor {
             guides: vec![-100.0, 100.0],
             ..descriptor(
-                "cci",
+                IndicatorId::Cci,
                 "CCI",
                 Target::Pane,
                 vec![period(20.0)],
@@ -477,7 +762,7 @@ fn build_descriptors() -> Vec<Descriptor> {
             guides: vec![20.0, 80.0],
             range: Some([0.0, 100.0]),
             ..descriptor(
-                "mfi",
+                IndicatorId::Mfi,
                 "MFI",
                 Target::Pane,
                 vec![period(14.0)],
@@ -487,7 +772,7 @@ fn build_descriptors() -> Vec<Descriptor> {
         Descriptor {
             range: Some([0.0, 100.0]),
             ..descriptor(
-                "adx",
+                IndicatorId::Adx,
                 "ADX",
                 Target::Pane,
                 vec![period(14.0)],
@@ -499,17 +784,23 @@ fn build_descriptors() -> Vec<Descriptor> {
             )
         },
         descriptor(
-            "atr",
+            IndicatorId::Atr,
             "ATR",
             Target::Pane,
             vec![period(14.0)],
             vec![line("atr", "ATR", "#f59e0b")],
         ),
-        descriptor("obv", "OBV", Target::Pane, Vec::new(), vec![line("obv", "OBV", "#22c55e")]),
+        descriptor(
+            IndicatorId::Obv,
+            "OBV",
+            Target::Pane,
+            Vec::new(),
+            vec![line("obv", "OBV", "#22c55e")],
+        ),
         Descriptor {
             kind: DescriptorKind::Divergence,
             ..descriptor(
-                "rsiDivergence",
+                IndicatorId::RsiDivergence,
                 "RSI Divergence",
                 Target::Overlay,
                 vec![
@@ -524,7 +815,7 @@ fn build_descriptors() -> Vec<Descriptor> {
         Descriptor {
             kind: DescriptorKind::Divergence,
             ..descriptor(
-                "macdDivergence",
+                IndicatorId::MacdDivergence,
                 "MACD Divergence",
                 Target::Overlay,
                 vec![
@@ -543,9 +834,15 @@ fn build_descriptors() -> Vec<Descriptor> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::slice;
 
-    use super::{Instance, Ohlcv, compute, descriptors};
+    use strum::EnumCount;
+
+    use super::{
+        DescriptorKind, IndicatorId, Instance, InstanceError, Ohlcv, compute, descriptors, divergence_input,
+        series_input_requirement, validate_instance,
+    };
 
     fn series() -> Vec<f64> {
         (1..=60).map(f64::from).collect()
@@ -560,23 +857,20 @@ mod tests {
         }
     }
 
+    fn instance(id: &str, params: &[(&str, f64)]) -> Instance {
+        Instance {
+            id: id.to_owned(),
+            params: params.iter().map(|(key, value)| ((*key).to_owned(), *value)).collect(),
+        }
+    }
+
     #[test]
     fn descriptors_cover_every_indicator() {
-        let ids: Vec<String> = descriptors().iter().map(|descriptor| descriptor.id.clone()).collect();
-        assert_eq!(ids.len(), 19);
-        for id in [
-            "sma",
-            "bollinger",
-            "vwap",
-            "supertrend",
-            "psar",
-            "rsi",
-            "macd",
-            "obv",
-            "rsiDivergence",
-            "macdDivergence",
-        ] {
-            assert!(ids.iter().any(|candidate| candidate == id), "missing descriptor {id}");
+        let ids: BTreeSet<&str> = descriptors().iter().map(|descriptor| descriptor.id.as_str()).collect();
+        assert_eq!(ids.len(), IndicatorId::COUNT);
+        for id in ids {
+            let parsed = id.parse::<IndicatorId>().expect("descriptor id");
+            assert_eq!(parsed.as_ref(), id);
         }
     }
 
@@ -600,6 +894,108 @@ mod tests {
                 assert_eq!(series.values.len(), values.len(), "{}/{} length", descriptor.id, series.key);
             }
         }
+    }
+
+    #[test]
+    fn validates_every_descriptor_boundary_and_step() {
+        for descriptor in descriptors() {
+            assert!(validate_instance(&instance(&descriptor.id, &[])).is_ok());
+            for parameter in &descriptor.params {
+                for value in [parameter.min, parameter.default, parameter.max] {
+                    assert!(
+                        validate_instance(&instance(&descriptor.id, &[(parameter.key.as_str(), value)])).is_ok(),
+                        "{}/{} should accept {value}",
+                        descriptor.id,
+                        parameter.key,
+                    );
+                }
+            }
+        }
+
+        assert!(validate_instance(&instance("bollinger", &[("mult", 2.1)])).is_ok());
+        assert!(validate_instance(&instance("psar", &[("step", 0.07)])).is_ok());
+
+        assert!(matches!(
+            validate_instance(&instance("nope", &[])),
+            Err(InstanceError::UnknownIndicator(indicator)) if indicator == "nope"
+        ));
+        assert!(matches!(
+            validate_instance(&instance("sma", &[("typo", 20.0)])),
+            Err(InstanceError::UnknownParameter { parameter, .. }) if parameter == "typo"
+        ));
+        assert!(matches!(
+            validate_instance(&instance("sma", &[("period", f64::INFINITY)])),
+            Err(InstanceError::NonFiniteParameter { parameter, .. }) if parameter == "period"
+        ));
+        assert!(matches!(
+            validate_instance(&instance("sma", &[("period", 501.0)])),
+            Err(InstanceError::ParameterOutOfRange { parameter, .. }) if parameter == "period"
+        ));
+        assert!(matches!(
+            validate_instance(&instance("sma", &[("period", 14.5)])),
+            Err(InstanceError::ParameterOffStep { parameter, .. }) if parameter == "period"
+        ));
+    }
+
+    #[test]
+    fn requirements_match_each_series_first_defined_output() {
+        let values = series();
+        for descriptor in descriptors()
+            .iter()
+            .filter(|descriptor| descriptor.kind == DescriptorKind::Series)
+        {
+            let instance = instance(&descriptor.id, &[]);
+            for output in &descriptor.outputs {
+                let required = series_input_requirement(&instance, &output.key).expect("requirement metadata");
+                let exact = values.get(..required).expect("default requirement fits fixture");
+                let computed = compute(slice::from_ref(&instance), &data(exact));
+                let output_values = computed
+                    .first()
+                    .and_then(|result| result.outputs.iter().find(|candidate| candidate.key == output.key))
+                    .map(|series| series.values.as_slice())
+                    .expect("descriptor output");
+                assert!(
+                    output_values.last().is_some_and(|value| value.is_finite()),
+                    "{}/{} should first be defined with {required} candles",
+                    descriptor.id,
+                    output.key,
+                );
+
+                let shorter = exact.get(..required - 1).unwrap_or_default();
+                let computed = compute(slice::from_ref(&instance), &data(shorter));
+                let has_value = computed
+                    .first()
+                    .and_then(|result| result.outputs.iter().find(|candidate| candidate.key == output.key))
+                    .is_some_and(|series| series.values.iter().any(|value| value.is_finite()));
+                assert!(
+                    !has_value,
+                    "{}/{} should be undefined one candle earlier",
+                    descriptor.id, output.key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn requirements_follow_output_specific_parameters() {
+        let macd = instance("macd", &[("fast", 30.0), ("slow", 10.0), ("signal", 5.0)]);
+        assert_eq!(series_input_requirement(&macd, "macd").expect("MACD line"), 30);
+        assert_eq!(series_input_requirement(&macd, "signal").expect("MACD signal"), 34);
+        assert_eq!(series_input_requirement(&macd, "histogram").expect("MACD histogram"), 34);
+
+        let stochastic = instance("stochastic", &[("period", 14.0), ("smoothD", 3.0)]);
+        assert_eq!(series_input_requirement(&stochastic, "k").expect("stochastic K"), 14);
+        assert_eq!(series_input_requirement(&stochastic, "d").expect("stochastic D"), 16);
+
+        let adx = instance("adx", &[("period", 14.0)]);
+        assert_eq!(series_input_requirement(&adx, "plusDi").expect("plus DI"), 15);
+        assert_eq!(series_input_requirement(&adx, "adx").expect("ADX"), 28);
+
+        let divergence = divergence_input(&instance("rsiDivergence", &[])).expect("divergence input");
+        assert_eq!(divergence.oscillator, 15);
+        assert_eq!(divergence.pivot_left, 5);
+        assert_eq!(divergence.pivot_right, 5);
+        assert_eq!(divergence.max_gap, 60);
     }
 
     #[test]

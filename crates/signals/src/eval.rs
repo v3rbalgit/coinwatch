@@ -3,19 +3,19 @@
 //!
 //! Masks are never combined across timeframes directly — their bar grids do not
 //! align. Each condition resolves on its own timeframe first; only its current
-//! boolean verdict flows through the tree. Warm-up values (`NaN`) and failed
-//! decimal conversions evaluate to `false`, keeping results conservative.
+//! boolean verdict flows through the tree. Insufficient warmup remains an
+//! explicit unknown verdict rather than being mistaken for a negative result.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use domain::{Candle, Timeframe};
-use indicators::{Instance, InstanceOutput, Ohlcv, compute};
+use indicators::{Instance, InstanceError, InstanceOutput, Ohlcv, compute};
 use rust_decimal::prelude::ToPrimitive;
 
 use crate::definition::{
-    ComparisonOp, Condition, CrossDirection, Node, Operand, Predicate, PriceField, SignalDefinition,
+    ComparisonOp, Condition, CrossDirection, DefinitionError, Node, Operand, Predicate, PriceField, SignalDefinition,
 };
 
 /// One condition's evaluation verdict.
@@ -27,6 +27,13 @@ pub enum OutcomeStatus {
     NotSatisfied,
     /// No completed candle data for the condition's timeframe was available.
     NoData,
+    /// Some candles exist, but not enough to evaluate the complete requested window.
+    InsufficientHistory {
+        /// Exact completed-candle requirement.
+        required: usize,
+        /// Completed candles supplied to the evaluator.
+        available: usize,
+    },
 }
 
 /// Per-condition result, including evidence for "why did it fire".
@@ -204,9 +211,17 @@ fn resolve_operand<'a>(operand: &'a Operand, condition_id: &str, prepared: &'a T
     }
 }
 
-/// Evaluate a validated signal definition against one coin's completed bars.
-#[must_use]
-pub fn evaluate(definition: &SignalDefinition, coin: &str, data: &CoinData) -> EvalReport {
+/// Validate and evaluate a signal definition against one coin's completed bars.
+pub fn evaluate(definition: &SignalDefinition, coin: &str, data: &CoinData) -> Result<EvalReport, DefinitionError> {
+    definition.validate()?;
+    evaluate_validated(definition, coin, data)
+}
+
+pub(crate) fn evaluate_validated(
+    definition: &SignalDefinition,
+    coin: &str,
+    data: &CoinData,
+) -> Result<EvalReport, DefinitionError> {
     let mut by_timeframe: BTreeMap<Timeframe, Vec<(&str, &Condition)>> = BTreeMap::new();
     for (id, condition) in &definition.conditions {
         by_timeframe.entry(condition.timeframe).or_default().push((id, condition));
@@ -226,7 +241,12 @@ pub fn evaluate(definition: &SignalDefinition, coin: &str, data: &CoinData) -> E
     let mut outcomes = BTreeMap::new();
     for (id, condition) in &definition.conditions {
         let outcome = match prepared.get(&condition.timeframe) {
-            Some(timeframe) => evaluate_condition(id, condition, timeframe),
+            Some(timeframe) => {
+                evaluate_condition(id, condition, timeframe).map_err(|source| DefinitionError::InvalidIndicator {
+                    condition: id.clone(),
+                    source,
+                })?
+            }
             None => ConditionOutcome {
                 status: OutcomeStatus::NoData,
                 last_true_bar: None,
@@ -247,13 +267,13 @@ pub fn evaluate(definition: &SignalDefinition, coin: &str, data: &CoinData) -> E
         .filter_map(|outcome| outcome.last_true_bar)
         .max();
 
-    EvalReport {
+    Ok(EvalReport {
         coin: coin.to_owned(),
         satisfied,
         triggered_at,
         conditions: outcomes,
         missing_data,
-    }
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,7 +326,7 @@ fn eval_node(node: &Node, outcomes: &BTreeMap<String, ConditionOutcome>) -> Trut
         Node::Condition { id } => match outcomes.get(id).map(|outcome| outcome.status) {
             Some(OutcomeStatus::Satisfied) => Truth::True,
             Some(OutcomeStatus::NotSatisfied) => Truth::False,
-            Some(OutcomeStatus::NoData) | None => Truth::Unknown,
+            Some(OutcomeStatus::NoData | OutcomeStatus::InsufficientHistory { .. }) | None => Truth::Unknown,
         },
     }
 }
@@ -340,9 +360,25 @@ fn collect_supporting<'a>(
     }
 }
 
-fn evaluate_condition(condition_id: &str, condition: &Condition, prepared: &TimeframePrepared<'_>) -> ConditionOutcome {
-    let mask = build_mask(condition_id, condition, prepared);
-    let window_len = usize::try_from(condition.within_bars).unwrap_or(usize::MAX).saturating_add(1);
+fn evaluate_condition(
+    condition_id: &str,
+    condition: &Condition,
+    prepared: &TimeframePrepared<'_>,
+) -> Result<ConditionOutcome, InstanceError> {
+    let available = prepared.candles.len();
+    let requirement = condition.requirement()?;
+    if available < requirement.completed_bars {
+        return Ok(ConditionOutcome {
+            status: OutcomeStatus::InsufficientHistory {
+                required: requirement.completed_bars,
+                available,
+            },
+            last_true_bar: None,
+        });
+    }
+
+    let mask = build_mask(condition_id, condition, prepared, requirement.confirmation_bars);
+    let window_len = condition.within_bars as usize + 1;
     let satisfied = mask.iter().rev().take(window_len).any(|&held| held);
     let last_true_bar = mask
         .iter()
@@ -354,10 +390,15 @@ fn evaluate_condition(condition_id: &str, condition: &Condition, prepared: &Time
     } else {
         OutcomeStatus::NotSatisfied
     };
-    ConditionOutcome { status, last_true_bar }
+    Ok(ConditionOutcome { status, last_true_bar })
 }
 
-fn build_mask(condition_id: &str, condition: &Condition, prepared: &TimeframePrepared<'_>) -> Vec<bool> {
+fn build_mask(
+    condition_id: &str,
+    condition: &Condition,
+    prepared: &TimeframePrepared<'_>,
+    confirmation_bars: usize,
+) -> Vec<bool> {
     match &condition.predicate {
         Predicate::Threshold { left, right, op } => {
             let left = resolve_operand(left, condition_id, prepared);
@@ -378,7 +419,8 @@ fn build_mask(condition_id: &str, condition: &Condition, prepared: &TimeframePre
             for span in spans {
                 if kind.matches(span.kind)
                     && direction.matches(span.direction)
-                    && let Some(slot) = mask.get_mut(span.to_index)
+                    && let Some(confirmation) = span.to_index.checked_add(confirmation_bars)
+                    && let Some(slot) = mask.get_mut(confirmation)
                 {
                     *slot = true;
                 }
@@ -431,13 +473,13 @@ mod tests {
 
     use chrono::{TimeZone, Utc};
     use domain::{Candle, Timeframe};
-    use indicators::Instance;
+    use indicators::{Instance, InstanceError};
     use rust_decimal::Decimal;
 
     use super::{CoinData, OutcomeStatus, evaluate};
     use crate::definition::{
-        ComparisonOp, Condition, CrossDirection, DEFINITION_VERSION, Direction, DirectionFilter, KindFilter, Node,
-        Operand, Predicate, PriceField, SignalDefinition,
+        ComparisonOp, Condition, CrossDirection, DEFINITION_VERSION, DefinitionError, Direction, DirectionFilter,
+        KindFilter, Node, Operand, Predicate, PriceField, SignalDefinition,
     };
 
     fn candle(index: usize, close: f64) -> Candle {
@@ -502,11 +544,11 @@ mod tests {
         let mut data = CoinData::default();
         data.insert(Timeframe::Hour1, candles(&[10.0, 20.0, 100.0, 50.0]));
 
-        let recent_report = evaluate(&recent, "BTC", &data);
+        let recent_report = evaluate(&recent, "BTC", &data).expect("valid recent signal");
         assert!(recent_report.satisfied);
         assert_eq!(recent_report.conditions["hot"].status, OutcomeStatus::Satisfied);
 
-        let stale_report = evaluate(&stale, "BTC", &data);
+        let stale_report = evaluate(&stale, "BTC", &data).expect("valid stale signal");
         assert!(!stale_report.satisfied);
         assert_eq!(stale_report.conditions["hot"].status, OutcomeStatus::NotSatisfied);
         assert_eq!(
@@ -536,8 +578,59 @@ mod tests {
         let mut data = CoinData::default();
         data.insert(Timeframe::Hour1, candles(&[10.0, 10.0, 10.0, 5.0, 10.0]));
 
-        let report = evaluate(&signal, "BTC", &data);
+        let report = evaluate(&signal, "BTC", &data).expect("valid cross signal");
         assert!(report.satisfied, "expected a close-over-SMA cross on the final bar");
+    }
+
+    #[test]
+    fn invalid_definitions_fail_before_data_statuses_are_computed() {
+        let mut signal = definition(
+            vec![("invalid", sma_threshold(Timeframe::Hour1, 80.0, 0))],
+            Node::Condition {
+                id: "invalid".to_owned(),
+            },
+        );
+        signal
+            .conditions
+            .get_mut("invalid")
+            .expect("fixture condition")
+            .indicator
+            .params
+            .insert("typo".to_owned(), 1.0);
+
+        assert!(matches!(
+            evaluate(&signal, "BTC", &CoinData::default()),
+            Err(DefinitionError::InvalidIndicator {
+                source: InstanceError::UnknownParameter { parameter, .. },
+                ..
+            }) if parameter == "typo"
+        ));
+    }
+
+    #[test]
+    fn insufficient_warmup_is_unknown_and_cannot_satisfy_negation() {
+        let mut condition = sma_threshold(Timeframe::Hour1, 80.0, 1);
+        condition.indicator.params.insert("period".to_owned(), 3.0);
+        let signal = definition(
+            vec![("warmup", condition)],
+            Node::Not {
+                child: Box::new(Node::Condition {
+                    id: "warmup".to_owned(),
+                }),
+            },
+        );
+        let mut data = CoinData::default();
+        data.insert(Timeframe::Hour1, candles(&[10.0, 20.0, 30.0]));
+
+        let report = evaluate(&signal, "BTC", &data).expect("valid warmup signal");
+        assert_eq!(
+            report.conditions["warmup"].status,
+            OutcomeStatus::InsufficientHistory {
+                required: 4,
+                available: 3,
+            }
+        );
+        assert!(!report.satisfied, "unknown history must not satisfy negation");
     }
 
     #[test]
@@ -559,7 +652,7 @@ mod tests {
         let mut data = CoinData::default();
         data.insert(Timeframe::Hour4, candles(&[100.0, 100.0]));
 
-        let report = evaluate(&signal, "BTC", &data);
+        let report = evaluate(&signal, "BTC", &data).expect("valid missing-data signal");
         assert_eq!(report.conditions["hot"].status, OutcomeStatus::Satisfied);
         assert_eq!(report.conditions["weekly"].status, OutcomeStatus::NoData);
         assert_eq!(report.missing_data, vec![Timeframe::Week1]);
@@ -573,7 +666,11 @@ mod tests {
                 }),
             },
         );
-        assert!(!evaluate(&negated, "BTC", &CoinData::default()).satisfied);
+        assert!(
+            !evaluate(&negated, "BTC", &CoinData::default())
+                .expect("valid negated signal")
+                .satisfied
+        );
     }
 
     #[test]
@@ -605,7 +702,7 @@ mod tests {
         let mut data = CoinData::default();
         data.insert(Timeframe::Hour1, candles(&[100.0, 100.0]));
 
-        assert!(evaluate(&signal, "BTC", &data).satisfied);
+        assert!(evaluate(&signal, "BTC", &data).expect("valid nested signal").satisfied);
     }
 
     #[test]
@@ -617,7 +714,7 @@ mod tests {
             ("period".to_owned(), 2.0),
             ("pivotLeft".to_owned(), 1.0),
             ("pivotRight".to_owned(), 1.0),
-            ("maxGap".to_owned(), 20.0),
+            ("maxGap".to_owned(), 5.0),
         ]
         .into_iter()
         .collect::<BTreeMap<_, _>>();
@@ -631,14 +728,24 @@ mod tests {
                 kind: KindFilter::Regular,
                 direction: DirectionFilter::Bearish,
             },
-            within_bars: 1,
+            within_bars: 0,
         };
         let signal = definition(vec![("div", condition)], Node::Condition { id: "div".to_owned() });
+        let mut insufficient = CoinData::default();
+        insufficient.insert(Timeframe::Hour1, candles(closes.get(..8).expect("short divergence fixture")));
+        let insufficient_report = evaluate(&signal, "BTC", &insufficient).expect("valid divergence signal");
+        assert_eq!(
+            insufficient_report.conditions["div"].status,
+            OutcomeStatus::InsufficientHistory {
+                required: 9,
+                available: 8,
+            }
+        );
+
         let mut data = CoinData::default();
         data.insert(Timeframe::Hour1, candles(&closes));
-
-        let report = evaluate(&signal, "BTC", &data);
+        let report = evaluate(&signal, "BTC", &data).expect("valid divergence signal");
         assert!(report.satisfied);
-        assert_eq!(report.conditions["div"].last_true_bar, Utc.timestamp_opt(8 * 3_600, 0).single());
+        assert_eq!(report.conditions["div"].last_true_bar, Utc.timestamp_opt(9 * 3_600, 0).single());
     }
 }
