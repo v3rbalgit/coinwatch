@@ -7,6 +7,7 @@
   import { goto } from "$app/navigation"
   import { page } from "$app/stores"
   import Chart from "$lib/chart/Chart.svelte"
+  import { parseDrawingsPayload, serializeDrawings, type Drawing } from "$lib/chart/drawings/types"
   import type { IndicatorInstance } from "$lib/chart/indicators"
   import { fmtPrice } from "$lib/chart/theme"
   import type { Bar } from "$lib/chart/types"
@@ -39,6 +40,8 @@
     { id: "rsiDivergence", params: {} },
     { id: "macdDivergence", params: {} },
   ])
+  // Drawings persist per coin (a trendline on BTC is meaningless on ETH).
+  let chartDrawings = $state<Drawing[]>([])
 
   async function loadCandles() {
     const [c, t] = [coin, tf]
@@ -80,6 +83,13 @@
     indicatorInstances = next
     invoke("set_setting", { key: "chart.indicators", value: JSON.stringify(next) }).catch(error =>
       console.error("failed to save chart indicators", error)
+    )
+  }
+
+  // Drawings persist per coin under their own key.
+  function persistDrawings(next: readonly Drawing[]) {
+    invoke("set_setting", { key: `chart.drawings.${coin}`, value: serializeDrawings(next) }).catch(error =>
+      console.error("failed to save chart drawings", error)
     )
   }
 
@@ -126,6 +136,18 @@
       exhausted = false
       void loadCandles()
     }
+  })
+
+  // Load this coin's saved drawings; clear first so the previous coin's don't linger.
+  $effect(() => {
+    const active = coin
+    if (!active) return
+    chartDrawings = []
+    void invoke<string | null>("get_setting", { key: `chart.drawings.${active}` })
+      .then(saved => {
+        if (active === coin) chartDrawings = parseDrawingsPayload(saved).drawings
+      })
+      .catch(error => console.error("failed to load chart drawings", error))
   })
 
   onMount(() => {
@@ -231,7 +253,15 @@
   </div>
 
   <div class="relative min-h-0 flex-1 overflow-hidden rounded-lg border border-border">
-    <Chart {bars} {seed} instances={indicatorInstances} onInstancesChange={persistInstances} onLoadOlder={loadOlder} />
+    <Chart
+      {bars}
+      {seed}
+      instances={indicatorInstances}
+      drawings={chartDrawings}
+      onInstancesChange={persistInstances}
+      onDrawingsChange={persistDrawings}
+      onLoadOlder={loadOlder}
+    />
     {#if bars.length === 0}
       <div class="absolute inset-0 flex items-center justify-center gap-2 text-sm text-muted-foreground">
         <LoaderCircle class="size-4 animate-spin" />

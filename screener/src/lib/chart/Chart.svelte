@@ -43,14 +43,18 @@
       { id: "rsiDivergence", params: {} },
       { id: "macdDivergence", params: {} },
     ],
+    drawings = [],
     onLoadOlder,
     onInstancesChange,
+    onDrawingsChange,
   }: {
     bars: Bar[]
     seed?: number
     instances?: IndicatorInstance[]
+    drawings?: Drawing[]
     onLoadOlder?: () => void
     onInstancesChange?: (instances: IndicatorInstance[]) => void
+    onDrawingsChange?: (drawings: readonly Drawing[]) => void
   } = $props()
 
   const VISIBLE_BARS = 150
@@ -279,7 +283,7 @@
 
     drawingsPrimitive = new DrawingsPrimitive()
     candles.attachPrimitive(drawingsPrimitive)
-    drawingStore = new DrawingStore()
+    drawingStore = new DrawingStore(next => onDrawingsChange?.(next))
     // The full interaction engine: click-click or drag-to-draw with live preview,
     // hit-tested selection, body/handle drags, Escape/Delete, magnet, tool hotkeys.
     drawingInteraction = new DrawingInteraction(
@@ -392,6 +396,12 @@
   })
   $effect(() => {
     drawingInteraction?.setMagnet(magnet)
+  })
+
+  // Load the parent-provided drawings into the store (the parent swaps them per coin).
+  $effect(() => {
+    if (!ready) return
+    drawingStore?.load(drawings)
   })
 
   // Close the indicator picker on a click outside it (or the ƒx button).
