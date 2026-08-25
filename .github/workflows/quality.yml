@@ -1,0 +1,119 @@
+name: Quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust quality
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt
+          rustup default 1.98.0
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
+        with:
+          tool: cargo-deny@0.20.2
+          fallback: none
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --workspace
+
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --workspace --no-deps
+
+      - name: Check dependency policy
+        run: cargo deny check
+
+      - name: Check patch whitespace
+        run: git diff --check
+
+  frontend:
+    name: Frontend quality
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          version: 11.21.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: screener/pnpm-lock.yaml
+
+      - name: Install Rust and WebAssembly target
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal --target wasm32-unknown-unknown
+          rustup default 1.98.0
+
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
+        with:
+          tool: wasm-pack@0.15.0
+          fallback: none
+
+      - name: Install frontend dependencies
+        run: pnpm --dir screener install --frozen-lockfile
+
+      - name: Build indicator WebAssembly
+        run: pnpm --dir screener run wasm
+
+      - name: Check formatting
+        run: pnpm --dir screener exec prettier --check .
+
+      - name: Run ESLint
+        run: pnpm --dir screener exec eslint .
+
+      - name: Run Svelte checks
+        run: pnpm --dir screener check
+
+      - name: Run frontend tests
+        run: pnpm --dir screener exec vitest run
+
+      - name: Build frontend
+        run: pnpm --dir screener exec vite build

@@ -1,8 +1,9 @@
 {
   "name": "screener",
   "version": "0.1.0",
-  "description": "",
+  "description": "Real-time Hyperliquid market screener desktop application.",
   "type": "module",
+  "packageManager": "pnpm@11.21.0",
   "scripts": {
     "wasm": "wasm-pack build ../crates/indicators-wasm --target web --out-dir ../../screener/src/lib/wasm --out-name indicators --release",
     "dev": "pnpm run wasm && vite dev",

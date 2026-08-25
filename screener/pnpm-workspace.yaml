@@ -1,5 +1,5 @@
 allowBuilds:
-  esbuild: set this to true or false
-onlyBuiltDependencies:
-  - esbuild
+  esbuild: true
+overrides:
+  cookie: 0.7.2
 verifyDepsBeforeRun: false
