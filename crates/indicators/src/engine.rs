@@ -172,14 +172,7 @@ fn get(params: &BTreeMap<String, f64>, key: &str, default: f64) -> f64 {
 }
 
 fn period(params: &BTreeMap<String, f64>, key: &str, default: f64) -> usize {
-    let value = get(params, key, default).max(1.0);
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "periods are small positive integers"
-    )]
-    let period = value as usize;
-    period
+    get(params, key, default).max(1.0) as usize
 }
 
 /// Compute one instance's output series over `data`. Unknown ids yield no outputs.
