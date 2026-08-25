@@ -9,8 +9,8 @@ use chrono::{DateTime, Utc};
 use domain::{Candle, Timeframe};
 use hl_feed::MarketStore;
 
-use crate::definition::SignalDefinition;
-use crate::eval::{CoinData, EvalReport, evaluate};
+use crate::definition::{DefinitionError, SignalDefinition};
+use crate::eval::{CoinData, EvalReport, evaluate, evaluate_validated};
 
 /// Length of the completed prefix in an oldest-first candle series.
 fn completed_len(candles: &[Candle], timeframe: Timeframe, now: DateTime<Utc>) -> usize {
@@ -52,9 +52,13 @@ pub fn collect_coin_data(
     data
 }
 
-/// Evaluate a signal on one coin using hot-cache completed bars.
-#[must_use]
-pub fn evaluate_coin(store: &MarketStore, definition: &SignalDefinition, coin: &str, now: DateTime<Utc>) -> EvalReport {
+/// Validate and evaluate a signal on one coin using hot-cache completed bars.
+pub fn evaluate_coin(
+    store: &MarketStore,
+    definition: &SignalDefinition,
+    coin: &str,
+    now: DateTime<Utc>,
+) -> Result<EvalReport, DefinitionError> {
     let data = collect_coin_data(store, coin, definition, now);
     evaluate(definition, coin, &data)
 }
@@ -68,21 +72,21 @@ pub enum RunScope {
     Coins(Vec<String>),
 }
 
-/// Evaluate a signal across a scope, one report per coin.
-#[must_use]
+/// Validate and evaluate a signal across a scope, one report per coin.
 pub fn run_signal(
     store: &MarketStore,
     definition: &SignalDefinition,
     scope: &RunScope,
     now: DateTime<Utc>,
-) -> Vec<EvalReport> {
+) -> Result<Vec<EvalReport>, DefinitionError> {
+    definition.validate()?;
+    let evaluate_one = |coin: &str| {
+        let data = collect_coin_data(store, coin, definition, now);
+        evaluate_validated(definition, coin, &data)
+    };
     match scope {
-        RunScope::Universe => store
-            .universe()
-            .iter()
-            .map(|coin| evaluate_coin(store, definition, &coin.coin, now))
-            .collect(),
-        RunScope::Coins(coins) => coins.iter().map(|coin| evaluate_coin(store, definition, coin, now)).collect(),
+        RunScope::Universe => store.universe().iter().map(|coin| evaluate_one(&coin.coin)).collect(),
+        RunScope::Coins(coins) => coins.iter().map(|coin| evaluate_one(coin)).collect(),
     }
 }
 
