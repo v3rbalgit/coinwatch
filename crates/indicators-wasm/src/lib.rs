@@ -1,14 +1,14 @@
-//! WebAssembly bindings for [`indicators`]. The chart computes RSI/MACD and
-//! divergences from the exact same Rust code the scanner uses, so the two can
-//! never drift. The pure [`analyze`] entry point is shared by the native test and
-//! the wasm export.
+//! WebAssembly bindings for [`indicators`]. The chart computes RSI/MACD,
+//! divergences, and the instance-driven indicator engine from the exact same Rust
+//! code the backend evaluator uses, so the two can never drift. The pure [`analyze`]
+//! entry point is shared by the native test and the wasm export.
 
-use indicators::{DivergenceDirection, DivergenceKind, detect_divergences, macd, rsi};
+use indicators::{
+    DivergenceDirection, DivergenceKind, Instance, Ohlcv, compute, descriptors, detect_divergences, macd, rsi,
+};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsValue;
 use wasm_bindgen::prelude::wasm_bindgen;
-
-mod engine;
 
 /// Indicator parameters (camelCase to match the JS caller).
 #[derive(Debug, Clone, Deserialize)]
@@ -121,7 +121,7 @@ pub fn analyze_series(closes: &[f64], config: JsValue) -> Result<JsValue, JsValu
 /// Wasm entry point: the indicator registry (metadata for the chart's toggle UI).
 #[wasm_bindgen(js_name = indicatorDescriptors)]
 pub fn indicator_descriptors() -> Result<JsValue, JsValue> {
-    serde_wasm_bindgen::to_value(&engine::descriptors()).map_err(|error| JsValue::from_str(&error.to_string()))
+    serde_wasm_bindgen::to_value(descriptors()).map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
 /// Wasm entry point: compute configured indicator instances over an OHLCV series.
@@ -133,15 +133,15 @@ pub fn compute_indicators(
     close: &[f64],
     volume: &[f64],
 ) -> Result<JsValue, JsValue> {
-    let instances: Vec<engine::Instance> =
+    let instances: Vec<Instance> =
         serde_wasm_bindgen::from_value(instances).map_err(|error| JsValue::from_str(&error.to_string()))?;
-    let data = engine::Ohlcv {
+    let data = Ohlcv {
         high,
         low,
         close,
         volume,
     };
-    let outputs = engine::compute(&instances, &data);
+    let outputs = compute(&instances, &data);
     serde_wasm_bindgen::to_value(&outputs).map_err(|error| JsValue::from_str(&error.to_string()))
 }
 

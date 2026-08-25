@@ -3903,6 +3903,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "signals"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "domain",
+ "hl-feed",
+ "indicators",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"

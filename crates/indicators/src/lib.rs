@@ -11,6 +11,7 @@ mod bollinger;
 mod cci;
 mod divergence;
 mod donchian;
+mod engine;
 mod macd;
 mod mfi;
 mod obv;
@@ -30,6 +31,10 @@ pub use bollinger::{Bollinger, bollinger};
 pub use cci::cci;
 pub use divergence::{Divergence, DivergenceDirection, DivergenceKind, detect_divergences};
 pub use donchian::{Donchian, donchian};
+pub use engine::{
+    Descriptor, DescriptorKind, Instance, InstanceOutput, Ohlcv, Output, OutputKind, OutputSeries, Param, Target,
+    compute, descriptors,
+};
 pub use macd::{Macd, ema, macd};
 pub use mfi::mfi;
 pub use obv::obv;

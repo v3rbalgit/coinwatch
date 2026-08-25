@@ -1,21 +1,21 @@
-//! The instance-driven indicator engine behind the chart.
+//! The instance-driven indicator engine: configured `{id, params}` instances
+//! computed over one OHLCV series.
 //!
-//! [`descriptors`] lists every indicator the chart can draw (metadata for its
-//! toggle UI); [`compute`] runs a set of configured instances over one OHLCV
-//! series. The chart only toggles visibility and passes conventional default
-//! params — indicator *configuration* lives in the future signal builder — but the
-//! same instance shape (`{id, params}`) lets a fired signal later hand the chart
-//! its exact conditions to draw. All math is the shared `indicators` crate, so the
-//! chart can never drift from the scanner.
+//! [`descriptors`] is the registry metadata (labels, tunable params, plotted
+//! outputs) that drives editor UIs; [`compute`] turns instances into output
+//! series and divergence spans. Consumers share this one dispatch so indicator
+//! ids, param keys, and defaults can never drift between them.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
-use indicators::{
+use serde::{Deserialize, Serialize};
+
+use crate::{
     Adx, Bollinger, DivergenceDirection, DivergenceKind, Donchian, Macd, Stochastic, Supertrend, adx, atr, bollinger,
     cci, detect_divergences, donchian, ema, macd, mfi, obv, psar, rsi, sma, stochastic, supertrend, vwap, williams_r,
     wma,
 };
-use serde::{Deserialize, Serialize};
 
 /// Where an indicator draws: over the price pane, or in its own pane below.
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -25,6 +25,16 @@ pub enum Target {
     Overlay,
     /// Drawn in a dedicated pane below the price.
     Pane,
+}
+
+/// What an indicator instance produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DescriptorKind {
+    /// One or more numeric output series.
+    Series,
+    /// Divergence spans between price and an oscillator.
+    Divergence,
 }
 
 /// How one output series is plotted.
@@ -37,7 +47,7 @@ pub enum OutputKind {
     Histogram,
 }
 
-/// A tunable parameter — surfaced with defaults now, editable in the signal builder later.
+/// A tunable parameter — surfaced with conventional defaults, editable by callers.
 #[derive(Debug, Clone, Serialize)]
 pub struct Param {
     /// Instance-params key.
@@ -46,11 +56,11 @@ pub struct Param {
     pub label: String,
     /// Conventional default value.
     pub default: f64,
-    /// Minimum for a future editor.
+    /// Minimum for an editor.
     pub min: f64,
-    /// Maximum for a future editor.
+    /// Maximum for an editor.
     pub max: f64,
-    /// Step for a future editor.
+    /// Step for an editor.
     pub step: f64,
 }
 
@@ -63,17 +73,19 @@ pub struct Output {
     pub label: String,
     /// Line vs histogram.
     pub kind: OutputKind,
-    /// Default line/bar color (hex); the chart may override from its theme.
+    /// Default line/bar color (hex); renderers may override from their theme.
     pub color: String,
 }
 
-/// Static metadata for one indicator: drives the toggle picker and the renderer.
+/// Static metadata for one indicator: drives pickers/editors and the renderer.
 #[derive(Debug, Clone, Serialize)]
 pub struct Descriptor {
     /// Stable id (matches `Instance.id`).
     pub id: String,
     /// Human label.
     pub label: String,
+    /// Whether instances produce numeric series or divergence spans.
+    pub kind: DescriptorKind,
     /// Overlay vs own pane.
     pub target: Target,
     /// Tunable params with defaults.
@@ -87,13 +99,13 @@ pub struct Descriptor {
 }
 
 /// A configured indicator to compute: an id plus its params.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Instance {
     /// Which indicator (matches a [`Descriptor::id`]).
     pub id: String,
     /// Params by key; missing keys fall back to conventional defaults.
     #[serde(default)]
-    pub params: HashMap<String, f64>,
+    pub params: BTreeMap<String, f64>,
 }
 
 /// One computed output series, aligned index-for-index with the input (`NaN` where
@@ -155,11 +167,11 @@ fn out(key: &str, series: &[Option<f64>]) -> OutputSeries {
     }
 }
 
-fn get(params: &HashMap<String, f64>, key: &str, default: f64) -> f64 {
+fn get(params: &BTreeMap<String, f64>, key: &str, default: f64) -> f64 {
     params.get(key).copied().unwrap_or(default)
 }
 
-fn period(params: &HashMap<String, f64>, key: &str, default: f64) -> usize {
+fn period(params: &BTreeMap<String, f64>, key: &str, default: f64) -> usize {
     let value = get(params, key, default).max(1.0);
     #[expect(
         clippy::cast_possible_truncation,
@@ -241,7 +253,7 @@ fn compute_one(instance: &Instance, data: &Ohlcv) -> Vec<OutputSeries> {
 
 /// Divergence spans for a divergence instance (empty for other ids): `close` is
 /// compared against the instance's oscillator using its pivot/gap params (defaults
-/// mirror the scanner).
+/// mirror the divergence detector's conventional settings).
 fn compute_divergences(instance: &Instance, data: &Ohlcv) -> Vec<DivergenceSpan> {
     let params = &instance.params;
     let close = data.close;
@@ -311,6 +323,7 @@ fn descriptor(id: &str, label: &str, target: Target, params: Vec<Param>, outputs
     Descriptor {
         id: id.to_owned(),
         label: label.to_owned(),
+        kind: DescriptorKind::Series,
         target,
         params,
         outputs,
@@ -319,9 +332,18 @@ fn descriptor(id: &str, label: &str, target: Target, params: Vec<Param>, outputs
     }
 }
 
-/// The registry of indicators the chart can toggle, with conventional defaults.
+static DESCRIPTORS: OnceLock<Vec<Descriptor>> = OnceLock::new();
+
+/// The registry of supported indicators, with conventional defaults.
+///
+/// Metadata is allocated once because validation, the chart, and the builder all
+/// read the same immutable registry.
 #[must_use]
-pub fn descriptors() -> Vec<Descriptor> {
+pub fn descriptors() -> &'static [Descriptor] {
+    DESCRIPTORS.get_or_init(build_descriptors)
+}
+
+fn build_descriptors() -> Vec<Descriptor> {
     let period = |default: f64| param("period", "Period", default, 1.0, 500.0, 1.0);
     vec![
         descriptor(
@@ -406,7 +428,7 @@ pub fn descriptors() -> Vec<Descriptor> {
             )
         },
         {
-            let mut macd = descriptor(
+            let mut macd_descriptor = descriptor(
                 "macd",
                 "MACD",
                 Target::Pane,
@@ -417,14 +439,14 @@ pub fn descriptors() -> Vec<Descriptor> {
                 ],
                 vec![line("macd", "MACD", "#3b82f6"), line("signal", "Signal", "#f59e0b")],
             );
-            macd.outputs.push(Output {
+            macd_descriptor.outputs.push(Output {
                 key: "histogram".to_owned(),
                 label: "Histogram".to_owned(),
                 kind: OutputKind::Histogram,
                 color: "#6b7280".to_owned(),
             });
-            macd.guides = vec![0.0];
-            macd
+            macd_descriptor.guides = vec![0.0];
+            macd_descriptor
         },
         Descriptor {
             guides: vec![20.0, 80.0],
@@ -491,47 +513,63 @@ pub fn descriptors() -> Vec<Descriptor> {
             vec![line("atr", "ATR", "#f59e0b")],
         ),
         descriptor("obv", "OBV", Target::Pane, Vec::new(), vec![line("obv", "OBV", "#22c55e")]),
-        descriptor(
-            "rsiDivergence",
-            "RSI Divergence",
-            Target::Overlay,
-            vec![
-                period(14.0),
-                param("pivotLeft", "Pivot left", 5.0, 1.0, 50.0, 1.0),
-                param("pivotRight", "Pivot right", 5.0, 1.0, 50.0, 1.0),
-                param("maxGap", "Max gap", 60.0, 1.0, 500.0, 1.0),
-            ],
-            Vec::new(),
-        ),
-        descriptor(
-            "macdDivergence",
-            "MACD Divergence",
-            Target::Overlay,
-            vec![
-                param("fast", "Fast", 12.0, 1.0, 100.0, 1.0),
-                param("slow", "Slow", 26.0, 1.0, 200.0, 1.0),
-                param("signal", "Signal", 9.0, 1.0, 100.0, 1.0),
-                param("pivotLeft", "Pivot left", 5.0, 1.0, 50.0, 1.0),
-                param("pivotRight", "Pivot right", 5.0, 1.0, 50.0, 1.0),
-                param("maxGap", "Max gap", 60.0, 1.0, 500.0, 1.0),
-            ],
-            Vec::new(),
-        ),
+        Descriptor {
+            kind: DescriptorKind::Divergence,
+            ..descriptor(
+                "rsiDivergence",
+                "RSI Divergence",
+                Target::Overlay,
+                vec![
+                    period(14.0),
+                    param("pivotLeft", "Pivot left", 5.0, 1.0, 50.0, 1.0),
+                    param("pivotRight", "Pivot right", 5.0, 1.0, 50.0, 1.0),
+                    param("maxGap", "Max gap", 60.0, 1.0, 500.0, 1.0),
+                ],
+                Vec::new(),
+            )
+        },
+        Descriptor {
+            kind: DescriptorKind::Divergence,
+            ..descriptor(
+                "macdDivergence",
+                "MACD Divergence",
+                Target::Overlay,
+                vec![
+                    param("fast", "Fast", 12.0, 1.0, 100.0, 1.0),
+                    param("slow", "Slow", 26.0, 1.0, 200.0, 1.0),
+                    param("signal", "Signal", 9.0, 1.0, 100.0, 1.0),
+                    param("pivotLeft", "Pivot left", 5.0, 1.0, 50.0, 1.0),
+                    param("pivotRight", "Pivot right", 5.0, 1.0, 50.0, 1.0),
+                    param("maxGap", "Max gap", 60.0, 1.0, 500.0, 1.0),
+                ],
+                Vec::new(),
+            )
+        },
     ]
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{Instance, Ohlcv, compute, descriptors};
-    use std::collections::HashMap;
 
     fn series() -> Vec<f64> {
         (1..=60).map(f64::from).collect()
     }
 
+    fn data(values: &[f64]) -> Ohlcv<'_> {
+        Ohlcv {
+            high: values,
+            low: values,
+            close: values,
+            volume: values,
+        }
+    }
+
     #[test]
     fn descriptors_cover_every_indicator() {
-        let ids: Vec<String> = descriptors().into_iter().map(|descriptor| descriptor.id).collect();
+        let ids: Vec<String> = descriptors().iter().map(|descriptor| descriptor.id.clone()).collect();
         assert_eq!(ids.len(), 19);
         for id in [
             "sma",
@@ -552,12 +590,7 @@ mod tests {
     #[test]
     fn every_descriptor_computes_full_length_outputs() {
         let values = series();
-        let data = Ohlcv {
-            high: &values,
-            low: &values,
-            close: &values,
-            volume: &values,
-        };
+        let ohlcv = data(&values);
         for descriptor in descriptors() {
             let instance = Instance {
                 id: descriptor.id.clone(),
@@ -567,7 +600,7 @@ mod tests {
                     .map(|param| (param.key.clone(), param.default))
                     .collect(),
             };
-            let computed = compute(&[instance], &data);
+            let computed = compute(&[instance], &ohlcv);
             let outputs = &computed.first().expect("one instance").outputs;
             assert_eq!(outputs.len(), descriptor.outputs.len(), "{} output count", descriptor.id);
             for series in outputs {
@@ -579,18 +612,13 @@ mod tests {
     #[test]
     fn unknown_id_yields_no_outputs() {
         let values = series();
-        let data = Ohlcv {
-            high: &values,
-            low: &values,
-            close: &values,
-            volume: &values,
-        };
+        let ohlcv = data(&values);
         let computed = compute(
             &[Instance {
                 id: "nope".to_owned(),
-                params: HashMap::new(),
+                params: BTreeMap::new(),
             }],
-            &data,
+            &ohlcv,
         );
         let output = computed.first().expect("one instance");
         assert!(output.outputs.is_empty() && output.divergences.is_empty());
@@ -598,22 +626,17 @@ mod tests {
 
     #[test]
     fn rsi_divergence_matches_detect_divergences_and_has_no_series() {
-        use indicators::{detect_divergences, rsi};
+        use crate::{detect_divergences, rsi};
         let close: Vec<f64> = (0..120)
             .map(|index| 100.0 + (f64::from(index) / 7.0).sin() * 15.0 - f64::from(index) * 0.05)
             .collect();
-        let data = Ohlcv {
-            high: &close,
-            low: &close,
-            close: &close,
-            volume: &close,
-        };
+        let ohlcv = data(&close);
         let computed = compute(
             &[Instance {
                 id: "rsiDivergence".to_owned(),
-                params: HashMap::new(),
+                params: BTreeMap::new(),
             }],
-            &data,
+            &ohlcv,
         );
         let output = computed.first().expect("one instance");
         assert!(output.outputs.is_empty(), "a divergence indicator has no series outputs");
