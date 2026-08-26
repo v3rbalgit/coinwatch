@@ -22,6 +22,9 @@ type IndicatorKind = "series" | "divergence"
 /** How one output series is plotted. */
 type OutputKind = "line" | "histogram"
 
+/** Numeric family represented by an indicator's outputs. */
+export type ValueDomain = "price" | "priceDelta" | "volume" | "boundedOscillator" | "unboundedOscillator"
+
 /** A tunable indicator parameter (defaults now, editable in the future signal builder). */
 type IndicatorParam = {
   key: string
@@ -45,6 +48,7 @@ export type IndicatorDescriptor = {
   id: string
   label: string
   kind: IndicatorKind
+  outputDomain: ValueDomain
   target: IndicatorTarget
   params: IndicatorParam[]
   outputs: IndicatorOutput[]

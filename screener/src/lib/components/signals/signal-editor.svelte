@@ -7,10 +7,11 @@
   import Button from "$lib/components/ui/button.svelte"
   import Input from "$lib/components/ui/input.svelte"
   import type { SignalDirection } from "$lib/signals/definition"
-  import { createConditionDraft } from "$lib/signals/draft"
+  import { compileSignalDraft, createConditionDraft } from "$lib/signals/draft"
   import type { ConditionDraft, FlatMatch } from "$lib/signals/draft"
   import { createDefaultPredicate, isDraftSessionDirty } from "$lib/signals/editor"
   import type { SignalEditorSession } from "$lib/signals/editor"
+  import { definitionPreview } from "$lib/signals/format"
   import type { IndicatorPresetEntry } from "$lib/signals/presets"
   import { draftCanSave, draftValidationMessage } from "$lib/signals/validation"
 
@@ -55,6 +56,7 @@
     session.name.trim().length === 0 ? "Enter a signal name." : draftValidationMessage(session.draft, descriptors)
   )
   const canSave = $derived(draftCanSave(session.name, session.draft, descriptors) && dirty && !busy)
+  const preview = $derived(definitionPreview(compileSignalDraft(session.draft), descriptors))
   const runButtonLabel = $derived(
     runActive && activeRunName !== null && activeRunName !== session.name
       ? `View ${activeRunName} run`
@@ -152,9 +154,12 @@
     </div>
 
     <div class="mt-4 flex flex-wrap items-center gap-5">
-      <fieldset class="flex items-center gap-2">
-        <legend class="sr-only">Signal direction</legend>
-        <span class="text-xs text-muted-foreground">Intent</span>
+      <fieldset
+        class="flex items-center gap-2"
+        title="Descriptive bias only; the conditions determine whether the signal matches."
+      >
+        <legend class="sr-only">Signal bias</legend>
+        <span class="text-xs text-muted-foreground">Bias</span>
         <div class="inline-flex rounded-md border border-border bg-card p-1">
           {#each directions as direction (direction)}
             <button
@@ -175,19 +180,19 @@
 
       <fieldset class="flex items-center gap-2">
         <legend class="sr-only">Condition composition</legend>
-        <span class="text-xs text-muted-foreground">Match</span>
+        <span class="text-xs text-muted-foreground">Require</span>
         <div class="inline-flex rounded-md border border-border bg-card p-1">
           {#each matches as match (match)}
             <button
               type="button"
-              class="rounded px-3 py-1.5 text-xs font-medium uppercase transition-colors {session.draft.match === match
+              class="rounded px-3 py-1.5 text-xs font-medium transition-colors {session.draft.match === match
                 ? 'bg-accent text-accent-foreground'
                 : 'text-muted-foreground hover:text-foreground'}"
               disabled={busy}
               aria-pressed={session.draft.match === match}
               onclick={() => changeDraft({ ...session.draft, match })}
             >
-              {match}
+              {match === "all" ? "All" : "Any"}
             </button>
           {/each}
         </div>
@@ -228,6 +233,16 @@
       </div>
     {:else}
       <div class="mx-auto max-w-6xl space-y-4">
+        <section class="rounded-xl border border-border bg-card px-4 py-3" aria-label="Signal definition preview">
+          <h2 class="text-xs font-medium tracking-wide text-muted-foreground uppercase">Definition preview</h2>
+          <p class="mt-2 text-sm font-medium text-foreground">{preview.heading}</p>
+          <ul class="mt-2 space-y-1 text-sm text-muted-foreground">
+            {#each preview.lines as line, index (`${index}-${line}`)}
+              <li class="flex gap-2"><span aria-hidden="true">—</span><span>{line}</span></li>
+            {/each}
+          </ul>
+        </section>
+
         {#each session.draft.conditions as condition, index (condition.id)}
           <ConditionCard
             {condition}
