@@ -47,29 +47,139 @@ function isChartTimeframe(value: string): value is ChartTimeframe {
   return CHART_TIMEFRAMES.some(timeframe => timeframe === value)
 }
 
-export function parseChartViewSettings(raw: string | null): ChartViewSettings {
-  let value: unknown = null
-  if (raw !== null) {
-    try {
-      value = JSON.parse(raw)
-    } catch (error) {
-      throw new Error("Malformed chart view settings", { cause: error })
-    }
+type PersistedSettingsName = "chart view" | "chart chrome"
+
+type ChartChromeBase = Pick<ChartChromeSettings, "magnet" | "toolbarPosition">
+
+interface PersistedSettings {
+  version?: unknown
+  timeframe?: unknown
+  logScale?: unknown
+  magnet?: unknown
+  toolbarPosition?: unknown
+  paneLayout?: unknown
+}
+
+interface PersistedToolbarPosition {
+  x?: unknown
+  y?: unknown
+}
+
+interface PersistedPaneLayoutEntry {
+  id?: unknown
+  stretchFactor?: unknown
+}
+
+function isPersistedSettings(value: unknown): value is PersistedSettings {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function parsePersistedSettings(raw: string | null, name: PersistedSettingsName): PersistedSettings | null {
+  if (raw === null) return null
+  try {
+    const value: unknown = JSON.parse(raw)
+    return isPersistedSettings(value) ? value : null
+  } catch (error) {
+    throw new Error(`Malformed ${name} settings`, { cause: error })
   }
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value)
+}
+
+function decodeChartViewSettings(value: PersistedSettings | null): ChartViewSettings | null {
+  if (value === null) return null
   if (
-    typeof value !== "object" ||
-    value === null ||
-    !("version" in value) ||
     value.version !== VIEW_SETTINGS_VERSION ||
-    !("timeframe" in value) ||
     typeof value.timeframe !== "string" ||
     !isChartTimeframe(value.timeframe) ||
-    !("logScale" in value) ||
     typeof value.logScale !== "boolean"
   ) {
-    return defaultChartViewSettings()
+    return null
   }
   return { timeframe: value.timeframe, logScale: value.logScale }
+}
+
+function isPersistedToolbarPosition(value: unknown): value is PersistedToolbarPosition {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function decodeToolbarPosition(value: unknown): ToolbarPosition | null {
+  if (
+    !isPersistedToolbarPosition(value) ||
+    !isFiniteNumber(value.x) ||
+    value.x < 0 ||
+    !isFiniteNumber(value.y) ||
+    value.y < 0
+  ) {
+    return null
+  }
+  return { x: value.x, y: value.y }
+}
+
+function decodeChartChromeBase(value: PersistedSettings): ChartChromeBase | null {
+  if (typeof value.magnet !== "boolean") return null
+  const toolbarPosition = decodeToolbarPosition(value.toolbarPosition)
+  return toolbarPosition === null ? null : { magnet: value.magnet, toolbarPosition }
+}
+
+function isPersistedPaneLayoutEntry(value: unknown): value is PersistedPaneLayoutEntry {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function decodePaneLayoutEntry(value: unknown): PaneLayoutEntry | null {
+  if (
+    !isPersistedPaneLayoutEntry(value) ||
+    typeof value.id !== "string" ||
+    value.id.length === 0 ||
+    !isFiniteNumber(value.stretchFactor) ||
+    value.stretchFactor <= 0
+  ) {
+    return null
+  }
+  return { id: value.id, stretchFactor: value.stretchFactor }
+}
+
+function decodePaneLayout(value: unknown): PaneLayoutEntry[] | null {
+  if (!Array.isArray(value)) return null
+  const paneLayout: PaneLayoutEntry[] = []
+  const paneIds = new Set<string>()
+  for (const valueEntry of value) {
+    const entry = decodePaneLayoutEntry(valueEntry)
+    if (entry === null || paneIds.has(entry.id)) return null
+    paneIds.add(entry.id)
+    paneLayout.push(entry)
+  }
+  return paneLayout
+}
+
+function decodeLegacyChartChromeSettings(value: PersistedSettings): ChartChromeSettings | null {
+  const base = decodeChartChromeBase(value)
+  return base === null ? null : { ...base, paneLayout: [] }
+}
+
+function decodeCurrentChartChromeSettings(value: PersistedSettings): ChartChromeSettings | null {
+  const base = decodeChartChromeBase(value)
+  if (base === null) return null
+  const paneLayout = decodePaneLayout(value.paneLayout)
+  return paneLayout === null ? null : { ...base, paneLayout }
+}
+
+function decodeChartChromeSettings(value: PersistedSettings | null): ChartChromeSettings | null {
+  if (value === null) return null
+  switch (value.version) {
+    case LEGACY_CHROME_SETTINGS_VERSION:
+      return decodeLegacyChartChromeSettings(value)
+    case CHROME_SETTINGS_VERSION:
+      return decodeCurrentChartChromeSettings(value)
+    default:
+      return null
+  }
+}
+
+export function parseChartViewSettings(raw: string | null): ChartViewSettings {
+  return decodeChartViewSettings(parsePersistedSettings(raw, "chart view")) ?? defaultChartViewSettings()
 }
 
 export function serializeChartViewSettings(settings: ChartViewSettings): string {
@@ -77,69 +187,7 @@ export function serializeChartViewSettings(settings: ChartViewSettings): string 
 }
 
 export function parseChartChromeSettings(raw: string | null): ChartChromeSettings {
-  let value: unknown = null
-  if (raw !== null) {
-    try {
-      value = JSON.parse(raw)
-    } catch (error) {
-      throw new Error("Malformed chart chrome settings", { cause: error })
-    }
-  }
-  if (
-    typeof value !== "object" ||
-    value === null ||
-    !("version" in value) ||
-    (value.version !== LEGACY_CHROME_SETTINGS_VERSION && value.version !== CHROME_SETTINGS_VERSION) ||
-    !("magnet" in value) ||
-    typeof value.magnet !== "boolean" ||
-    !("toolbarPosition" in value)
-  ) {
-    return defaultChartChromeSettings()
-  }
-  const position = value.toolbarPosition
-  if (
-    typeof position !== "object" ||
-    position === null ||
-    !("x" in position) ||
-    typeof position.x !== "number" ||
-    !Number.isFinite(position.x) ||
-    position.x < 0 ||
-    !("y" in position) ||
-    typeof position.y !== "number" ||
-    !Number.isFinite(position.y) ||
-    position.y < 0
-  ) {
-    return defaultChartChromeSettings()
-  }
-  const toolbarPosition = { x: position.x, y: position.y }
-  if (value.version === LEGACY_CHROME_SETTINGS_VERSION) {
-    return { magnet: value.magnet, toolbarPosition, paneLayout: [] }
-  }
-  if (!("paneLayout" in value) || !Array.isArray(value.paneLayout)) {
-    return defaultChartChromeSettings()
-  }
-  const paneLayout: PaneLayoutEntry[] = []
-  const paneIds = new Set<string>()
-  for (const rawEntry of value.paneLayout) {
-    const entry: unknown = rawEntry
-    if (
-      typeof entry !== "object" ||
-      entry === null ||
-      !("id" in entry) ||
-      typeof entry.id !== "string" ||
-      entry.id.length === 0 ||
-      paneIds.has(entry.id) ||
-      !("stretchFactor" in entry) ||
-      typeof entry.stretchFactor !== "number" ||
-      !Number.isFinite(entry.stretchFactor) ||
-      entry.stretchFactor <= 0
-    ) {
-      return defaultChartChromeSettings()
-    }
-    paneIds.add(entry.id)
-    paneLayout.push({ id: entry.id, stretchFactor: entry.stretchFactor })
-  }
-  return { magnet: value.magnet, toolbarPosition, paneLayout }
+  return decodeChartChromeSettings(parsePersistedSettings(raw, "chart chrome")) ?? defaultChartChromeSettings()
 }
 
 export function serializeChartChromeSettings(settings: ChartChromeSettings): string {
