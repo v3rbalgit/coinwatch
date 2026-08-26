@@ -520,6 +520,25 @@ pub fn validate_instance(instance: &Instance) -> Result<&'static Descriptor, Ins
     validated_instance(instance).map(|(_, descriptor)| descriptor)
 }
 
+/// Validate an instance and return a stable configuration containing every
+/// descriptor parameter, with omitted values replaced by their current defaults.
+pub fn resolve_instance(instance: &Instance) -> Result<Instance, InstanceError> {
+    let descriptor = validate_instance(instance)?;
+    Ok(Instance {
+        id: instance.id.clone(),
+        params: descriptor
+            .params
+            .iter()
+            .map(|parameter| {
+                (
+                    parameter.key.clone(),
+                    instance.params.get(&parameter.key).copied().unwrap_or(parameter.default),
+                )
+            })
+            .collect(),
+    })
+}
+
 fn resolved_period(instance: &Instance, descriptor: &Descriptor, key: &str) -> Result<usize, InstanceError> {
     let parameter = descriptor.params.iter().find(|parameter| parameter.key == key).ok_or_else(|| {
         InstanceError::UnknownParameter {
@@ -842,7 +861,7 @@ mod tests {
 
     use super::{
         DescriptorKind, IndicatorId, Instance, InstanceError, Ohlcv, compute, descriptors, divergence_input,
-        series_input_requirement, validate_instance,
+        resolve_instance, series_input_requirement, validate_instance,
     };
 
     fn series() -> Vec<f64> {
@@ -873,6 +892,19 @@ mod tests {
             let parsed = id.parse::<IndicatorId>().expect("descriptor id");
             assert_eq!(parsed.as_ref(), id);
         }
+    }
+
+    #[test]
+    fn resolving_an_instance_fills_every_descriptor_default() {
+        let resolved = resolve_instance(&instance("macd", &[("fast", 8.0)])).expect("valid partial instance");
+        assert_eq!(
+            resolved.params,
+            BTreeMap::from([
+                ("fast".to_owned(), 8.0),
+                ("signal".to_owned(), 9.0),
+                ("slow".to_owned(), 26.0),
+            ])
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ use domain::{Candle, Timeframe};
 use sqlx::SqlitePool;
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
+use thiserror::Error;
 
 /// A persisted candle series for one (coin, timeframe), oldest candle first.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,7 +76,7 @@ struct CandleRow {
 }
 
 /// A store-backend failure.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Error)]
 pub enum StoreError {
     /// The database rejected the operation.
     #[error(transparent)]
@@ -83,9 +84,18 @@ pub enum StoreError {
     /// A schema migration failed.
     #[error(transparent)]
     Migration(#[from] sqlx::migrate::MigrateError),
+    /// Another signal already owns the generated id.
+    #[error("a signal with id '{0}' already exists")]
+    DuplicateSignalId(String),
     /// Another signal already owns the requested catalog name.
     #[error("a signal named '{0}' already exists")]
     DuplicateSignalName(String),
+    /// No signal owns the requested id.
+    #[error("no signal with id '{0}' exists")]
+    SignalNotFound(String),
+    /// Another preset already owns the generated id.
+    #[error("an indicator preset with id '{0}' already exists")]
+    DuplicatePresetId(String),
     /// Another preset for the same indicator already owns the requested name.
     #[error("a preset named '{name}' already exists for indicator '{indicator_id}'")]
     DuplicatePresetName {
@@ -94,6 +104,9 @@ pub enum StoreError {
         /// Conflicting preset name.
         name: String,
     },
+    /// No indicator preset owns the requested id.
+    #[error("no indicator preset with id '{0}' exists")]
+    PresetNotFound(String),
     /// SQLite opened the file but its integrity check failed. The file is left in
     /// place so user data can be recovered explicitly.
     #[error("database at '{}' failed its integrity check", .0.display())]
@@ -299,12 +312,10 @@ impl SqliteStore {
         )
     }
 
-    /// Insert a signal or update the row with the same id. Names remain unique
-    /// across the catalog; a conflict returns [`StoreError::DuplicateSignalName`].
-    pub async fn save_signal(&self, id: &str, name: &str, definition: &str) -> Result<(), StoreError> {
-        sqlx::query!(
-            "INSERT INTO signals (id, name, definition) VALUES (?, ?, ?) \
-             ON CONFLICT(id) DO UPDATE SET name = excluded.name, definition = excluded.definition",
+    /// Insert a new signal. Ids and names must both be unique.
+    pub async fn create_signal(&self, id: &str, name: &str, definition: &str) -> Result<(), StoreError> {
+        let result = sqlx::query!(
+            "INSERT INTO signals (id, name, definition) VALUES (?, ?, ?) ON CONFLICT(id) DO NOTHING",
             id,
             name,
             definition,
@@ -312,6 +323,21 @@ impl SqliteStore {
         .execute(&self.pool)
         .await
         .map_err(|error| map_signal_write_error(error, name))?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::DuplicateSignalId(id.to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Update an existing signal without creating a missing row.
+    pub async fn update_signal(&self, id: &str, name: &str, definition: &str) -> Result<(), StoreError> {
+        let result = sqlx::query!("UPDATE signals SET name = ?, definition = ? WHERE id = ?", name, definition, id,)
+            .execute(&self.pool)
+            .await
+            .map_err(|error| map_signal_write_error(error, name))?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::SignalNotFound(id.to_owned()));
+        }
         Ok(())
     }
 
@@ -332,19 +358,29 @@ impl SqliteStore {
         .await?)
     }
 
-    /// Insert a preset or update the row with the same id. Names are unique only
-    /// within one indicator.
-    pub async fn save_indicator_preset(
+    /// One indicator preset by stable id.
+    pub async fn indicator_preset(&self, id: &str) -> Result<Option<IndicatorPresetRecord>, StoreError> {
+        Ok(sqlx::query_as!(
+            IndicatorPresetRecord,
+            "SELECT id, indicator_id, name, params FROM indicator_presets WHERE id = ?",
+            id
+        )
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Insert a new preset. Ids are globally unique; names are unique within one
+    /// indicator.
+    pub async fn create_indicator_preset(
         &self,
         id: &str,
         indicator_id: &str,
         name: &str,
         params: &str,
     ) -> Result<(), StoreError> {
-        sqlx::query!(
+        let result = sqlx::query!(
             "INSERT INTO indicator_presets (id, indicator_id, name, params) VALUES (?, ?, ?, ?) \
-             ON CONFLICT(id) DO UPDATE SET \
-                 indicator_id = excluded.indicator_id, name = excluded.name, params = excluded.params",
+             ON CONFLICT(id) DO NOTHING",
             id,
             indicator_id,
             name,
@@ -353,6 +389,33 @@ impl SqliteStore {
         .execute(&self.pool)
         .await
         .map_err(|error| map_preset_write_error(error, indicator_id, name))?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::DuplicatePresetId(id.to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Update an existing preset while preserving its indicator identity.
+    pub async fn update_indicator_preset(
+        &self,
+        id: &str,
+        indicator_id: &str,
+        name: &str,
+        params: &str,
+    ) -> Result<(), StoreError> {
+        let result = sqlx::query!(
+            "UPDATE indicator_presets SET name = ?, params = ? WHERE id = ? AND indicator_id = ?",
+            name,
+            params,
+            id,
+            indicator_id,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|error| map_preset_write_error(error, indicator_id, name))?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::PresetNotFound(id.to_owned()));
+        }
         Ok(())
     }
 
@@ -649,19 +712,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signals_round_trip_update_and_delete() {
+    async fn signals_create_update_and_delete_are_distinct() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SqliteStore::open(&dir.path().join("cw.db")).await.expect("open");
         assert!(store.signals().await.expect("empty catalog").is_empty());
 
         store
-            .save_signal("signal-b", "Zeta", r#"{"version":1}"#)
+            .create_signal("signal-b", "Zeta", r#"{"version":1}"#)
             .await
-            .expect("save zeta");
+            .expect("create zeta");
         store
-            .save_signal("signal-a", "Alpha", r#"{"version":1}"#)
+            .create_signal("signal-a", "Alpha", r#"{"version":1}"#)
             .await
-            .expect("save alpha");
+            .expect("create alpha");
+        assert!(matches!(
+            store.create_signal("signal-a", "Other", "{}").await,
+            Err(StoreError::DuplicateSignalId(id)) if id == "signal-a"
+        ));
         assert_eq!(
             store.signals().await.expect("list signals"),
             vec![
@@ -679,7 +746,7 @@ mod tests {
         );
 
         store
-            .save_signal("signal-b", "Beta", r#"{"version":2}"#)
+            .update_signal("signal-b", "Beta", r#"{"version":2}"#)
             .await
             .expect("update signal");
         assert_eq!(
@@ -690,27 +757,39 @@ mod tests {
                 definition: r#"{"version":2}"#.to_owned(),
             })
         );
+        assert!(matches!(
+            store.update_signal("missing", "Missing", "{}").await,
+            Err(StoreError::SignalNotFound(id)) if id == "missing"
+        ));
 
-        let duplicate = store.save_signal("signal-c", "alpha", "{}").await;
+        let duplicate = store.create_signal("signal-c", "alpha", "{}").await;
         assert!(matches!(duplicate, Err(StoreError::DuplicateSignalName(name)) if name == "alpha"));
+        let duplicate = store.update_signal("signal-b", "ALPHA", "{}").await;
+        assert!(matches!(duplicate, Err(StoreError::DuplicateSignalName(name)) if name == "ALPHA"));
 
         store.delete_signal("signal-a").await.expect("delete signal");
         assert_eq!(store.signals().await.expect("list after delete").len(), 1);
     }
 
     #[tokio::test]
-    async fn indicator_presets_are_unique_per_indicator() {
+    async fn indicator_presets_create_update_and_delete_are_distinct() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SqliteStore::open(&dir.path().join("cw.db")).await.expect("open");
 
         store
-            .save_indicator_preset("rsi-fast", "rsi", "Fast", r#"{"period":7}"#)
+            .create_indicator_preset("rsi-fast", "rsi", "Fast", r#"{"period":7}"#)
             .await
-            .expect("save RSI");
+            .expect("create RSI");
         store
-            .save_indicator_preset("ema-fast", "ema", "Fast", r#"{"period":10}"#)
+            .create_indicator_preset("ema-fast", "ema", "Fast", r#"{"period":10}"#)
             .await
-            .expect("save EMA");
+            .expect("create EMA");
+        assert!(matches!(
+            store
+                .create_indicator_preset("rsi-fast", "rsi", "Other", "{}")
+                .await,
+            Err(StoreError::DuplicatePresetId(id)) if id == "rsi-fast"
+        ));
         assert_eq!(
             store.indicator_presets().await.expect("list presets"),
             vec![
@@ -728,12 +807,29 @@ mod tests {
                 },
             ]
         );
+        assert_eq!(
+            store.indicator_preset("rsi-fast").await.expect("get preset"),
+            Some(IndicatorPresetRecord {
+                id: "rsi-fast".to_owned(),
+                indicator_id: "rsi".to_owned(),
+                name: "Fast".to_owned(),
+                params: r#"{"period":7}"#.to_owned(),
+            })
+        );
 
         store
-            .save_indicator_preset("rsi-fast", "rsi", "Quick", r#"{"period":5}"#)
+            .update_indicator_preset("rsi-fast", "rsi", "Quick", r#"{"period":5}"#)
             .await
             .expect("update preset");
-        let duplicate = store.save_indicator_preset("rsi-other", "rsi", "quick", "{}").await;
+        assert!(matches!(
+            store.update_indicator_preset("rsi-fast", "ema", "Wrong", "{}").await,
+            Err(StoreError::PresetNotFound(id)) if id == "rsi-fast"
+        ));
+        assert!(matches!(
+            store.update_indicator_preset("missing", "rsi", "Missing", "{}").await,
+            Err(StoreError::PresetNotFound(id)) if id == "missing"
+        ));
+        let duplicate = store.create_indicator_preset("rsi-other", "rsi", "quick", "{}").await;
         assert!(matches!(
             duplicate,
             Err(StoreError::DuplicatePresetName { indicator_id, name })

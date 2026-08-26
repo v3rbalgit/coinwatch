@@ -5,6 +5,8 @@
 //! scans), so the UI never waits on the network. Live mids stream in over the
 //! WebSocket and are relayed to the frontend as `mid` events.
 
+mod indicator_presets;
+mod signal_catalog;
 mod signal_runs;
 
 use std::collections::HashMap;
@@ -13,12 +15,12 @@ use std::time::Duration;
 
 use domain::{Candle, Timeframe};
 use hl_feed::{
-    spawn_sync, CandleHistory, ConnectionState, HyperliquidAdapter, HyperliquidRest, MarketEvent, MarketStatus,
-    MarketStore, SyncConfig, SyncPhase,
+    CandleHistory, ConnectionState, HyperliquidAdapter, HyperliquidRest, MarketEvent, MarketStatus, MarketStore,
+    SyncConfig, SyncPhase, spawn_sync,
 };
 use indicators::{DivergenceDirection, DivergenceKind};
 use rust_decimal::prelude::ToPrimitive;
-use scanner::{scan_coin as scan_one, scan_universe, ScanConfig, Signal, SignalSource};
+use scanner::{ScanConfig, Signal, SignalSource, scan_coin as scan_one, scan_universe};
 use serde::Serialize;
 use storage::{CandleStore, ListView, SqliteStore};
 use tauri::{Emitter, Manager};
@@ -312,10 +314,10 @@ async fn cache_logos(market: Arc<MarketStore>, db: Arc<SqliteStore>, client: req
             if cached.contains(&coin.coin) {
                 continue;
             }
-            if let Some(svg) = fetch_logo(&client, &coin.coin).await {
-                if let Err(error) = db.cache_logo(&coin.coin, &svg).await {
-                    tracing::warn!(coin = %coin.coin, %error, "failed to cache logo");
-                }
+            if let Some(svg) = fetch_logo(&client, &coin.coin).await
+                && let Err(error) = db.cache_logo(&coin.coin, &svg).await
+            {
+                tracing::warn!(coin = %coin.coin, %error, "failed to cache logo");
             }
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
@@ -446,6 +448,15 @@ pub fn run() {
             get_setting,
             set_setting,
             set_active_coin,
+            signal_catalog::list_signals,
+            signal_catalog::get_signal,
+            signal_catalog::create_signal,
+            signal_catalog::update_signal,
+            signal_catalog::delete_signal,
+            indicator_presets::list_indicator_presets,
+            indicator_presets::create_indicator_preset,
+            indicator_presets::update_indicator_preset,
+            indicator_presets::delete_indicator_preset,
             signal_runs::start_signal_run,
             signal_runs::cancel_signal_run
         ])
