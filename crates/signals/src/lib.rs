@@ -6,6 +6,7 @@
 
 pub mod definition;
 pub mod eval;
+pub mod historical;
 pub mod run;
 
 pub use definition::{
@@ -14,4 +15,8 @@ pub use definition::{
     decode_definition,
 };
 pub use eval::{CoinData, ConditionEvidence, ConditionOutcome, EvalReport, OutcomeStatus};
+pub use historical::{
+    HistoricalMatchSpan, HistoricalProgress, HistoricalRange, HistoricalValidation, HistoricalValidationError,
+    evaluate_historical, validate_historical,
+};
 pub use run::{RunProgress, RunSummary, evaluate_coin, run_signal};
