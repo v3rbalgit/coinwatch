@@ -41,8 +41,8 @@ export function timeGridFromData(data: readonly { time: Time }[]): TimeGrid | nu
 }
 
 export function timeGridOf(times: readonly UTCTimestamp[]): TimeGrid | null {
-  const lastTime = times[times.length - 1]
-  const previousTime = times[times.length - 2]
+  const lastTime = times.at(-1)
+  const previousTime = times.at(-2)
   if (lastTime === undefined || previousTime === undefined) return null
   const intervalSec = lastTime - previousTime
   if (intervalSec <= 0) return null

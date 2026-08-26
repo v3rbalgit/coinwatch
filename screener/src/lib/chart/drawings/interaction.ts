@@ -1,20 +1,20 @@
-import type { IChartApi, ISeriesApi, UTCTimestamp } from "lightweight-charts"
+import type { IChartApi, ISeriesApi } from "lightweight-charts"
 
-import { timeAtLogical, timeAtLogicalExact, timeGridFromData } from "./coords"
-import { nearestValueWithin, type Px } from "./geometry"
+import { moveDrawingPoints, type DrawingDragTarget } from "./drag"
+import type { Px } from "./geometry"
+import { DrawingMarketCoordinates } from "./market-coordinates"
+import { DrawingPlacement } from "./placement"
 import type { DrawingsPrimitive } from "./primitive"
 import type { DrawingStore } from "./store"
-import { newDrawing, pointsRequired, type Drawing, type DrawingPoint, type DrawingTool } from "./types"
+import type { DrawingPoint, InteractiveDrawingTool } from "./types"
 
-export interface InteractionCallbacks {
+interface InteractionCallbacks {
   /** Placement finished or cancelled — the toolbar disarms back to pointer mode. */
   onToolDone: () => void
-  /** The text tool wants input at a pixel position for a market anchor. */
-  onRequestText: (at: Px, point: DrawingPoint) => void
   /** Selection changed — the style bar follows it. */
   onSelectionChange?: (id: string | null) => void
   /** A tool hotkey was pressed while the cursor was over the chart. */
-  onToolHotkey?: (tool: DrawingTool) => void
+  onToolHotkey?: (tool: InteractiveDrawingTool) => void
   /** The magnet hotkey was pressed while the cursor was over the chart. */
   onToggleMagnet?: () => void
   /** The log-scale hotkey was pressed while the cursor was over the chart. */
@@ -25,96 +25,95 @@ export interface InteractionCallbacks {
   onEscape?: () => boolean
 }
 
-/** Single-key tool hotkeys, active while the cursor is over the chart. */
-export const TOOL_HOTKEYS: Record<string, DrawingTool> = {
-  t: "trendline",
-  y: "ray",
-  h: "hline",
-  v: "vline",
-  r: "rect",
-  f: "fib",
-  e: "fibext",
-  c: "channel",
-  b: "brush",
-  n: "text",
+interface DrawingInteractionOptions {
+  container: HTMLElement
+  chart: IChartApi
+  series: ISeriesApi<"Candlestick">
+  store: DrawingStore
+  primitive: DrawingsPrimitive
+  callbacks: InteractionCallbacks
+  /** Outside-click boundary; controls inside it do not drop selection. */
+  uiRoot?: HTMLElement
 }
 
-export const MAGNET_HOTKEY = "m"
-export const LOG_SCALE_HOTKEY = "l"
-export const RESET_VIEW_HOTKEY = "0"
+const TOOL_HOTKEYS = new Map<string, InteractiveDrawingTool>([
+  ["t", "trendline"],
+  ["y", "ray"],
+  ["h", "hline"],
+  ["v", "vline"],
+  ["r", "rect"],
+  ["f", "fib"],
+  ["e", "fibext"],
+  ["c", "channel"],
+  ["b", "brush"],
+])
+const MAGNET_HOTKEY = "m"
+const LOG_SCALE_HOTKEY = "l"
+const RESET_VIEW_HOTKEY = "0"
 
 interface DragState {
   id: string
-  /** "body" translates every anchor; a number drags that single anchor. */
-  target: "body" | number
+  target: DrawingDragTarget
   last: DrawingPoint
-  /** Anchor snapshot at drag start — Escape/pointercancel revert to it. */
+  /** Anchor snapshot at drag start — Escape/pointercancel restore it. */
   original: DrawingPoint[]
-  /** Only a drag that actually moved persists — a bare select click must not. */
+  /** Only a drag that moved persists; a bare selection click does not. */
   moved: boolean
 }
 
-/** Pixels of travel between anchor press and release that reads as drag-to-draw. */
-const DRAG_DRAW_THRESHOLD = 8
-
-/** Cursor-to-level distance at which the magnet grabs an OHLC value. */
-const MAGNET_TOLERANCE = 8
-
-/** Minimum pixel travel between recorded brush points — keeps paths lean. */
-const BRUSH_MIN_STEP = 3
-
-function shift(time: UTCTimestamp, delta: number): UTCTimestamp {
-  return (time + delta) as UTCTimestamp
-}
-
-/** Finger-sized hit targets: touch pointers double every hit tolerance. */
+/** Finger-sized hit targets double mouse tolerance. */
 function touchScale(event: PointerEvent): number {
   return event.pointerType === "touch" ? 2 : 1
 }
 
-function distance(a: Px, b: Px): number {
-  return Math.hypot(a.x - b.x, a.y - b.y)
+function isEditableTarget(target: EventTarget | null): boolean {
+  return (
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement ||
+    (target instanceof HTMLElement && target.isContentEditable)
+  )
 }
 
-/**
- * Pointer/keyboard state machine over the drawings layer: armed-tool
- * placement (click-click or drag-to-draw, with live preview), selection,
- * handle and body drags, Escape to cancel, Delete to remove. Chart pan/zoom
- * is suspended while a tool is armed or a drag is active so the two never
- * fight; every teardown path (pointerup, pointercancel, Escape, destroy)
- * restores it and settles pending drag state.
- */
+/** DOM event orchestrator for placement, selection, dragging, and chart hotkeys. */
 export class DrawingInteraction {
-  private tool: DrawingTool | null = null
-  /** Anchors placed so far for a click-click tool (2- or 3-point). */
-  private pending: DrawingPoint[] = []
-  private pendingStartPx: Px | null = null
-  /** Freehand path being captured while the brush is held down. */
-  private brushing: DrawingPoint[] | null = null
-  private lastBrushPx: Px | null = null
+  private container: HTMLElement
+  private chart: IChartApi
+  private store: DrawingStore
+  private primitive: DrawingsPrimitive
+  private callbacks: InteractionCallbacks
+  private uiRoot: HTMLElement
+  private coordinates: DrawingMarketCoordinates
+  private placement: DrawingPlacement
   private drag: DragState | null = null
   private selectedId: string | null = null
   private magnet = false
-  /** Hotkeys apply only while the cursor is over the chart. */
   private pointerInside = false
+  private chartInteractionEnabled = true
 
-  constructor(
-    private container: HTMLElement,
-    private chart: IChartApi,
-    private series: ISeriesApi<"Candlestick">,
-    private store: DrawingStore,
-    private primitive: DrawingsPrimitive,
-    private callbacks: InteractionCallbacks,
-    /** Outside-click deselect boundary — the chart UI root, so clicks on the
-     * rail or style bar don't drop the selection (and unmount the bar mid-click). */
-    private uiRoot: HTMLElement = container
-  ) {
-    store.onChange = () => primitive.setDrawings(store.all())
-    primitive.setDrawings(store.all())
-    container.addEventListener("pointerdown", this.onPointerDown)
-    container.addEventListener("pointermove", this.onPointerMove)
-    container.addEventListener("pointerenter", this.onPointerEnter)
-    container.addEventListener("pointerleave", this.onPointerLeave)
+  constructor(options: DrawingInteractionOptions) {
+    this.container = options.container
+    this.chart = options.chart
+    this.store = options.store
+    this.primitive = options.primitive
+    this.callbacks = options.callbacks
+    this.uiRoot = options.uiRoot ?? options.container
+    this.coordinates = new DrawingMarketCoordinates(options.chart, options.series)
+    this.placement = new DrawingPlacement({
+      toMarket: px => this.coordinates.toMarket(px, this.magnet),
+      toMarketSmooth: px => this.coordinates.toMarketSmooth(px, this.magnet),
+      addDrawing: (drawing, select) => {
+        this.store.add(drawing)
+        if (select) this.select(drawing.id)
+      },
+      setPreview: drawing => this.primitive.setPreview(drawing),
+      onToolDone: () => this.callbacks.onToolDone(),
+    })
+
+    this.primitive.setDrawings(this.store.all())
+    this.container.addEventListener("pointerdown", this.onPointerDown)
+    this.container.addEventListener("pointermove", this.onPointerMove)
+    this.container.addEventListener("pointerenter", this.onPointerEnter)
+    this.container.addEventListener("pointerleave", this.onPointerLeave)
     window.addEventListener("pointerup", this.onPointerUp)
     window.addEventListener("pointercancel", this.onPointerCancel)
     window.addEventListener("keydown", this.onKeyDown)
@@ -136,24 +135,9 @@ export class DrawingInteraction {
     document.removeEventListener("pointerdown", this.onDocumentPointerDown)
   }
 
-  private onPointerEnter = (): void => {
-    this.pointerInside = true
-  }
-
-  private onPointerLeave = (): void => {
-    this.pointerInside = false
-    this.primitive.setSnapIndicator(null)
-  }
-
-  setTool(tool: DrawingTool | null): void {
-    this.tool = tool
-    this.pending = []
-    this.pendingStartPx = null
-    this.brushing = null
-    this.lastBrushPx = null
-    this.primitive.setPreview(null)
-    // Arming a tool clears any selection; disarming (after a placement) keeps it so
-    // the just-drawn shape stays selected.
+  setTool(tool: InteractiveDrawingTool | null): void {
+    this.placement.setTool(tool)
+    // Arming clears selection; disarming leaves a newly placed drawing selected.
     if (tool !== null) this.select(null)
     this.setChartInteraction(tool === null)
   }
@@ -168,9 +152,13 @@ export class DrawingInteraction {
     this.select(null)
   }
 
-  /** Programmatic selection — the context menu's pick-under-cursor path. */
-  selectDrawing(id: string): void {
-    this.select(id)
+  private onPointerEnter = (): void => {
+    this.pointerInside = true
+  }
+
+  private onPointerLeave = (): void => {
+    this.pointerInside = false
+    this.primitive.setSnapIndicator(null)
   }
 
   private select(id: string | null): void {
@@ -181,6 +169,8 @@ export class DrawingInteraction {
   }
 
   private setChartInteraction(enabled: boolean): void {
+    if (this.chartInteractionEnabled === enabled) return
+    this.chartInteractionEnabled = enabled
     this.chart.applyOptions({ handleScroll: enabled, handleScale: enabled })
   }
 
@@ -189,89 +179,18 @@ export class DrawingInteraction {
     return { x: event.clientX - rect.left, y: event.clientY - rect.top }
   }
 
-  /**
-   * Main-pane pixel → bar time. `coordinateToTime` is null outside the loaded
-   * bars (notably the permanent right-offset whitespace), so fall back to
-   * extrapolating the bar grid through logical space.
-   */
-  private timeAt(px: Px): UTCTimestamp | null {
-    const time = this.chart.timeScale().coordinateToTime(px.x)
-    if (typeof time === "number") return time
-    const logical = this.chart.timeScale().coordinateToLogical(px.x)
-    const grid = timeGridFromData(this.series.data())
-    if (logical === null || !grid) return null
-    return timeAtLogical(logical, grid)
-  }
-
-  /** Main-pane pixel → market coordinates, snapping price to O/H/L/C under the magnet. */
-  private toMarket(px: Px): DrawingPoint | null {
-    const price = this.series.coordinateToPrice(px.y)
-    if (price === null) return null
-    const time = this.timeAt(px)
-    if (time === null) return null
-    return { time, price: this.magnet ? (this.snapTarget(time, px.y) ?? price) : price }
-  }
-
-  /** Magnet: the bar's O/H/L/C level nearest the cursor within tolerance, or null if none. */
-  private snapTarget(time: UTCTimestamp, cursorY: number): number | null {
-    const bar = this.series.data().find(item => item.time === time)
-    if (!bar || !("open" in bar)) return null
-    const candidates = [bar.open, bar.high, bar.low, bar.close].flatMap(value => {
-      const y = this.series.priceToCoordinate(value)
-      return y === null ? [] : [{ value, y }]
-    })
-    return nearestValueWithin(cursorY, candidates, MAGNET_TOLERANCE)
-  }
-
-  /** Show the magnet's snap target as a marker so the grab is visible before a click. */
   private updateSnapIndicator(px: Px): void {
-    const time = this.magnet && this.inMainPane(px) ? this.timeAt(px) : null
-    const price = time !== null ? this.snapTarget(time, px.y) : null
-    this.primitive.setSnapIndicator(time !== null && price !== null ? { time, price } : null)
-  }
-
-  /**
-   * Freehand conversion: unrounded time so brush strokes don't quantize to
-   * candle width. Price still respects the magnet.
-   */
-  private toMarketSmooth(px: Px): DrawingPoint | null {
-    const point = this.toMarket(px)
-    if (!point) return null
-    const logical = this.chart.timeScale().coordinateToLogical(px.x)
-    const grid = timeGridFromData(this.series.data())
-    if (logical === null || !grid) return point
-    return { time: timeAtLogicalExact(logical, grid), price: point.price }
-  }
-
-  /** Drawings live on the price pane only — ignore indicator panes below it. */
-  private inMainPane(px: Px): boolean {
-    return px.y <= this.chart.paneSize(0).height
-  }
-
-  /** Cursor→market conversion for UI layers (context menu) — the same bar-grid extrapolation as tool placement. */
-  marketPointAt(px: Px): DrawingPoint | null {
-    return this.toMarket(px)
+    this.primitive.setSnapIndicator(this.coordinates.snapIndicator(px, this.magnet))
   }
 
   private onPointerDown = (event: PointerEvent): void => {
     if (event.button !== 0) return
     const px = this.cursor(event)
-    if (!this.inMainPane(px)) return
+    if (!this.coordinates.inMainPane(px)) return
 
-    if (this.tool === "brush") {
-      const point = this.toMarketSmooth(px)
-      if (!point) return
-      event.preventDefault()
-      this.brushing = [point]
-      this.lastBrushPx = px
-      this.container.setPointerCapture(event.pointerId)
-      return
-    }
-    if (this.tool) {
-      this.placePoint(this.tool, px, event)
-      // Keep the drag-to-draw preview alive when the pointer leaves the
-      // container; capture auto-releases on pointerup.
-      if (this.pending.length > 0) this.container.setPointerCapture(event.pointerId)
+    if (this.placement.tool !== null) {
+      if (this.placement.pointerDown(px)) event.preventDefault()
+      if (this.placement.inFlight) this.container.setPointerCapture(event.pointerId)
       return
     }
 
@@ -280,204 +199,115 @@ export class DrawingInteraction {
       this.select(null)
       return
     }
-    const point = this.toMarket(px)
+    const point = this.coordinates.toMarket(px, this.magnet)
     this.select(hit.id)
     const drawing = this.store.byId(hit.id)
-    if (!point || !drawing) return
+    if (point === null || drawing === undefined) return
     this.drag = { id: hit.id, target: hit.target, last: point, original: drawing.points, moved: false }
     this.container.setPointerCapture(event.pointerId)
     this.setChartInteraction(false)
     event.preventDefault()
   }
 
-  /** Clicking anything outside the chart drops the selection, so a global
-   * Delete keypress can never reach a drawing the user is no longer on. */
+  /** Clicking outside chart chrome drops selection before global Delete can act on it. */
   private onDocumentPointerDown = (event: PointerEvent): void => {
     if (event.target instanceof Node && !this.uiRoot.contains(event.target)) this.select(null)
-  }
-
-  private placePoint(tool: DrawingTool, px: Px, event: PointerEvent): void {
-    const point = this.toMarket(px)
-    if (!point) return
-    event.preventDefault()
-
-    if (tool === "text") {
-      this.callbacks.onRequestText(px, point)
-      this.finishPlacement()
-      return
-    }
-    if (pointsRequired(tool) === 1) {
-      this.addDrawing(newDrawing(tool, [point]))
-      this.finishPlacement()
-      return
-    }
-    if (this.pending.length === 0) this.pendingStartPx = px
-    this.pending.push(point)
-    if (this.pending.length >= pointsRequired(tool)) {
-      this.addDrawing(newDrawing(tool, this.pending))
-      this.finishPlacement()
-      return
-    }
-    this.primitive.setPreview(newDrawing(tool, [...this.pending, point]))
-  }
-
-  private finishPlacement(): void {
-    this.pending = []
-    this.pendingStartPx = null
-    this.brushing = null
-    this.lastBrushPx = null
-    this.primitive.setPreview(null)
-    this.callbacks.onToolDone()
-  }
-
-  /** Add a drawing and select it, so its handles + style bar are immediately available. */
-  private addDrawing(drawing: Drawing): void {
-    this.store.add(drawing)
-    this.select(drawing.id)
-  }
-
-  /** Abandons a click-click / drag-to-draw in progress (Escape, pointercancel). */
-  private cancelPlacement(): void {
-    if (!this.tool) return
-    this.finishPlacement()
   }
 
   private onPointerMove = (event: PointerEvent): void => {
     const px = this.cursor(event)
     this.updateSnapIndicator(px)
+    if (this.placement.pointerMove(px)) return
+    if (this.updateDrag(px)) return
+    this.updateHoverCursor(px, event)
+  }
 
-    if (this.brushing && this.lastBrushPx) {
-      if (distance(px, this.lastBrushPx) < BRUSH_MIN_STEP) return
-      const point = this.toMarketSmooth(px)
-      if (!point) return
-      this.brushing.push(point)
-      this.lastBrushPx = px
-      this.primitive.setPreview(newDrawing("brush", this.brushing))
-      return
-    }
-
-    if (this.tool && this.pending.length > 0) {
-      const point = this.toMarket(px)
-      if (point) this.primitive.setPreview(newDrawing(this.tool, [...this.pending, point]))
-      return
-    }
-
+  private updateDrag(px: Px): boolean {
     const drag = this.drag
-    if (drag) {
-      const point = this.toMarket(px)
-      const drawing = this.store.byId(drag.id)
-      if (!point || !drawing) return
-      const points =
-        drag.target === "body"
-          ? drawing.points.map(anchor => ({
-              time: shift(anchor.time, point.time - drag.last.time),
-              price: anchor.price + point.price - drag.last.price,
-            }))
-          : drawing.points.map((anchor, index) => (index === drag.target ? point : anchor))
-      this.store.update(drag.id, { points }, { persist: false })
-      drag.last = point
-      drag.moved = true
-      return
-    }
+    if (drag === null) return false
+    const point = this.coordinates.toMarket(px, this.magnet)
+    const drawing = this.store.byId(drag.id)
+    if (point === null || drawing === undefined) return true
+    const points = moveDrawingPoints(drawing.points, drag.target, drag.last, point)
+    this.store.update(drag.id, { points }, { persist: false })
+    drag.last = point
+    drag.moved = true
+    return true
+  }
 
-    if (!this.tool) {
-      // Own only the "move" affordance — the price-line layer's cursors
-      // (ns-resize/grab/pointer) were set moments earlier on this same event
-      // and an unconditional reset here would stomp them.
-      if (this.inMainPane(px) && this.primitive.hitTestAt(px, touchScale(event))) {
-        this.container.style.cursor = "move"
-      } else if (this.container.style.cursor === "move") {
-        this.container.style.cursor = ""
-      }
+  private updateHoverCursor(px: Px, event: PointerEvent): void {
+    if (this.placement.tool !== null) return
+    // Own only the move affordance; resetting any other cursor would stomp the
+    // price-line layer's resize/grab cursor set earlier on this same event.
+    if (this.coordinates.inMainPane(px) && this.primitive.hitTestAt(px, touchScale(event))) {
+      this.container.style.cursor = "move"
+    } else if (this.container.style.cursor === "move") {
+      this.container.style.cursor = ""
     }
   }
 
   private onPointerUp = (event: PointerEvent): void => {
-    // A held brush finalizes on release; a stray click without travel
-    // discards. Either way the brush STAYS ARMED for the next stroke —
-    // disarming here made every follow-up press select instead of draw.
-    if (this.brushing) {
-      if (this.brushing.length >= 2) this.store.add(newDrawing("brush", this.brushing))
-      this.brushing = null
-      this.lastBrushPx = null
-      this.primitive.setPreview(null)
-      return
-    }
-    // Drag-to-draw: press at the first anchor, release far away = second
-    // anchor. Two-point tools only — 3-point tools stay click-click-click.
-    if (this.tool && pointsRequired(this.tool) === 2 && this.pending.length === 1 && this.pendingStartPx) {
-      const px = this.cursor(event)
-      if (distance(px, this.pendingStartPx) > DRAG_DRAW_THRESHOLD) {
-        const first = this.pending[0]
-        const point = this.toMarket(px)
-        if (first && point) {
-          this.addDrawing(newDrawing(this.tool, [first, point]))
-          this.finishPlacement()
-        }
-      }
-      return
-    }
+    if (this.placement.inFlight && this.placement.pointerUp(this.cursor(event))) return
+    this.finishDrag(event)
+  }
+
+  private finishDrag(event: PointerEvent): void {
     const drag = this.drag
-    if (!drag) return
+    if (drag === null) return
     this.drag = null
     if (drag.moved) this.store.persist()
     if (this.container.hasPointerCapture(event.pointerId)) this.container.releasePointerCapture(event.pointerId)
-    this.setChartInteraction(this.tool === null)
+    this.setChartInteraction(this.placement.tool === null)
   }
 
-  /** Interrupted gesture (touch scroll takeover, palm rejection) — revert. */
+  /** Interrupted gestures revert drags and cancel in-flight placement. */
   private onPointerCancel = (event: PointerEvent): void => {
-    if (this.drag) {
+    if (this.drag !== null) {
       this.revertDrag()
       if (this.container.hasPointerCapture(event.pointerId)) this.container.releasePointerCapture(event.pointerId)
       return
     }
-    // Only an in-flight placement cancels; an idle armed tool stays armed.
-    if (this.brushing || this.pending.length > 0) this.cancelPlacement()
+    this.placement.cancelGesture()
   }
 
   private revertDrag(): void {
     const drag = this.drag
-    if (!drag) return
+    if (drag === null) return
     this.drag = null
     this.store.update(drag.id, { points: drag.original })
-    this.setChartInteraction(this.tool === null)
+    this.setChartInteraction(this.placement.tool === null)
   }
 
   private onKeyDown = (event: KeyboardEvent): void => {
-    const target = event.target
-    if (
-      target instanceof HTMLInputElement ||
-      target instanceof HTMLTextAreaElement ||
-      (target instanceof HTMLElement && target.isContentEditable)
-    ) {
-      return
-    }
+    if (isEditableTarget(event.target)) return
+    if (this.handleEscape(event)) return
+    if (this.handleDelete(event)) return
+    this.handleShortcut(event)
+  }
 
-    if (event.key === "Escape") {
-      if (this.callbacks.onEscape?.()) {
-        event.preventDefault()
-        return
-      }
-      if (this.drag) {
-        this.revertDrag()
-      } else if (this.tool) {
-        this.cancelPlacement()
-      } else if (this.selectedId) {
-        this.select(null)
-      }
-      return
-    }
-
-    if ((event.key === "Delete" || event.key === "Backspace") && this.selectedId) {
-      // Backspace can still mean back-navigation in some browser configs.
+  private handleEscape(event: KeyboardEvent): boolean {
+    if (event.key !== "Escape") return false
+    if (this.callbacks.onEscape?.()) {
       event.preventDefault()
-      this.store.remove(this.selectedId)
+    } else if (this.drag !== null) {
+      this.revertDrag()
+    } else if (this.placement.cancelTool()) {
+      // Placement handles the callback and preview reset.
+    } else if (this.selectedId !== null) {
       this.select(null)
-      return
     }
+    return true
+  }
 
-    // Single-key hotkeys, only over the chart and never with modifiers.
+  private handleDelete(event: KeyboardEvent): boolean {
+    if ((event.key !== "Delete" && event.key !== "Backspace") || this.selectedId === null) return false
+    event.preventDefault()
+    this.store.remove(this.selectedId)
+    this.select(null)
+    return true
+  }
+
+  private handleShortcut(event: KeyboardEvent): void {
     if (!this.pointerInside || event.ctrlKey || event.metaKey || event.altKey) return
     const key = event.key.toLowerCase()
     if (key === RESET_VIEW_HOTKEY) {
@@ -495,8 +325,8 @@ export class DrawingInteraction {
       this.callbacks.onToggleMagnet?.()
       return
     }
-    const tool = TOOL_HOTKEYS[key]
-    if (tool) {
+    const tool = TOOL_HOTKEYS.get(key)
+    if (tool !== undefined) {
       event.preventDefault()
       this.callbacks.onToolHotkey?.(tool)
     }

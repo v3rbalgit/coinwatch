@@ -21,6 +21,9 @@ export const DRAWING_TOOLS = [
 ] as const
 export type DrawingTool = (typeof DRAWING_TOOLS)[number]
 
+/** Drawing tools that the current chart interaction can create. */
+export type InteractiveDrawingTool = Exclude<DrawingTool, "text">
+
 /** Anchor in market coordinates, so drawings survive interval switches and reloads. */
 export interface DrawingPoint {
   time: UTCTimestamp
@@ -37,7 +40,7 @@ export interface DrawingStyle {
 export interface Drawing {
   id: string
   tool: DrawingTool
-  /** 1 anchor for hline/vline/text, 2 for line/rectangle/range/fib tools. */
+  /** Market anchors required by the tool; brush paths may contain additional samples. */
   points: DrawingPoint[]
   /** Only for the text tool. */
   text?: string

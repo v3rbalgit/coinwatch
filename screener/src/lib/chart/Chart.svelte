@@ -33,7 +33,7 @@
   import { DrawingInteraction } from "./drawings/interaction"
   import { DrawingsPrimitive } from "./drawings/primitive"
   import { DrawingStore } from "./drawings/store"
-  import { type Drawing, type DrawingStyle, type DrawingTool } from "./drawings/types"
+  import { type Drawing, type DrawingStyle, type InteractiveDrawingTool } from "./drawings/types"
   import {
     computeIndicators,
     indicatorDescriptors,
@@ -124,10 +124,9 @@
   let fxButton = $state<HTMLButtonElement>()
   let availableDescriptors = $state<IndicatorDescriptor[]>([])
   let rootEl: HTMLDivElement
-  let drawingsPrimitive: DrawingsPrimitive | undefined
   let drawingStore: DrawingStore | undefined
   let drawingInteraction: DrawingInteraction | undefined
-  let activeTool = $state<DrawingTool | null>(null)
+  let activeTool = $state<InteractiveDrawingTool | null>(null)
   let selectedDrawing = $state<Drawing | null>(null)
   let hasDrawings = $state(false)
   const drawingPalette = [chartTheme.drawing, chartTheme.signal, chartTheme.rsi, chartTheme.up, chartTheme.down]
@@ -167,10 +166,10 @@
   }
 
   // Arm a drawing tool (or toggle it off); the interaction owns placement.
-  function selectTool(tool: DrawingTool) {
+  function selectTool(tool: InteractiveDrawingTool) {
     activeTool = activeTool === tool ? null : tool
   }
-  const toolClass = (tool: DrawingTool) =>
+  const toolClass = (tool: InteractiveDrawingTool) =>
     `flex justify-center rounded py-1.5 ${
       activeTool === tool ? "bg-accent text-accent-foreground" : "text-muted-foreground hover:bg-accent/50"
     }`
@@ -462,35 +461,33 @@
     })
     chart.priceScale("volume").applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } })
 
-    drawingsPrimitive = new DrawingsPrimitive()
-    candles.attachPrimitive(drawingsPrimitive)
-    drawingStore = new DrawingStore(next => onDrawingsChange?.(next))
-    // The full interaction engine: click-click or drag-to-draw with live preview,
-    // hit-tested selection, body/handle drags, Escape/Delete, magnet, tool hotkeys.
-    drawingInteraction = new DrawingInteraction(
+    const primitive = new DrawingsPrimitive()
+    candles.attachPrimitive(primitive)
+    const store = new DrawingStore(next => onDrawingsChange?.(next))
+    drawingStore = store
+    store.onChange = () => {
+      primitive.setDrawings(store.all())
+      hasDrawings = store.all().length > 0
+    }
+    // The interaction engine owns gestures and selection; Chart owns redraw
+    // composition so store changes also update chrome state.
+    drawingInteraction = new DrawingInteraction({
       container,
       chart,
-      candles,
-      drawingStore,
-      drawingsPrimitive,
-      {
+      series: candles,
+      store,
+      primitive,
+      callbacks: {
         onToolDone: () => (activeTool = null),
-        onRequestText: () => {},
-        onSelectionChange: id => (selectedDrawing = id ? (drawingStore?.byId(id) ?? null) : null),
+        onSelectionChange: id => (selectedDrawing = id ? (store.byId(id) ?? null) : null),
         onToolHotkey: tool => (activeTool = activeTool === tool ? null : tool),
         onToggleMagnet: toggleMagnet,
         onToggleLogScale: toggleLogScale,
         onResetView: resetChartView,
         onEscape: closeChrome,
       },
-      rootEl
-    )
-    // Interaction set its own onChange (redraw); ours supersedes it, keeping the
-    // redraw and also tracking emptiness for the clear button.
-    drawingStore.onChange = () => {
-      drawingsPrimitive?.setDrawings(drawingStore?.all() ?? [])
-      hasDrawings = (drawingStore?.all().length ?? 0) > 0
-    }
+      uiRoot: rootEl,
+    })
 
     chart.subscribeCrosshairMove(param => {
       const index = param.time === undefined ? -1 : bars.findIndex(bar => bar.time === param.time)
