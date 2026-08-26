@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { IndicatorDescriptor, IndicatorInstance } from "$lib/chart/indicators"
+  import type { IndicatorDescriptor, IndicatorInstance, ValueDomain } from "$lib/chart/indicators"
   import IndicatorEditor from "$lib/components/signals/indicator-editor.svelte"
   import NumberField from "$lib/components/ui/number-field.svelte"
   import Select from "$lib/components/ui/select.svelte"
@@ -13,12 +13,12 @@
     { value: "indicator", label: "Indicator" },
     { value: "constant", label: "Constant" },
   ]
-  const candleFields: readonly { value: CandleField; label: string }[] = [
-    { value: "open", label: "Open" },
-    { value: "high", label: "High" },
-    { value: "low", label: "Low" },
-    { value: "close", label: "Close" },
-    { value: "volume", label: "Volume" },
+  const candleFields: readonly { value: CandleField; label: string; domain: ValueDomain }[] = [
+    { value: "open", label: "Open", domain: "price" },
+    { value: "high", label: "High", domain: "price" },
+    { value: "low", label: "Low", domain: "price" },
+    { value: "close", label: "Close", domain: "price" },
+    { value: "volume", label: "Volume", domain: "volume" },
   ]
 
   const {
@@ -27,6 +27,7 @@
     presets,
     busy = false,
     label,
+    requiredDomain = null,
     onChange,
     onCreatePreset,
     onUpdatePreset,
@@ -37,6 +38,7 @@
     presets: IndicatorPresetEntry[]
     busy?: boolean
     label: string
+    requiredDomain?: ValueDomain | null
     onChange: (operand: Operand) => void
     onCreatePreset: (indicatorId: string, name: string, params: Record<string, number>) => void
     onUpdatePreset: (id: string, name: string, params: Record<string, number>) => void
@@ -44,10 +46,29 @@
   } = $props()
 
   const seriesDescriptors = $derived(descriptors.filter(descriptor => descriptor.kind === "series"))
+  const compatibleSeriesDescriptors = $derived(
+    seriesDescriptors.filter(
+      descriptor =>
+        requiredDomain === null ||
+        descriptor.outputDomain === requiredDomain ||
+        (operand.type === "indicator" && descriptor.id === operand.instance.id)
+    )
+  )
 
   function changeType(value: string) {
     const type = operandTypes.find(candidate => candidate.value === value)?.value
-    if (type !== undefined) onChange(createDefaultOperand(type, seriesDescriptors))
+    if (type === "field" && requiredDomain === "volume") {
+      onChange({ type: "field", field: "volume" })
+    } else if (type !== undefined) {
+      onChange(createDefaultOperand(type, compatibleSeriesDescriptors))
+    }
+  }
+
+  function typeUnavailable(type: OperandType): boolean {
+    if (type === "field") {
+      return requiredDomain !== null && requiredDomain !== "price" && requiredDomain !== "volume"
+    }
+    return type === "indicator" && compatibleSeriesDescriptors.length === 0
   }
 
   function changeField(value: string) {
@@ -88,7 +109,7 @@
     <span>Source</span>
     <Select value={operand.type} onValueChange={changeType} disabled={busy}>
       {#each operandTypes as option (option.value)}
-        <option value={option.value}>{option.label}</option>
+        <option value={option.value} disabled={typeUnavailable(option.value)}>{option.label}</option>
       {/each}
     </Select>
   </label>
@@ -98,7 +119,9 @@
       <span>Field</span>
       <Select value={operand.field} onValueChange={changeField} disabled={busy}>
         {#each candleFields as field (field.value)}
-          <option value={field.value}>{field.label}</option>
+          <option value={field.value} disabled={requiredDomain !== null && field.domain !== requiredDomain}>
+            {field.label}
+          </option>
         {/each}
       </Select>
     </label>
@@ -116,7 +139,7 @@
     <IndicatorEditor
       instance={operand.instance}
       output={operand.output}
-      descriptors={seriesDescriptors}
+      descriptors={compatibleSeriesDescriptors}
       {presets}
       {busy}
       onChange={changeIndicator}

@@ -19,10 +19,12 @@
   import type { ConditionDraft } from "$lib/signals/draft"
   import { createDefaultPredicate } from "$lib/signals/editor"
   import type { PredicateType } from "$lib/signals/editor"
+  import { recencyDurationLabel } from "$lib/signals/format"
   import type { IndicatorPresetEntry } from "$lib/signals/presets"
+  import { operandDomain } from "$lib/signals/validation"
 
   const predicateTypes: readonly { value: PredicateType; label: string }[] = [
-    { value: "threshold", label: "Comparison" },
+    { value: "threshold", label: "State" },
     { value: "cross", label: "Cross" },
     { value: "divergence", label: "Divergence" },
   ]
@@ -146,20 +148,31 @@
         <option value={timeframe}>{timeframe}</option>
       {/each}
     </Select>
-    <label class="flex items-center gap-2 text-xs text-muted-foreground">
-      within
-      <NumberField
-        value={condition.withinBars}
-        min={0}
-        max={10000}
-        step={1}
-        class="h-8 w-20"
-        disabled={busy}
-        aria-label={`Condition ${position} freshness bars`}
-        onValueChange={(withinBars: number) => onChange({ ...condition, withinBars })}
-      />
-      bars
-    </label>
+    {#if condition.predicate.type === "threshold"}
+      <span class="text-xs text-muted-foreground">
+        {condition.withinBars === 0 ? "Latest completed candle" : `Recent state · ≤ ${condition.withinBars} bars old`}
+      </span>
+    {:else}
+      <label class="flex items-center gap-2 text-xs text-muted-foreground">
+        {condition.predicate.type === "cross" ? "Occurred" : "Confirmed"} no more than
+        <NumberField
+          value={condition.withinBars}
+          min={0}
+          max={10000}
+          step={1}
+          class="h-8 w-20"
+          disabled={busy}
+          aria-label={`Condition ${position} event recency bars`}
+          onValueChange={(withinBars: number) => onChange({ ...condition, withinBars })}
+        />
+        bars ago
+      </label>
+      <span class="text-[11px] text-muted-foreground">
+        {condition.withinBars === 0
+          ? "Latest completed candle only"
+          : `Approximately ${recencyDurationLabel(condition.timeframe, condition.withinBars)}`}
+      </span>
+    {/if}
 
     <div class="ml-auto flex items-center gap-0.5">
       <button
@@ -206,6 +219,7 @@
       <div class="grid items-start gap-3 xl:grid-cols-[minmax(0,1fr)_6rem_minmax(0,1fr)]">
         <OperandEditor
           operand={condition.predicate.left}
+          requiredDomain={operandDomain(condition.predicate.right, descriptors)}
           {descriptors}
           {presets}
           {busy}
@@ -226,6 +240,7 @@
         </label>
         <OperandEditor
           operand={condition.predicate.right}
+          requiredDomain={operandDomain(condition.predicate.left, descriptors)}
           {descriptors}
           {presets}
           {busy}
@@ -237,10 +252,46 @@
           {onDeletePreset}
         />
       </div>
+
+      <details class="mt-4 border-t border-border/60 pt-3" open={condition.withinBars > 0}>
+        <summary class="cursor-pointer text-xs font-medium text-muted-foreground">Advanced state timing</summary>
+        <div class="mt-3 space-y-3 rounded-md bg-muted/30 p-3">
+          <label class="flex items-center gap-2 text-xs text-foreground">
+            <input
+              type="checkbox"
+              checked={condition.withinBars > 0}
+              disabled={busy}
+              onchange={() => onChange({ ...condition, withinBars: condition.withinBars === 0 ? 1 : 0 })}
+            />
+            Allow a state that was true recently instead of requiring it on the latest candle
+          </label>
+          {#if condition.withinBars > 0}
+            <label class="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+              True now or no more than
+              <NumberField
+                value={condition.withinBars}
+                min={1}
+                max={10000}
+                step={1}
+                class="h-8 w-20"
+                disabled={busy}
+                aria-label={`Condition ${position} recent state bars`}
+                onValueChange={(withinBars: number) => onChange({ ...condition, withinBars })}
+              />
+              completed bars ago
+            </label>
+            <p class="text-[11px] text-muted-foreground">
+              On {condition.timeframe}, this accepts a state up to approximately
+              {recencyDurationLabel(condition.timeframe, condition.withinBars)} old, even if it is no longer true now.
+            </p>
+          {/if}
+        </div>
+      </details>
     {:else if condition.predicate.type === "cross"}
       <div class="grid items-start gap-3 xl:grid-cols-[minmax(0,1fr)_7rem_minmax(0,1fr)]">
         <OperandEditor
           operand={condition.predicate.left}
+          requiredDomain={operandDomain(condition.predicate.right, descriptors)}
           {descriptors}
           {presets}
           {busy}
@@ -261,6 +312,7 @@
         </label>
         <OperandEditor
           operand={condition.predicate.right}
+          requiredDomain={operandDomain(condition.predicate.left, descriptors)}
           {descriptors}
           {presets}
           {busy}

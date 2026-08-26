@@ -1,5 +1,5 @@
-import type { IndicatorDescriptor } from "$lib/chart/indicators"
-import type { Operand } from "$lib/signals/definition"
+import type { IndicatorDescriptor, ValueDomain } from "$lib/chart/indicators"
+import type { Operand, OperandAdjustment } from "$lib/signals/definition"
 import type { SignalDraft } from "$lib/signals/draft"
 import { draftSnapshot } from "$lib/signals/editor"
 
@@ -58,6 +58,69 @@ function operandValidationMessage(operand: Operand, descriptors: readonly Indica
     : null
 }
 
+function adjustmentsEqual(left: OperandAdjustment | undefined, right: OperandAdjustment | undefined): boolean {
+  if (left === undefined || right === undefined) return left === right
+  return left.type === right.type && left.value === right.value
+}
+
+function paramsEquivalent(
+  id: string,
+  left: Readonly<Record<string, number>>,
+  right: Readonly<Record<string, number>>,
+  descriptors: readonly IndicatorDescriptor[]
+): boolean {
+  const descriptor = descriptors.find(candidate => candidate.id === id)
+  if (descriptor === undefined) return false
+  return descriptor.params.every(parameter => {
+    const leftValue = left[parameter.key] ?? parameter.default
+    const rightValue = right[parameter.key] ?? parameter.default
+    return leftValue === rightValue
+  })
+}
+
+export function operandsEquivalent(
+  left: Operand,
+  right: Operand,
+  descriptors: readonly IndicatorDescriptor[]
+): boolean {
+  if (left.type !== right.type) return false
+  switch (left.type) {
+    case "constant":
+      return right.type === "constant" && left.value === right.value
+    case "field":
+      return right.type === "field" && left.field === right.field && adjustmentsEqual(left.adjustment, right.adjustment)
+    case "indicator":
+      return (
+        right.type === "indicator" &&
+        left.instance.id === right.instance.id &&
+        paramsEquivalent(left.instance.id, left.instance.params, right.instance.params, descriptors) &&
+        left.output === right.output &&
+        adjustmentsEqual(left.adjustment, right.adjustment)
+      )
+  }
+}
+
+export function operandDomain(operand: Operand, descriptors: readonly IndicatorDescriptor[]): ValueDomain | null {
+  switch (operand.type) {
+    case "constant":
+      return null
+    case "field":
+      return operand.field === "volume" ? "volume" : "price"
+    case "indicator":
+      return descriptors.find(descriptor => descriptor.id === operand.instance.id)?.outputDomain ?? null
+  }
+}
+
+function domainLabel(domain: ValueDomain): string {
+  return {
+    price: "price",
+    priceDelta: "price-change",
+    volume: "volume",
+    boundedOscillator: "bounded-oscillator",
+    unboundedOscillator: "unbounded-oscillator",
+  }[domain]
+}
+
 export function draftValidationMessage(draft: SignalDraft, descriptors: readonly IndicatorDescriptor[]): string | null {
   if (draft.conditions.length === 0) return "Add at least one condition before saving."
   const conditionIds = new Set<string>()
@@ -87,6 +150,14 @@ export function draftValidationMessage(draft: SignalDraft, descriptors: readonly
     if (leftIssue !== null) return `Condition ${index + 1}: ${leftIssue}`
     const rightIssue = operandValidationMessage(predicate.right, descriptors)
     if (rightIssue !== null) return `Condition ${index + 1}: ${rightIssue}`
+    if (operandsEquivalent(predicate.left, predicate.right, descriptors)) {
+      return `Condition ${index + 1} uses the same source on both sides.`
+    }
+    const leftDomain = operandDomain(predicate.left, descriptors)
+    const rightDomain = operandDomain(predicate.right, descriptors)
+    if (leftDomain !== null && rightDomain !== null && leftDomain !== rightDomain) {
+      return `Condition ${index + 1} compares incompatible ${domainLabel(leftDomain)} and ${domainLabel(rightDomain)} sources.`
+    }
   }
   return null
 }

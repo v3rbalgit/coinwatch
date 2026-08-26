@@ -15,13 +15,14 @@ import {
   openCatalogEntry,
   signalCatalogErrorMessage,
 } from "$lib/signals/editor"
-import { draftValidationMessage } from "$lib/signals/validation"
+import { draftValidationMessage, operandsEquivalent } from "$lib/signals/validation"
 
 const descriptors: IndicatorDescriptor[] = [
   {
     id: "sma",
     label: "SMA",
     kind: "series",
+    outputDomain: "price",
     target: "overlay",
     params: [{ key: "period", label: "Period", default: 20, min: 1, max: 500, step: 1 }],
     outputs: [{ key: "sma", label: "SMA", kind: "line", color: "#fff" }],
@@ -32,6 +33,7 @@ const descriptors: IndicatorDescriptor[] = [
     id: "rsiDivergence",
     label: "RSI Divergence",
     kind: "divergence",
+    outputDomain: "boundedOscillator",
     target: "overlay",
     params: [
       { key: "period", label: "Period", default: 14, min: 1, max: 500, step: 1 },
@@ -177,6 +179,48 @@ describe("signal editor model", () => {
     }
     trend.predicate.right.instance.params.period = 20.5
     expect(draftValidationMessage(offStep, descriptors)).toContain("increments of 1")
+  })
+
+  it("rejects equivalent operands and incompatible source domains", () => {
+    expect(
+      operandsEquivalent(
+        { type: "indicator", instance: { id: "sma", params: { period: 20 } }, output: "sma" },
+        { type: "indicator", instance: { id: "sma", params: {} }, output: "sma" },
+        descriptors
+      )
+    ).toBe(true)
+
+    const equivalent = draft()
+    equivalent.conditions[0] = createConditionDraft(
+      {
+        timeframe: "1h",
+        predicate: {
+          type: "cross",
+          left: { type: "field", field: "close" },
+          right: { type: "field", field: "close" },
+          direction: "over",
+        },
+        withinBars: 0,
+      },
+      "equivalent"
+    )
+    expect(draftValidationMessage(equivalent, descriptors)).toContain("same source")
+
+    const incompatible = draft()
+    incompatible.conditions[0] = createConditionDraft(
+      {
+        timeframe: "1h",
+        predicate: {
+          type: "threshold",
+          left: { type: "field", field: "close" },
+          op: "greaterThan",
+          right: { type: "field", field: "volume" },
+        },
+        withinBars: 0,
+      },
+      "incompatible"
+    )
+    expect(draftValidationMessage(incompatible, descriptors)).toContain("incompatible price and volume")
   })
 
   it("returns null snapshots for unsavable names, empty drafts, and duplicate IDs", () => {

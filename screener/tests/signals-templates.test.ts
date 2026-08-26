@@ -14,6 +14,7 @@ function parameter(key: string, defaultValue: number): IndicatorParam {
 function descriptor(
   id: string,
   kind: IndicatorDescriptor["kind"],
+  outputDomain: IndicatorDescriptor["outputDomain"],
   params: IndicatorParam[],
   output?: string
 ): IndicatorDescriptor {
@@ -21,6 +22,7 @@ function descriptor(
     id,
     label: id,
     kind,
+    outputDomain,
     target: "pane",
     params,
     outputs: output === undefined ? [] : [{ key: output, label: output, kind: "line", color: "#fff" }],
@@ -30,16 +32,16 @@ function descriptor(
 }
 
 const descriptors: IndicatorDescriptor[] = [
-  descriptor("sma", "series", [parameter("period", 20)], "sma"),
-  descriptor("ema", "series", [parameter("period", 20)], "ema"),
-  descriptor("rsi", "series", [parameter("period", 14)], "rsi"),
-  descriptor("rsiDivergence", "divergence", [
+  descriptor("sma", "series", "price", [parameter("period", 20)], "sma"),
+  descriptor("ema", "series", "price", [parameter("period", 20)], "ema"),
+  descriptor("rsi", "series", "boundedOscillator", [parameter("period", 14)], "rsi"),
+  descriptor("rsiDivergence", "divergence", "boundedOscillator", [
     parameter("period", 14),
     parameter("pivotLeft", 5),
     parameter("pivotRight", 5),
     parameter("maxGap", 60),
   ]),
-  descriptor("macdDivergence", "divergence", [
+  descriptor("macdDivergence", "divergence", "unboundedOscillator", [
     parameter("fast", 12),
     parameter("slow", 26),
     parameter("signal", 9),
