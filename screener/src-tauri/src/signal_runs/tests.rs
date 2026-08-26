@@ -46,16 +46,19 @@ fn history() -> Arc<CandleHistory> {
 
 fn definition() -> SignalDefinition {
     serde_json::from_value(json!({
-        "version": 1,
+        "version": 2,
         "direction": "bullish",
         "root": { "type": "condition", "id": "trend" },
         "conditions": {
             "trend": {
                 "timeframe": "1h",
-                "indicator": { "id": "sma", "params": { "period": 1.0 } },
                 "predicate": {
                     "type": "threshold",
-                    "left": { "type": "output", "key": "sma" },
+                    "left": {
+                        "type": "indicator",
+                        "instance": { "id": "sma", "params": { "period": 1.0 } },
+                        "output": "sma"
+                    },
                     "op": "greaterThan",
                     "right": { "type": "constant", "value": 0.0 }
                 },

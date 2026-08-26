@@ -126,6 +126,7 @@ pub struct Descriptor {
 
 /// A configured indicator to compute: an id plus its params.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Instance {
     /// Which indicator (matches a [`Descriptor::id`]).
     pub id: String,

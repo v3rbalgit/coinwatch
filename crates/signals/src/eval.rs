@@ -16,7 +16,8 @@ use rust_decimal::prelude::ToPrimitive;
 use serde::Serialize;
 
 use crate::definition::{
-    ComparisonOp, Condition, CrossDirection, DefinitionError, Node, Operand, Predicate, PriceField, SignalDefinition,
+    CandleField, ComparisonOp, Condition, CrossDirection, DefinitionError, Node, Operand, OperandAdjustment, Predicate,
+    SignalDefinition,
 };
 
 /// One condition's evaluation verdict.
@@ -133,12 +134,12 @@ struct TimeframePrepared<'a> {
     low: Vec<f64>,
     close: Vec<f64>,
     volume: Vec<f64>,
+    instances: Vec<Instance>,
     outputs: Vec<InstanceOutput>,
-    instance_index: HashMap<&'a str, usize>,
 }
 
 impl<'a> TimeframePrepared<'a> {
-    fn build(candles: &'a [Candle], conditions: &[(&'a str, &'a Condition)]) -> Self {
+    fn build(candles: &'a [Candle], conditions: &[&Condition]) -> Self {
         // Slice iterators have an exact size hint, so each collect allocates its
         // final capacity once. Decimal failures become NaN and cannot satisfy a
         // predicate.
@@ -151,19 +152,15 @@ impl<'a> TimeframePrepared<'a> {
         let close = column(|candle| &candle.close);
         let volume = column(|candle| &candle.volume);
 
-        // Signals commonly reuse the same configured instance in several
-        // predicates; compute it once per timeframe and retain a leaf→output map.
-        let mut unique_instances = Vec::<Instance>::with_capacity(conditions.len());
-        let mut instance_index = HashMap::with_capacity(conditions.len());
-        for (id, condition) in conditions {
-            let index = unique_instances
-                .iter()
-                .position(|built| built == &condition.indicator)
-                .unwrap_or_else(|| {
-                    unique_instances.push(condition.indicator.clone());
-                    unique_instances.len() - 1
-                });
-            instance_index.insert(*id, index);
+        // Configured instances can be reused across conditions or both sides of
+        // one predicate. Compute each distinct configuration once per timeframe.
+        let mut instances = Vec::<Instance>::with_capacity(conditions.len());
+        for condition in conditions {
+            for instance in condition.instances().into_iter().flatten() {
+                if !instances.iter().any(|built| built == instance) {
+                    instances.push(instance.clone());
+                }
+            }
         }
 
         let ohlcv = Ohlcv {
@@ -172,7 +169,7 @@ impl<'a> TimeframePrepared<'a> {
             close: &close,
             volume: &volume,
         };
-        let outputs = compute(&unique_instances, &ohlcv);
+        let outputs = compute(&instances, &ohlcv);
         Self {
             candles,
             open,
@@ -180,27 +177,30 @@ impl<'a> TimeframePrepared<'a> {
             low,
             close,
             volume,
+            instances,
             outputs,
-            instance_index,
         }
     }
 
-    fn field(&self, field: PriceField) -> &[f64] {
+    fn field(&self, field: CandleField) -> &[f64] {
         match field {
-            PriceField::Open => &self.open,
-            PriceField::High => &self.high,
-            PriceField::Low => &self.low,
-            PriceField::Close => &self.close,
-            PriceField::Volume => &self.volume,
+            CandleField::Open => &self.open,
+            CandleField::High => &self.high,
+            CandleField::Low => &self.low,
+            CandleField::Close => &self.close,
+            CandleField::Volume => &self.volume,
         }
     }
 
-    fn output_for(&self, condition_id: &str) -> Option<&InstanceOutput> {
-        self.instance_index.get(condition_id).and_then(|index| self.outputs.get(*index))
+    fn output_for(&self, instance: &Instance) -> Option<&InstanceOutput> {
+        self.instances
+            .iter()
+            .position(|built| built == instance)
+            .and_then(|index| self.outputs.get(index))
     }
 
-    fn series_of(&self, condition_id: &str, key: &str) -> &[f64] {
-        self.output_for(condition_id)
+    fn series_of(&self, instance: &Instance, key: &str) -> &[f64] {
+        self.output_for(instance)
             .and_then(|output| output.outputs.iter().find(|series| series.key == key))
             .map(|series| series.values.as_slice())
             .unwrap_or_default()
@@ -208,23 +208,30 @@ impl<'a> TimeframePrepared<'a> {
 }
 
 enum Source<'a> {
-    Series(&'a [f64]),
+    Series(&'a [f64], Option<OperandAdjustment>),
     Scalar(f64),
 }
 
 impl Source<'_> {
     fn value_at(&self, index: usize) -> Option<f64> {
         match self {
-            Self::Series(series) => series.get(index).copied(),
+            Self::Series(series, adjustment) => series
+                .get(index)
+                .copied()
+                .map(|value| adjustment.map_or(value, |adjustment| adjustment.apply(value))),
             Self::Scalar(value) => Some(*value),
         }
     }
 }
 
-fn resolve_operand<'a>(operand: &'a Operand, condition_id: &str, prepared: &'a TimeframePrepared<'_>) -> Source<'a> {
+fn resolve_operand<'a>(operand: &'a Operand, prepared: &'a TimeframePrepared<'_>) -> Source<'a> {
     match operand {
-        Operand::Output { key } => Source::Series(prepared.series_of(condition_id, key)),
-        Operand::Field { field } => Source::Series(prepared.field(*field)),
+        Operand::Indicator {
+            instance,
+            output,
+            adjustment,
+        } => Source::Series(prepared.series_of(instance, output), *adjustment),
+        Operand::Field { field, adjustment } => Source::Series(prepared.field(*field), *adjustment),
         Operand::Constant { value } => Source::Scalar(*value),
     }
 }
@@ -240,9 +247,9 @@ pub(crate) fn evaluate_validated(
     coin: &str,
     data: &CoinData,
 ) -> Result<EvalReport, DefinitionError> {
-    let mut by_timeframe: BTreeMap<Timeframe, Vec<(&str, &Condition)>> = BTreeMap::new();
-    for (id, condition) in &definition.conditions {
-        by_timeframe.entry(condition.timeframe).or_default().push((id, condition));
+    let mut by_timeframe: BTreeMap<Timeframe, Vec<&Condition>> = BTreeMap::new();
+    for condition in definition.conditions.values() {
+        by_timeframe.entry(condition.timeframe).or_default().push(condition);
     }
 
     let mut prepared = HashMap::with_capacity(by_timeframe.len());
@@ -267,12 +274,12 @@ pub(crate) fn evaluate_validated(
             }
         } else {
             match prepared.get(&condition.timeframe) {
-                Some(timeframe) => evaluate_condition(id, condition, timeframe).map_err(|source| {
-                    DefinitionError::InvalidIndicator {
+                Some(timeframe) => {
+                    evaluate_condition(condition, timeframe).map_err(|source| DefinitionError::InvalidIndicator {
                         condition: id.clone(),
                         source,
-                    }
-                })?,
+                    })?
+                }
                 None => ConditionOutcome {
                     status: OutcomeStatus::NoData,
                     last_true_bar: None,
@@ -390,7 +397,6 @@ fn collect_supporting<'a>(
 }
 
 fn evaluate_condition(
-    condition_id: &str,
     condition: &Condition,
     prepared: &TimeframePrepared<'_>,
 ) -> Result<ConditionOutcome, InstanceError> {
@@ -406,7 +412,7 @@ fn evaluate_condition(
         });
     }
 
-    let mask = build_mask(condition_id, condition, prepared, requirement.confirmation_bars);
+    let mask = build_mask(condition, prepared, requirement.confirmation_bars);
     let window_len = condition.within_bars as usize + 1;
     let satisfied = mask.iter().rev().take(window_len).any(|&held| held);
     let last_true_bar = mask
@@ -422,27 +428,26 @@ fn evaluate_condition(
     Ok(ConditionOutcome { status, last_true_bar })
 }
 
-fn build_mask(
-    condition_id: &str,
-    condition: &Condition,
-    prepared: &TimeframePrepared<'_>,
-    confirmation_bars: usize,
-) -> Vec<bool> {
+fn build_mask(condition: &Condition, prepared: &TimeframePrepared<'_>, confirmation_bars: usize) -> Vec<bool> {
     match &condition.predicate {
         Predicate::Threshold { left, right, op } => {
-            let left = resolve_operand(left, condition_id, prepared);
-            let right = resolve_operand(right, condition_id, prepared);
+            let left = resolve_operand(left, prepared);
+            let right = resolve_operand(right, prepared);
             threshold_mask(*op, &left, &right, prepared.candles.len())
         }
         Predicate::Cross { left, right, direction } => {
-            let left = resolve_operand(left, condition_id, prepared);
-            let right = resolve_operand(right, condition_id, prepared);
+            let left = resolve_operand(left, prepared);
+            let right = resolve_operand(right, prepared);
             cross_mask(*direction, &left, &right, prepared.candles.len())
         }
-        Predicate::Divergence { kind, direction } => {
+        Predicate::Divergence {
+            instance,
+            kind,
+            direction,
+        } => {
             let mut mask = vec![false; prepared.candles.len()];
             let spans = prepared
-                .output_for(condition_id)
+                .output_for(instance)
                 .map(|output| output.divergences.as_slice())
                 .unwrap_or_default();
             for span in spans {
@@ -508,11 +513,11 @@ mod tests {
 
     use super::{CoinData, ConditionOutcome, OutcomeStatus, evaluate};
     use crate::definition::{
-        ComparisonOp, Condition, CrossDirection, DEFINITION_VERSION, DefinitionError, Direction, DirectionFilter,
-        KindFilter, Node, Operand, Predicate, PriceField, SignalDefinition,
+        CandleField, ComparisonOp, Condition, CrossDirection, DEFINITION_VERSION, DefinitionError, Direction,
+        DirectionFilter, KindFilter, Node, Operand, OperandAdjustment, Predicate, SignalDefinition,
     };
 
-    fn candle(index: usize, close: f64) -> Candle {
+    fn candle_with_volume(index: usize, close: f64, volume: f64) -> Candle {
         let price = Decimal::try_from(close).expect("finite close");
         Candle {
             open_time: Utc
@@ -523,23 +528,38 @@ mod tests {
             high: price,
             low: price,
             close: price,
-            volume: Decimal::ZERO,
+            volume: Decimal::try_from(volume).expect("finite volume"),
         }
+    }
+
+    fn candle(index: usize, close: f64) -> Candle {
+        candle_with_volume(index, close, 0.0)
     }
 
     fn candles(closes: &[f64]) -> Vec<Candle> {
         closes.iter().enumerate().map(|(index, &close)| candle(index, close)).collect()
     }
 
+    fn indicator(id: &str, params: impl IntoIterator<Item = (&'static str, f64)>) -> Instance {
+        Instance {
+            id: id.to_owned(),
+            params: params.into_iter().map(|(key, value)| (key.to_owned(), value)).collect(),
+        }
+    }
+
+    fn indicator_operand(instance: Instance, output: &str, adjustment: Option<OperandAdjustment>) -> Operand {
+        Operand::Indicator {
+            instance,
+            output: output.to_owned(),
+            adjustment,
+        }
+    }
+
     fn sma_threshold(timeframe: Timeframe, value: f64, within_bars: u32) -> Condition {
         Condition {
             timeframe,
-            indicator: Instance {
-                id: "sma".to_owned(),
-                params: [("period".to_owned(), 1.0)].into_iter().collect(),
-            },
             predicate: Predicate::Threshold {
-                left: Operand::Output { key: "sma".to_owned() },
+                left: indicator_operand(indicator("sma", [("period", 1.0)]), "sma", None),
                 op: ComparisonOp::GreaterThan,
                 right: Operand::Constant { value },
             },
@@ -588,18 +608,155 @@ mod tests {
     }
 
     #[test]
+    fn raw_price_and_volume_conditions_combine_without_an_indicator() {
+        let price = Condition {
+            timeframe: Timeframe::Hour1,
+            predicate: Predicate::Threshold {
+                left: Operand::Field {
+                    field: CandleField::Close,
+                    adjustment: None,
+                },
+                op: ComparisonOp::GreaterThan,
+                right: Operand::Constant { value: 100.0 },
+            },
+            within_bars: 0,
+        };
+        let volume = Condition {
+            timeframe: Timeframe::Hour1,
+            predicate: Predicate::Threshold {
+                left: Operand::Field {
+                    field: CandleField::Volume,
+                    adjustment: None,
+                },
+                op: ComparisonOp::GreaterThan,
+                right: Operand::Constant { value: 1_000.0 },
+            },
+            within_bars: 0,
+        };
+        let signal = definition(
+            vec![("price", price), ("volume", volume)],
+            Node::All {
+                children: vec![
+                    Node::Condition { id: "price".to_owned() },
+                    Node::Condition {
+                        id: "volume".to_owned(),
+                    },
+                ],
+            },
+        );
+        let mut data = CoinData::default();
+        data.insert(Timeframe::Hour1, vec![candle_with_volume(0, 110.0, 1_500.0)]);
+
+        let report = evaluate(&signal, "BTC", &data).expect("valid raw market signal");
+        assert!(report.satisfied);
+        assert_eq!(report.conditions["price"].status, OutcomeStatus::Satisfied);
+        assert_eq!(report.conditions["volume"].status, OutcomeStatus::Satisfied);
+    }
+
+    #[test]
+    fn detects_close_crossing_three_percent_above_ema() {
+        let condition = Condition {
+            timeframe: Timeframe::Day1,
+            predicate: Predicate::Cross {
+                left: Operand::Field {
+                    field: CandleField::Close,
+                    adjustment: None,
+                },
+                right: indicator_operand(
+                    indicator("ema", [("period", 3.0)]),
+                    "ema",
+                    Some(OperandAdjustment::Percent { value: 3.0 }),
+                ),
+                direction: CrossDirection::Over,
+            },
+            within_bars: 0,
+        };
+        let signal = definition(vec![("cross", condition)], Node::Condition { id: "cross".to_owned() });
+        let mut data = CoinData::default();
+        data.insert(Timeframe::Day1, candles(&[100.0, 100.0, 100.0, 103.0, 110.0]));
+
+        let report = evaluate(&signal, "BTC", &data).expect("valid adjusted cross signal");
+        assert!(report.satisfied);
+        assert_eq!(
+            report.conditions["cross"].last_true_bar,
+            Utc.timestamp_opt(4 * 3_600, 0).single()
+        );
+    }
+
+    #[test]
+    fn multi_timeframe_rsi_thresholds_combine_with_all() {
+        let condition = |timeframe| Condition {
+            timeframe,
+            predicate: Predicate::Threshold {
+                left: indicator_operand(indicator("rsi", [("period", 14.0)]), "rsi", None),
+                op: ComparisonOp::GreaterThan,
+                right: Operand::Constant { value: 70.0 },
+            },
+            within_bars: 0,
+        };
+        let signal = definition(
+            vec![
+                ("rsi1h", condition(Timeframe::Hour1)),
+                ("rsi4h", condition(Timeframe::Hour4)),
+                ("rsi1d", condition(Timeframe::Day1)),
+            ],
+            Node::All {
+                children: vec![
+                    Node::Condition { id: "rsi1h".to_owned() },
+                    Node::Condition { id: "rsi4h".to_owned() },
+                    Node::Condition { id: "rsi1d".to_owned() },
+                ],
+            },
+        );
+        let rising = candles(&(1..=16).map(f64::from).collect::<Vec<_>>());
+        let mut data = CoinData::default();
+        data.insert(Timeframe::Hour1, rising.clone());
+        data.insert(Timeframe::Hour4, rising.clone());
+        data.insert(Timeframe::Day1, rising);
+
+        let report = evaluate(&signal, "BTC", &data).expect("valid multi-timeframe RSI signal");
+        assert!(report.satisfied);
+        assert!(
+            report
+                .conditions
+                .values()
+                .all(|outcome| outcome.status == OutcomeStatus::Satisfied)
+        );
+    }
+
+    #[test]
+    fn compares_independently_configured_indicator_instances() {
+        let condition = Condition {
+            timeframe: Timeframe::Hour1,
+            predicate: Predicate::Cross {
+                left: indicator_operand(indicator("sma", [("period", 2.0)]), "sma", None),
+                right: indicator_operand(indicator("sma", [("period", 3.0)]), "sma", None),
+                direction: CrossDirection::Over,
+            },
+            within_bars: 0,
+        };
+        let signal = definition(vec![("cross", condition)], Node::Condition { id: "cross".to_owned() });
+        let mut data = CoinData::default();
+        data.insert(Timeframe::Hour1, candles(&[3.0, 2.0, 1.0, 2.0, 3.0]));
+
+        let report = evaluate(&signal, "BTC", &data).expect("valid two-instance signal");
+        assert!(report.satisfied);
+        assert_eq!(
+            report.conditions["cross"].last_true_bar,
+            Utc.timestamp_opt(4 * 3_600, 0).single()
+        );
+    }
+
+    #[test]
     fn detects_close_crossing_over_sma_on_latest_bar() {
         let condition = Condition {
             timeframe: Timeframe::Hour1,
-            indicator: Instance {
-                id: "sma".to_owned(),
-                params: [("period".to_owned(), 3.0)].into_iter().collect(),
-            },
             predicate: Predicate::Cross {
                 left: Operand::Field {
-                    field: PriceField::Close,
+                    field: CandleField::Close,
+                    adjustment: None,
                 },
-                right: Operand::Output { key: "sma".to_owned() },
+                right: indicator_operand(indicator("sma", [("period", 3.0)]), "sma", None),
                 direction: CrossDirection::Over,
             },
             within_bars: 0,
@@ -620,13 +777,14 @@ mod tests {
                 id: "invalid".to_owned(),
             },
         );
-        signal
-            .conditions
-            .get_mut("invalid")
-            .expect("fixture condition")
-            .indicator
-            .params
-            .insert("typo".to_owned(), 1.0);
+        let Predicate::Threshold {
+            left: Operand::Indicator { instance, .. },
+            ..
+        } = &mut signal.conditions.get_mut("invalid").expect("fixture condition").predicate
+        else {
+            panic!("fixture indicator operand")
+        };
+        instance.params.insert("typo".to_owned(), 1.0);
 
         assert!(matches!(
             evaluate(&signal, "BTC", &CoinData::default()),
@@ -707,7 +865,14 @@ mod tests {
     #[test]
     fn insufficient_warmup_is_unknown_and_cannot_satisfy_negation() {
         let mut condition = sma_threshold(Timeframe::Hour1, 80.0, 1);
-        condition.indicator.params.insert("period".to_owned(), 3.0);
+        let Predicate::Threshold {
+            left: Operand::Indicator { instance, .. },
+            ..
+        } = &mut condition.predicate
+        else {
+            panic!("fixture indicator operand")
+        };
+        instance.params.insert("period".to_owned(), 3.0);
         let signal = definition(
             vec![("warmup", condition)],
             Node::Not {
@@ -817,11 +982,11 @@ mod tests {
         .collect::<BTreeMap<_, _>>();
         let condition = Condition {
             timeframe: Timeframe::Hour1,
-            indicator: Instance {
-                id: "rsiDivergence".to_owned(),
-                params,
-            },
             predicate: Predicate::Divergence {
+                instance: Instance {
+                    id: "rsiDivergence".to_owned(),
+                    params,
+                },
                 kind: KindFilter::Regular,
                 direction: DirectionFilter::Bearish,
             },
