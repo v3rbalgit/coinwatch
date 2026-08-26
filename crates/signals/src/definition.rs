@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use domain::Timeframe;
 use indicators::{
-    DescriptorKind, DivergenceDirection, DivergenceKind, Instance, InstanceError, divergence_input, resolve_instance,
-    series_input_requirement, validate_instance,
+    DescriptorKind, DivergenceDirection, DivergenceKind, Instance, InstanceError, ValueDomain, divergence_input,
+    resolve_instance, series_input_requirement, validate_instance,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -98,6 +98,19 @@ pub enum DefinitionError {
     /// A series predicate compares constants without reading market data.
     #[error("condition '{0}' must reference at least one market or indicator series")]
     PredicateIgnoresMarketData(String),
+    /// Both sides resolve to the exact same source and adjustment.
+    #[error("condition '{0}' uses equivalent operands on both sides")]
+    EquivalentOperands(String),
+    /// The two source families do not share meaningful units.
+    #[error("condition '{condition}' compares incompatible {left} and {right} sources")]
+    IncompatibleDomains {
+        /// Condition id.
+        condition: String,
+        /// Left source family.
+        left: ValueDomain,
+        /// Right source family.
+        right: ValueDomain,
+    },
 }
 
 /// A serialized definition could not be decoded with the current contract.
@@ -577,12 +590,22 @@ fn validate_condition(id: &str, condition: &Condition) -> Result<(), DefinitionE
 
     match &condition.predicate {
         Predicate::Threshold { left, right, .. } | Predicate::Cross { left, right, .. } => {
-            let operands = [left, right];
-            if operands.iter().all(|operand| matches!(operand, Operand::Constant { .. })) {
+            if matches!(left, Operand::Constant { .. }) && matches!(right, Operand::Constant { .. }) {
                 return Err(DefinitionError::PredicateIgnoresMarketData(id.to_owned()));
             }
-            for operand in operands {
-                validate_operand(id, operand)?;
+            let left_domain = validate_operand(id, left)?;
+            let right_domain = validate_operand(id, right)?;
+            if operands_equivalent(id, left, right)? {
+                return Err(DefinitionError::EquivalentOperands(id.to_owned()));
+            }
+            if let (Some(left), Some(right)) = (left_domain, right_domain)
+                && left != right
+            {
+                return Err(DefinitionError::IncompatibleDomains {
+                    condition: id.to_owned(),
+                    left,
+                    right,
+                });
             }
         }
         Predicate::Divergence { instance, .. } => {
@@ -601,7 +624,47 @@ fn validate_condition(id: &str, condition: &Condition) -> Result<(), DefinitionE
     Ok(())
 }
 
-fn validate_operand(id: &str, operand: &Operand) -> Result<(), DefinitionError> {
+fn operands_equivalent(id: &str, left: &Operand, right: &Operand) -> Result<bool, DefinitionError> {
+    match (left, right) {
+        (Operand::Constant { value: left }, Operand::Constant { value: right }) => Ok(left.total_cmp(right).is_eq()),
+        (
+            Operand::Field {
+                field: left_field,
+                adjustment: left_adjustment,
+            },
+            Operand::Field {
+                field: right_field,
+                adjustment: right_adjustment,
+            },
+        ) => Ok(left_field == right_field && left_adjustment == right_adjustment),
+        (
+            Operand::Indicator {
+                instance: left_instance,
+                output: left_output,
+                adjustment: left_adjustment,
+            },
+            Operand::Indicator {
+                instance: right_instance,
+                output: right_output,
+                adjustment: right_adjustment,
+            },
+        ) => {
+            if left_output != right_output || left_adjustment != right_adjustment {
+                return Ok(false);
+            }
+            let resolve = |instance: &Instance| {
+                resolve_instance(instance).map_err(|source| DefinitionError::InvalidIndicator {
+                    condition: id.to_owned(),
+                    source,
+                })
+            };
+            Ok(resolve(left_instance)? == resolve(right_instance)?)
+        }
+        (Operand::Indicator { .. } | Operand::Field { .. } | Operand::Constant { .. }, _) => Ok(false),
+    }
+}
+
+fn validate_operand(id: &str, operand: &Operand) -> Result<Option<ValueDomain>, DefinitionError> {
     if operand.adjustment().is_some_and(|adjustment| !adjustment.value().is_finite()) {
         return Err(DefinitionError::NonFiniteAdjustment(id.to_owned()));
     }
@@ -611,8 +674,12 @@ fn validate_operand(id: &str, operand: &Operand) -> Result<(), DefinitionError> 
             if !value.is_finite() {
                 return Err(DefinitionError::NonFiniteConstant(id.to_owned()));
             }
+            Ok(None)
         }
-        Operand::Field { .. } => {}
+        Operand::Field { field, .. } => Ok(Some(match field {
+            CandleField::Open | CandleField::High | CandleField::Low | CandleField::Close => ValueDomain::Price,
+            CandleField::Volume => ValueDomain::Volume,
+        })),
         Operand::Indicator { instance, output, .. } => {
             let descriptor = validate_instance(instance).map_err(|source| DefinitionError::InvalidIndicator {
                 condition: id.to_owned(),
@@ -631,9 +698,9 @@ fn validate_operand(id: &str, operand: &Operand) -> Result<(), DefinitionError> 
                     output: output.clone(),
                 });
             }
+            Ok(Some(descriptor.output_domain))
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -641,7 +708,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use domain::Timeframe;
-    use indicators::{Instance, InstanceError};
+    use indicators::{Instance, InstanceError, ValueDomain};
     use serde_json::json;
 
     use super::{
@@ -897,6 +964,48 @@ mod tests {
             right: Operand::Constant { value: 80.0 },
         };
         assert!(matches!(bad_output.validate(), Err(DefinitionError::UnknownOutput { .. })));
+    }
+
+    #[test]
+    fn rejects_equivalent_and_incompatible_operands() {
+        let mut equivalent = definition(Node::Condition { id: "hot".to_owned() });
+        equivalent.conditions.get_mut("hot").expect("fixture condition").predicate = Predicate::Cross {
+            left: sma_output(20.0),
+            right: Operand::Indicator {
+                instance: Instance {
+                    id: "sma".to_owned(),
+                    params: BTreeMap::new(),
+                },
+                output: "sma".to_owned(),
+                adjustment: None,
+            },
+            direction: CrossDirection::Over,
+        };
+        assert!(matches!(
+            equivalent.validate(),
+            Err(DefinitionError::EquivalentOperands(id)) if id == "hot"
+        ));
+
+        let mut incompatible = definition(Node::Condition { id: "hot".to_owned() });
+        incompatible.conditions.get_mut("hot").expect("fixture condition").predicate = Predicate::Threshold {
+            left: Operand::Field {
+                field: CandleField::Close,
+                adjustment: None,
+            },
+            op: ComparisonOp::GreaterThan,
+            right: Operand::Field {
+                field: CandleField::Volume,
+                adjustment: None,
+            },
+        };
+        assert!(matches!(
+            incompatible.validate(),
+            Err(DefinitionError::IncompatibleDomains {
+                left: ValueDomain::Price,
+                right: ValueDomain::Volume,
+                ..
+            })
+        ));
     }
 
     #[test]

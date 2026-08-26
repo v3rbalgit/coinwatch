@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
-use strum::{AsRefStr, EnumCount, EnumString};
+use strum::{AsRefStr, Display, EnumCount, EnumString};
 use thiserror::Error;
 
 use crate::adx::{Adx, adx};
@@ -105,6 +105,25 @@ impl IndicatorId {
             | Self::Obv => None,
         }
     }
+
+    const fn output_domain(self) -> ValueDomain {
+        match self {
+            Self::Sma
+            | Self::Ema
+            | Self::Wma
+            | Self::Bollinger
+            | Self::Vwap
+            | Self::Donchian
+            | Self::Supertrend
+            | Self::Psar => ValueDomain::Price,
+            Self::Atr => ValueDomain::PriceDelta,
+            Self::Obv => ValueDomain::Volume,
+            Self::Rsi | Self::Stochastic | Self::Williams | Self::Mfi | Self::Adx | Self::RsiDivergence => {
+                ValueDomain::BoundedOscillator
+            }
+            Self::Macd | Self::Cci | Self::MacdDivergence => ValueDomain::UnboundedOscillator,
+        }
+    }
 }
 
 /// How one output series is plotted.
@@ -115,6 +134,23 @@ pub enum OutputKind {
     Line,
     /// A histogram (e.g. the MACD histogram).
     Histogram,
+}
+
+/// Numeric family shared by every output of one indicator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[strum(serialize_all = "camelCase")]
+pub enum ValueDomain {
+    /// Absolute market-price levels.
+    Price,
+    /// Price movement or volatility rather than an absolute level.
+    PriceDelta,
+    /// Raw or accumulated traded volume.
+    Volume,
+    /// Oscillators with a fixed finite range.
+    BoundedOscillator,
+    /// Oscillators without a fixed finite range.
+    UnboundedOscillator,
 }
 
 /// A tunable parameter — surfaced with conventional defaults, editable by callers.
@@ -149,6 +185,7 @@ pub struct Output {
 
 /// Static metadata for one indicator: drives pickers/editors and the renderer.
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Descriptor {
     /// Stable id (matches `Instance.id`).
     pub id: String,
@@ -156,6 +193,8 @@ pub struct Descriptor {
     pub label: String,
     /// Whether instances produce numeric series or divergence spans.
     pub kind: DescriptorKind,
+    /// Numeric family represented by the descriptor's outputs or divergence oscillator.
+    pub output_domain: ValueDomain,
     /// Overlay vs own pane.
     pub target: Target,
     /// Tunable params with defaults.
@@ -470,6 +509,7 @@ fn descriptor(id: IndicatorId, label: &str, target: Target, params: Vec<Param>, 
         id: id.as_ref().to_owned(),
         label: label.to_owned(),
         kind: DescriptorKind::Series,
+        output_domain: id.output_domain(),
         target,
         params,
         outputs,
@@ -887,8 +927,8 @@ mod tests {
     use crate::rsi::rsi;
 
     use super::{
-        DescriptorKind, IndicatorId, Instance, InstanceError, Ohlcv, compute, descriptors, divergence_input,
-        resolve_instance, series_input_requirement, validate_instance,
+        DescriptorKind, IndicatorId, Instance, InstanceError, Ohlcv, ValueDomain, compute, descriptors,
+        divergence_input, resolve_instance, series_input_requirement, validate_instance,
     };
 
     fn series() -> Vec<f64> {
@@ -919,6 +959,24 @@ mod tests {
             let parsed = id.parse::<IndicatorId>().expect("descriptor id");
             assert_eq!(parsed.as_ref(), id);
         }
+    }
+
+    #[test]
+    fn descriptor_domains_distinguish_numeric_families() {
+        let domain = |id: &str| {
+            descriptors()
+                .iter()
+                .find(|descriptor| descriptor.id == id)
+                .map(|descriptor| descriptor.output_domain)
+                .expect("descriptor domain")
+        };
+        assert_eq!(domain("sma"), ValueDomain::Price);
+        assert_eq!(domain("atr"), ValueDomain::PriceDelta);
+        assert_eq!(domain("obv"), ValueDomain::Volume);
+        assert_eq!(domain("rsi"), ValueDomain::BoundedOscillator);
+        assert_eq!(domain("rsiDivergence"), ValueDomain::BoundedOscillator);
+        assert_eq!(domain("macd"), ValueDomain::UnboundedOscillator);
+        assert_eq!(domain("macdDivergence"), ValueDomain::UnboundedOscillator);
     }
 
     #[test]

@@ -28,6 +28,6 @@ mod wma;
 pub use divergence::{DivergenceDirection, DivergenceKind};
 pub use engine::{
     Descriptor, DescriptorKind, DivergenceInput, Instance, InstanceError, InstanceOutput, Ohlcv, Output, OutputKind,
-    OutputSeries, Param, Target, compute, descriptors, divergence_input, resolve_instance, series_input_requirement,
-    validate_instance,
+    OutputSeries, Param, Target, ValueDomain, compute, descriptors, divergence_input, resolve_instance,
+    series_input_requirement, validate_instance,
 };
