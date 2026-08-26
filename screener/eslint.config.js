@@ -1,6 +1,7 @@
 import js from "@eslint/js"
 import prettier from "eslint-config-prettier"
 import svelte from "eslint-plugin-svelte"
+import { defineConfig } from "eslint/config"
 import globals from "globals"
 import ts from "typescript-eslint"
 
@@ -8,7 +9,7 @@ import svelteConfig from "./svelte.config.js"
 
 // Type-aware lint config: typescript-eslint + eslint-plugin-svelte, with Prettier
 // disabling stylistic rules.
-export default ts.config(
+export default defineConfig(
   {
     ignores: [
       "build/",

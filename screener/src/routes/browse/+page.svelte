@@ -12,6 +12,7 @@
   import CoinIcon from "$lib/components/ui/coin-icon.svelte"
   import Input from "$lib/components/ui/input.svelte"
   import Skeleton from "$lib/components/ui/skeleton.svelte"
+  import { formatCompactNumber, formatPrice } from "$lib/format"
 
   type Row = {
     coin: string
@@ -153,16 +154,6 @@
     if (activeList === name) activeList = null
     await loadLists()
   }
-  const fmtUsd = (n: number) =>
-    n >= 1e9
-      ? (n / 1e9).toFixed(2) + "B"
-      : n >= 1e6
-        ? (n / 1e6).toFixed(1) + "M"
-        : n >= 1e3
-          ? (n / 1e3).toFixed(0) + "k"
-          : n.toFixed(0)
-  const fmtPrice = (n: number) => (n >= 100 ? n.toFixed(2) : n >= 1 ? n.toFixed(3) : n.toPrecision(4))
-
   const cols: { key: SortKey; label: string; num: boolean }[] = [
     { key: "coin", label: "Coin", num: false },
     { key: "price", label: "Price", num: true },
@@ -295,12 +286,12 @@
                   {row.coin}
                 </span>
               </td>
-              <td class="px-3 py-1.5 text-right">{fmtPrice(price)}</td>
+              <td class="px-3 py-1.5 text-right">{formatPrice(price)}</td>
               <td class="px-3 py-1.5 text-right {chg > 0 ? 'text-green-500' : chg < 0 ? 'text-red-500' : ''}">
                 {chg.toFixed(2)}%
               </td>
-              <td class="px-3 py-1.5 text-right text-muted-foreground">{fmtUsd(row.volume_usd)}</td>
-              <td class="px-3 py-1.5 text-right text-muted-foreground">{fmtUsd(row.open_interest_usd)}</td>
+              <td class="px-3 py-1.5 text-right text-muted-foreground">{formatCompactNumber(row.volume_usd)}</td>
+              <td class="px-3 py-1.5 text-right text-muted-foreground">{formatCompactNumber(row.open_interest_usd)}</td>
               <td
                 class="px-3 py-1.5 text-right {row.funding > 0
                   ? 'text-green-500'
