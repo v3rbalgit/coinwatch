@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE indicator_presets SET name = ?, params = ? WHERE id = ? AND indicator_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "f60507ffcaabb81bb1f175b8911728c72b699277cc9f808d26dc8f31c229d49b"
+}

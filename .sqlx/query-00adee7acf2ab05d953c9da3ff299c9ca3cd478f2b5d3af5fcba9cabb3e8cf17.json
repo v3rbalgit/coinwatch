@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id, indicator_id, name, params FROM indicator_presets WHERE id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "indicator_presets",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "indicator_id",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "indicator_presets",
+            "name": "indicator_id"
+          }
+        }
+      },
+      {
+        "name": "name",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "indicator_presets",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "name": "params",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "indicator_presets",
+            "name": "params"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "00adee7acf2ab05d953c9da3ff299c9ca3cd478f2b5d3af5fcba9cabb3e8cf17"
+}

@@ -9,8 +9,9 @@ pub mod eval;
 pub mod run;
 
 pub use definition::{
-    CandleField, ComparisonOp, Condition, CrossDirection, DEFINITION_VERSION, DefinitionError, Direction,
-    DirectionFilter, KindFilter, Node, Operand, OperandAdjustment, Predicate, SignalDefinition,
+    CandleField, ComparisonOp, Condition, CrossDirection, DEFINITION_VERSION, DefinitionDecodeError, DefinitionError,
+    Direction, DirectionFilter, KindFilter, Node, Operand, OperandAdjustment, Predicate, SignalDefinition,
+    decode_definition,
 };
 pub use eval::{CoinData, ConditionOutcome, EvalReport, OutcomeStatus};
 pub use run::{RunProgress, RunSummary, evaluate_coin, run_signal};

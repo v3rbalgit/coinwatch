@@ -33,7 +33,8 @@ pub use divergence::{Divergence, DivergenceDirection, DivergenceKind, detect_div
 pub use donchian::{Donchian, donchian};
 pub use engine::{
     Descriptor, DescriptorKind, DivergenceInput, Instance, InstanceError, InstanceOutput, Ohlcv, Output, OutputKind,
-    OutputSeries, Param, Target, compute, descriptors, divergence_input, series_input_requirement, validate_instance,
+    OutputSeries, Param, Target, compute, descriptors, divergence_input, resolve_instance, series_input_requirement,
+    validate_instance,
 };
 pub use macd::{Macd, ema, macd};
 pub use mfi::mfi;

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE signals SET name = ?, definition = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "965e7376dd29b9a07096d4aeb6c9efe8dab1731cd9a13fd86c464cc49d1be855"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO indicator_presets (id, indicator_id, name, params) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "9049e4a040358b35f90af591c6bc74355cd17aff27ed4f572111b22cee782c01"
+}

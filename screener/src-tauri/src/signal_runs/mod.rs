@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use chrono::Utc;
 use hl_feed::{CandleHistory, MarketStore};
 use serde::{Deserialize, Serialize};
-use signals::{run_signal, DefinitionError, EvalReport, RunSummary, SignalDefinition};
+use signals::{DefinitionError, EvalReport, RunSummary, SignalDefinition, run_signal};
 use tauri::ipc::Channel;
 use thiserror::Error;
 use tokio::sync::watch;

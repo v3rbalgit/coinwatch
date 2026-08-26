@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use domain::Timeframe;
 use indicators::{
-    DescriptorKind, DivergenceDirection, DivergenceKind, Instance, InstanceError, divergence_input,
+    DescriptorKind, DivergenceDirection, DivergenceKind, Instance, InstanceError, divergence_input, resolve_instance,
     series_input_requirement, validate_instance,
 };
 use serde::{Deserialize, Serialize};
@@ -100,6 +100,32 @@ pub enum DefinitionError {
     PredicateIgnoresMarketData(String),
 }
 
+/// A serialized definition could not be decoded with the current contract.
+#[derive(Debug, Error)]
+pub enum DefinitionDecodeError {
+    /// The JSON is malformed or does not match the current schema.
+    #[error("invalid serialized signal definition: {0}")]
+    InvalidJson(#[source] serde_json::Error),
+    /// The JSON uses a definition version this build cannot decode.
+    #[error("unsupported definition version {0}")]
+    UnsupportedVersion(u32),
+}
+
+#[derive(Deserialize)]
+struct DefinitionVersion {
+    version: u32,
+}
+
+/// Decode JSON only after inspecting its version independently of the complete
+/// schema. This preserves a useful unsupported-version result for older shapes.
+pub fn decode_definition(value: &str) -> Result<SignalDefinition, DefinitionDecodeError> {
+    let version: DefinitionVersion = serde_json::from_str(value).map_err(DefinitionDecodeError::InvalidJson)?;
+    if version.version != DEFINITION_VERSION {
+        return Err(DefinitionDecodeError::UnsupportedVersion(version.version));
+    }
+    serde_json::from_str(value).map_err(DefinitionDecodeError::InvalidJson)
+}
+
 /// Trading bias of a saved signal — user intent, shown in catalogs and results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -173,6 +199,13 @@ pub enum Operand {
 
 impl Operand {
     const fn instance(&self) -> Option<&Instance> {
+        match self {
+            Self::Indicator { instance, .. } => Some(instance),
+            Self::Field { .. } | Self::Constant { .. } => None,
+        }
+    }
+
+    const fn instance_mut(&mut self) -> Option<&mut Instance> {
         match self {
             Self::Indicator { instance, .. } => Some(instance),
             Self::Field { .. } | Self::Constant { .. } => None,
@@ -373,6 +406,15 @@ impl Condition {
         }
     }
 
+    const fn instances_mut(&mut self) -> [Option<&mut Instance>; 2] {
+        match &mut self.predicate {
+            Predicate::Threshold { left, right, .. } | Predicate::Cross { left, right, .. } => {
+                [left.instance_mut(), right.instance_mut()]
+            }
+            Predicate::Divergence { instance, .. } => [Some(instance), None],
+        }
+    }
+
     /// Completed candles needed to evaluate the full freshness window.
     pub fn required_completed_bars(&self) -> Result<usize, InstanceError> {
         self.requirement().map(|requirement| requirement.completed_bars)
@@ -451,6 +493,21 @@ impl SignalDefinition {
         validate_node(&self.root, &self.conditions, &mut referenced)?;
         if let Some(id) = self.conditions.keys().find(|id| !referenced.contains(*id)) {
             return Err(DefinitionError::UnreferencedCondition(id.clone()));
+        }
+        Ok(())
+    }
+
+    /// Validate the definition and replace omitted indicator parameters with
+    /// descriptor defaults so persisted instances remain stable across releases.
+    pub fn resolve_indicator_defaults(&mut self) -> Result<(), DefinitionError> {
+        self.validate()?;
+        for (id, condition) in &mut self.conditions {
+            for instance in condition.instances_mut().into_iter().flatten() {
+                *instance = resolve_instance(instance).map_err(|source| DefinitionError::InvalidIndicator {
+                    condition: id.clone(),
+                    source,
+                })?;
+            }
         }
         Ok(())
     }
@@ -588,8 +645,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CandleField, ComparisonOp, Condition, CrossDirection, DEFINITION_VERSION, DefinitionError, Direction,
-        DirectionFilter, KindFilter, Node, Operand, OperandAdjustment, Predicate, SignalDefinition,
+        CandleField, ComparisonOp, Condition, CrossDirection, DEFINITION_VERSION, DefinitionDecodeError,
+        DefinitionError, Direction, DirectionFilter, KindFilter, Node, Operand, OperandAdjustment, Predicate,
+        SignalDefinition, decode_definition,
     };
 
     fn sma(period: f64) -> Instance {
@@ -692,6 +750,40 @@ mod tests {
                 ..
             }) if parameter == "period"
         ));
+    }
+
+    #[test]
+    fn resolving_indicator_defaults_makes_persisted_instances_complete() {
+        let mut signal = definition(Node::Condition { id: "hot".to_owned() });
+        let Predicate::Threshold {
+            left: Operand::Indicator { instance, output, .. },
+            ..
+        } = &mut signal.conditions.get_mut("hot").expect("fixture condition").predicate
+        else {
+            panic!("fixture indicator operand")
+        };
+        *instance = Instance {
+            id: "macd".to_owned(),
+            params: [("fast".to_owned(), 8.0)].into_iter().collect(),
+        };
+        *output = "macd".to_owned();
+
+        signal.resolve_indicator_defaults().expect("resolve defaults");
+        let Predicate::Threshold {
+            left: Operand::Indicator { instance, .. },
+            ..
+        } = &signal.conditions["hot"].predicate
+        else {
+            panic!("resolved indicator operand")
+        };
+        assert_eq!(
+            instance.params,
+            BTreeMap::from([
+                ("fast".to_owned(), 8.0),
+                ("signal".to_owned(), 9.0),
+                ("slow".to_owned(), 26.0),
+            ])
+        );
     }
 
     #[test]
@@ -861,6 +953,33 @@ mod tests {
 
         let round_trip: SignalDefinition = serde_json::from_value(value).expect("deserialize definition");
         assert_eq!(round_trip, signal);
+    }
+
+    #[test]
+    fn version_first_decoder_preserves_unsupported_versions() {
+        assert!(matches!(
+            decode_definition(r#"{"version":1}"#),
+            Err(DefinitionDecodeError::UnsupportedVersion(1))
+        ));
+    }
+
+    #[test]
+    fn version_first_decoder_rejects_invalid_current_shapes() {
+        assert!(matches!(
+            decode_definition("not JSON"),
+            Err(DefinitionDecodeError::InvalidJson(_))
+        ));
+        assert!(matches!(
+            decode_definition(r#"{"version":2}"#),
+            Err(DefinitionDecodeError::InvalidJson(_))
+        ));
+    }
+
+    #[test]
+    fn version_first_decoder_round_trips_a_valid_definition() {
+        let signal = definition(Node::Condition { id: "hot".to_owned() });
+        let encoded = serde_json::to_string(&signal).expect("serialize definition");
+        assert_eq!(decode_definition(&encoded).expect("decode definition"), signal);
     }
 
     #[test]

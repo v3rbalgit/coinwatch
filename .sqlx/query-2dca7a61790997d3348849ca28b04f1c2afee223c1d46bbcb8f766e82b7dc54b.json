@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO signals (id, name, definition) VALUES (?, ?, ?) ON CONFLICT(id) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "2dca7a61790997d3348849ca28b04f1c2afee223c1d46bbcb8f766e82b7dc54b"
+}

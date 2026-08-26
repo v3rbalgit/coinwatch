@@ -10,6 +10,7 @@ domain = { workspace = true }
 indicators = { workspace = true }
 hl-feed = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 chrono = { workspace = true }
 rust_decimal = { workspace = true }
 thiserror = { workspace = true }
@@ -18,7 +19,6 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-serde_json = { workspace = true }
 storage = { workspace = true }
 tokio = { workspace = true }
 
