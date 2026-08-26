@@ -10,6 +10,7 @@
     OctagonX,
   } from "@lucide/svelte"
 
+  import { goto } from "$app/navigation"
   import type { IndicatorDescriptor } from "$lib/chart/indicators"
   import Badge from "$lib/components/ui/badge.svelte"
   import Button from "$lib/components/ui/button.svelte"
@@ -194,7 +195,7 @@
     {:else}
       <div class="mx-auto max-w-5xl space-y-2">
         {#each filteredReports as report (report.coin)}
-          <details class="group rounded-lg border border-border bg-card shadow-sm">
+          <details class="group rounded-lg border border-border bg-card">
             <summary class="flex cursor-pointer list-none flex-wrap items-center gap-3 px-4 py-3 marker:hidden">
               <span class="min-w-24 text-sm font-semibold text-foreground">{report.coin}</span>
               <Badge variant={report.satisfied ? "success" : "outline"}>
@@ -206,6 +207,17 @@
               <span class="ml-auto text-xs text-muted-foreground">
                 {report.triggeredAt === null ? "Not triggered" : `Triggered ${formatTimestamp(report.triggeredAt)}`}
               </span>
+              <a
+                class="inline-flex shrink-0 items-center gap-1 text-xs font-medium text-primary hover:underline"
+                href={`/browse/${encodeURIComponent(report.coin)}`}
+                onclick={event => {
+                  event.preventDefault()
+                  event.stopPropagation()
+                  void goto(`/browse/${encodeURIComponent(report.coin)}`)
+                }}
+              >
+                Open market <ExternalLink class="size-3" />
+              </a>
               <ChevronDown
                 class="size-4 text-muted-foreground transition-transform group-open:rotate-180"
                 aria-hidden="true"
@@ -213,16 +225,7 @@
             </summary>
 
             <div class="border-t border-border px-4 py-4">
-              <div class="flex justify-end">
-                <a
-                  class="inline-flex items-center gap-1 text-xs font-medium text-primary hover:underline"
-                  href={`/browse/${encodeURIComponent(report.coin)}`}
-                >
-                  Open market <ExternalLink class="size-3" />
-                </a>
-              </div>
-
-              <h3 class="mt-3 text-xs font-medium tracking-wide text-muted-foreground uppercase">Condition outcomes</h3>
+              <h3 class="text-xs font-medium tracking-wide text-muted-foreground uppercase">Condition outcomes</h3>
               <div class="mt-2 divide-y divide-border/60 rounded-md border border-border/70">
                 {#each conditionEvidence(snapshot.definition, report, descriptors) as condition (condition.id)}
                   <div class="grid gap-1 px-3 py-2 text-xs sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">

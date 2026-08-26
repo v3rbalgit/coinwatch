@@ -117,7 +117,7 @@
   }
 </script>
 
-<article class="rounded-xl border border-border bg-card shadow-sm">
+<article class="rounded-xl border border-border bg-card">
   <header class="flex flex-wrap items-center gap-2 border-b border-border px-4 py-3">
     <span
       class="flex size-6 items-center justify-center rounded-full bg-muted text-xs font-semibold text-muted-foreground"
