@@ -244,12 +244,15 @@ mod tests {
                 "trend".to_owned(),
                 Condition {
                     timeframe: Timeframe::Hour1,
-                    indicator: Instance {
-                        id: "sma".to_owned(),
-                        params: [("period".to_owned(), period)].into_iter().collect(),
-                    },
                     predicate: Predicate::Threshold {
-                        left: Operand::Output { key: "sma".to_owned() },
+                        left: Operand::Indicator {
+                            instance: Instance {
+                                id: "sma".to_owned(),
+                                params: [("period".to_owned(), period)].into_iter().collect(),
+                            },
+                            output: "sma".to_owned(),
+                            adjustment: None,
+                        },
                         op: ComparisonOp::GreaterThan,
                         right: Operand::Constant { value: 0.0 },
                     },

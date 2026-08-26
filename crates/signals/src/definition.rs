@@ -1,4 +1,4 @@
-//! The persisted signal model: configured indicator conditions composed into a
+//! The persisted signal model: market and indicator conditions composed into a
 //! boolean logic tree.
 //!
 //! Definitions use an explicitly tagged, camel-case JSON contract because the
@@ -13,16 +13,20 @@ use indicators::{
     series_input_requirement, validate_instance,
 };
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// Current schema version of serialized signal definitions.
-pub const DEFINITION_VERSION: u32 = 1;
+///
+/// Version 1 was internal-only. Version 2 is the first builder-ready contract
+/// and moves configured indicators onto the operands that consume them.
+pub const DEFINITION_VERSION: u32 = 2;
 
 /// Sanity bound preventing corrupted definitions from requesting unbounded work.
 /// Valid requirements within this bound may be loaded beyond the hot cache.
 const MAX_WITHIN_BARS: u32 = 10_000;
 
 /// A definition validation failure.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Error)]
 pub enum DefinitionError {
     /// The definition uses a schema version this build does not understand.
     #[error("unsupported definition version {0}")]
@@ -62,6 +66,9 @@ pub enum DefinitionError {
     /// A predicate constant is NaN or infinite.
     #[error("condition '{0}' has a non-finite constant")]
     NonFiniteConstant(String),
+    /// An operand adjustment is NaN or infinite.
+    #[error("condition '{0}' has a non-finite operand adjustment")]
+    NonFiniteAdjustment(String),
     /// A divergence predicate was assigned to a numeric-series indicator.
     #[error("condition '{condition}' uses a divergence predicate on series indicator '{indicator}'")]
     DivergenceRequiresDivergenceIndicator {
@@ -88,9 +95,9 @@ pub enum DefinitionError {
         /// Output key.
         output: String,
     },
-    /// A series predicate never reads its selected indicator.
-    #[error("condition '{0}' must reference at least one indicator output")]
-    PredicateIgnoresIndicator(String),
+    /// A series predicate compares constants without reading market data.
+    #[error("condition '{0}' must reference at least one market or indicator series")]
+    PredicateIgnoresMarketData(String),
 }
 
 /// Trading bias of a saved signal — user intent, shown in catalogs and results.
@@ -103,19 +110,59 @@ pub enum Direction {
     Bearish,
 }
 
-/// Which series an operand reads from.
+/// A single non-composable adjustment applied to a series before comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+pub enum OperandAdjustment {
+    /// Add a fixed value in the series' own units.
+    Absolute {
+        /// Signed value to add.
+        value: f64,
+    },
+    /// Scale by `1 + value / 100`.
+    Percent {
+        /// Signed percentage, such as `3` for three percent above.
+        value: f64,
+    },
+}
+
+impl OperandAdjustment {
+    pub(crate) fn apply(self, value: f64) -> f64 {
+        match self {
+            Self::Absolute { value: offset } => value + offset,
+            Self::Percent { value: percent } => value * (1.0 + percent / 100.0),
+        }
+    }
+
+    const fn value(self) -> f64 {
+        match self {
+            Self::Absolute { value } | Self::Percent { value } => value,
+        }
+    }
+}
+
+/// Which scalar or series an operand reads from.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum Operand {
-    /// One output of this condition's indicator instance.
-    Output {
+    /// One output of a configured indicator instance.
+    Indicator {
+        /// Indicator id and resolved parameters. Presets are copied here rather
+        /// than referenced so a saved signal remains stable.
+        instance: Instance,
         /// Descriptor output key.
-        key: String,
+        output: String,
+        /// Optional absolute or percentage adjustment.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        adjustment: Option<OperandAdjustment>,
     },
     /// A raw OHLCV candle field.
     Field {
         /// Field to read.
-        field: PriceField,
+        field: CandleField,
+        /// Optional absolute or percentage adjustment.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        adjustment: Option<OperandAdjustment>,
     },
     /// A literal number broadcast over the series.
     Constant {
@@ -124,10 +171,26 @@ pub enum Operand {
     },
 }
 
+impl Operand {
+    const fn instance(&self) -> Option<&Instance> {
+        match self {
+            Self::Indicator { instance, .. } => Some(instance),
+            Self::Field { .. } | Self::Constant { .. } => None,
+        }
+    }
+
+    const fn adjustment(&self) -> Option<OperandAdjustment> {
+        match self {
+            Self::Indicator { adjustment, .. } | Self::Field { adjustment, .. } => *adjustment,
+            Self::Constant { .. } => None,
+        }
+    }
+}
+
 /// Raw OHLCV fields usable as operands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum PriceField {
+pub enum CandleField {
     /// Bar open price.
     Open,
     /// Bar high price.
@@ -220,7 +283,7 @@ impl DirectionFilter {
     }
 }
 
-/// How a condition judges its indicator instance.
+/// How a condition judges market fields or configured indicator outputs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum Predicate {
@@ -244,6 +307,8 @@ pub enum Predicate {
     },
     /// True at confirming-pivot bars of matching divergences.
     Divergence {
+        /// Configured divergence indicator. Preset parameters are snapshotted.
+        instance: Instance,
         /// Which divergence kinds count.
         kind: KindFilter,
         /// Which divergence directions count.
@@ -258,8 +323,6 @@ pub enum Predicate {
 pub struct Condition {
     /// Timeframe whose candles the condition evaluates on.
     pub timeframe: Timeframe,
-    /// Indicator instance (registry id + params).
-    pub indicator: Instance,
     /// What the condition tests.
     pub predicate: Predicate,
     /// Bars of tolerance back from the latest completed bar (`0` = latest only).
@@ -277,20 +340,15 @@ impl Condition {
         let freshness = self.within_bars as usize;
         match &self.predicate {
             Predicate::Threshold { left, right, .. } => Ok(ConditionRequirement {
-                completed_bars: operand_requirement(&self.indicator, left)?
-                    .max(operand_requirement(&self.indicator, right)?)
-                    + freshness,
+                completed_bars: operand_requirement(left)?.max(operand_requirement(right)?) + freshness,
                 confirmation_bars: 0,
             }),
             Predicate::Cross { left, right, .. } => Ok(ConditionRequirement {
-                completed_bars: operand_requirement(&self.indicator, left)?
-                    .max(operand_requirement(&self.indicator, right)?)
-                    + freshness
-                    + 1,
+                completed_bars: operand_requirement(left)?.max(operand_requirement(right)?) + freshness + 1,
                 confirmation_bars: 0,
             }),
-            Predicate::Divergence { .. } => {
-                let input = divergence_input(&self.indicator)?;
+            Predicate::Divergence { instance, .. } => {
+                let input = divergence_input(instance)?;
                 // The recent pivot is known after its right-hand confirmation;
                 // its prior same-kind pivot may be `max_gap` bars earlier, and
                 // that pivot needs both left context and a defined oscillator.
@@ -306,16 +364,26 @@ impl Condition {
         }
     }
 
+    pub(crate) const fn instances(&self) -> [Option<&Instance>; 2] {
+        match &self.predicate {
+            Predicate::Threshold { left, right, .. } | Predicate::Cross { left, right, .. } => {
+                [left.instance(), right.instance()]
+            }
+            Predicate::Divergence { instance, .. } => [Some(instance), None],
+        }
+    }
+
     /// Completed candles needed to evaluate the full freshness window.
     pub fn required_completed_bars(&self) -> Result<usize, InstanceError> {
         self.requirement().map(|requirement| requirement.completed_bars)
     }
 }
 
-fn operand_requirement(instance: &Instance, operand: &Operand) -> Result<usize, InstanceError> {
+fn operand_requirement(operand: &Operand) -> Result<usize, InstanceError> {
     match operand {
-        Operand::Output { key } => series_input_requirement(instance, key),
-        Operand::Field { .. } | Operand::Constant { .. } => Ok(1),
+        Operand::Indicator { instance, output, .. } => series_input_requirement(instance, output),
+        Operand::Field { .. } => Ok(1),
+        Operand::Constant { .. } => Ok(0),
     }
 }
 
@@ -365,8 +433,8 @@ pub struct SignalDefinition {
 }
 
 impl SignalDefinition {
-    /// Validate structure, registry membership, params, and predicate/indicator
-    /// pairing before persistence or evaluation.
+    /// Validate structure, registry membership, configured sources, and predicate
+    /// compatibility before persistence or evaluation.
     pub fn validate(&self) -> Result<(), DefinitionError> {
         if self.version != DEFINITION_VERSION {
             return Err(DefinitionError::UnsupportedVersion(self.version));
@@ -449,21 +517,22 @@ fn validate_condition(id: &str, condition: &Condition) -> Result<(), DefinitionE
             maximum: MAX_WITHIN_BARS,
         });
     }
-    for operand in predicate_operands(&condition.predicate).into_iter().flatten() {
-        if let Operand::Constant { value } = operand
-            && !value.is_finite()
-        {
-            return Err(DefinitionError::NonFiniteConstant(id.to_owned()));
-        }
-    }
-
-    let descriptor = validate_instance(&condition.indicator).map_err(|source| DefinitionError::InvalidIndicator {
-        condition: id.to_owned(),
-        source,
-    })?;
 
     match &condition.predicate {
-        Predicate::Divergence { .. } => {
+        Predicate::Threshold { left, right, .. } | Predicate::Cross { left, right, .. } => {
+            let operands = [left, right];
+            if operands.iter().all(|operand| matches!(operand, Operand::Constant { .. })) {
+                return Err(DefinitionError::PredicateIgnoresMarketData(id.to_owned()));
+            }
+            for operand in operands {
+                validate_operand(id, operand)?;
+            }
+        }
+        Predicate::Divergence { instance, .. } => {
+            let descriptor = validate_instance(instance).map_err(|source| DefinitionError::InvalidIndicator {
+                condition: id.to_owned(),
+                source,
+            })?;
             if descriptor.kind != DescriptorKind::Divergence {
                 return Err(DefinitionError::DivergenceRequiresDivergenceIndicator {
                     condition: id.to_owned(),
@@ -471,37 +540,43 @@ fn validate_condition(id: &str, condition: &Condition) -> Result<(), DefinitionE
                 });
             }
         }
-        Predicate::Threshold { left, right, .. } | Predicate::Cross { left, right, .. } => {
+    }
+    Ok(())
+}
+
+fn validate_operand(id: &str, operand: &Operand) -> Result<(), DefinitionError> {
+    if operand.adjustment().is_some_and(|adjustment| !adjustment.value().is_finite()) {
+        return Err(DefinitionError::NonFiniteAdjustment(id.to_owned()));
+    }
+
+    match operand {
+        Operand::Constant { value } => {
+            if !value.is_finite() {
+                return Err(DefinitionError::NonFiniteConstant(id.to_owned()));
+            }
+        }
+        Operand::Field { .. } => {}
+        Operand::Indicator { instance, output, .. } => {
+            let descriptor = validate_instance(instance).map_err(|source| DefinitionError::InvalidIndicator {
+                condition: id.to_owned(),
+                source,
+            })?;
             if descriptor.kind != DescriptorKind::Series {
                 return Err(DefinitionError::SeriesRequiresSeriesIndicator {
                     condition: id.to_owned(),
                     indicator: descriptor.id.clone(),
                 });
             }
-            let operands = [left, right];
-            if !operands.iter().any(|operand| matches!(operand, Operand::Output { .. })) {
-                return Err(DefinitionError::PredicateIgnoresIndicator(id.to_owned()));
-            }
-            for operand in operands {
-                let Operand::Output { key } = operand else { continue };
-                if !descriptor.outputs.iter().any(|output| output.key == *key) {
-                    return Err(DefinitionError::UnknownOutput {
-                        condition: id.to_owned(),
-                        indicator: descriptor.id.clone(),
-                        output: key.clone(),
-                    });
-                }
+            if !descriptor.outputs.iter().any(|candidate| candidate.key == *output) {
+                return Err(DefinitionError::UnknownOutput {
+                    condition: id.to_owned(),
+                    indicator: descriptor.id.clone(),
+                    output: output.clone(),
+                });
             }
         }
     }
     Ok(())
-}
-
-const fn predicate_operands(predicate: &Predicate) -> [Option<&Operand>; 2] {
-    match predicate {
-        Predicate::Threshold { left, right, .. } | Predicate::Cross { left, right, .. } => [Some(left), Some(right)],
-        Predicate::Divergence { .. } => [None, None],
-    }
 }
 
 #[cfg(test)]
@@ -513,19 +588,41 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ComparisonOp, Condition, CrossDirection, DEFINITION_VERSION, DefinitionError, Direction, DirectionFilter,
-        KindFilter, Node, Operand, Predicate, SignalDefinition,
+        CandleField, ComparisonOp, Condition, CrossDirection, DEFINITION_VERSION, DefinitionError, Direction,
+        DirectionFilter, KindFilter, Node, Operand, OperandAdjustment, Predicate, SignalDefinition,
     };
+
+    fn sma(period: f64) -> Instance {
+        Instance {
+            id: "sma".to_owned(),
+            params: [("period".to_owned(), period)].into_iter().collect(),
+        }
+    }
+
+    fn sma_output(period: f64) -> Operand {
+        Operand::Indicator {
+            instance: sma(period),
+            output: "sma".to_owned(),
+            adjustment: None,
+        }
+    }
+
+    fn indicator_instance_mut(condition: &mut Condition) -> &mut Instance {
+        let Predicate::Threshold {
+            left: Operand::Indicator { instance, .. },
+            ..
+        } = &mut condition.predicate
+        else {
+            panic!("fixture indicator operand")
+        };
+        instance
+    }
 
     fn threshold() -> Condition {
         Condition {
             timeframe: Timeframe::Hour1,
-            indicator: Instance {
-                id: "sma".to_owned(),
-                params: [("period".to_owned(), 20.0)].into_iter().collect(),
-            },
             predicate: Predicate::Threshold {
-                left: Operand::Output { key: "sma".to_owned() },
+                left: sma_output(20.0),
                 op: ComparisonOp::GreaterThan,
                 right: Operand::Constant { value: 80.0 },
             },
@@ -543,19 +640,37 @@ mod tests {
     }
 
     #[test]
-    fn validates_a_well_formed_definition() {
+    fn validates_indicator_and_raw_market_conditions() {
         let signal = definition(Node::Condition { id: "hot".to_owned() });
         assert!(signal.validate().is_ok());
+
+        let mut raw = signal;
+        raw.conditions.get_mut("hot").expect("fixture condition").predicate = Predicate::Threshold {
+            left: Operand::Field {
+                field: CandleField::Close,
+                adjustment: None,
+            },
+            op: ComparisonOp::GreaterThan,
+            right: Operand::Constant { value: 80.0 },
+        };
+        assert!(raw.validate().is_ok());
+        assert_eq!(raw.conditions["hot"].required_completed_bars().expect("raw history"), 1);
+
+        raw.conditions.get_mut("hot").expect("fixture condition").predicate = Predicate::Threshold {
+            left: Operand::Constant { value: 100.0 },
+            op: ComparisonOp::GreaterThan,
+            right: Operand::Constant { value: 80.0 },
+        };
+        assert!(matches!(
+            raw.validate(),
+            Err(DefinitionError::PredicateIgnoresMarketData(id)) if id == "hot"
+        ));
     }
 
     #[test]
     fn rejects_indicator_parameters_outside_descriptor_contracts() {
         let mut unknown = definition(Node::Condition { id: "hot".to_owned() });
-        unknown
-            .conditions
-            .get_mut("hot")
-            .expect("fixture condition")
-            .indicator
+        indicator_instance_mut(unknown.conditions.get_mut("hot").expect("fixture condition"))
             .params
             .insert("typo".to_owned(), 20.0);
         assert!(matches!(
@@ -567,11 +682,7 @@ mod tests {
         ));
 
         let mut fractional = definition(Node::Condition { id: "hot".to_owned() });
-        fractional
-            .conditions
-            .get_mut("hot")
-            .expect("fixture condition")
-            .indicator
+        indicator_instance_mut(fractional.conditions.get_mut("hot").expect("fixture condition"))
             .params
             .insert("period".to_owned(), 20.5);
         assert!(matches!(
@@ -591,19 +702,19 @@ mod tests {
 
         let mut cross = threshold.clone();
         cross.predicate = Predicate::Cross {
-            left: Operand::Output { key: "sma".to_owned() },
-            right: Operand::Constant { value: 80.0 },
+            left: sma_output(20.0),
+            right: sma_output(50.0),
             direction: CrossDirection::Over,
         };
-        assert_eq!(cross.required_completed_bars().expect("cross history"), 24);
+        assert_eq!(cross.required_completed_bars().expect("cross history"), 54);
 
         let divergence = Condition {
             timeframe: Timeframe::Day1,
-            indicator: Instance {
-                id: "rsiDivergence".to_owned(),
-                params: BTreeMap::new(),
-            },
             predicate: Predicate::Divergence {
+                instance: Instance {
+                    id: "rsiDivergence".to_owned(),
+                    params: BTreeMap::new(),
+                },
                 kind: KindFilter::Any,
                 direction: DirectionFilter::Any,
             },
@@ -661,11 +772,11 @@ mod tests {
                 "div".to_owned(),
                 Condition {
                     timeframe: Timeframe::Hour1,
-                    indicator: Instance {
-                        id: "sma".to_owned(),
-                        params: BTreeMap::new(),
-                    },
                     predicate: Predicate::Divergence {
+                        instance: Instance {
+                            id: "sma".to_owned(),
+                            params: BTreeMap::new(),
+                        },
                         kind: KindFilter::Any,
                         direction: DirectionFilter::Any,
                     },
@@ -685,11 +796,33 @@ mod tests {
             panic!("fixture condition")
         };
         condition.predicate = Predicate::Threshold {
-            left: Operand::Output { key: "nope".to_owned() },
+            left: Operand::Indicator {
+                instance: sma(20.0),
+                output: "nope".to_owned(),
+                adjustment: None,
+            },
             op: ComparisonOp::GreaterThan,
             right: Operand::Constant { value: 80.0 },
         };
         assert!(matches!(bad_output.validate(), Err(DefinitionError::UnknownOutput { .. })));
+    }
+
+    #[test]
+    fn rejects_non_finite_operand_adjustments() {
+        let mut signal = definition(Node::Condition { id: "hot".to_owned() });
+        let Predicate::Threshold {
+            left: Operand::Indicator { adjustment, .. },
+            ..
+        } = &mut signal.conditions.get_mut("hot").expect("fixture condition").predicate
+        else {
+            panic!("fixture indicator operand")
+        };
+        *adjustment = Some(OperandAdjustment::Percent { value: f64::NAN });
+
+        assert!(matches!(
+            signal.validate(),
+            Err(DefinitionError::NonFiniteAdjustment(id)) if id == "hot"
+        ));
     }
 
     #[test]
@@ -699,16 +832,49 @@ mod tests {
             panic!("fixture condition")
         };
         condition.within_bars = 3;
+        let Predicate::Threshold {
+            left: Operand::Indicator { adjustment, .. },
+            ..
+        } = &mut condition.predicate
+        else {
+            panic!("fixture indicator operand")
+        };
+        *adjustment = Some(OperandAdjustment::Percent { value: 3.0 });
 
         let value = serde_json::to_value(&signal).expect("serialize definition");
+        assert_eq!(value.pointer("/version"), Some(&json!(2)));
         assert_eq!(value.pointer("/direction"), Some(&json!("bearish")));
         assert_eq!(value.pointer("/root/type"), Some(&json!("condition")));
         assert_eq!(value.pointer("/conditions/hot/timeframe"), Some(&json!("1h")));
         assert_eq!(value.pointer("/conditions/hot/withinBars"), Some(&json!(3)));
         assert_eq!(value.pointer("/conditions/hot/predicate/type"), Some(&json!("threshold")));
-        assert_eq!(value.pointer("/conditions/hot/predicate/left/type"), Some(&json!("output")));
+        assert_eq!(value.pointer("/conditions/hot/predicate/left/type"), Some(&json!("indicator")));
+        assert_eq!(value.pointer("/conditions/hot/predicate/left/instance/id"), Some(&json!("sma")));
+        assert_eq!(
+            value.pointer("/conditions/hot/predicate/left/adjustment/type"),
+            Some(&json!("percent"))
+        );
+        assert_eq!(
+            value.pointer("/conditions/hot/predicate/left/adjustment/value"),
+            Some(&json!(3.0))
+        );
 
         let round_trip: SignalDefinition = serde_json::from_value(value).expect("deserialize definition");
         assert_eq!(round_trip, signal);
+    }
+
+    #[test]
+    fn nested_indicator_instances_reject_unknown_fields() {
+        let signal = definition(Node::Condition { id: "hot".to_owned() });
+        let mut value = serde_json::to_value(signal).expect("serialize definition");
+        let Some(instance) = value
+            .pointer_mut("/conditions/hot/predicate/left/instance")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            panic!("serialized instance object")
+        };
+        instance.insert("presetId".to_owned(), json!("fast"));
+
+        assert!(serde_json::from_value::<SignalDefinition>(value).is_err());
     }
 }
