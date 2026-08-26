@@ -1,9 +1,9 @@
 //! SQLite-backed local store: candle persistence (the [`CandleStore`] port),
 //! watchlists, saved signals, indicator presets, logos, and UI settings.
 //!
-//! OHLCV values are text for exact [`rust_decimal::Decimal`] precision; open times are epoch
-//! milliseconds. Signal definitions and preset params remain opaque JSON here so
-//! storage stays independent of the product model that validates them.
+//! OHLCV values are stored as text to preserve exact decimal precision; open times
+//! are epoch milliseconds. Signal definitions and preset params remain opaque JSON
+//! here so storage stays independent of the product model that validates them.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -136,6 +136,12 @@ impl TryFrom<CandleRow> for Candle {
             volume,
         })
     }
+}
+
+fn candles_oldest_first(rows: Vec<CandleRow>) -> Result<Vec<Candle>, StoreError> {
+    let mut candles = rows.into_iter().map(Candle::try_from).collect::<Result<Vec<_>, _>>()?;
+    candles.reverse();
+    Ok(candles)
 }
 
 /// A durable candle cache the sync seeds from on startup and writes through.
@@ -470,9 +476,7 @@ impl CandleStore for SqliteStore {
         .fetch_all(&self.pool)
         .await?;
 
-        let mut candles = rows.into_iter().map(Candle::try_from).collect::<Result<Vec<_>, _>>()?;
-        candles.reverse();
-        Ok(candles)
+        candles_oldest_first(rows)
     }
 
     async fn load_recent(&self, limit: usize) -> Result<Vec<CandleSeries>, StoreError> {
@@ -504,8 +508,7 @@ impl CandleStore for SqliteStore {
             )
             .fetch_all(&self.pool)
             .await?;
-            let mut candles = rows.into_iter().map(Candle::try_from).collect::<Result<Vec<_>, _>>()?;
-            candles.reverse();
+            let candles = candles_oldest_first(rows)?;
             if !candles.is_empty() {
                 series.push(CandleSeries {
                     coin: group.coin,
