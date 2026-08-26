@@ -6,6 +6,7 @@
 //! bar is missing or a gap is being reconciled, avoiding repainting and stale matches.
 
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -86,58 +87,85 @@ pub async fn evaluate_coin(
     evaluate_validated(definition, coin, &data)
 }
 
-/// Scope of coins one signal run covers.
+/// One completed coin evaluation within a batch run.
 #[derive(Debug, Clone)]
-pub enum RunScope {
-    /// Every coin in the cached universe.
-    Universe,
-    /// An explicit set of coins (for example, a saved watchlist).
-    Coins(Vec<String>),
+pub struct RunProgress {
+    /// Number of coins evaluated, including this report.
+    pub completed: usize,
+    /// Fixed number of coins in the run.
+    pub total: usize,
+    /// Evaluation result for the coin just completed.
+    pub report: EvalReport,
 }
 
-/// Validate and evaluate a signal across a scope, one report per coin.
-pub async fn run_signal(
+/// Terminal accounting for a batch run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunSummary {
+    /// Number of coins evaluated.
+    pub completed: usize,
+    /// Fixed number of coins in the run.
+    pub total: usize,
+    /// Whether the progress consumer requested an early stop.
+    pub stopped: bool,
+}
+
+/// Validate and evaluate a fixed coin snapshot sequentially.
+///
+/// The callback receives each report immediately and can stop the remaining
+/// work by returning [`ControlFlow::Break`].
+pub async fn run_signal<F>(
     store: &MarketStore,
     history: &CandleHistory,
     definition: &SignalDefinition,
-    scope: &RunScope,
+    coins: &[String],
     now: DateTime<Utc>,
-) -> Result<Vec<EvalReport>, DefinitionError> {
+    mut on_progress: F,
+) -> Result<RunSummary, DefinitionError>
+where
+    F: FnMut(RunProgress) -> ControlFlow<()>,
+{
     let requirements = definition.required_history()?;
-    let mut reports = Vec::new();
-    match scope {
-        RunScope::Universe => {
-            let coins = store.universe();
-            reports.reserve(coins.len());
-            for coin in coins {
-                let data = hydrate_coin_data(store, history, &coin.coin, &requirements, now).await;
-                reports.push(evaluate_validated(definition, &coin.coin, &data)?);
-            }
-        }
-        RunScope::Coins(coins) => {
-            reports.reserve(coins.len());
-            for coin in coins {
-                let data = hydrate_coin_data(store, history, coin, &requirements, now).await;
-                reports.push(evaluate_validated(definition, coin, &data)?);
-            }
+    let total = coins.len();
+    let mut completed = 0;
+    for coin in coins {
+        let data = hydrate_coin_data(store, history, coin, &requirements, now).await;
+        let report = evaluate_validated(definition, coin, &data)?;
+        completed += 1;
+        if on_progress(RunProgress {
+            completed,
+            total,
+            report,
+        })
+        .is_break()
+        {
+            return Ok(RunSummary {
+                completed,
+                total,
+                stopped: true,
+            });
         }
     }
-    Ok(reports)
+    Ok(RunSummary {
+        completed,
+        total,
+        stopped: false,
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::ops::ControlFlow;
     use std::sync::{Arc, Mutex, PoisonError};
 
     use async_trait::async_trait;
     use chrono::{DateTime, TimeZone, Utc};
     use domain::{Candle, Timeframe};
-    use hl_feed::{CandleHistory, HyperliquidRest};
+    use hl_feed::{CandleHistory, HyperliquidRest, MarketStore};
     use indicators::Instance;
     use rust_decimal::Decimal;
     use storage::{CandleSeries, CandleStore, StoreError};
 
-    use super::{completed_len, hydrate_timeframe};
+    use super::{RunSummary, completed_len, hydrate_timeframe, run_signal};
     use crate::definition::{
         ComparisonOp, Condition, DEFINITION_VERSION, Direction, Node, Operand, Predicate, SignalDefinition,
     };
@@ -306,6 +334,34 @@ mod tests {
         assert_eq!(report.conditions["trend"].status, OutcomeStatus::Satisfied);
         let requests = store.requests.lock().unwrap_or_else(PoisonError::into_inner);
         assert_eq!(requests.as_slice(), &[(5 * Timeframe::Hour1.duration_ms(), 3)]);
+    }
+
+    #[tokio::test]
+    async fn batch_reports_progress_and_stops_without_evaluating_the_rest() {
+        let store = Arc::new(CachedStore::new(Vec::new(), true));
+        let history = history(store.clone());
+        let market = MarketStore::new();
+        let signal = definition(1.0);
+        let coins = vec!["BTC".to_owned(), "ETH".to_owned()];
+        let mut seen = Vec::new();
+
+        let summary = run_signal(&market, &history, &signal, &coins, during_forming_bar(), |progress| {
+            seen.push((progress.completed, progress.total, progress.report.coin));
+            ControlFlow::Break(())
+        })
+        .await
+        .expect("valid batch signal");
+
+        assert_eq!(
+            summary,
+            RunSummary {
+                completed: 1,
+                total: 2,
+                stopped: true,
+            }
+        );
+        assert_eq!(seen, vec![(1, 2, "BTC".to_owned())]);
+        assert!(store.requests.lock().unwrap_or_else(PoisonError::into_inner).is_empty());
     }
 
     #[tokio::test]

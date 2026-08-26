@@ -26,12 +26,17 @@ domain = { workspace = true }
 hl-feed = { workspace = true }
 indicators = { workspace = true }
 scanner = { workspace = true }
+signals = { workspace = true }
 storage = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }
 rust_decimal = { workspace = true }
 reqwest = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
 

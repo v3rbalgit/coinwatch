@@ -5,6 +5,8 @@
 //! scans), so the UI never waits on the network. Live mids stream in over the
 //! WebSocket and are relayed to the frontend as `mid` events.
 
+mod signal_runs;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +23,8 @@ use serde::Serialize;
 use storage::{CandleStore, ListView, SqliteStore};
 use tauri::{Emitter, Manager};
 use tokio::sync::broadcast::error::RecvError;
+
+use crate::signal_runs::SignalRunState;
 
 /// One screener row: live metadata from `metaAndAssetCtxs`. Reads memory only —
 /// no network, no database — so it returns instantly.
@@ -347,6 +351,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(store)
+        .manage(Arc::new(SignalRunState::default()))
         .setup(move |app| {
             // Client clones share one pool; Hyperliquid requests add the shared
             // weight limiter while logo downloads use the same HTTP transport directly.
@@ -440,7 +445,9 @@ pub fn run() {
             coin_history,
             get_setting,
             set_setting,
-            set_active_coin
+            set_active_coin,
+            signal_runs::start_signal_run,
+            signal_runs::cancel_signal_run
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

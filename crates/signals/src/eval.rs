@@ -13,13 +13,15 @@ use chrono::{DateTime, Utc};
 use domain::{Candle, Timeframe};
 use indicators::{Instance, InstanceError, InstanceOutput, Ohlcv, compute};
 use rust_decimal::prelude::ToPrimitive;
+use serde::Serialize;
 
 use crate::definition::{
     ComparisonOp, Condition, CrossDirection, DefinitionError, Node, Operand, Predicate, PriceField, SignalDefinition,
 };
 
 /// One condition's evaluation verdict.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
 pub enum OutcomeStatus {
     /// The predicate held within the condition's freshness window.
     Satisfied,
@@ -39,16 +41,19 @@ pub enum OutcomeStatus {
 }
 
 /// Per-condition result, including evidence for "why did it fire".
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConditionOutcome {
     /// Verdict.
+    #[serde(flatten)]
     pub status: OutcomeStatus,
     /// Open time of the most recent bar where the predicate held, if any.
     pub last_true_bar: Option<DateTime<Utc>>,
 }
 
 /// Result of evaluating one signal against one coin.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EvalReport {
     /// Coin symbol.
     pub coin: String,
@@ -499,8 +504,9 @@ mod tests {
     use domain::{Candle, Timeframe};
     use indicators::{Instance, InstanceError};
     use rust_decimal::Decimal;
+    use serde_json::json;
 
-    use super::{CoinData, OutcomeStatus, evaluate};
+    use super::{CoinData, ConditionOutcome, OutcomeStatus, evaluate};
     use crate::definition::{
         ComparisonOp, Condition, CrossDirection, DEFINITION_VERSION, DefinitionError, Direction, DirectionFilter,
         KindFilter, Node, Operand, Predicate, PriceField, SignalDefinition,
@@ -629,6 +635,30 @@ mod tests {
                 ..
             }) if parameter == "typo"
         ));
+    }
+
+    #[test]
+    fn outcome_status_serialization_is_stable() {
+        assert_eq!(
+            serde_json::to_value(ConditionOutcome {
+                status: OutcomeStatus::InsufficientHistory {
+                    required: 12,
+                    available: 7,
+                },
+                last_true_bar: None,
+            })
+            .expect("serializable outcome"),
+            json!({
+                "status": "insufficientHistory",
+                "required": 12,
+                "available": 7,
+                "lastTrueBar": null,
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(OutcomeStatus::Unavailable).expect("serializable status"),
+            json!({ "status": "unavailable" })
+        );
     }
 
     #[test]
