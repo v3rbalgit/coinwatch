@@ -277,6 +277,7 @@ fn evaluated_event_serialization_matches_the_frontend_contract() {
                     available: 7,
                 },
                 last_true_bar: None,
+                evidence: None,
             },
         )]),
         missing_data: vec![Timeframe::Week1],
@@ -307,6 +308,7 @@ fn evaluated_event_serialization_matches_the_frontend_contract() {
                             "required": 12,
                             "available": 7,
                             "lastTrueBar": null,
+                            "evidence": null,
                         }
                     },
                     "missingData": ["1w"],

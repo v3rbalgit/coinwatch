@@ -3,7 +3,7 @@ import type { SignalDefinition, SignalNode } from "$lib/signals/definition"
 import { conditionLabel } from "$lib/signals/format"
 import type { ConditionOutcome, EvalReport } from "$lib/signals/run"
 
-export type SignalRunResultFilter = "matches" | "all" | "issues"
+export type SignalRunResultFilter = "matches" | "closest" | "all" | "issues"
 
 export interface SignalRunConditionEvidence {
   id: string
@@ -59,10 +59,88 @@ export function reportHasDataIssues(report: EvalReport): boolean {
   )
 }
 
-export function filterSignalRunReports(reports: readonly EvalReport[], filter: SignalRunResultFilter): EvalReport[] {
+function directPositiveConditionIds(definition: SignalDefinition): string[] {
+  const { root } = definition
+  if (root.type === "condition") return [root.id]
+  if (root.type !== "all" && root.type !== "any") return []
+  const ids: string[] = []
+  for (const child of root.children) {
+    if (child.type !== "condition") return []
+    ids.push(child.id)
+  }
+  return ids
+}
+
+function normalizedThresholdDistance(
+  definition: SignalDefinition,
+  conditionId: string,
+  report: EvalReport
+): number | null {
+  const condition = definition.conditions[conditionId]
+  const outcome = report.conditions[conditionId]
+  if (condition?.predicate.type !== "threshold" || outcome?.evidence?.type !== "state") return null
+  const { left, right } = outcome.evidence
+  const gap =
+    condition.predicate.op === "lessThan" || condition.predicate.op === "lessOrEqual" ? left - right : right - left
+  return Math.max(0, gap) / Math.max(Math.abs(right), 1)
+}
+
+interface CandidateScore {
+  report: EvalReport
+  satisfiedConditions: number
+  thresholdDistance: number
+  measuredThresholds: number
+}
+
+export function rankClosestSignalRunReports(
+  definition: SignalDefinition,
+  reports: readonly EvalReport[]
+): EvalReport[] {
+  const conditionIds = directPositiveConditionIds(definition)
+  if (conditionIds.length === 0) return []
+  const scores: CandidateScore[] = reports
+    .filter(report => !report.satisfied && !reportHasDataIssues(report))
+    .map(report => {
+      let satisfiedConditions = 0
+      let thresholdDistance = 0
+      let measuredThresholds = 0
+      for (const id of conditionIds) {
+        if (report.conditions[id]?.status === "satisfied") satisfiedConditions += 1
+        const distance = normalizedThresholdDistance(definition, id, report)
+        if (distance !== null) {
+          thresholdDistance += distance
+          measuredThresholds += 1
+        }
+      }
+      return { report, satisfiedConditions, thresholdDistance, measuredThresholds }
+    })
+  const distinctSatisfiedCounts = new Set(scores.map(score => score.satisfiedConditions))
+  const hasThresholdDistance = scores.some(score => score.measuredThresholds > 0)
+  if (!hasThresholdDistance && distinctSatisfiedCounts.size < 2) return []
+
+  scores.sort((left, right) => {
+    const satisfied = right.satisfiedConditions - left.satisfiedConditions
+    if (satisfied !== 0) return satisfied
+    const leftDistance =
+      left.measuredThresholds === 0 ? Number.POSITIVE_INFINITY : left.thresholdDistance / left.measuredThresholds
+    const rightDistance =
+      right.measuredThresholds === 0 ? Number.POSITIVE_INFINITY : right.thresholdDistance / right.measuredThresholds
+    const distance = leftDistance - rightDistance
+    return distance === 0 || Number.isNaN(distance) ? left.report.coin.localeCompare(right.report.coin) : distance
+  })
+  return scores.map(score => score.report)
+}
+
+export function filterSignalRunReports(
+  definition: SignalDefinition,
+  reports: readonly EvalReport[],
+  filter: SignalRunResultFilter
+): EvalReport[] {
   switch (filter) {
     case "matches":
       return reports.filter(report => report.satisfied)
+    case "closest":
+      return rankClosestSignalRunReports(definition, reports).slice(0, 20)
     case "issues":
       return reports.filter(reportHasDataIssues)
     case "all":

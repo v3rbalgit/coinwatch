@@ -34,7 +34,7 @@ function report(satisfied: boolean): EvalReport {
     satisfied,
     triggeredAt: satisfied ? "2026-01-01T00:00:00Z" : null,
     conditions: {
-      price: { status: satisfied ? "satisfied" : "notSatisfied", lastTrueBar: null },
+      price: { status: satisfied ? "satisfied" : "notSatisfied", lastTrueBar: null, evidence: null },
     },
     missingData: [],
     unavailableData: {},

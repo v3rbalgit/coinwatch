@@ -1,6 +1,7 @@
 import type { SignalDefinition } from "$lib/signals/definition"
 import { idleSignalRunProgress, reduceSignalRunProgress } from "$lib/signals/run"
 import type { EvalReport, SignalRunClient, SignalRunEvent, SignalRunProgress, SignalRunScope } from "$lib/signals/run"
+import { rankClosestSignalRunReports } from "$lib/signals/run-results"
 import type { SignalRunResultFilter } from "$lib/signals/run-results"
 
 export interface SignalRunSnapshot {
@@ -58,6 +59,11 @@ function applyWorkspaceEvent(state: SignalRunWorkspaceState, event: SignalRunEve
   if (event.event === "evaluated") state.reports.push(event.data.report)
   state.progress = reduceSignalRunProgress(state.progress, event)
   if (event.event === "started") state.starting = false
+  if (event.event === "completed" && event.data.matched === 0 && state.filter === "matches") {
+    const definition = state.snapshot?.definition
+    state.filter =
+      definition !== undefined && rankClosestSignalRunReports(definition, state.reports).length > 0 ? "closest" : "all"
+  }
   if (event.event === "completed" || event.event === "cancelled" || event.event === "failed") {
     state.starting = false
     state.cancellationPending = false

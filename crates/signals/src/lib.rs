@@ -13,5 +13,5 @@ pub use definition::{
     Direction, DirectionFilter, KindFilter, Node, Operand, OperandAdjustment, Predicate, SignalDefinition,
     decode_definition,
 };
-pub use eval::{CoinData, ConditionOutcome, EvalReport, OutcomeStatus};
+pub use eval::{CoinData, ConditionEvidence, ConditionOutcome, EvalReport, OutcomeStatus};
 pub use run::{RunProgress, RunSummary, evaluate_coin, run_signal};

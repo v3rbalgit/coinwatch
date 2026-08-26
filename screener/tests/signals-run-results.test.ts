@@ -6,6 +6,7 @@ import {
   conditionEvidence,
   filterSignalRunReports,
   orderedConditionIds,
+  rankClosestSignalRunReports,
   reportHasDataIssues,
 } from "$lib/signals/run-results"
 
@@ -63,9 +64,9 @@ function report(
     satisfied,
     triggeredAt: satisfied ? "2026-08-26T10:00:00Z" : null,
     conditions: {
-      trend: { status: "notSatisfied", lastTrueBar: null },
-      volume: { status: "satisfied", lastTrueBar: "2026-08-26T08:00:00Z" },
-      retained: { status: "notSatisfied", lastTrueBar: null },
+      trend: { status: "notSatisfied", lastTrueBar: null, evidence: null },
+      volume: { status: "satisfied", lastTrueBar: "2026-08-26T08:00:00Z", evidence: null },
+      retained: { status: "notSatisfied", lastTrueBar: null, evidence: null },
     },
     missingData: overrides.missingData ?? [],
     unavailableData: overrides.unavailableData ?? {},
@@ -86,20 +87,98 @@ describe("signal run result helpers", () => {
     const plain = report("ETH", false)
     const missing = report("SOL", false, { missingData: ["1d"] })
     const unavailable = report("HYPE", false, { unavailableData: { "4h": "provider unavailable" } })
-    unavailable.conditions.volume = { status: "unavailable", lastTrueBar: null }
+    unavailable.conditions.volume = { status: "unavailable", lastTrueBar: null, evidence: null }
     const insufficient = report("DOGE", false)
     insufficient.conditions.trend = {
       status: "insufficientHistory",
       required: 20,
       available: 12,
       lastTrueBar: null,
+      evidence: null,
     }
     const reports = [matched, plain, missing, unavailable, insufficient]
 
-    expect(filterSignalRunReports(reports, "matches").map(item => item.coin)).toEqual(["BTC"])
-    expect(filterSignalRunReports(reports, "all")).toEqual(reports)
-    expect(filterSignalRunReports(reports, "issues").map(item => item.coin)).toEqual(["SOL", "HYPE", "DOGE"])
+    expect(filterSignalRunReports(definition, reports, "matches").map(item => item.coin)).toEqual(["BTC"])
+    expect(filterSignalRunReports(definition, reports, "all")).toEqual(reports)
+    expect(filterSignalRunReports(definition, reports, "issues").map(item => item.coin)).toEqual([
+      "SOL",
+      "HYPE",
+      "DOGE",
+    ])
     expect(reportHasDataIssues(plain)).toBe(false)
     expect(reportHasDataIssues(insufficient)).toBe(true)
+  })
+
+  it("ranks honest closest candidates by satisfied leaves and normalized threshold miss", () => {
+    const flatDefinition: SignalDefinition = {
+      ...definition,
+      root: {
+        type: "all",
+        children: [
+          { type: "condition", id: "trend" },
+          { type: "condition", id: "volume" },
+        ],
+      },
+    }
+    const near = report("NEAR", false)
+    near.conditions.trend = {
+      status: "notSatisfied",
+      lastTrueBar: null,
+      evidence: { type: "state", observedAt: "2026-08-26T10:00:00Z", left: 95, right: 100 },
+    }
+    const far = report("FAR", false)
+    far.conditions.trend = {
+      status: "notSatisfied",
+      lastTrueBar: null,
+      evidence: { type: "state", observedAt: "2026-08-26T10:00:00Z", left: 60, right: 100 },
+    }
+    const noConditions = report("NONE", false)
+    noConditions.conditions.volume = {
+      status: "notSatisfied",
+      lastTrueBar: null,
+      evidence: { type: "state", observedAt: "2026-08-26T08:00:00Z", left: 900, right: 1000 },
+    }
+    const dataIssue = report("ISSUE", false, { missingData: ["1h"] })
+    const matched = report("MATCH", true)
+
+    expect(
+      rankClosestSignalRunReports(flatDefinition, [far, noConditions, dataIssue, near, matched]).map(r => r.coin)
+    ).toEqual(["NEAR", "FAR", "NONE"])
+    expect(filterSignalRunReports(flatDefinition, [far, near], "closest").map(r => r.coin)).toEqual(["NEAR", "FAR"])
+    expect(rankClosestSignalRunReports(definition, [near])).toEqual([])
+
+    const eventDefinition: SignalDefinition = {
+      version: 2,
+      direction: "bullish",
+      root: { type: "condition", id: "cross" },
+      conditions: {
+        cross: {
+          timeframe: "1h",
+          predicate: {
+            type: "cross",
+            left: { type: "field", field: "close" },
+            right: { type: "constant", value: 100 },
+            direction: "over",
+          },
+          withinBars: 0,
+        },
+      },
+    }
+    const eventOnly = report("EVENT", false)
+    eventOnly.conditions = {
+      cross: {
+        status: "notSatisfied",
+        lastTrueBar: null,
+        evidence: {
+          type: "cross",
+          observedAt: "2026-08-26T10:00:00Z",
+          previousLeft: 90,
+          previousRight: 100,
+          left: 95,
+          right: 100,
+        },
+      },
+    }
+    expect(rankClosestSignalRunReports(eventDefinition, [eventOnly])).toEqual([])
   })
 })
