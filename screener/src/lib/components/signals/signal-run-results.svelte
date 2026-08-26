@@ -12,15 +12,11 @@
 
   import { goto } from "$app/navigation"
   import type { IndicatorDescriptor } from "$lib/chart/indicators"
+  import ConditionOutcomes from "$lib/components/signals/condition-outcomes.svelte"
   import Badge from "$lib/components/ui/badge.svelte"
   import Button from "$lib/components/ui/button.svelte"
-  import type { ConditionOutcome, EvalReport, SignalRunProgress } from "$lib/signals/run"
-  import {
-    conditionEvidence,
-    filterSignalRunReports,
-    rankClosestSignalRunReports,
-    reportHasDataIssues,
-  } from "$lib/signals/run-results"
+  import type { EvalReport, SignalRunProgress } from "$lib/signals/run"
+  import { filterSignalRunReports, rankClosestSignalRunReports, reportHasDataIssues } from "$lib/signals/run-results"
   import type { SignalRunResultFilter } from "$lib/signals/run-results"
   import type { SignalRunSnapshot } from "$lib/signals/run-workspace.svelte"
 
@@ -71,53 +67,6 @@
     if (value === null) return "—"
     const parsed = new Date(value)
     return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString()
-  }
-
-  function outcomeLabel(outcome: ConditionOutcome | null): string {
-    if (outcome === null) return "No outcome"
-    switch (outcome.status) {
-      case "satisfied":
-        return "Satisfied"
-      case "notSatisfied":
-        return "Not satisfied"
-      case "noData":
-        return "No data"
-      case "unavailable":
-        return "Unavailable"
-      case "insufficientHistory":
-        return `Needs ${outcome.required} bars · ${outcome.available} available`
-    }
-  }
-
-  function outcomeTone(outcome: ConditionOutcome | null): string {
-    const status = outcome?.status
-    if (status === "satisfied") return "text-emerald-500"
-    if (status === "notSatisfied") return "text-muted-foreground"
-    return "text-amber-500"
-  }
-
-  function formatObservedValue(value: number): string {
-    return Number(value.toPrecision(6)).toLocaleString(undefined, { maximumSignificantDigits: 6 })
-  }
-
-  function evidenceLabel(outcome: ConditionOutcome | null): string | null {
-    const evidence = outcome?.evidence
-    if (evidence === null || evidence === undefined) return null
-    if (evidence.type === "state") {
-      return `Observed ${formatObservedValue(evidence.left)} vs ${formatObservedValue(evidence.right)} · ${formatTimestamp(evidence.observedAt)}`
-    }
-    return `Previous ${formatObservedValue(evidence.previousLeft)} vs ${formatObservedValue(evidence.previousRight)} → current ${formatObservedValue(evidence.left)} vs ${formatObservedValue(evidence.right)} · ${formatTimestamp(evidence.observedAt)}`
-  }
-
-  function lastTrueLabel(outcome: ConditionOutcome | null): string | null {
-    if (
-      outcome?.lastTrueBar === null ||
-      outcome?.lastTrueBar === undefined ||
-      outcome.lastTrueBar === outcome.evidence?.observedAt
-    ) {
-      return null
-    }
-    return `Last true ${formatTimestamp(outcome.lastTrueBar)}`
   }
 
   function satisfiedConditionCount(report: EvalReport): number {
@@ -267,21 +216,7 @@
             </summary>
 
             <div class="border-t border-border px-4 py-4">
-              <h3 class="text-xs font-medium tracking-wide text-muted-foreground uppercase">Condition outcomes</h3>
-              <div class="mt-2 divide-y divide-border/60 rounded-md border border-border/70">
-                {#each conditionEvidence(snapshot.definition, report, descriptors) as condition (condition.id)}
-                  <div class="grid gap-1 px-3 py-2 text-xs lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
-                    <span class="text-foreground">{condition.label}</span>
-                    <span class={outcomeTone(condition.outcome)}>{outcomeLabel(condition.outcome)}</span>
-                    {#if evidenceLabel(condition.outcome) !== null}
-                      <span class="text-muted-foreground lg:col-span-2">{evidenceLabel(condition.outcome)}</span>
-                    {/if}
-                    {#if lastTrueLabel(condition.outcome) !== null}
-                      <span class="text-muted-foreground lg:col-span-2">{lastTrueLabel(condition.outcome)}</span>
-                    {/if}
-                  </div>
-                {/each}
-              </div>
+              <ConditionOutcomes definition={snapshot.definition} {report} {descriptors} />
 
               {#if report.missingData.length > 0 || Object.keys(report.unavailableData).length > 0}
                 <h3 class="mt-4 text-xs font-medium tracking-wide text-muted-foreground uppercase">Data details</h3>

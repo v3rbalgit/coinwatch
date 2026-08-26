@@ -3,14 +3,13 @@ import type {
   IPrimitivePaneView,
   ISeriesPrimitive,
   ISeriesPrimitiveAxisView,
-  Logical,
   PrimitivePaneViewZOrder,
   SeriesAttachedParameter,
   UTCTimestamp,
 } from "lightweight-charts"
 
 import { chartTheme } from "../theme"
-import { logicalFor, timeGridFromData, type TimeGrid } from "./coords"
+import { coordinateForTime, timeGridFromData, type TimeGrid } from "./coords"
 import { nearPoint, type Px, type Viewport } from "./geometry"
 import { DRAWING_HANDLE_SIZE, drawingHandleEntries, hitDrawingBody } from "./hit-test"
 import { renderDrawing, renderSnapIndicator } from "./renderer"
@@ -194,13 +193,9 @@ export class DrawingsPrimitive implements ISeriesPrimitive {
   private toPx(time: UTCTimestamp, price: number): Px | null {
     const param = this.param
     if (!param) return null
-    const timeScale = param.chart.timeScale()
-    let x = timeScale.timeToCoordinate(time)
-    if (x === null && this.grid) {
-      // Off the loaded range (unloaded history, future whitespace) — index
-      // space extends linearly instead of snapping to a data edge.
-      x = timeScale.logicalToCoordinate(logicalFor(time, this.grid) as Logical)
-    }
+    // Off the loaded range (unloaded history, future whitespace), index space
+    // extends linearly instead of snapping to a data edge.
+    const x = coordinateForTime(time, param, this.grid)
     const y = param.series.priceToCoordinate(price)
     if (x === null || y === null) return null
     return { x, y }
