@@ -11,13 +11,13 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use domain::{Candle, Timeframe};
-use indicators::{Instance, InstanceError, InstanceOutput, Ohlcv, compute};
+use indicators::{Instance, InstanceOutput, Ohlcv, compute};
 use rust_decimal::prelude::ToPrimitive;
 use serde::Serialize;
 
 use crate::definition::{
-    CandleField, ComparisonOp, Condition, CrossDirection, DefinitionError, Node, Operand, OperandAdjustment, Predicate,
-    SignalDefinition,
+    CandleField, ComparisonOp, Condition, ConditionRequirement, CrossDirection, DefinitionError, Node, Operand,
+    OperandAdjustment, Predicate, SignalDefinition,
 };
 
 /// One condition's evaluation verdict.
@@ -151,7 +151,7 @@ impl CoinData {
         self.unavailable.insert(timeframe, reason);
     }
 
-    fn get(&self, timeframe: Timeframe) -> Option<&[Candle]> {
+    pub(crate) fn get(&self, timeframe: Timeframe) -> Option<&[Candle]> {
         self.series.get(&timeframe).map(CompletedSeries::as_slice)
     }
 }
@@ -237,6 +237,154 @@ impl<'a> TimeframePrepared<'a> {
     }
 }
 
+struct PreparedCondition {
+    requirement: ConditionRequirement,
+    mask: Vec<bool>,
+    latest_true: Vec<Option<usize>>,
+}
+
+/// Indicator outputs and predicate masks shared by current and historical reports.
+pub(crate) struct PreparedEvaluation<'a> {
+    timeframes: HashMap<Timeframe, TimeframePrepared<'a>>,
+    conditions: BTreeMap<String, PreparedCondition>,
+    missing_data: Vec<Timeframe>,
+    unavailable_data: BTreeMap<Timeframe, String>,
+}
+
+impl<'a> PreparedEvaluation<'a> {
+    pub(crate) fn build(definition: &SignalDefinition, data: &'a CoinData) -> Result<Self, DefinitionError> {
+        let mut by_timeframe: BTreeMap<Timeframe, Vec<&Condition>> = BTreeMap::new();
+        for condition in definition.conditions.values() {
+            by_timeframe.entry(condition.timeframe).or_default().push(condition);
+        }
+
+        let mut timeframes = HashMap::with_capacity(by_timeframe.len());
+        let mut missing_data = Vec::with_capacity(by_timeframe.len());
+        let mut unavailable_data = BTreeMap::new();
+        for (timeframe, conditions) in &by_timeframe {
+            if let Some(reason) = data.unavailable.get(timeframe) {
+                unavailable_data.insert(*timeframe, reason.clone());
+            } else if let Some(candles) = data.get(*timeframe) {
+                timeframes.insert(*timeframe, TimeframePrepared::build(candles, conditions));
+            } else {
+                missing_data.push(*timeframe);
+            }
+        }
+
+        let mut conditions = BTreeMap::new();
+        for (id, condition) in &definition.conditions {
+            let Some(timeframe) = timeframes.get(&condition.timeframe) else {
+                continue;
+            };
+            let requirement = condition.requirement().map_err(|source| DefinitionError::InvalidIndicator {
+                condition: id.clone(),
+                source,
+            })?;
+            let mask = build_mask(condition, timeframe, requirement.confirmation_bars);
+            let mut last_true = None;
+            let latest_true = mask
+                .iter()
+                .enumerate()
+                .map(|(index, held)| {
+                    if *held {
+                        last_true = Some(index);
+                    }
+                    last_true
+                })
+                .collect();
+            conditions.insert(
+                id.clone(),
+                PreparedCondition {
+                    requirement,
+                    mask,
+                    latest_true,
+                },
+            );
+        }
+
+        Ok(Self {
+            timeframes,
+            conditions,
+            missing_data,
+            unavailable_data,
+        })
+    }
+
+    fn full_lengths(&self) -> BTreeMap<Timeframe, usize> {
+        self.timeframes
+            .iter()
+            .map(|(timeframe, prepared)| (*timeframe, prepared.candles.len()))
+            .collect()
+    }
+
+    pub(crate) fn lengths_at(&self, evaluated_at: DateTime<Utc>) -> BTreeMap<Timeframe, usize> {
+        let evaluated_ms = evaluated_at.timestamp_millis();
+        self.timeframes
+            .iter()
+            .map(|(timeframe, prepared)| {
+                let completed = prepared.candles.partition_point(|candle| {
+                    candle.open_time.timestamp_millis().saturating_add(timeframe.duration_ms()) <= evaluated_ms
+                });
+                (*timeframe, completed)
+            })
+            .collect()
+    }
+
+    pub(crate) fn report_at(
+        &self,
+        definition: &SignalDefinition,
+        coin: &str,
+        completed_lengths: &BTreeMap<Timeframe, usize>,
+    ) -> EvalReport {
+        let mut outcomes = BTreeMap::new();
+        for (id, condition) in &definition.conditions {
+            let outcome = if self.unavailable_data.contains_key(&condition.timeframe) {
+                ConditionOutcome {
+                    status: OutcomeStatus::Unavailable,
+                    last_true_bar: None,
+                    evidence: None,
+                }
+            } else {
+                match (self.timeframes.get(&condition.timeframe), self.conditions.get(id)) {
+                    (Some(timeframe), Some(prepared_condition)) => evaluate_condition_at(
+                        condition,
+                        timeframe,
+                        prepared_condition,
+                        completed_lengths.get(&condition.timeframe).copied().unwrap_or_default(),
+                    ),
+                    _ => ConditionOutcome {
+                        status: OutcomeStatus::NoData,
+                        last_true_bar: None,
+                        evidence: None,
+                    },
+                }
+            };
+            outcomes.insert(id.clone(), outcome);
+        }
+
+        let truth = eval_node(&definition.root, &outcomes);
+        let satisfied = truth == Truth::True;
+        let mut supporting = Vec::with_capacity(definition.conditions.len());
+        if satisfied {
+            collect_supporting(&definition.root, &outcomes, &mut supporting);
+        }
+        let triggered_at = supporting
+            .into_iter()
+            .filter_map(|id| outcomes.get(id))
+            .filter_map(|outcome| outcome.last_true_bar)
+            .max();
+
+        EvalReport {
+            coin: coin.to_owned(),
+            satisfied,
+            triggered_at,
+            conditions: outcomes,
+            missing_data: self.missing_data.clone(),
+            unavailable_data: self.unavailable_data.clone(),
+        }
+    }
+}
+
 enum Source<'a> {
     Series(&'a [f64], Option<OperandAdjustment>),
     Scalar(f64),
@@ -277,70 +425,9 @@ pub(crate) fn evaluate_validated(
     coin: &str,
     data: &CoinData,
 ) -> Result<EvalReport, DefinitionError> {
-    let mut by_timeframe: BTreeMap<Timeframe, Vec<&Condition>> = BTreeMap::new();
-    for condition in definition.conditions.values() {
-        by_timeframe.entry(condition.timeframe).or_default().push(condition);
-    }
-
-    let mut prepared = HashMap::with_capacity(by_timeframe.len());
-    let mut missing_data = Vec::with_capacity(by_timeframe.len());
-    let mut unavailable_data = BTreeMap::new();
-    for (timeframe, conditions) in &by_timeframe {
-        if let Some(reason) = data.unavailable.get(timeframe) {
-            unavailable_data.insert(*timeframe, reason.clone());
-        } else if let Some(candles) = data.get(*timeframe) {
-            prepared.insert(*timeframe, TimeframePrepared::build(candles, conditions));
-        } else {
-            missing_data.push(*timeframe);
-        }
-    }
-
-    let mut outcomes = BTreeMap::new();
-    for (id, condition) in &definition.conditions {
-        let outcome = if unavailable_data.contains_key(&condition.timeframe) {
-            ConditionOutcome {
-                status: OutcomeStatus::Unavailable,
-                last_true_bar: None,
-                evidence: None,
-            }
-        } else {
-            match prepared.get(&condition.timeframe) {
-                Some(timeframe) => {
-                    evaluate_condition(condition, timeframe).map_err(|source| DefinitionError::InvalidIndicator {
-                        condition: id.clone(),
-                        source,
-                    })?
-                }
-                None => ConditionOutcome {
-                    status: OutcomeStatus::NoData,
-                    last_true_bar: None,
-                    evidence: None,
-                },
-            }
-        };
-        outcomes.insert(id.clone(), outcome);
-    }
-
-    let truth = eval_node(&definition.root, &outcomes);
-    let satisfied = truth == Truth::True;
-    let mut supporting = Vec::with_capacity(definition.conditions.len());
-    if satisfied {
-        collect_supporting(&definition.root, &outcomes, &mut supporting);
-    }
-    let triggered_at = supporting
-        .into_iter()
-        .filter_map(|id| outcomes.get(id))
-        .filter_map(|outcome| outcome.last_true_bar)
-        .max();
-
-    Ok(EvalReport {
-        coin: coin.to_owned(),
-        satisfied,
-        triggered_at,
-        conditions: outcomes,
-        missing_data,
-        unavailable_data,
-    })
+    let prepared = PreparedEvaluation::build(definition, data)?;
+    let completed_lengths = prepared.full_lengths();
+    Ok(prepared.report_at(definition, coin, &completed_lengths))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -428,34 +515,37 @@ fn collect_supporting<'a>(
     }
 }
 
-fn evaluate_condition(
+fn evaluate_condition_at(
     condition: &Condition,
     prepared: &TimeframePrepared<'_>,
-) -> Result<ConditionOutcome, InstanceError> {
-    let available = prepared.candles.len();
-    let requirement = condition.requirement()?;
+    prepared_condition: &PreparedCondition,
+    available: usize,
+) -> ConditionOutcome {
+    let available = available.min(prepared.candles.len()).min(prepared_condition.mask.len());
+    let requirement = prepared_condition.requirement;
     if available < requirement.completed_bars {
-        return Ok(ConditionOutcome {
+        return ConditionOutcome {
             status: OutcomeStatus::InsufficientHistory {
                 required: requirement.completed_bars,
                 available,
             },
             last_true_bar: None,
             evidence: None,
-        });
+        };
     }
 
-    let mask = build_mask(condition, prepared, requirement.confirmation_bars);
-    let window_len = condition.within_bars as usize + 1;
-    let satisfied = mask.iter().rev().take(window_len).any(|&held| held);
-    let last_true_index = mask.iter().rposition(|&held| held);
+    let last_true_index = available
+        .checked_sub(1)
+        .and_then(|index| prepared_condition.latest_true.get(index).copied().flatten());
+    let window_start = available.saturating_sub(condition.within_bars as usize + 1);
+    let satisfied = last_true_index.is_some_and(|index| index >= window_start);
     let last_true_bar = last_true_index
         .and_then(|index| prepared.candles.get(index))
         .map(|candle| candle.open_time);
     let evidence_index = if satisfied {
         last_true_index
     } else {
-        prepared.candles.len().checked_sub(1)
+        available.checked_sub(1)
     };
     let evidence = evidence_index.and_then(|index| condition_evidence(condition, prepared, index));
     let status = if satisfied {
@@ -463,11 +553,11 @@ fn evaluate_condition(
     } else {
         OutcomeStatus::NotSatisfied
     };
-    Ok(ConditionOutcome {
+    ConditionOutcome {
         status,
         last_true_bar,
         evidence,
-    })
+    }
 }
 
 fn operand_values(

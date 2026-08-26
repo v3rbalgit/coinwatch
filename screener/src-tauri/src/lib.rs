@@ -8,6 +8,7 @@
 mod indicator_presets;
 mod signal_catalog;
 mod signal_runs;
+mod signal_validation;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,6 +26,7 @@ use tauri::{Emitter, Manager};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::signal_runs::SignalRunState;
+use crate::signal_validation::SignalValidationState;
 
 /// One screener row: live metadata from `metaAndAssetCtxs`. Reads memory only —
 /// no network, no database — so it returns instantly.
@@ -306,6 +308,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(store)
         .manage(Arc::new(SignalRunState::default()))
+        .manage(Arc::new(SignalValidationState::default()))
         .setup(move |app| {
             // Client clones share one pool; Hyperliquid requests add the shared
             // weight limiter while logo downloads use the same HTTP transport directly.
@@ -408,7 +411,9 @@ pub fn run() {
             indicator_presets::update_indicator_preset,
             indicator_presets::delete_indicator_preset,
             signal_runs::start_signal_run,
-            signal_runs::cancel_signal_run
+            signal_runs::cancel_signal_run,
+            signal_validation::start_signal_validation,
+            signal_validation::cancel_signal_validation
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,5 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core"
 
+import { createSignalChannelClient } from "$lib/signals/channel-client"
+import type { SignalChannelTransport } from "$lib/signals/channel-client"
 import type { SignalDefinition, SignalTimeframe } from "$lib/signals/definition"
 
 export type SignalRunScope = { type: "universe" } | { type: "coins"; coins: string[] }
@@ -143,121 +145,39 @@ export interface SignalRunClient {
   isActive(): boolean
 }
 
-interface PendingCancellation {
-  promise: Promise<boolean>
-  resolve(value: boolean): void
-  reject(reason: unknown): void
-}
-
-interface ActiveSession {
-  runId: number | null
-  terminal: boolean
-  pendingCancellation: PendingCancellation | null
-}
-
-type ReleaseSession = (session: ActiveSession) => void
-
-function createPendingCancellation(): PendingCancellation {
-  let resolvePromise: (value: boolean) => void = () => undefined
-  let rejectPromise: (reason: unknown) => void = () => undefined
-  const promise = new Promise<boolean>((resolve, reject) => {
-    resolvePromise = resolve
-    rejectPromise = reject
-  })
-  return { promise, resolve: resolvePromise, reject: rejectPromise }
-}
-
-function isTerminalEvent(event: SignalRunEvent): boolean {
-  return event.event === "completed" || event.event === "cancelled" || event.event === "failed"
-}
-
-function flushCancellation(session: ActiveSession, transport: SignalRunTransport): void {
-  if (session.runId === null || session.pendingCancellation === null) return
-  const pending = session.pendingCancellation
-  session.pendingCancellation = null
-  void transport.cancel(session.runId).then(
-    cancelled => pending.resolve(cancelled),
-    error => pending.reject(error)
-  )
-}
-
-function handleRunEvent(
-  session: ActiveSession,
-  event: SignalRunEvent,
-  onEvent: (event: SignalRunEvent) => void,
-  release: ReleaseSession,
-  transport: SignalRunTransport
-): void {
-  if (session.terminal) return
-  session.runId ??= event.data.runId
-  flushCancellation(session, transport)
-  if (event.data.runId !== session.runId) return
-
-  if (isTerminalEvent(event)) {
-    session.terminal = true
-    release(session)
-  }
-  onEvent(event)
-}
-
-function reconcileRunId(
-  session: ActiveSession,
-  returnedRunId: number,
-  release: ReleaseSession,
-  transport: SignalRunTransport
-): number {
-  if (session.runId !== null && session.runId !== returnedRunId) {
-    session.terminal = true
-    release(session)
-    throw new SignalRunProtocolError(session.runId, returnedRunId)
-  }
-  session.runId = returnedRunId
-  flushCancellation(session, transport)
-  return returnedRunId
-}
-
-function rejectStart(session: ActiveSession, error: unknown, release: ReleaseSession): never {
-  session.terminal = true
-  session.pendingCancellation?.resolve(false)
-  session.pendingCancellation = null
-  release(session)
-  throw error
+interface SignalRunStart {
+  definition: SignalDefinition
+  scope: SignalRunScope
 }
 
 export function createSignalRunClient(transport: SignalRunTransport = tauriSignalRunTransport): SignalRunClient {
-  let active: ActiveSession | null = null
-  const release: ReleaseSession = session => {
-    if (active === session) active = null
+  const channelTransport: SignalChannelTransport<SignalRunStart, SignalRunEvent> = {
+    start(input, onEvent) {
+      return transport.start(input.definition, input.scope, onEvent)
+    },
+    cancel(runId) {
+      return transport.cancel(runId)
+    },
   }
+  const client = createSignalChannelClient(channelTransport, {
+    eventId: event => event.data.runId,
+    isTerminal: event => event.event === "completed" || event.event === "cancelled" || event.event === "failed",
+    alreadyActiveError: () => new SignalRunAlreadyActiveError(),
+    protocolError: (observedId, returnedId) => new SignalRunProtocolError(observedId, returnedId),
+  })
 
   return {
     start(definition, scope, onEvent) {
-      if (active !== null) return Promise.reject(new SignalRunAlreadyActiveError())
-
-      const session: ActiveSession = {
-        runId: null,
-        terminal: false,
-        pendingCancellation: null,
-      }
-      active = session
-      return transport
-        .start(definition, scope, event => handleRunEvent(session, event, onEvent, release, transport))
-        .then(
-          runId => reconcileRunId(session, runId, release, transport),
-          error => rejectStart(session, error, release)
-        )
+      return client.start({ definition, scope }, onEvent)
     },
     cancel() {
-      if (active === null) return Promise.resolve(false)
-      if (active.runId !== null) return transport.cancel(active.runId)
-      active.pendingCancellation ??= createPendingCancellation()
-      return active.pendingCancellation.promise
+      return client.cancel()
     },
     activeRunId() {
-      return active?.runId ?? null
+      return client.activeId()
     },
     isActive() {
-      return active !== null
+      return client.isActive()
     },
   }
 }
