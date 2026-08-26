@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Copy, Trash2 } from "@lucide/svelte"
+  import { Activity, Copy, Play, Trash2 } from "@lucide/svelte"
 
   import type { IndicatorDescriptor } from "$lib/chart/indicators"
   import Badge from "$lib/components/ui/badge.svelte"
@@ -12,6 +12,10 @@
     descriptors,
     busy = false,
     error = "",
+    runActive = false,
+    activeRunName = null,
+    onRun,
+    onViewRun,
     onDuplicate,
     onDelete,
   } = $props<{
@@ -19,11 +23,20 @@
     descriptors: readonly IndicatorDescriptor[]
     busy?: boolean
     error?: string
+    runActive?: boolean
+    activeRunName?: string | null
+    onRun: () => void
+    onViewRun: () => void
     onDuplicate: () => void
     onDelete: () => void
   }>()
 
   const lines = $derived(definitionLines(entry.definition, descriptors))
+  const runButtonLabel = $derived(
+    runActive && activeRunName !== null && activeRunName !== entry.name
+      ? `View ${activeRunName} run`
+      : "View active run"
+  )
 </script>
 
 <div class="flex h-full min-w-0 flex-1 flex-col">
@@ -39,10 +52,26 @@
         </div>
         <p class="mt-1 max-w-2xl text-xs leading-relaxed text-muted-foreground">
           This definition uses richer boolean logic than the flat ALL/ANY editor can represent. It remains preserved
-          exactly and will become runnable in the next checkpoint.
+          exactly and can be evaluated without flattening it.
         </p>
       </div>
-      <div class="flex gap-2">
+      <div class="flex flex-wrap gap-2">
+        <Button
+          variant="outline"
+          onclick={runActive ? onViewRun : onRun}
+          disabled={busy && !runActive}
+          title={runActive
+            ? `View active run for ${activeRunName ?? "signal"}`
+            : busy
+              ? "Finish the current catalog action before running."
+              : undefined}
+        >
+          {#if runActive}
+            <Activity class="size-4" /><span class="max-w-44 truncate">{runButtonLabel}</span>
+          {:else}
+            <Play class="size-4" />Run
+          {/if}
+        </Button>
         <Button variant="outline" onclick={onDuplicate} disabled={busy}>
           <Copy class="size-4" />Duplicate
         </Button>

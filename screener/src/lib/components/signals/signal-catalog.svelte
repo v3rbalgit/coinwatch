@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Copy, EllipsisVertical, Plus, Trash2 } from "@lucide/svelte"
+  import { Activity, Copy, EllipsisVertical, Plus, Trash2 } from "@lucide/svelte"
   import { DropdownMenu } from "bits-ui"
 
   import Badge from "$lib/components/ui/badge.svelte"
@@ -19,6 +19,9 @@
     selectedId,
     loading,
     busy = false,
+    runActive = false,
+    hasRun = false,
+    onViewRun,
     onSelect,
     onNew,
     onDuplicate,
@@ -28,6 +31,9 @@
     selectedId: string | null
     loading: boolean
     busy?: boolean
+    runActive?: boolean
+    hasRun?: boolean
+    onViewRun: () => void
     onSelect: (entry: SignalCatalogEntry) => void
     onNew: () => void
     onDuplicate: (entry: SignalCatalogEntry) => void
@@ -67,7 +73,21 @@
         <h1 class="text-sm font-semibold text-foreground">Personal signals</h1>
         <p class="text-xs text-muted-foreground">{entries.length} saved</p>
       </div>
-      <Button size="sm" onclick={onNew} disabled={loading || busy}><Plus class="mr-1 size-3.5" />New</Button>
+      <div class="flex items-center gap-1">
+        {#if hasRun}
+          <Button
+            size="icon"
+            variant="outline"
+            class="size-8"
+            onclick={onViewRun}
+            title={runActive ? "View active run" : "View latest run"}
+            aria-label={runActive ? "View active signal run" : "View latest signal run"}
+          >
+            <Activity class="size-3.5 {runActive ? 'text-primary' : ''}" />
+          </Button>
+        {/if}
+        <Button size="sm" onclick={onNew} disabled={loading || busy}><Plus class="mr-1 size-3.5" />New</Button>
+      </div>
     </div>
     <Input bind:value={query} class="mt-3 h-8" placeholder="Filter signals…" aria-label="Filter signals" />
   </div>

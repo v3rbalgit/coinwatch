@@ -8,6 +8,8 @@
   import RichDefinitionView from "$lib/components/signals/rich-definition-view.svelte"
   import SignalCatalog from "$lib/components/signals/signal-catalog.svelte"
   import SignalEditor from "$lib/components/signals/signal-editor.svelte"
+  import SignalRunDialog from "$lib/components/signals/signal-run-dialog.svelte"
+  import SignalRunResults from "$lib/components/signals/signal-run-results.svelte"
   import TemplatePicker from "$lib/components/signals/template-picker.svelte"
   import UnavailableSignalView from "$lib/components/signals/unavailable-signal-view.svelte"
   import Button from "$lib/components/ui/button.svelte"
@@ -31,14 +33,35 @@
     updateIndicatorPreset,
   } from "$lib/signals/presets"
   import type { IndicatorPresetEntry } from "$lib/signals/presets"
+  import type { SignalRunScope } from "$lib/signals/run"
+  import { snapshotSignalDefinition } from "$lib/signals/run-workspace"
+  import {
+    cancelSignalWorkspaceRun,
+    setSignalRunResultFilter,
+    showSignalRunDefinition,
+    showSignalRunResults,
+    signalRunIsActive,
+    signalRunWorkspace,
+    startSignalWorkspaceRun,
+  } from "$lib/signals/run-workspace.svelte"
   import type { NewSignalDraft } from "$lib/signals/templates"
+  import { listSignalWatchlists } from "$lib/signals/watchlists"
+  import type { SignalWatchlist } from "$lib/signals/watchlists"
 
   type PendingAction =
     { type: "select"; entry: SignalCatalogEntry } | { type: "new" } | { type: "duplicate"; entry: SignalCatalogEntry }
 
+  interface SignalRunCandidate {
+    name: string
+    definition: ReturnType<typeof compileSignalDraft>
+    source: "draft" | "saved"
+  }
+
   let entries = $state<SignalCatalogEntry[]>([])
   let presets = $state<IndicatorPresetEntry[]>([])
   let descriptors = $state<IndicatorDescriptor[]>([])
+  let watchlists = $state<SignalWatchlist[]>([])
+  let watchlistError = $state("")
   let loading = $state(true)
   let busy = $state(false)
   let error = $state("")
@@ -48,6 +71,8 @@
   let deleteOpen = $state(false)
   let presetDeleteOpen = $state(false)
   let duplicateOpen = $state(false)
+  let runDialogOpen = $state(false)
+  let runCandidate = $state.raw<SignalRunCandidate | null>(null)
   let pendingAction = $state<PendingAction | null>(null)
   let signalToDelete = $state<SignalCatalogEntry | null>(null)
   let signalToDuplicate = $state<SignalCatalogEntry | null>(null)
@@ -55,6 +80,9 @@
   let toastTimer: ReturnType<typeof setTimeout> | undefined
 
   const session = $derived(signalEditorWorkspace.session)
+  const runActive = $derived(signalRunIsActive())
+  const activeRunName = $derived(runActive ? (signalRunWorkspace.snapshot?.name ?? null) : null)
+  const hasRun = $derived(signalRunWorkspace.snapshot !== null)
   const selectedId = $derived.by(() => {
     switch (session.type) {
       case "draft":
@@ -78,6 +106,7 @@
 
   function setSession(next: SignalEditorSession) {
     signalEditorWorkspace.session = next
+    showSignalRunDefinition()
     error = ""
   }
 
@@ -114,10 +143,11 @@
   }
 
   async function initializeWorkspace() {
-    const [catalogResult, presetResult, descriptorResult] = await Promise.allSettled([
+    const [catalogResult, presetResult, descriptorResult, watchlistResult] = await Promise.allSettled([
       listSignals(),
       listIndicatorPresets(),
       loadIndicators().then(() => indicatorDescriptors()),
+      listSignalWatchlists(),
     ])
     const errors: string[] = []
     if (catalogResult.status === "fulfilled") entries = catalogResult.value
@@ -129,6 +159,10 @@
       errors.push(
         descriptorResult.reason instanceof Error ? descriptorResult.reason.message : String(descriptorResult.reason)
       )
+    if (watchlistResult.status === "fulfilled") watchlists = watchlistResult.value
+    else
+      watchlistError =
+        watchlistResult.reason instanceof Error ? watchlistResult.reason.message : String(watchlistResult.reason)
     error = errors.join(" ")
     if (catalogResult.status === "fulfilled") reconcileSession()
     loading = false
@@ -175,6 +209,47 @@
 
   function createFromTemplate(created: NewSignalDraft) {
     setSession(createDraftSession(created.name, created.draft))
+  }
+
+  function requestRun() {
+    if (runActive) {
+      showSignalRunResults()
+      return
+    }
+    switch (session.type) {
+      case "draft":
+        runCandidate = {
+          name: session.name,
+          definition: compileSignalDraft(session.draft),
+          source: session.id === null || isDraftSessionDirty(session) ? "draft" : "saved",
+        }
+        break
+      case "rich":
+        runCandidate = {
+          name: session.entry.name,
+          definition: snapshotSignalDefinition(session.entry.definition),
+          source: "saved",
+        }
+        break
+      case "unavailable":
+      case "empty":
+        return
+    }
+    runDialogOpen = true
+  }
+
+  function startRun(scope: SignalRunScope, scopeLabel: string) {
+    const candidate = runCandidate
+    if (candidate === null) return
+    runCandidate = null
+    void startSignalWorkspaceRun({
+      name: candidate.name,
+      definition: snapshotSignalDefinition(candidate.definition),
+      scope,
+      scopeLabel,
+      source: candidate.source,
+      startedAt: new Date().toISOString(),
+    })
   }
 
   async function saveDraft() {
@@ -320,13 +395,30 @@
     {selectedId}
     {loading}
     {busy}
+    {runActive}
+    {hasRun}
+    onViewRun={showSignalRunResults}
     onSelect={(entry: SignalCatalogEntry) => requestAction({ type: "select", entry })}
     onNew={() => requestAction({ type: "new" })}
     onDuplicate={(entry: SignalCatalogEntry) => requestAction({ type: "duplicate", entry })}
     onDelete={requestDelete}
   />
 
-  {#if loading}
+  {#if signalRunWorkspace.view === "results" && signalRunWorkspace.snapshot !== null}
+    <SignalRunResults
+      snapshot={signalRunWorkspace.snapshot}
+      progress={signalRunWorkspace.progress}
+      reports={signalRunWorkspace.reports}
+      filter={signalRunWorkspace.filter}
+      {descriptors}
+      starting={signalRunWorkspace.starting}
+      cancellationPending={signalRunWorkspace.cancellationPending}
+      error={signalRunWorkspace.error}
+      onBack={showSignalRunDefinition}
+      onCancel={() => void cancelSignalWorkspaceRun()}
+      onFilterChange={setSignalRunResultFilter}
+    />
+  {:else if loading}
     <div class="flex min-w-0 flex-1 items-center justify-center text-sm text-muted-foreground">
       Loading signal workspace…
     </div>
@@ -343,8 +435,12 @@
       {presets}
       {busy}
       {error}
+      {runActive}
+      {activeRunName}
       onChange={setSession}
       onSave={() => void saveDraft()}
+      onRun={requestRun}
+      onViewRun={showSignalRunResults}
       onCreatePreset={createPreset}
       onUpdatePreset={updatePreset}
       onDeletePreset={requestPresetDelete}
@@ -355,6 +451,10 @@
       {descriptors}
       {busy}
       {error}
+      {runActive}
+      {activeRunName}
+      onRun={requestRun}
+      onViewRun={showSignalRunResults}
       onDuplicate={() => requestAction({ type: "duplicate", entry: session.entry })}
       onDelete={() => requestDelete(session.entry)}
     />
@@ -381,6 +481,15 @@
 </div>
 
 <TemplatePicker bind:open={templateOpen} {descriptors} onCreate={createFromTemplate} />
+
+<SignalRunDialog
+  bind:open={runDialogOpen}
+  signalName={runCandidate?.name ?? "Signal"}
+  {watchlists}
+  {watchlistError}
+  replacesPrevious={hasRun}
+  onRun={startRun}
+/>
 
 <DuplicateSignalDialog
   bind:open={duplicateOpen}

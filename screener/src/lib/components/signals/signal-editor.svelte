@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Plus, Save } from "@lucide/svelte"
+  import { Activity, Play, Plus, Save } from "@lucide/svelte"
 
   import type { IndicatorDescriptor } from "$lib/chart/indicators"
   import ConditionCard from "$lib/components/signals/condition-card.svelte"
@@ -25,7 +25,11 @@
     busy = false,
     error = "",
     onChange,
+    runActive = false,
+    activeRunName = null,
     onSave,
+    onRun,
+    onViewRun,
     onCreatePreset,
     onUpdatePreset,
     onDeletePreset,
@@ -35,8 +39,12 @@
     presets: IndicatorPresetEntry[]
     busy?: boolean
     error?: string
+    runActive?: boolean
+    activeRunName?: string | null
     onChange: (session: DraftSession) => void
     onSave: () => void
+    onRun: () => void
+    onViewRun: () => void
     onCreatePreset: (indicatorId: string, name: string, params: Record<string, number>) => void
     onUpdatePreset: (id: string, name: string, params: Record<string, number>) => void
     onDeletePreset: (id: string) => void
@@ -47,6 +55,11 @@
     session.name.trim().length === 0 ? "Enter a signal name." : draftValidationMessage(session.draft, descriptors)
   )
   const canSave = $derived(draftCanSave(session.name, session.draft, descriptors) && dirty && !busy)
+  const runButtonLabel = $derived(
+    runActive && activeRunName !== null && activeRunName !== session.name
+      ? `View ${activeRunName} run`
+      : "View active run"
+  )
 
   function changeDraft(draft: DraftSession["draft"]) {
     onChange({ ...session, draft })
@@ -122,6 +135,18 @@
         {#if dirty}<Badge variant="outline">Unsaved</Badge>{/if}
         <Button onclick={onSave} disabled={!canSave}>
           <Save class="size-4" />{busy ? "Saving…" : session.id === null ? "Create signal" : "Save changes"}
+        </Button>
+        <Button
+          variant="outline"
+          onclick={runActive ? onViewRun : onRun}
+          disabled={!runActive && (busy || validation !== null)}
+          title={runActive ? `View active run for ${activeRunName ?? "signal"}` : (validation ?? undefined)}
+        >
+          {#if runActive}
+            <Activity class="size-4" /><span class="max-w-44 truncate">{runButtonLabel}</span>
+          {:else}
+            <Play class="size-4" />Run
+          {/if}
         </Button>
       </div>
     </div>
