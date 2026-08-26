@@ -30,6 +30,7 @@
 
   import { formatCompactNumber, formatPrice } from "$lib/format"
 
+  import { logicalFor, timeGridOf } from "./drawings/coords"
   import { DrawingInteraction } from "./drawings/interaction"
   import { DrawingsPrimitive } from "./drawings/primitive"
   import { DrawingStore } from "./drawings/store"
@@ -43,8 +44,9 @@
     type InstanceOutput,
   } from "./indicators"
   import { PRICE_PANE_LAYOUT_ID, type PaneLayoutEntry, type ToolbarPosition } from "./settings"
+  import { SignalValidationPrimitive } from "./signal-validation-primitive"
   import { chartTheme } from "./theme"
-  import type { Bar } from "./types"
+  import type { Bar, SignalValidationMarking } from "./types"
 
   // `seed` changes when the whole series is replaced (coin / timeframe switch or a
   // history prepend), triggering a full setData + refit; otherwise bars flow in as
@@ -64,7 +66,12 @@
     magnet,
     styleBarPosition,
     paneLayout,
+    validationSpans = [],
+    selectedValidationSpan = null,
+    focusTime = null,
+    focusRevision = 0,
     onLoadOlder,
+    onValidationSpanSelect,
     onInstancesChange,
     onDrawingsChange,
     onLogScaleChange,
@@ -80,7 +87,12 @@
     magnet: boolean
     styleBarPosition: ToolbarPosition
     paneLayout: PaneLayoutEntry[]
+    validationSpans?: SignalValidationMarking[]
+    selectedValidationSpan?: number | null
+    focusTime?: number | null
+    focusRevision?: number
     onLoadOlder?: () => void
+    onValidationSpanSelect?: (index: number) => void
     onInstancesChange?: (instances: IndicatorInstance[]) => void
     onDrawingsChange?: (drawings: readonly Drawing[]) => void
     onLogScaleChange: (enabled: boolean) => void
@@ -96,6 +108,7 @@
   const PRICE_PANE_STRETCH = 3
   const INDICATOR_PANE_STRETCH = 1
   const PANE_STRETCH_EPSILON = 1e-6
+  const FOCUS_HALF_WINDOW = 60
 
   let container: HTMLDivElement
   let chart: IChartApi | undefined
@@ -126,6 +139,7 @@
   let rootEl: HTMLDivElement
   let drawingStore: DrawingStore | undefined
   let drawingInteraction: DrawingInteraction | undefined
+  let validationPrimitive: SignalValidationPrimitive | undefined
   let activeTool = $state<InteractiveDrawingTool | null>(null)
   let selectedDrawing = $state<Drawing | null>(null)
   let hasDrawings = $state(false)
@@ -463,6 +477,8 @@
 
     const primitive = new DrawingsPrimitive()
     candles.attachPrimitive(primitive)
+    validationPrimitive = new SignalValidationPrimitive()
+    candles.attachPrimitive(validationPrimitive)
     const store = new DrawingStore(next => onDrawingsChange?.(next))
     drawingStore = store
     store.onChange = () => {
@@ -487,6 +503,12 @@
         onEscape: closeChrome,
       },
       uiRoot: rootEl,
+    })
+
+    chart.subscribeClick(param => {
+      if (activeTool !== null || param.point === undefined) return
+      const index = validationPrimitive?.hitTestAt(param.point.x)
+      if (index !== null && index !== undefined) onValidationSpanSelect?.(index)
     })
 
     chart.subscribeCrosshairMove(param => {
@@ -559,6 +581,7 @@
       drawingInteraction?.destroy()
       chart?.remove()
       chart = undefined
+      validationPrimitive = undefined
     }
   })
 
@@ -599,6 +622,34 @@
       legend = legendFor(last)
       readouts = readoutsFor(bars.length - 1)
     }
+  })
+
+  $effect(() => {
+    void seed
+    void bars[0]?.time
+    void bars.at(-1)?.time
+    if (!ready || !validationPrimitive) return
+    validationPrimitive.setSpans(
+      validationSpans.map(span => ({
+        ...span,
+        startTime: stamp(span.startTime),
+        endTime: stamp(span.endTime),
+      }))
+    )
+    validationPrimitive.setSelected(selectedValidationSpan)
+  })
+
+  $effect(() => {
+    void focusRevision
+    if (!ready || !chart || focusTime === null || bars.length < 2) return
+    const grid = timeGridOf(bars.map(bar => stamp(bar.time)))
+    if (grid === null || focusTime < bars[0].time || focusTime > bars[bars.length - 1].time) return
+    const center = logicalFor(stamp(focusTime), grid)
+    suppressLoadOlder = true
+    chart.timeScale().setVisibleLogicalRange({
+      from: center - FOCUS_HALF_WINDOW,
+      to: center + FOCUS_HALF_WINDOW,
+    })
   })
 
   // Toggle the price pane between linear and logarithmic.

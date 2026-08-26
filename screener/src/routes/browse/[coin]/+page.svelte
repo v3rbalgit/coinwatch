@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { ArrowLeft, LoaderCircle } from "@lucide/svelte"
+  import { ArrowLeft, Ban, CalendarRange, Eye, EyeOff, ListTree, LoaderCircle, RotateCcw, Trash2 } from "@lucide/svelte"
   import { invoke } from "@tauri-apps/api/core"
   import { listen } from "@tauri-apps/api/event"
   import { onMount } from "svelte"
@@ -8,7 +8,12 @@
   import { page } from "$app/state"
   import Chart from "$lib/chart/Chart.svelte"
   import { parseDrawingsPayload, serializeDrawings, type Drawing } from "$lib/chart/drawings/types"
-  import type { IndicatorInstance } from "$lib/chart/indicators"
+  import {
+    indicatorDescriptors,
+    loadIndicators,
+    type IndicatorDescriptor,
+    type IndicatorInstance,
+  } from "$lib/chart/indicators"
   import {
     CHART_CHROME_SETTINGS_KEY,
     CHART_TIMEFRAMES,
@@ -25,11 +30,24 @@
     type PaneLayoutEntry,
     type ToolbarPosition,
   } from "$lib/chart/settings"
-  import type { Bar } from "$lib/chart/types"
+  import type { Bar, SignalValidationMarking } from "$lib/chart/types"
+  import SignalValidationDialog from "$lib/components/signals/signal-validation-dialog.svelte"
+  import SignalValidationPanel from "$lib/components/signals/signal-validation-panel.svelte"
   import Button from "$lib/components/ui/button.svelte"
   import CoinIcon from "$lib/components/ui/coin-icon.svelte"
   import Skeleton from "$lib/components/ui/skeleton.svelte"
   import { formatCompactNumber, formatPrice } from "$lib/format"
+  import { signalValidationFailureMessage, type HistoricalRange } from "$lib/signals/historical"
+  import { loadHistoricalSignalOptions, type HistoricalSignalOption } from "$lib/signals/historical-options"
+  import {
+    cancelHistoricalValidation,
+    clearHistoricalValidation,
+    historicalValidationWorkspace,
+    selectHistoricalValidationSpan,
+    setHistoricalValidationPanelOpen,
+    setHistoricalValidationVisible,
+    startHistoricalValidation,
+  } from "$lib/signals/historical-workspace.svelte"
 
   type Row = {
     coin: string
@@ -68,6 +86,38 @@
   ])
   // Drawings persist per coin (a trendline on BTC is meaningless on ETH).
   let chartDrawings = $state<Drawing[]>([])
+  let validationDialogOpen = $state(false)
+  let validationOptions = $state<HistoricalSignalOption[]>([])
+  let validationOptionsLoading = $state(false)
+  let validationOptionsError = $state("")
+  let validationDescriptors = $state<IndicatorDescriptor[]>([])
+  let focusTime = $state<number | null>(null)
+  let focusRevision = $state(0)
+  let validationNavigationError = $state("")
+
+  const validationForCoin = $derived(historicalValidationWorkspace.snapshot?.coin === coin)
+  const validationSnapshot = $derived(validationForCoin ? historicalValidationWorkspace.snapshot : null)
+  const validationResult = $derived(validationForCoin ? historicalValidationWorkspace.result : null)
+  const anyValidationActive = $derived(
+    historicalValidationWorkspace.starting || historicalValidationWorkspace.progress.status === "running"
+  )
+  const validationActive = $derived(validationForCoin && anyValidationActive)
+  const validationMarkings = $derived.by((): SignalValidationMarking[] => {
+    if (!validationForCoin || !historicalValidationWorkspace.visible || validationResult === null) return []
+    return validationResult.spans.map((span, index) => ({
+      index,
+      startTime: Math.floor(new Date(span.startedAt).getTime() / 1000),
+      endTime: Math.floor(new Date(span.endedAt).getTime() / 1000),
+      activeAtStart: span.activeAtStart,
+      activeAtEnd: span.activeAtEnd,
+    }))
+  })
+  const validationError = $derived.by(() => {
+    if (!validationForCoin) return historicalValidationWorkspace.error || validationNavigationError
+    const progress = historicalValidationWorkspace.progress
+    if (progress.status === "failed") return signalValidationFailureMessage(progress.failure)
+    return historicalValidationWorkspace.error || validationNavigationError
+  })
 
   async function loadCandles() {
     const [c, t] = [coin, tf]
@@ -83,18 +133,24 @@
   let exhausted = false
   // Page older history in on scroll-back; the backend serves the cache and fetches
   // from Hyperliquid + stores on a miss, so depth accumulates.
-  async function loadOlder() {
+  async function loadOlder(): Promise<boolean> {
     const oldest = bars[0]?.time
-    if (loadingOlder || exhausted || oldest === undefined) return
+    if (loadingOlder || exhausted || oldest === undefined) return false
     loadingOlder = true
     const [c, t] = [coin, tf]
     try {
       const older = await invoke<Bar[]>("coin_history", { coin: c, timeframe: t, beforeSeconds: oldest })
-      if (c === coin && t === tf) {
-        const fresh = older.filter(bar => bar.time < oldest)
-        if (fresh.length === 0) exhausted = true
-        else bars = [...fresh, ...bars]
+      if (c !== coin || t !== tf) return false
+      const fresh = older.filter(bar => bar.time < oldest)
+      if (fresh.length === 0) {
+        exhausted = true
+        return false
       }
+      bars = [...fresh, ...bars]
+      return true
+    } catch (error) {
+      console.error("failed to load older chart history", error)
+      return false
     } finally {
       loadingOlder = false
     }
@@ -102,6 +158,62 @@
   async function loadMeta() {
     const rows = await invoke<Row[]>("screener_rows")
     meta = rows.find(row => row.coin === coin) ?? null
+  }
+
+  async function openValidationDialog() {
+    validationDialogOpen = true
+    validationOptionsLoading = true
+    validationOptionsError = ""
+    try {
+      validationOptions = await loadHistoricalSignalOptions()
+      validationDescriptors = [...indicatorDescriptors()]
+    } catch (error) {
+      validationOptionsError = error instanceof Error ? error.message : String(error)
+      validationOptions = []
+    } finally {
+      validationOptionsLoading = false
+    }
+  }
+
+  function validateSignal(option: HistoricalSignalOption, range: HistoricalRange, rangeLabel: string) {
+    if (option.definition === null) {
+      validationNavigationError = option.disabledReason ?? "The selected definition cannot be validated."
+      return
+    }
+    validationNavigationError = ""
+    void startHistoricalValidation({
+      name: option.name,
+      definition: $state.snapshot(option.definition),
+      coin,
+      range,
+      rangeLabel,
+      source: option.source,
+    })
+  }
+
+  async function focusValidationSpan(index: number) {
+    const span = validationResult?.spans[index]
+    if (span === undefined) return
+    const [activeCoin, activeTimeframe] = [coin, tf]
+    selectHistoricalValidationSpan(index)
+    validationNavigationError = ""
+    const target = Math.floor(new Date(span.startedAt).getTime() / 1000)
+    while ((bars[0]?.time ?? target) > target) {
+      const loaded = await loadOlder()
+      if (activeCoin !== coin || activeTimeframe !== tf || !validationForCoin) return
+      if (!loaded) {
+        validationNavigationError = "The chart could not load candles around this matched period."
+        return
+      }
+    }
+    if (activeCoin !== coin || activeTimeframe !== tf || !validationForCoin) return
+    focusTime = target
+    focusRevision += 1
+  }
+
+  function selectValidationMarking(index: number) {
+    selectHistoricalValidationSpan(index)
+    setHistoricalValidationPanelOpen(true)
   }
 
   // The chart's visible indicators persist globally in SQLite.
@@ -234,6 +346,13 @@
     }
   })
 
+  $effect(() => {
+    if (!validationForCoin || validationResult === null || validationDescriptors.length > 0) return
+    void loadIndicators()
+      .then(() => (validationDescriptors = [...indicatorDescriptors()]))
+      .catch(error => (validationNavigationError = error instanceof Error ? error.message : String(error)))
+  })
+
   // Load this coin's saved drawings; clear first so the previous coin's don't linger.
   $effect(() => {
     const active = coin
@@ -313,18 +432,29 @@
       <Skeleton class="h-6 w-24" />
       <Skeleton class="h-5 w-14" />
     {/if}
-    <div class="ml-auto flex items-center gap-1">
-      {#each CHART_TIMEFRAMES as t (t)}
-        <button
-          class="rounded px-2.5 py-1 text-xs font-medium disabled:opacity-40 {tf === t
-            ? 'bg-accent text-accent-foreground'
-            : 'text-muted-foreground hover:bg-accent/50'}"
-          disabled={settingsCoin !== coin}
-          onclick={() => changeTimeframe(t)}
-        >
-          {t}
-        </button>
-      {/each}
+    <div class="ml-auto flex items-center gap-2">
+      <Button
+        variant="outline"
+        size="sm"
+        disabled={anyValidationActive}
+        title={anyValidationActive && !validationForCoin ? "Another market is being validated" : undefined}
+        onclick={openValidationDialog}
+      >
+        <CalendarRange class="size-4" />Validate signal
+      </Button>
+      <div class="flex items-center gap-1">
+        {#each CHART_TIMEFRAMES as t (t)}
+          <button
+            class="rounded px-2.5 py-1 text-xs font-medium disabled:opacity-40 {tf === t
+              ? 'bg-accent text-accent-foreground'
+              : 'text-muted-foreground hover:bg-accent/50'}"
+            disabled={settingsCoin !== coin}
+            onclick={() => changeTimeframe(t)}
+          >
+            {t}
+          </button>
+        {/each}
+      </div>
     </div>
   </header>
 
@@ -351,6 +481,83 @@
     {/if}
   </div>
 
+  {#if validationForCoin && validationSnapshot}
+    <section class="flex flex-wrap items-center gap-3 rounded-lg border border-border bg-card px-3 py-2 text-xs">
+      {#if validationActive}
+        <LoaderCircle class="size-4 animate-spin text-primary" />
+        <span class="font-medium text-foreground">Validating {validationSnapshot.name}</span>
+        {#if historicalValidationWorkspace.progress.status === "running"}
+          <span class="text-muted-foreground">
+            Loaded {historicalValidationWorkspace.progress.completed} / {historicalValidationWorkspace.progress.total}
+            timeframes
+          </span>
+        {:else}
+          <span class="text-muted-foreground">Preparing completed-candle history…</span>
+        {/if}
+        <Button
+          variant="ghost"
+          size="sm"
+          class="ml-auto"
+          disabled={historicalValidationWorkspace.cancellationPending}
+          onclick={cancelHistoricalValidation}
+        >
+          {#if historicalValidationWorkspace.cancellationPending}
+            <LoaderCircle class="size-4 animate-spin" />Cancelling…
+          {:else}
+            <Ban class="size-4" />Cancel
+          {/if}
+        </Button>
+      {:else if validationResult}
+        <span class="font-medium text-foreground">{validationSnapshot.name}</span>
+        <span class="text-muted-foreground">{validationSnapshot.rangeLabel}</span>
+        <span class="text-muted-foreground">
+          <strong class="text-foreground">{validationResult.spans.filter(span => !span.activeAtStart).length}</strong>
+          onsets · <strong class="text-foreground">{validationResult.spans.length}</strong> matched periods
+        </span>
+        <div class="ml-auto flex items-center gap-1">
+          <Button
+            variant="ghost"
+            size="sm"
+            onclick={() => setHistoricalValidationPanelOpen(!historicalValidationWorkspace.panelOpen)}
+          >
+            <ListTree class="size-4" />{historicalValidationWorkspace.panelOpen ? "Hide details" : "Details"}
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onclick={() => setHistoricalValidationVisible(!historicalValidationWorkspace.visible)}
+          >
+            {#if historicalValidationWorkspace.visible}
+              <EyeOff class="size-4" />Hide markings
+            {:else}
+              <Eye class="size-4" />Show markings
+            {/if}
+          </Button>
+          <Button variant="ghost" size="sm" onclick={openValidationDialog}>
+            <RotateCcw class="size-4" />Change
+          </Button>
+          <Button variant="ghost" size="icon" aria-label="Remove signal validation" onclick={clearHistoricalValidation}>
+            <Trash2 class="size-4" />
+          </Button>
+        </div>
+      {:else if historicalValidationWorkspace.progress.status === "cancelled"}
+        <CalendarRange class="size-4 text-muted-foreground" />
+        <span class="font-medium text-foreground">{validationSnapshot.name}</span>
+        <span class="text-muted-foreground">Validation cancelled before completion.</span>
+      {:else}
+        <CalendarRange class="size-4 text-muted-foreground" />
+        <span class="font-medium text-foreground">{validationSnapshot.name}</span>
+      {/if}
+      {#if validationError}
+        <p class="w-full text-xs text-destructive">{validationError}</p>
+      {/if}
+    </section>
+  {:else if validationError}
+    <p class="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+      {validationError}
+    </p>
+  {/if}
+
   <div class="relative min-h-0 flex-1 overflow-hidden rounded-lg border border-border">
     <Chart
       {bars}
@@ -361,6 +568,11 @@
       {magnet}
       {styleBarPosition}
       {paneLayout}
+      validationSpans={validationMarkings}
+      selectedValidationSpan={historicalValidationWorkspace.selectedSpan}
+      focusTime={validationForCoin ? focusTime : null}
+      {focusRevision}
+      onValidationSpanSelect={selectValidationMarking}
       onInstancesChange={persistInstances}
       onDrawingsChange={persistDrawings}
       onLogScaleChange={changeLogScale}
@@ -375,5 +587,25 @@
         Loading chart…
       </div>
     {/if}
+    {#if validationForCoin && validationSnapshot && validationResult && historicalValidationWorkspace.panelOpen && validationDescriptors.length > 0}
+      <SignalValidationPanel
+        snapshot={validationSnapshot}
+        result={validationResult}
+        selected={historicalValidationWorkspace.selectedSpan}
+        descriptors={validationDescriptors}
+        onSelect={focusValidationSpan}
+        onClose={() => setHistoricalValidationPanelOpen(false)}
+      />
+    {/if}
   </div>
+
+  <SignalValidationDialog
+    bind:open={validationDialogOpen}
+    {coin}
+    options={validationOptions}
+    loading={validationOptionsLoading}
+    error={validationOptionsError}
+    busy={anyValidationActive}
+    onValidate={validateSignal}
+  />
 </div>
