@@ -1,6 +1,6 @@
 import type { IndicatorDescriptor, IndicatorInstance } from "$lib/chart/indicators"
 
-export interface IndicatorPresetSnapshot {
+interface IndicatorPresetSnapshot {
   indicatorId: string
   params: Readonly<Record<string, number>>
 }
@@ -9,7 +9,7 @@ export interface IndicatorPresetSnapshot {
  * Materialize every descriptor parameter without duplicating Rust's range/step
  * validation. Complete instances stay stable if registry defaults later change.
  */
-export function resolveIndicatorParams(
+function resolveIndicatorParams(
   descriptor: IndicatorDescriptor,
   params: Readonly<Record<string, number>>
 ): Record<string, number> {
@@ -31,16 +31,6 @@ export function createIndicatorInstance(
     id: descriptor.id,
     params: resolveIndicatorParams(descriptor, params),
   }
-}
-
-export function resolveIndicatorInstance(
-  descriptor: IndicatorDescriptor,
-  instance: IndicatorInstance
-): IndicatorInstance {
-  if (instance.id !== descriptor.id) {
-    throw new Error(`Indicator instance '${instance.id}' does not match descriptor '${descriptor.id}'`)
-  }
-  return createIndicatorInstance(descriptor, instance.params)
 }
 
 /** Selecting a preset copies its values into a new instance; no preset identity survives. */

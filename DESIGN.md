@@ -6,37 +6,36 @@
 ## Product
 
 A single-user, GUI-first **mission-control screener** for Hyperliquid perps: stream the live
-universe, screen it on live metadata, chart any instrument, and scan candle history for setups.
-It is decision support, not an auto-trader.
+universe, screen it on live metadata, chart any instrument, and define and run reusable
+multi-timeframe personal signals. It is decision support, not an auto-trader.
 
-The trajectory, in order: **live screener** (done) → **coin-detail chart** with drawing tools,
-price-lines, and toggleable indicators (in progress) → a modular **signal builder** →
-**alerting**. The screener and one-shot scan are the seed; the builder and standing alerts are
-where the value compounds (see *Roadmap*).
+The current product layers are the **live screener**, the **coin-detail chart**, and the
+**personal signal catalog and run workspace**. **Alerting** is the next major workflow: standing
+runs and delivery channels turn on-demand evaluation into continuous decision support.
 
 ## Shape
 
 Tauri v2 + SvelteKit (Svelte 5 runes) over a Rust market-data engine, as a Cargo workspace:
 
-```
+```text
 domain           shared market types (Candle, Timeframe)
 hl-feed          the Hyperliquid engine — WS + REST + in-memory cache + sync
-storage          accumulating SQLite candle cache (sqlx) behind a CandleStore trait
-indicators       pure indicator + divergence math (17 indicators; regular + hidden divergence)
-indicators-wasm  wasm-bindgen wrapper so the chart runs the same indicator code as the scanner
-scanner          pure divergence scan over the cache
-screener/        Tauri app: commands + event streams to the SvelteKit UI
+storage          SQLite candles and user data behind a CandleStore trait
+indicators       indicator/divergence math, descriptors, validation, and compute engine
+indicators-wasm  wasm-bindgen chart boundary over the shared indicator engine
+signals          validated definitions, history requirements, evaluation, and run orchestration
+screener/        Tauri commands/event channels and the SvelteKit UI
 ```
 
-Data flows one way into a hot cache; reads never touch the network:
+Live data flows into the hot cache while completed candle history accumulates in SQLite.
+Signal definitions declare their exact history requirements; a run uses the hot window first,
+then hydrates older completed candles through `CandleHistory` when necessary.
 
-```
-Hyperliquid ──WS (allMids + fastAssetCtxs + candle)──┐
-            └─REST (metaAndAssetCtxs + candleSnapshot)┤
-                                                       ▼
-                                              MarketStore (in-memory)
-                                                       ▼
-                                     screener rows · divergence scan · UI
+```text
+Hyperliquid ──WS (allMids + fastAssetCtxs + candle)──▶ MarketStore ──▶ Browse · chart
+            └─REST (metaAndAssetCtxs + candleSnapshot)──┬────────────▶ SQLite history
+                                                        └────────────▶ signal hydration
+SQLite user data ──▶ watchlists · signal catalog · presets ──────────▶ Signals workspace
 ```
 
 ## hl-feed internals
@@ -65,34 +64,26 @@ Hyperliquid ──WS (allMids + fastAssetCtxs + candle)──┐
 - **One WS session** for prices and candles, not two connections.
 - **Hybrid candles**: the WebSocket keeps short timeframes live; REST backfills history once,
   paced to the weight limit and tracked so it isn't re-downloaded every cycle.
-- **Metadata-only screener**: it needs one `metaAndAssetCtxs` call, so it is usable
-  immediately; the slower candle backfill only gates the scanner.
+- **Metadata-first Browse workspace**: it needs one `metaAndAssetCtxs` call, so it is usable
+  immediately; chart depth and signal evidence improve as candle history accumulates.
 - **Granular status** on a `watch` channel, surfaced plainly in the UI.
 
 ## Roadmap: chart, signals & alerting
 
-The screener and one-shot scan are the seed; the value compounds through three stages.
+The chart and personal-signal workflows share one indicator definition and compute engine, so
+visual analysis and completed-bar evaluation use the same parameter contracts.
 
-**Coin-detail chart** (in progress). A lightweight-charts terminal: candles + volume, lazy
-scroll-back history, crosshair / OHLCV legend, log scale, drawing tools, trading price-lines,
-and **toggleable indicators**. Every indicator is computed in Rust (through `indicators-wasm`),
-so the chart and the scanner can never drift.
+**Coin-detail chart**. A lightweight-charts terminal with candles, volume, lazy scroll-back
+history, crosshair / OHLCV legend, log scale, drawing tools, trading price-lines, and toggleable
+indicator instances. The chart computes through `indicators-wasm`, which wraps the same Rust
+`indicators` crate used by signal evaluation.
 
-**Indicators on the chart are visibility toggles, not configuration.** The chart renders an
-*instance-driven* list — each drawn indicator is `{id, params, target, outputs}` — but the chart
-UI only shows/hides them; params come from conventional Rust defaults, and RSI/MACD/divergence
-stay pinned to the scanner's config. That same renderer later draws a fired signal's exact
-conditions ("why did it fire"), so no rework is needed when the builder lands. Indicator
-*configuration* lives in the signal builder, never on the chart.
-
-**Signal builder** (next). A modular workflow that composes signals from indicator
-**conditions**: each condition is an indicator with its own params **and its own timeframe**
-(e.g. RSI > 80 on 1h *and* 4h *and* 1d), combined with logical operators (AND/OR/NOT/XOR) and,
-where it fits, weighting. Signals are named, saved to a personal **catalog**, then run on demand
-against a Browse **list** or a single instrument — RSI/MACD/divergence are just the most basic
-conditions, and signals may themselves compose other signals. A multi-timeframe signal can't
-fully render on one chart; reviewing all of its components means switching the chart's timeframe
-(an accepted limitation).
+**Personal signals**. Conditions own their indicator parameters and timeframe and combine through
+AND/OR/NOT/XOR trees. Definitions are named and stored in a personal catalog; current drafts and
+saved rich definitions can run against the complete universe or an existing watchlist. Runs stream
+progress, per-market condition evidence, and data issues, with only the latest run retained in
+frontend memory. A multi-timeframe result cannot fully render on one chart; reviewing all of its
+components still requires switching chart timeframes.
 
 **Alerting** (the payoff). Running a signal on a button is still only the seed; the value is
 standing **alerts** that evaluate a signal continuously and push notifications over channels
@@ -103,13 +94,12 @@ alerts.
 ## Persistence & deployment
 
 Single-user and local. A `CandleStore` **trait seam** with a **local SQLite** implementation
-(via `sqlx`) is in place: the DB is the **accumulating candle cache** — charts lazy-page history
-into it while the in-memory store keeps the scanner's hot window — so restarts reuse history
-instead of re-backfilling. It is the foundation for user state: chart settings, saved signals,
-and alerts. The trait keeps the backend swappable: a **Postgres** implementation can drop in
-later **if** the app grows into a server-backed deployment (always-on alerts, multiple clients).
-We deliberately do **not** stand up managed Postgres/Redis now — nothing durable yet needs them,
-and the in-memory store is the hot cache.
+(via `sqlx`) is in place: the DB is the accumulating candle cache, while the in-memory store keeps
+a bounded hot window. Charts lazy-page older history and signal runs hydrate their exact completed-
+bar requirements, so restarts reuse persisted candles instead of re-backfilling everything. SQLite
+also stores watchlists, chart settings, saved signals, indicator presets, and cached logos. The trait
+keeps candle persistence swappable: a **Postgres** implementation can drop in later if the app grows
+into a server-backed deployment for always-on alerts or multiple clients.
 
 ## History
 

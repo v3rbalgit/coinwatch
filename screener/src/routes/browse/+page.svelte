@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Check, ChevronDown, EllipsisVertical, ExternalLink, Plus, ScanSearch, X } from "@lucide/svelte"
+  import { Check, ChevronDown, EllipsisVertical, ExternalLink, Plus, X } from "@lucide/svelte"
   import { invoke } from "@tauri-apps/api/core"
   import { listen } from "@tauri-apps/api/event"
   import { DropdownMenu } from "bits-ui"
@@ -34,7 +34,6 @@
   let sortDir = $state<1 | -1>(browseView.sortDir)
   const livePrices = $state<Record<string, number>>({})
   let live = $state(false)
-  let toast = $state("")
 
   // Inline list creation (window.prompt is unreliable in the webview).
   let creating = $state(false)
@@ -154,15 +153,6 @@
     if (activeList === name) activeList = null
     await loadLists()
   }
-  async function scanCoin(coin: string) {
-    const signals = await invoke<unknown[]>("scan_coin", { coin })
-    flash(signals.length ? `${coin}: ${signals.length} divergence(s)` : `${coin}: no divergences`)
-  }
-  function flash(message: string) {
-    toast = message
-    setTimeout(() => (toast = message === toast ? "" : toast), 3000)
-  }
-
   const fmtUsd = (n: number) =>
     n >= 1e9
       ? (n / 1e9).toFixed(2) + "B"
@@ -371,10 +361,6 @@
                           <ExternalLink class="size-3.5" />
                           Open on Hyperliquid
                         </DropdownMenu.Item>
-                        <DropdownMenu.Item class={menuItem} onSelect={() => scanCoin(row.coin)}>
-                          <ScanSearch class="size-3.5" />
-                          Scan this coin
-                        </DropdownMenu.Item>
                       </DropdownMenu.Content>
                     </DropdownMenu.Portal>
                   </DropdownMenu.Root>
@@ -384,14 +370,6 @@
           {/each}
         </tbody>
       </table>
-    </div>
-  {/if}
-
-  {#if toast}
-    <div
-      class="pointer-events-none fixed bottom-4 left-1/2 -translate-x-1/2 rounded-md border border-border bg-card px-3 py-1.5 text-sm text-foreground shadow-lg"
-    >
-      {toast}
     </div>
   {/if}
 </div>

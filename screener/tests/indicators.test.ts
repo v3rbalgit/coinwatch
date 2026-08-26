@@ -3,22 +3,35 @@ import { fileURLToPath } from "node:url"
 
 import { beforeAll, describe, expect, it } from "vitest"
 
-import type { Analysis, IndicatorConfig, IndicatorDescriptor, InstanceOutput } from "$lib/chart/indicators"
-import init, { analyzeSeries, computeIndicators, indicatorDescriptors } from "$lib/wasm/indicators.js"
+import {
+  computeIndicators,
+  indicatorDescriptors,
+  type IndicatorInstance,
+  type InstanceOutput,
+} from "$lib/chart/indicators"
+import init from "$lib/wasm/indicators.js"
 
-const config: IndicatorConfig = {
-  rsiPeriod: 14,
-  macdFast: 12,
-  macdSlow: 26,
-  macdSignal: 9,
-  pivotLeft: 5,
-  pivotRight: 5,
-  maxGap: 60,
+function columns(values: readonly number[]) {
+  const close = Float64Array.from(values)
+  return {
+    high: Float64Array.from(values, value => value + 0.5),
+    low: Float64Array.from(values, value => value - 0.5),
+    close,
+    volume: Float64Array.from(values, (_value, index) => 1_000 + index),
+  }
 }
 
-function run(closes: number[]): Analysis {
-  const analysis: Analysis = analyzeSeries(Float64Array.from(closes), config)
-  return analysis
+function computeOne(id: string, params: Record<string, number>, values: readonly number[]): InstanceOutput {
+  const { high, low, close, volume } = columns(values)
+  const result = computeIndicators([{ id, params }], { high, low, close, volume })[0]
+  if (result === undefined) throw new Error(`missing output for '${id}'`)
+  return result
+}
+
+function series(output: InstanceOutput, key: string): number[] {
+  const values = output.outputs.find(candidate => candidate.key === key)?.values
+  if (values === undefined) throw new Error(`missing '${key}' output`)
+  return values
 }
 
 // Node's fetch can't load a file:// URL, so hand the wasm bytes to init directly.
@@ -27,44 +40,11 @@ beforeAll(async () => {
   await init({ module_or_path: wasm })
 })
 
-describe("wasm indicator engine (parity with the Rust scanner)", () => {
-  it("saturates RSI to 100 on a monotonic rise", () => {
-    const rsi = run(Array.from({ length: 60 }, (_, index) => index + 1)).rsi.filter(value => !Number.isNaN(value))
-    expect(rsi.at(-1)).toBeCloseTo(100, 9)
-  })
-
-  it("lifts the MACD line above zero in an uptrend", () => {
-    const macd = run(Array.from({ length: 60 }, (_, index) => index + 1)).macd.filter(value => !Number.isNaN(value))
-    expect(macd.at(-1)).toBeGreaterThan(0)
-  })
-
-  it("finds no divergence in a clean trend", () => {
-    expect(run(Array.from({ length: 200 }, (_, index) => index + 1)).divergences).toHaveLength(0)
-  })
-
-  it("keeps series aligned and the histogram equal to macd - signal", () => {
-    const closes = Array.from({ length: 120 }, (_, index) => 100 + Math.sin(index / 5) * 10)
-    const result = run(closes)
-    expect(result.rsi).toHaveLength(closes.length)
-    expect(result.macd).toHaveLength(closes.length)
-    result.macd.forEach((macd, index) => {
-      const signal = result.signal[index]
-      if (!Number.isNaN(macd) && signal !== undefined && !Number.isNaN(signal)) {
-        expect(result.histogram[index]).toBeCloseTo(macd - signal, 9)
-      }
-    })
-  })
-})
-
-describe("wasm indicator engine (instance-driven, toggleable)", () => {
+describe("wasm indicator boundary", () => {
   const rising = Array.from({ length: 60 }, (_, index) => index + 1)
-  const columns = () => {
-    const values = Float64Array.from(rising)
-    return { high: values, low: values, close: values, volume: values }
-  }
 
   it("describes every indicator with targets, ranges, and guides", () => {
-    const descriptors: IndicatorDescriptor[] = indicatorDescriptors()
+    const descriptors = indicatorDescriptors()
     expect(descriptors).toHaveLength(19)
     const sma = descriptors.find(descriptor => descriptor.id === "sma")
     expect(sma?.target).toBe("overlay")
@@ -78,43 +58,65 @@ describe("wasm indicator engine (instance-driven, toggleable)", () => {
     expect(divergence?.outputs).toHaveLength(0)
   })
 
-  it("computes an SMA aligned to the input length", () => {
-    const { high, low, close, volume } = columns()
-    const results: InstanceOutput[] = computeIndicators(
-      [{ id: "sma", params: { period: 5 } }],
-      high,
-      low,
-      close,
-      volume
-    )
-    const output = results[0]?.outputs[0]
-    expect(output?.key).toBe("sma")
-    expect(output?.values).toHaveLength(rising.length)
-    expect(output?.values[4]).toBeCloseTo(3, 9) // mean(1..5)
+  it("serializes every registered default instance across the boundary", () => {
+    const descriptors = indicatorDescriptors()
+    const instances: IndicatorInstance[] = descriptors.map(descriptor => ({ id: descriptor.id, params: {} }))
+    const values = Array.from({ length: 600 }, (_, index) => 100 + index * 0.05 + Math.sin(index / 9) * 4)
+    const { high, low, close, volume } = columns(values)
+    const results = computeIndicators(instances, { high, low, close, volume })
+
+    expect(results).toHaveLength(descriptors.length)
+    results.forEach((result, index) => {
+      const descriptor = descriptors[index]
+      if (descriptor === undefined) throw new Error(`missing descriptor at index ${index}`)
+      expect(result.outputs.map(output => output.key)).toEqual(descriptor.outputs.map(output => output.key))
+      result.outputs.forEach(output => expect(output.values).toHaveLength(values.length))
+    })
   })
 
-  it("matches analyze() for RSI — shared Rust code, no drift", () => {
-    const { high, low, close, volume } = columns()
-    const results: InstanceOutput[] = computeIndicators(
-      [{ id: "rsi", params: { period: 14 } }],
-      high,
-      low,
-      close,
-      volume
-    )
-    const engineRsi = results[0]?.outputs[0]?.values ?? []
-    const analyzed: Analysis = analyzeSeries(Float64Array.from(rising), config)
-    engineRsi.forEach((value, index) => {
-      const reference = analyzed.rsi[index]
-      if (!Number.isNaN(value) && reference !== undefined && !Number.isNaN(reference)) {
-        expect(value).toBeCloseTo(reference, 9)
+  it("computes an SMA aligned to the input length", () => {
+    const output = series(computeOne("sma", { period: 5 }, rising), "sma")
+    expect(output).toHaveLength(rising.length)
+    expect(output[4]).toBeCloseTo(3, 9)
+  })
+
+  it("saturates RSI at 100 on an uninterrupted rise", () => {
+    const values = series(computeOne("rsi", { period: 14 }, rising), "rsi").filter(value => !Number.isNaN(value))
+    expect(values.at(-1)).toBeCloseTo(100, 9)
+  })
+
+  it("keeps MACD outputs aligned and derives the histogram from signal", () => {
+    const output = computeOne("macd", { fast: 12, slow: 26, signal: 9 }, rising)
+    const macd = series(output, "macd")
+    const signal = series(output, "signal")
+    const histogram = series(output, "histogram")
+    expect(macd).toHaveLength(rising.length)
+    expect(signal).toHaveLength(rising.length)
+    expect(histogram).toHaveLength(rising.length)
+    expect(macd.filter(value => !Number.isNaN(value)).at(-1)).toBeGreaterThan(0)
+    macd.forEach((value, index) => {
+      const signalValue = signal[index]
+      const histogramValue = histogram[index]
+      if (
+        !Number.isNaN(value) &&
+        signalValue !== undefined &&
+        !Number.isNaN(signalValue) &&
+        histogramValue !== undefined
+      ) {
+        expect(histogramValue).toBeCloseTo(value - signalValue, 9)
       }
     })
   })
 
-  it("yields no outputs for an unknown id", () => {
-    const { high, low, close, volume } = columns()
-    const results: InstanceOutput[] = computeIndicators([{ id: "nope", params: {} }], high, low, close, volume)
-    expect(results[0]?.outputs).toHaveLength(0)
+  it("finds no default divergence in a monotonic trend", () => {
+    const values = Array.from({ length: 200 }, (_, index) => index + 1)
+    expect(computeOne("rsiDivergence", {}, values).divergences).toEqual([])
+    expect(computeOne("macdDivergence", {}, values).divergences).toEqual([])
+  })
+
+  it("returns an empty result for an unknown indicator", () => {
+    const output = computeOne("nope", {}, rising)
+    expect(output.outputs).toEqual([])
+    expect(output.divergences).toEqual([])
   })
 })

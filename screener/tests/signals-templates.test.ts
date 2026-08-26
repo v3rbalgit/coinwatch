@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest"
 
-import type { IndicatorDescriptor, IndicatorParam } from "$lib/chart/indicators"
+import type { IndicatorDescriptor } from "$lib/chart/indicators"
 import type { SignalTimeframe } from "$lib/signals/definition"
 import { compileSignalDraft } from "$lib/signals/draft"
 import { buildSignalTemplate, SIGNAL_TEMPLATES } from "$lib/signals/templates"
+
+type IndicatorParam = IndicatorDescriptor["params"][number]
 
 function parameter(key: string, defaultValue: number): IndicatorParam {
   return { key, label: key, default: defaultValue, min: 1, max: 500, step: 1 }

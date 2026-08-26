@@ -16,7 +16,6 @@ repository = "https://github.com/v3rbalgit/coinwatch"
 domain = { path = "crates/domain", version = "0.1.0" }
 hl-feed = { path = "crates/hl-feed", version = "0.1.0" }
 indicators = { path = "crates/indicators", version = "0.1.0" }
-scanner = { path = "crates/scanner", version = "0.1.0" }
 signals = { path = "crates/signals", version = "0.1.0" }
 storage = { path = "crates/storage", version = "0.1.0" }
 
