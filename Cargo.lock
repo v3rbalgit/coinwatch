@@ -2139,7 +2139,6 @@ name = "indicators-wasm"
 version = "0.1.0"
 dependencies = [
  "indicators",
- "serde",
  "serde-wasm-bindgen",
  "wasm-bindgen",
 ]
@@ -3582,18 +3581,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "scanner"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "domain",
- "hl-feed",
- "indicators",
- "rust_decimal",
- "serde",
-]
-
-[[package]]
 name = "schannel"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3671,7 +3658,6 @@ dependencies = [
  "reqwest",
  "rust_decimal",
  "rustls",
- "scanner",
  "serde",
  "serde_json",
  "signals",

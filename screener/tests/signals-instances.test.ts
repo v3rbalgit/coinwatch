@@ -1,12 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import type { IndicatorDescriptor } from "$lib/chart/indicators"
-import {
-  applyIndicatorPreset,
-  createIndicatorInstance,
-  resolveIndicatorInstance,
-  resolveIndicatorParams,
-} from "$lib/signals/instances"
+import { applyIndicatorPreset, createIndicatorInstance } from "$lib/signals/instances"
 
 const descriptor: IndicatorDescriptor = {
   id: "macd",
@@ -29,24 +24,14 @@ const descriptor: IndicatorDescriptor = {
 describe("signal indicator instances", () => {
   it("fills every descriptor default into a fresh parameter map", () => {
     const supplied = { fast: 8 }
-    const resolved = resolveIndicatorParams(descriptor, supplied)
+    const instance = createIndicatorInstance(descriptor, supplied)
 
-    expect(resolved).toEqual({ fast: 8, slow: 26, signal: 9 })
-    expect(resolved).not.toBe(supplied)
-    expect(createIndicatorInstance(descriptor, supplied)).toEqual({
-      id: "macd",
-      params: { fast: 8, slow: 26, signal: 9 },
-    })
+    expect(instance).toEqual({ id: "macd", params: { fast: 8, slow: 26, signal: 9 } })
+    expect(instance.params).not.toBe(supplied)
   })
 
-  it("rejects unknown parameter keys and mismatched descriptors", () => {
-    expect(() => resolveIndicatorParams(descriptor, { typo: 8 })).toThrow("Unknown parameter 'typo'")
-    expect(() =>
-      resolveIndicatorInstance(descriptor, {
-        id: "rsi",
-        params: { period: 14 },
-      })
-    ).toThrow("does not match descriptor")
+  it("rejects unknown parameter keys", () => {
+    expect(() => createIndicatorInstance(descriptor, { typo: 8 })).toThrow("Unknown parameter 'typo'")
   })
 
   it("copies preset values without retaining identity or aliases", () => {

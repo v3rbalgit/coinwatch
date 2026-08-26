@@ -3,7 +3,7 @@
 use serde::Serialize;
 use strum::Display;
 
-use crate::pivot::{PivotKind, pivots};
+use crate::pivot::{Pivot, PivotKind, pivots};
 
 /// Regular (reversal) versus hidden (continuation) divergence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Display)]
@@ -25,19 +25,43 @@ pub enum DivergenceDirection {
 
 /// A divergence spanning two consecutive same-kind pivots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Divergence {
+pub(crate) struct Divergence {
     /// Reversal or continuation.
-    pub kind: DivergenceKind,
+    pub(crate) kind: DivergenceKind,
     /// Bullish or bearish.
-    pub direction: DivergenceDirection,
+    pub(crate) direction: DivergenceDirection,
     /// Index of the earlier pivot.
-    pub prior_index: usize,
+    pub(crate) prior_index: usize,
     /// Index of the later pivot.
-    pub recent_index: usize,
+    pub(crate) recent_index: usize,
 }
 
-/// Detect divergences between `price` and an aligned `oscillator` (e.g. the output
-/// of [`rsi`](crate::rsi)). Price swing pivots — found with `left`/`right` bars of
+fn divergence_for_pair(
+    prior: &Pivot,
+    recent: &Pivot,
+    prior_oscillator: f64,
+    recent_oscillator: f64,
+) -> Option<Divergence> {
+    use DivergenceDirection::{Bearish, Bullish};
+    use DivergenceKind::{Hidden, Regular};
+
+    let (kind, direction) = match prior.kind {
+        PivotKind::Low if recent.value < prior.value && recent_oscillator > prior_oscillator => (Regular, Bullish),
+        PivotKind::Low if recent.value > prior.value && recent_oscillator < prior_oscillator => (Hidden, Bullish),
+        PivotKind::High if recent.value > prior.value && recent_oscillator < prior_oscillator => (Regular, Bearish),
+        PivotKind::High if recent.value < prior.value && recent_oscillator > prior_oscillator => (Hidden, Bearish),
+        PivotKind::Low | PivotKind::High => return None,
+    };
+    Some(Divergence {
+        kind,
+        direction,
+        prior_index: prior.index,
+        recent_index: recent.index,
+    })
+}
+
+/// Detect divergences between `price` and an aligned oscillator. Price swing
+/// pivots — found with `left`/`right` bars of
 /// confirmation — are compared against the oscillator's value at the same bars;
 /// consecutive same-kind pivots more than `max_gap` bars apart are ignored.
 ///
@@ -46,76 +70,32 @@ pub struct Divergence {
 /// - Regular bearish: price higher high, oscillator lower high.
 /// - Hidden bearish: price lower high, oscillator higher high.
 #[must_use]
-pub fn detect_divergences(
+pub(crate) fn detect_divergences(
     price: &[f64],
     oscillator: &[Option<f64>],
     left: usize,
     right: usize,
     max_gap: usize,
 ) -> Vec<Divergence> {
-    use DivergenceDirection::{Bearish, Bullish};
-    use DivergenceKind::{Hidden, Regular};
-
     let all = pivots(price, left, right);
-    let lows: Vec<&_> = all.iter().filter(|p| p.kind == PivotKind::Low).collect();
-    let highs: Vec<&_> = all.iter().filter(|p| p.kind == PivotKind::High).collect();
-    let mut out = Vec::new();
+    let lows: Vec<&_> = all.iter().filter(|pivot| pivot.kind == PivotKind::Low).collect();
+    let highs: Vec<&_> = all.iter().filter(|pivot| pivot.kind == PivotKind::High).collect();
 
-    for pair in lows.windows(2) {
-        let [prior, recent] = pair else { continue };
-        if recent.index.saturating_sub(prior.index) > max_gap {
-            continue;
-        }
-        let (Some(&Some(prior_osc)), Some(&Some(recent_osc))) =
-            (oscillator.get(prior.index), oscillator.get(recent.index))
-        else {
-            continue;
-        };
-        if recent.value < prior.value && recent_osc > prior_osc {
-            out.push(Divergence {
-                kind: Regular,
-                direction: Bullish,
-                prior_index: prior.index,
-                recent_index: recent.index,
-            });
-        } else if recent.value > prior.value && recent_osc < prior_osc {
-            out.push(Divergence {
-                kind: Hidden,
-                direction: Bullish,
-                prior_index: prior.index,
-                recent_index: recent.index,
-            });
-        }
-    }
-
-    for pair in highs.windows(2) {
-        let [prior, recent] = pair else { continue };
-        if recent.index.saturating_sub(prior.index) > max_gap {
-            continue;
-        }
-        let (Some(&Some(prior_osc)), Some(&Some(recent_osc))) =
-            (oscillator.get(prior.index), oscillator.get(recent.index))
-        else {
-            continue;
-        };
-        if recent.value > prior.value && recent_osc < prior_osc {
-            out.push(Divergence {
-                kind: Regular,
-                direction: Bearish,
-                prior_index: prior.index,
-                recent_index: recent.index,
-            });
-        } else if recent.value < prior.value && recent_osc > prior_osc {
-            out.push(Divergence {
-                kind: Hidden,
-                direction: Bearish,
-                prior_index: prior.index,
-                recent_index: recent.index,
-            });
-        }
-    }
-
-    out
+    lows.windows(2)
+        .chain(highs.windows(2))
+        .filter_map(|pair| {
+            let [prior, recent] = pair else { return None };
+            if recent.index.saturating_sub(prior.index) > max_gap {
+                return None;
+            }
+            let (&Some(prior_oscillator), &Some(recent_oscillator)) =
+                (oscillator.get(prior.index)?, oscillator.get(recent.index)?)
+            else {
+                return None;
+            };
+            divergence_for_pair(prior, recent, prior_oscillator, recent_oscillator)
+        })
+        .collect()
 }
 
 #[cfg(test)]

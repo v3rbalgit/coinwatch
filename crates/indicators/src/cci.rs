@@ -1,5 +1,7 @@
 //! Commodity Channel Index (a momentum oscillator around zero).
 
+use crate::typical::typical_prices;
+
 /// Commodity Channel Index over `period`, aligned index-for-index with the input.
 ///
 /// Uses the typical price `(high + low + close) / 3`:
@@ -12,12 +14,7 @@ pub fn cci(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Vec<Optio
     if period == 0 {
         return out;
     }
-    let typical: Vec<f64> = high
-        .iter()
-        .zip(low)
-        .zip(close)
-        .map(|((high, low), close)| (high + low + close) / 3.0)
-        .collect();
+    let typical = typical_prices(high, low, close);
     let period_f = period as f64;
     for (index, window) in typical.windows(period).enumerate() {
         let mean = window.iter().sum::<f64>() / period_f;

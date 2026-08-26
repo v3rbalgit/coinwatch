@@ -47,7 +47,7 @@
   // `seed` changes when the whole series is replaced (coin / timeframe switch or a
   // history prepend), triggering a full setData + refit; otherwise bars flow in as
   // tail updates. Indicators are computed here from `bars` via the shared Rust
-  // engine (WASM), so they match the scanner and update per tick over any depth.
+  // engine (WASM), so they match signal evaluation and update per tick over any depth.
   const {
     bars,
     seed = 0,
@@ -768,7 +768,7 @@
     const low = Float64Array.from(bars, bar => bar.low)
     const close = Float64Array.from(bars, bar => bar.close)
     const volume = Float64Array.from(bars, bar => bar.volume)
-    const computed = computeIndicators(chosen, high, low, close, volume)
+    const computed = computeIndicators(chosen, { high, low, close, volume })
     latestComputed = computed
     latestChosen = chosen
     if (!hovering) readouts = readoutsFor(bars.length - 1)

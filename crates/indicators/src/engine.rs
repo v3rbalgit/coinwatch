@@ -13,11 +13,23 @@ use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, EnumCount, EnumString};
 use thiserror::Error;
 
-use crate::{
-    Adx, Bollinger, DivergenceDirection, DivergenceKind, Donchian, Macd, Stochastic, Supertrend, adx, atr, bollinger,
-    cci, detect_divergences, donchian, ema, macd, mfi, obv, psar, rsi, sma, stochastic, supertrend, vwap, williams_r,
-    wma,
-};
+use crate::adx::{Adx, adx};
+use crate::atr::atr;
+use crate::bollinger::{Bollinger, bollinger};
+use crate::cci::cci;
+use crate::divergence::{DivergenceDirection, DivergenceKind, detect_divergences};
+use crate::donchian::{Donchian, donchian};
+use crate::macd::{Macd, ema, macd};
+use crate::mfi::mfi;
+use crate::obv::obv;
+use crate::psar::psar;
+use crate::rsi::rsi;
+use crate::sma::sma;
+use crate::stochastic::{Stochastic, stochastic};
+use crate::supertrend::{Supertrend, supertrend};
+use crate::vwap::vwap;
+use crate::williams::williams_r;
+use crate::wma::wma;
 
 /// Where an indicator draws: over the price pane, or in its own pane below.
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -61,6 +73,38 @@ enum IndicatorId {
     Obv,
     RsiDivergence,
     MacdDivergence,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DivergenceOscillator {
+    Rsi,
+    Macd,
+}
+
+impl IndicatorId {
+    const fn divergence_oscillator(self) -> Option<DivergenceOscillator> {
+        match self {
+            Self::RsiDivergence => Some(DivergenceOscillator::Rsi),
+            Self::MacdDivergence => Some(DivergenceOscillator::Macd),
+            Self::Sma
+            | Self::Ema
+            | Self::Wma
+            | Self::Bollinger
+            | Self::Vwap
+            | Self::Donchian
+            | Self::Supertrend
+            | Self::Psar
+            | Self::Rsi
+            | Self::Macd
+            | Self::Stochastic
+            | Self::Williams
+            | Self::Cci
+            | Self::Mfi
+            | Self::Adx
+            | Self::Atr
+            | Self::Obv => None,
+        }
+    }
 }
 
 /// How one output series is plotted.
@@ -355,11 +399,14 @@ fn compute_divergences(instance: &Instance, data: &Ohlcv) -> Vec<DivergenceSpan>
     let Ok(indicator) = instance.id.parse::<IndicatorId>() else {
         return Vec::new();
     };
+    let Some(divergence) = indicator.divergence_oscillator() else {
+        return Vec::new();
+    };
     let params = &instance.params;
     let close = data.close;
-    let oscillator = match indicator {
-        IndicatorId::RsiDivergence => rsi(close, period(params, "period", 14.0)),
-        IndicatorId::MacdDivergence => {
+    let oscillator = match divergence {
+        DivergenceOscillator::Rsi => rsi(close, period(params, "period", 14.0)),
+        DivergenceOscillator::Macd => {
             macd(
                 close,
                 period(params, "fast", 12.0),
@@ -368,23 +415,6 @@ fn compute_divergences(instance: &Instance, data: &Ohlcv) -> Vec<DivergenceSpan>
             )
             .macd
         }
-        IndicatorId::Sma
-        | IndicatorId::Ema
-        | IndicatorId::Wma
-        | IndicatorId::Bollinger
-        | IndicatorId::Vwap
-        | IndicatorId::Donchian
-        | IndicatorId::Supertrend
-        | IndicatorId::Psar
-        | IndicatorId::Rsi
-        | IndicatorId::Macd
-        | IndicatorId::Stochastic
-        | IndicatorId::Williams
-        | IndicatorId::Cci
-        | IndicatorId::Mfi
-        | IndicatorId::Adx
-        | IndicatorId::Atr
-        | IndicatorId::Obv => return Vec::new(),
     };
     detect_divergences(
         close,
@@ -610,28 +640,14 @@ pub fn series_input_requirement(instance: &Instance, output: &str) -> Result<usi
 /// Parameters needed to derive an exact divergence-condition history requirement.
 pub fn divergence_input(instance: &Instance) -> Result<DivergenceInput, InstanceError> {
     let (indicator, descriptor) = validated_instance(instance)?;
-    let oscillator = match indicator {
-        IndicatorId::RsiDivergence => resolved_period(instance, descriptor, "period")? + 1,
-        IndicatorId::MacdDivergence => {
+    let divergence = indicator
+        .divergence_oscillator()
+        .ok_or_else(|| InstanceError::NotDivergence(instance.id.clone()))?;
+    let oscillator = match divergence {
+        DivergenceOscillator::Rsi => resolved_period(instance, descriptor, "period")? + 1,
+        DivergenceOscillator::Macd => {
             resolved_period(instance, descriptor, "fast")?.max(resolved_period(instance, descriptor, "slow")?)
         }
-        IndicatorId::Sma
-        | IndicatorId::Ema
-        | IndicatorId::Wma
-        | IndicatorId::Bollinger
-        | IndicatorId::Vwap
-        | IndicatorId::Donchian
-        | IndicatorId::Supertrend
-        | IndicatorId::Psar
-        | IndicatorId::Rsi
-        | IndicatorId::Macd
-        | IndicatorId::Stochastic
-        | IndicatorId::Williams
-        | IndicatorId::Cci
-        | IndicatorId::Mfi
-        | IndicatorId::Adx
-        | IndicatorId::Atr
-        | IndicatorId::Obv => return Err(InstanceError::NotDivergence(instance.id.clone())),
     };
     Ok(DivergenceInput {
         oscillator,
@@ -639,6 +655,14 @@ pub fn divergence_input(instance: &Instance) -> Result<DivergenceInput, Instance
         pivot_right: resolved_period(instance, descriptor, "pivotRight")?,
         max_gap: resolved_period(instance, descriptor, "maxGap")?,
     })
+}
+
+fn divergence_params() -> Vec<Param> {
+    vec![
+        param("pivotLeft", "Pivot left", 5.0, 1.0, 50.0, 1.0),
+        param("pivotRight", "Pivot right", 5.0, 1.0, 50.0, 1.0),
+        param("maxGap", "Max gap", 60.0, 1.0, 500.0, 1.0),
+    ]
 }
 
 fn build_descriptors() -> Vec<Descriptor> {
@@ -817,37 +841,37 @@ fn build_descriptors() -> Vec<Descriptor> {
             Vec::new(),
             vec![line("obv", "OBV", "#22c55e")],
         ),
-        Descriptor {
-            kind: DescriptorKind::Divergence,
-            ..descriptor(
-                IndicatorId::RsiDivergence,
-                "RSI Divergence",
-                Target::Overlay,
-                vec![
-                    period(14.0),
-                    param("pivotLeft", "Pivot left", 5.0, 1.0, 50.0, 1.0),
-                    param("pivotRight", "Pivot right", 5.0, 1.0, 50.0, 1.0),
-                    param("maxGap", "Max gap", 60.0, 1.0, 500.0, 1.0),
-                ],
-                Vec::new(),
-            )
+        {
+            let mut params = vec![period(14.0)];
+            params.extend(divergence_params());
+            Descriptor {
+                kind: DescriptorKind::Divergence,
+                ..descriptor(
+                    IndicatorId::RsiDivergence,
+                    "RSI Divergence",
+                    Target::Overlay,
+                    params,
+                    Vec::new(),
+                )
+            }
         },
-        Descriptor {
-            kind: DescriptorKind::Divergence,
-            ..descriptor(
-                IndicatorId::MacdDivergence,
-                "MACD Divergence",
-                Target::Overlay,
-                vec![
-                    param("fast", "Fast", 12.0, 1.0, 100.0, 1.0),
-                    param("slow", "Slow", 26.0, 1.0, 200.0, 1.0),
-                    param("signal", "Signal", 9.0, 1.0, 100.0, 1.0),
-                    param("pivotLeft", "Pivot left", 5.0, 1.0, 50.0, 1.0),
-                    param("pivotRight", "Pivot right", 5.0, 1.0, 50.0, 1.0),
-                    param("maxGap", "Max gap", 60.0, 1.0, 500.0, 1.0),
-                ],
-                Vec::new(),
-            )
+        {
+            let mut params = vec![
+                param("fast", "Fast", 12.0, 1.0, 100.0, 1.0),
+                param("slow", "Slow", 26.0, 1.0, 200.0, 1.0),
+                param("signal", "Signal", 9.0, 1.0, 100.0, 1.0),
+            ];
+            params.extend(divergence_params());
+            Descriptor {
+                kind: DescriptorKind::Divergence,
+                ..descriptor(
+                    IndicatorId::MacdDivergence,
+                    "MACD Divergence",
+                    Target::Overlay,
+                    params,
+                    Vec::new(),
+                )
+            }
         },
     ]
 }
@@ -858,6 +882,9 @@ mod tests {
     use std::slice;
 
     use strum::EnumCount;
+
+    use crate::divergence::detect_divergences;
+    use crate::rsi::rsi;
 
     use super::{
         DescriptorKind, IndicatorId, Instance, InstanceError, Ohlcv, compute, descriptors, divergence_input,
@@ -1048,7 +1075,6 @@ mod tests {
 
     #[test]
     fn rsi_divergence_matches_detect_divergences_and_has_no_series() {
-        use crate::{detect_divergences, rsi};
         let close: Vec<f64> = (0..120)
             .map(|index| 100.0 + (f64::from(index) / 7.0).sin() * 15.0 - f64::from(index) * 0.05)
             .collect();

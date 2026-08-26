@@ -1,5 +1,7 @@
 //! Money Flow Index (a volume-weighted momentum oscillator), bounded 0–100.
 
+use crate::typical::typical_prices;
+
 /// Money Flow Index over `period`, aligned index-for-index with the input.
 ///
 /// Uses the typical price `(high + low + close) / 3` and raw money flow
@@ -14,12 +16,7 @@ pub fn mfi(high: &[f64], low: &[f64], close: &[f64], volume: &[f64], period: usi
     if period == 0 {
         return out;
     }
-    let typical: Vec<f64> = high
-        .iter()
-        .zip(low)
-        .zip(close)
-        .map(|((high, low), close)| (high + low + close) / 3.0)
-        .collect();
+    let typical = typical_prices(high, low, close);
 
     let mut positive = vec![0.0; len];
     let mut negative = vec![0.0; len];

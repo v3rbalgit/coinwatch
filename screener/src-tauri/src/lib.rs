@@ -1,9 +1,9 @@
 //! Hyperliquid market screener — Tauri backend.
 //!
-//! The market sync engine keeps a hot [`MarketStore`] cache warm from Hyperliquid;
-//! commands read that cache and compute on demand (screener metrics, divergence
-//! scans), so the UI never waits on the network. Live mids stream in over the
-//! WebSocket and are relayed to the frontend as `mid` events.
+//! The market sync engine keeps a hot [`MarketStore`] cache warm from Hyperliquid.
+//! Commands expose live metadata, candle history, user data, and personal signal
+//! evaluation. Live mids stream over the WebSocket and are relayed to the frontend
+//! as `mid` events.
 
 mod indicator_presets;
 mod signal_catalog;
@@ -18,9 +18,7 @@ use hl_feed::{
     CandleHistory, ConnectionState, HyperliquidAdapter, HyperliquidRest, MarketEvent, MarketStatus, MarketStore,
     SyncConfig, SyncPhase, spawn_sync,
 };
-use indicators::{DivergenceDirection, DivergenceKind};
 use rust_decimal::prelude::ToPrimitive;
-use scanner::{ScanConfig, Signal, SignalSource, scan_coin as scan_one, scan_universe};
 use serde::Serialize;
 use storage::{CandleStore, ListView, SqliteStore};
 use tauri::{Emitter, Manager};
@@ -96,52 +94,6 @@ impl From<&MarketStatus> for StatusPayload {
             fetch_rate: status.fetch_rate,
         }
     }
-}
-
-/// A divergence setup forwarded to the frontend as a `scan:signal` event.
-#[derive(Clone, Serialize)]
-struct SignalPayload {
-    coin: String,
-    timeframe: Timeframe,
-    source: SignalSource,
-    kind: DivergenceKind,
-    direction: DivergenceDirection,
-    at: String,
-}
-
-impl From<&Signal> for SignalPayload {
-    fn from(signal: &Signal) -> Self {
-        Self {
-            coin: signal.coin.clone(),
-            timeframe: signal.timeframe,
-            source: signal.source,
-            kind: signal.kind,
-            direction: signal.direction,
-            at: signal.at.to_rfc3339(),
-        }
-    }
-}
-
-/// Scan the cached universe for fresh divergences and stream them to the UI.
-/// Pure CPU over the hot cache — returns in milliseconds.
-#[tauri::command]
-fn start_scan(app: tauri::AppHandle, store: tauri::State<'_, Arc<MarketStore>>) -> Result<(), String> {
-    let signals = scan_universe(store.inner(), &ScanConfig::default());
-    let _ = app.emit("scan:started", signals.len());
-    for signal in &signals {
-        let _ = app.emit("scan:signal", SignalPayload::from(signal));
-    }
-    let _ = app.emit("scan:done", signals.len());
-    Ok(())
-}
-
-/// Scan a single coin for fresh divergences.
-#[tauri::command]
-fn scan_coin(store: tauri::State<'_, Arc<MarketStore>>, coin: String) -> Vec<SignalPayload> {
-    scan_one(store.inner(), &coin, &ScanConfig::default())
-        .iter()
-        .map(SignalPayload::from)
-        .collect()
 }
 
 /// A candle in the shape lightweight-charts expects: epoch-second time, numeric OHLCV.
@@ -434,8 +386,6 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             screener_rows,
-            start_scan,
-            scan_coin,
             open_on_hyperliquid,
             lists,
             create_list,

@@ -58,8 +58,8 @@
   let seed = $state(0)
   let meta = $state<Row | null>(null)
   let livePrice = $state<number | null>(null)
-  // Which indicators the chart shows; seeded with the scanner's signals, then the
-  // user toggles the rest via the chart's picker.
+  // Seed the chart with the core momentum and divergence set; the user toggles
+  // additional instances through the chart picker.
   let indicatorInstances = $state<IndicatorInstance[]>([
     { id: "rsi", params: {} },
     { id: "macd", params: {} },

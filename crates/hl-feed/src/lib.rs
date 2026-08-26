@@ -30,13 +30,12 @@ pub use sync::{SyncConfig, spawn_sync};
 /// Candles retained per (coin, timeframe): the indicator hot working window,
 /// shared by the DB seed, REST backfill depth, and in-memory cap.
 ///
-/// Derived from the shipped scanner parameters (MACD 26/9, RSI 14, 5-bar pivots, max_gap 60,
-/// recent_within 3): the freshest reported divergence reaches back
-/// recent_within(3) + pivot_right(5) + max_gap(60) = 68 bars, and its oscillator
-/// values need MACD's slow-EMA(26) warmup (~90 bars to under 1% seed influence),
-/// so ~158 bars are load-bearing. 200 adds ~25% margin so the oldest usable bars
-/// are comfortably converged. Deeper chart history lives in the DB, not memory;
-/// user-defined signals needing more history require a separate validated contract.
+/// The built-in divergence template reaches back 68 bars (freshness 3 + pivot-right
+/// 5 + max-gap 60); the default MACD slow EMA needs about 90 more bars to reduce seed
+/// influence below 1%. The resulting ~158-bar working set plus ~25% headroom gives
+/// 200. Custom definitions calculate their exact completed-bar requirements and
+/// hydrate older SQLite/REST history through `CandleHistory`, so this is a performance
+/// boundary rather than a validity limit.
 pub(crate) const CANDLE_WINDOW: usize = 200;
 
 #[cfg(test)]

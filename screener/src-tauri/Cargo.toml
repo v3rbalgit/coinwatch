@@ -25,7 +25,6 @@ serde_json = { workspace = true }
 domain = { workspace = true }
 hl-feed = { workspace = true }
 indicators = { workspace = true }
-scanner = { workspace = true }
 signals = { workspace = true }
 storage = { workspace = true }
 tokio = { workspace = true }

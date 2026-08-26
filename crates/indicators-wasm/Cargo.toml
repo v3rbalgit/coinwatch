@@ -1,6 +1,6 @@
 [package]
 name = "indicators-wasm"
-description = "WebAssembly bindings for the indicators crate: one engine for the chart and the scanner."
+description = "WebAssembly bindings for the shared indicator engine."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,7 +10,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 indicators = { workspace = true }
-serde = { workspace = true }
 wasm-bindgen = "0.2"
 serde-wasm-bindgen = "0.6"
 
