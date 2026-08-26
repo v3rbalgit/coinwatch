@@ -25,11 +25,11 @@
     type PaneLayoutEntry,
     type ToolbarPosition,
   } from "$lib/chart/settings"
-  import { fmtPrice } from "$lib/chart/theme"
   import type { Bar } from "$lib/chart/types"
   import Button from "$lib/components/ui/button.svelte"
   import CoinIcon from "$lib/components/ui/coin-icon.svelte"
   import Skeleton from "$lib/components/ui/skeleton.svelte"
+  import { formatCompactNumber, formatPrice } from "$lib/format"
 
   type Row = {
     coin: string
@@ -292,14 +292,6 @@
   const price = $derived(livePrice ?? meta?.price ?? 0)
   const change = $derived(meta && meta.prev_day > 0 ? (price / meta.prev_day - 1) * 100 : 0)
   const hasPrice = $derived(livePrice !== null || meta !== null)
-  const fmtUsd = (n: number) =>
-    n >= 1e9
-      ? (n / 1e9).toFixed(2) + "B"
-      : n >= 1e6
-        ? (n / 1e6).toFixed(1) + "M"
-        : n >= 1e3
-          ? (n / 1e3).toFixed(0) + "k"
-          : n.toFixed(0)
 </script>
 
 <div class="flex h-full flex-col gap-3 p-4">
@@ -311,7 +303,7 @@
     <CoinIcon {coin} size={28} />
     <h1 class="text-lg font-semibold text-foreground">{coin}</h1>
     {#if hasPrice}
-      <span class="text-lg text-foreground tabular-nums">{fmtPrice(price)}</span>
+      <span class="text-lg text-foreground tabular-nums">{formatPrice(price)}</span>
       <span
         class="tabular-nums {change > 0 ? 'text-green-500' : change < 0 ? 'text-red-500' : 'text-muted-foreground'}"
       >
@@ -338,8 +330,8 @@
 
   <div class="flex flex-shrink-0 items-center gap-6 text-xs text-muted-foreground">
     {#if meta}
-      <span>Vol <span class="text-foreground tabular-nums">{fmtUsd(meta.volume_usd)}</span></span>
-      <span>OI <span class="text-foreground tabular-nums">{fmtUsd(meta.open_interest_usd)}</span></span>
+      <span>Vol <span class="text-foreground tabular-nums">{formatCompactNumber(meta.volume_usd)}</span></span>
+      <span>OI <span class="text-foreground tabular-nums">{formatCompactNumber(meta.open_interest_usd)}</span></span>
       <span>
         Funding
         <span

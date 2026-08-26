@@ -28,6 +28,8 @@
   } from "lightweight-charts"
   import { onMount } from "svelte"
 
+  import { formatCompactNumber, formatPrice } from "$lib/format"
+
   import { DrawingInteraction } from "./drawings/interaction"
   import { DrawingsPrimitive } from "./drawings/primitive"
   import { DrawingStore } from "./drawings/store"
@@ -41,7 +43,7 @@
     type InstanceOutput,
   } from "./indicators"
   import { PRICE_PANE_LAYOUT_ID, type PaneLayoutEntry, type ToolbarPosition } from "./settings"
-  import { chartTheme, fmtPrice } from "./theme"
+  import { chartTheme } from "./theme"
   import type { Bar } from "./types"
 
   // `seed` changes when the whole series is replaced (coin / timeframe switch or a
@@ -144,14 +146,6 @@
   const contextMenuItem =
     "flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-foreground hover:bg-accent/70 disabled:opacity-40"
 
-  const fmtVol = (value: number) =>
-    value >= 1e9
-      ? (value / 1e9).toFixed(2) + "B"
-      : value >= 1e6
-        ? (value / 1e6).toFixed(1) + "M"
-        : value >= 1e3
-          ? (value / 1e3).toFixed(0) + "k"
-          : value.toFixed(0)
   const fmtReadout = (value: number) =>
     Math.abs(value) >= 100 ? value.toFixed(0) : Math.abs(value) >= 1 ? value.toFixed(2) : value.toFixed(4)
 
@@ -898,11 +892,11 @@
       <div
         class="pointer-events-none absolute top-2 left-2 z-10 flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-muted-foreground tabular-nums"
       >
-        <span>O <span class="text-foreground">{fmtPrice(legend.open)}</span></span>
-        <span>H <span class="text-foreground">{fmtPrice(legend.high)}</span></span>
-        <span>L <span class="text-foreground">{fmtPrice(legend.low)}</span></span>
-        <span>C <span class="text-foreground">{fmtPrice(legend.close)}</span></span>
-        <span>V <span class="text-foreground">{fmtVol(legend.volume)}</span></span>
+        <span>O <span class="text-foreground">{formatPrice(legend.open)}</span></span>
+        <span>H <span class="text-foreground">{formatPrice(legend.high)}</span></span>
+        <span>L <span class="text-foreground">{formatPrice(legend.low)}</span></span>
+        <span>C <span class="text-foreground">{formatPrice(legend.close)}</span></span>
+        <span>V <span class="text-foreground">{formatCompactNumber(legend.volume)}</span></span>
         <span class={legend.change > 0 ? "text-green-500" : legend.change < 0 ? "text-red-500" : ""}>
           {legend.change >= 0 ? "+" : ""}{legend.change.toFixed(2)}%
         </span>

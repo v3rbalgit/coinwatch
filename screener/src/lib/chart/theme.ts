@@ -26,8 +26,3 @@ export function withAlpha(hex: string, alpha: number): string {
   if (hex.length !== 7 || Number.isNaN(value)) return hex
   return `rgba(${(value >> 16) & 255}, ${(value >> 8) & 255}, ${value & 255}, ${alpha})`
 }
-
-/** Format a price with magnitude-appropriate precision. */
-export function fmtPrice(n: number): string {
-  return n >= 100 ? n.toFixed(2) : n >= 1 ? n.toFixed(3) : n.toPrecision(4)
-}
