@@ -10,6 +10,30 @@ export interface Viewport {
   height: number
 }
 
+export interface Bounds {
+  min: Px
+  max: Px
+}
+
+export function boundingBox(points: readonly Px[]): Bounds | null {
+  const first = points[0]
+  if (!first) return null
+  const min = { ...first }
+  const max = { ...first }
+  for (const point of points) {
+    min.x = Math.min(min.x, point.x)
+    min.y = Math.min(min.y, point.y)
+    max.x = Math.max(max.x, point.x)
+    max.y = Math.max(max.y, point.y)
+  }
+  return { min, max }
+}
+
+/** Endpoint of a channel rail through `offset`, parallel to a–b. */
+export function parallelEndpoint(a: Px, b: Px, offset: Px): Px {
+  return { x: offset.x + (b.x - a.x), y: offset.y + (b.y - a.y) }
+}
+
 /** Distance from cursor to the closest point of segment a–b. */
 export function distToSegment(cursor: Px, a: Px, b: Px): number {
   const dx = b.x - a.x
@@ -21,14 +45,20 @@ export function distToSegment(cursor: Px, a: Px, b: Px): number {
   return Math.hypot(cursor.x - px, cursor.y - py)
 }
 
+function rayAxisScale(origin: number, delta: number, extent: number): number {
+  if (delta === 0) return Number.POSITIVE_INFINITY
+  const distance = delta > 0 ? extent - origin : -origin
+  return distance / delta
+}
+
 /** Endpoint of the ray from a through b, extended to the viewport edge. */
 export function extendRay(a: Px, b: Px, viewport: Viewport): Px {
   const dx = b.x - a.x
   const dy = b.y - a.y
   if (dx === 0 && dy === 0) return b
   // Scale the direction until it leaves the viewport on every axis it moves along.
-  const scaleX = dx !== 0 ? (dx > 0 ? viewport.width - a.x : -a.x) / dx : Number.POSITIVE_INFINITY
-  const scaleY = dy !== 0 ? (dy > 0 ? viewport.height - a.y : -a.y) / dy : Number.POSITIVE_INFINITY
+  const scaleX = rayAxisScale(a.x, dx, viewport.width)
+  const scaleY = rayAxisScale(a.y, dy, viewport.height)
   const scale = Math.max(1, Math.min(scaleX, scaleY))
   return { x: a.x + dx * scale, y: a.y + dy * scale }
 }
