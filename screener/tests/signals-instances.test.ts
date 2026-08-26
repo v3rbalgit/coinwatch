@@ -8,6 +8,7 @@ const descriptor: IndicatorDescriptor = {
   label: "MACD",
   kind: "series",
   outputDomain: "unboundedOscillator",
+  supportsSignals: true,
   target: "pane",
   params: [
     { key: "fast", label: "Fast", default: 12, min: 1, max: 100, step: 1 },

@@ -45,7 +45,9 @@
     onDeletePreset: (id: string) => void
   } = $props()
 
-  const seriesDescriptors = $derived(descriptors.filter(descriptor => descriptor.kind === "series"))
+  const seriesDescriptors = $derived(
+    descriptors.filter(descriptor => descriptor.kind === "series" && descriptor.supportsSignals)
+  )
   const compatibleSeriesDescriptors = $derived(
     seriesDescriptors.filter(
       descriptor =>

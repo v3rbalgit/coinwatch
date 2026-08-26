@@ -85,6 +85,14 @@ pub enum DefinitionError {
         /// Indicator id.
         indicator: String,
     },
+    /// An indicator's value depends on an undefined history anchor.
+    #[error("condition '{condition}' uses indicator '{indicator}', which has no stable signal-history semantics")]
+    IndicatorNotSignalCompatible {
+        /// Condition id.
+        condition: String,
+        /// Indicator id.
+        indicator: String,
+    },
     /// An output operand does not exist on the selected indicator.
     #[error("condition '{condition}' references unknown output '{output}' of '{indicator}'")]
     UnknownOutput {
@@ -376,6 +384,7 @@ pub struct Condition {
     pub within_bars: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConditionRequirement {
     pub(crate) completed_bars: usize,
     pub(crate) confirmation_bars: usize,
@@ -619,6 +628,12 @@ fn validate_condition(id: &str, condition: &Condition) -> Result<(), DefinitionE
                     indicator: descriptor.id.clone(),
                 });
             }
+            if !descriptor.supports_signals {
+                return Err(DefinitionError::IndicatorNotSignalCompatible {
+                    condition: id.to_owned(),
+                    indicator: descriptor.id.clone(),
+                });
+            }
         }
     }
     Ok(())
@@ -687,6 +702,12 @@ fn validate_operand(id: &str, operand: &Operand) -> Result<Option<ValueDomain>, 
             })?;
             if descriptor.kind != DescriptorKind::Series {
                 return Err(DefinitionError::SeriesRequiresSeriesIndicator {
+                    condition: id.to_owned(),
+                    indicator: descriptor.id.clone(),
+                });
+            }
+            if !descriptor.supports_signals {
+                return Err(DefinitionError::IndicatorNotSignalCompatible {
                     condition: id.to_owned(),
                     indicator: descriptor.id.clone(),
                 });
@@ -964,6 +985,24 @@ mod tests {
             right: Operand::Constant { value: 80.0 },
         };
         assert!(matches!(bad_output.validate(), Err(DefinitionError::UnknownOutput { .. })));
+
+        let mut cumulative = definition(Node::Condition { id: "hot".to_owned() });
+        cumulative.conditions.get_mut("hot").expect("fixture condition").predicate = Predicate::Threshold {
+            left: Operand::Indicator {
+                instance: Instance {
+                    id: "vwap".to_owned(),
+                    params: BTreeMap::new(),
+                },
+                output: "vwap".to_owned(),
+                adjustment: None,
+            },
+            op: ComparisonOp::GreaterThan,
+            right: Operand::Constant { value: 80.0 },
+        };
+        assert!(matches!(
+            cumulative.validate(),
+            Err(DefinitionError::IndicatorNotSignalCompatible { indicator, .. }) if indicator == "vwap"
+        ));
     }
 
     #[test]

@@ -47,14 +47,18 @@ function operandValidationMessage(operand: Operand, descriptors: readonly Indica
   if (operand.adjustment !== undefined && !Number.isFinite(operand.adjustment.value)) {
     return "Source adjustments must be finite numbers."
   }
-  return operand.type === "indicator"
-    ? instanceValidationMessage({
-        id: operand.instance.id,
-        params: operand.instance.params,
-        expectedKind: "series",
-        output: operand.output,
-        descriptors,
-      })
+  if (operand.type !== "indicator") return null
+  const issue = instanceValidationMessage({
+    id: operand.instance.id,
+    params: operand.instance.params,
+    expectedKind: "series",
+    output: operand.output,
+    descriptors,
+  })
+  if (issue !== null) return issue
+  const descriptor = descriptors.find(candidate => candidate.id === operand.instance.id)
+  return descriptor?.supportsSignals === false
+    ? `${descriptor.label} cannot be used in signals until it has stable history anchoring.`
     : null
 }
 
@@ -141,6 +145,10 @@ export function draftValidationMessage(draft: SignalDraft, descriptors: readonly
         descriptors,
       })
       if (issue !== null) return `Condition ${index + 1}: ${issue}`
+      const descriptor = descriptors.find(candidate => candidate.id === predicate.instance.id)
+      if (descriptor?.supportsSignals === false) {
+        return `Condition ${index + 1}: ${descriptor.label} cannot be used in signals until it has stable history anchoring.`
+      }
       continue
     }
     if (predicate.left.type === "constant" && predicate.right.type === "constant") {

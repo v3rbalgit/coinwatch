@@ -106,6 +106,10 @@ impl IndicatorId {
         }
     }
 
+    const fn supports_signals(self) -> bool {
+        !matches!(self, Self::Vwap | Self::Obv)
+    }
+
     const fn output_domain(self) -> ValueDomain {
         match self {
             Self::Sma
@@ -195,6 +199,8 @@ pub struct Descriptor {
     pub kind: DescriptorKind,
     /// Numeric family represented by the descriptor's outputs or divergence oscillator.
     pub output_domain: ValueDomain,
+    /// Whether values are stable under the signal engine's finite history contract.
+    pub supports_signals: bool,
     /// Overlay vs own pane.
     pub target: Target,
     /// Tunable params with defaults.
@@ -510,6 +516,7 @@ fn descriptor(id: IndicatorId, label: &str, target: Target, params: Vec<Param>, 
         label: label.to_owned(),
         kind: DescriptorKind::Series,
         output_domain: id.output_domain(),
+        supports_signals: id.supports_signals(),
         target,
         params,
         outputs,
@@ -977,6 +984,17 @@ mod tests {
         assert_eq!(domain("rsiDivergence"), ValueDomain::BoundedOscillator);
         assert_eq!(domain("macd"), ValueDomain::UnboundedOscillator);
         assert_eq!(domain("macdDivergence"), ValueDomain::UnboundedOscillator);
+
+        let supports_signals = |id: &str| {
+            descriptors()
+                .iter()
+                .find(|descriptor| descriptor.id == id)
+                .map(|descriptor| descriptor.supports_signals)
+                .expect("descriptor signal capability")
+        };
+        assert!(supports_signals("rsi"));
+        assert!(!supports_signals("vwap"));
+        assert!(!supports_signals("obv"));
     }
 
     #[test]
