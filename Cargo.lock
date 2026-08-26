@@ -4270,13 +4270,11 @@ dependencies = [
  "async-trait",
  "chrono",
  "domain",
- "rust_decimal",
  "serde",
  "sqlx",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
- "tracing",
 ]
 
 [[package]]
