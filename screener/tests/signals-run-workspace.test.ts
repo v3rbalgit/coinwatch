@@ -86,7 +86,9 @@ const evaluated: SignalRunEvent = {
       coin: "BTC",
       satisfied: true,
       triggeredAt: "2026-08-26T09:00:00Z",
-      conditions: { price: { status: "satisfied", lastTrueBar: "2026-08-26T09:00:00Z" } },
+      conditions: {
+        price: { status: "satisfied", lastTrueBar: "2026-08-26T09:00:00Z", evidence: null },
+      },
       missingData: [],
       unavailableData: {},
     },
@@ -169,6 +171,38 @@ describe("signal run workspace", () => {
     if (resolveStart === undefined) throw new Error("missing start resolver")
     resolveStart(7)
     await started
+  })
+
+  it("shows closest candidates automatically when a completed run has no matches", async () => {
+    const fake = fakeTransport()
+    const workspace = createSignalRunWorkspace(createSignalRunClient(fake.transport))
+    const started = workspace.start(snapshot())
+    fake.emit({ event: "started", data: { runId: 7, total: 1 } })
+    await started
+    fake.emit({
+      event: "evaluated",
+      data: {
+        runId: 7,
+        completed: 1,
+        total: 1,
+        report: {
+          coin: "BTC",
+          satisfied: false,
+          triggeredAt: null,
+          conditions: {
+            price: {
+              status: "notSatisfied",
+              lastTrueBar: null,
+              evidence: { type: "state", observedAt: "2026-08-26T09:00:00Z", left: 90, right: 100 },
+            },
+          },
+          missingData: [],
+          unavailableData: {},
+        },
+      },
+    })
+    fake.emit({ event: "completed", data: { runId: 7, completed: 1, total: 1, matched: 0 } })
+    expect(workspace.state.filter).toBe("closest")
   })
 
   it("does not restart while active and resets terminal results for a deliberate new run", async () => {

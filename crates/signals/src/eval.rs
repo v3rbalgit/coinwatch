@@ -41,6 +41,34 @@ pub enum OutcomeStatus {
     },
 }
 
+/// Numeric evidence captured at the bar most relevant to a condition verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum ConditionEvidence {
+    /// Values used by a state comparison.
+    State {
+        /// Open time of the observed completed candle.
+        observed_at: DateTime<Utc>,
+        /// Resolved left operand after any adjustment.
+        left: f64,
+        /// Resolved right operand after any adjustment.
+        right: f64,
+    },
+    /// Values on both sides immediately before and at a crossing candidate.
+    Cross {
+        /// Open time of the current completed candle.
+        observed_at: DateTime<Utc>,
+        /// Left operand on the preceding candle.
+        previous_left: f64,
+        /// Right operand on the preceding candle.
+        previous_right: f64,
+        /// Left operand on the current candle.
+        left: f64,
+        /// Right operand on the current candle.
+        right: f64,
+    },
+}
+
 /// Per-condition result, including evidence for "why did it fire".
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -50,6 +78,8 @@ pub struct ConditionOutcome {
     pub status: OutcomeStatus,
     /// Open time of the most recent bar where the predicate held, if any.
     pub last_true_bar: Option<DateTime<Utc>>,
+    /// Operand values at the most recent true bar, or at the latest bar when false.
+    pub evidence: Option<ConditionEvidence>,
 }
 
 /// Result of evaluating one signal against one coin.
@@ -271,6 +301,7 @@ pub(crate) fn evaluate_validated(
             ConditionOutcome {
                 status: OutcomeStatus::Unavailable,
                 last_true_bar: None,
+                evidence: None,
             }
         } else {
             match prepared.get(&condition.timeframe) {
@@ -283,6 +314,7 @@ pub(crate) fn evaluate_validated(
                 None => ConditionOutcome {
                     status: OutcomeStatus::NoData,
                     last_true_bar: None,
+                    evidence: None,
                 },
             }
         };
@@ -409,23 +441,79 @@ fn evaluate_condition(
                 available,
             },
             last_true_bar: None,
+            evidence: None,
         });
     }
 
     let mask = build_mask(condition, prepared, requirement.confirmation_bars);
     let window_len = condition.within_bars as usize + 1;
     let satisfied = mask.iter().rev().take(window_len).any(|&held| held);
-    let last_true_bar = mask
-        .iter()
-        .rposition(|&held| held)
+    let last_true_index = mask.iter().rposition(|&held| held);
+    let last_true_bar = last_true_index
         .and_then(|index| prepared.candles.get(index))
         .map(|candle| candle.open_time);
+    let evidence_index = if satisfied {
+        last_true_index
+    } else {
+        prepared.candles.len().checked_sub(1)
+    };
+    let evidence = evidence_index.and_then(|index| condition_evidence(condition, prepared, index));
     let status = if satisfied {
         OutcomeStatus::Satisfied
     } else {
         OutcomeStatus::NotSatisfied
     };
-    Ok(ConditionOutcome { status, last_true_bar })
+    Ok(ConditionOutcome {
+        status,
+        last_true_bar,
+        evidence,
+    })
+}
+
+fn operand_values(
+    left: &Operand,
+    right: &Operand,
+    prepared: &TimeframePrepared<'_>,
+    index: usize,
+) -> Option<(f64, f64)> {
+    let left = resolve_operand(left, prepared)
+        .value_at(index)
+        .filter(|value| value.is_finite())?;
+    let right = resolve_operand(right, prepared)
+        .value_at(index)
+        .filter(|value| value.is_finite())?;
+    Some((left, right))
+}
+
+fn condition_evidence(
+    condition: &Condition,
+    prepared: &TimeframePrepared<'_>,
+    index: usize,
+) -> Option<ConditionEvidence> {
+    let observed_at = prepared.candles.get(index)?.open_time;
+    match &condition.predicate {
+        Predicate::Threshold { left, right, .. } => {
+            let (left, right) = operand_values(left, right, prepared, index)?;
+            Some(ConditionEvidence::State {
+                observed_at,
+                left,
+                right,
+            })
+        }
+        Predicate::Cross { left, right, .. } => {
+            let previous = index.checked_sub(1)?;
+            let (previous_left, previous_right) = operand_values(left, right, prepared, previous)?;
+            let (left, right) = operand_values(left, right, prepared, index)?;
+            Some(ConditionEvidence::Cross {
+                observed_at,
+                previous_left,
+                previous_right,
+                left,
+                right,
+            })
+        }
+        Predicate::Divergence { .. } => None,
+    }
 }
 
 fn build_mask(condition: &Condition, prepared: &TimeframePrepared<'_>, confirmation_bars: usize) -> Vec<bool> {
@@ -511,7 +599,7 @@ mod tests {
     use rust_decimal::Decimal;
     use serde_json::json;
 
-    use super::{CoinData, ConditionOutcome, OutcomeStatus, evaluate};
+    use super::{CoinData, ConditionEvidence, ConditionOutcome, OutcomeStatus, evaluate};
     use crate::definition::{
         CandleField, ComparisonOp, Condition, CrossDirection, DEFINITION_VERSION, DefinitionError, Direction,
         DirectionFilter, KindFilter, Node, Operand, OperandAdjustment, Predicate, SignalDefinition,
@@ -722,6 +810,14 @@ mod tests {
                 .values()
                 .all(|outcome| outcome.status == OutcomeStatus::Satisfied)
         );
+        assert!(matches!(
+            report.conditions["rsi1h"].evidence,
+            Some(ConditionEvidence::State {
+                left: 100.0,
+                right: 70.0,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -767,6 +863,17 @@ mod tests {
 
         let report = evaluate(&signal, "BTC", &data).expect("valid cross signal");
         assert!(report.satisfied, "expected a close-over-SMA cross on the final bar");
+        assert!(matches!(
+            report.conditions["cross"].evidence,
+            Some(ConditionEvidence::Cross {
+                previous_left: 5.0,
+                previous_right,
+                left: 10.0,
+                right,
+                ..
+            }) if (previous_right - 25.0 / 3.0).abs() < f64::EPSILON
+                && (right - 25.0 / 3.0).abs() < f64::EPSILON
+        ));
     }
 
     #[test]
@@ -804,6 +911,7 @@ mod tests {
                     available: 7,
                 },
                 last_true_bar: None,
+                evidence: None,
             })
             .expect("serializable outcome"),
             json!({
@@ -811,11 +919,30 @@ mod tests {
                 "required": 12,
                 "available": 7,
                 "lastTrueBar": null,
+                "evidence": null,
             })
         );
         assert_eq!(
             serde_json::to_value(OutcomeStatus::Unavailable).expect("serializable status"),
             json!({ "status": "unavailable" })
+        );
+        assert_eq!(
+            serde_json::to_value(ConditionEvidence::Cross {
+                observed_at: Utc.timestamp_opt(7_200, 0).single().expect("timestamp"),
+                previous_left: 1.0,
+                previous_right: 2.0,
+                left: 3.0,
+                right: 4.0,
+            })
+            .expect("serializable evidence"),
+            json!({
+                "type": "cross",
+                "observedAt": "1970-01-01T02:00:00Z",
+                "previousLeft": 1.0,
+                "previousRight": 2.0,
+                "left": 3.0,
+                "right": 4.0,
+            })
         );
     }
 

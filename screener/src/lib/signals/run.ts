@@ -4,8 +4,20 @@ import type { SignalDefinition, SignalTimeframe } from "$lib/signals/definition"
 
 export type SignalRunScope = { type: "universe" } | { type: "coins"; coins: string[] }
 
+export type ConditionEvidence =
+  | { type: "state"; observedAt: string; left: number; right: number }
+  | {
+      type: "cross"
+      observedAt: string
+      previousLeft: number
+      previousRight: number
+      left: number
+      right: number
+    }
+
 export type ConditionOutcome = {
   lastTrueBar: string | null
+  evidence: ConditionEvidence | null
 } & (
   | { status: "satisfied" }
   | { status: "notSatisfied" }

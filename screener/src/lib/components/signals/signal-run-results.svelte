@@ -15,7 +15,12 @@
   import Badge from "$lib/components/ui/badge.svelte"
   import Button from "$lib/components/ui/button.svelte"
   import type { ConditionOutcome, EvalReport, SignalRunProgress } from "$lib/signals/run"
-  import { conditionEvidence, filterSignalRunReports, reportHasDataIssues } from "$lib/signals/run-results"
+  import {
+    conditionEvidence,
+    filterSignalRunReports,
+    rankClosestSignalRunReports,
+    reportHasDataIssues,
+  } from "$lib/signals/run-results"
   import type { SignalRunResultFilter } from "$lib/signals/run-results"
   import type { SignalRunSnapshot } from "$lib/signals/run-workspace.svelte"
 
@@ -47,11 +52,14 @@
 
   const filters: readonly { value: SignalRunResultFilter; label: string }[] = [
     { value: "matches", label: "Matches" },
+    { value: "closest", label: "Closest" },
     { value: "all", label: "All evaluated" },
     { value: "issues", label: "Data issues" },
   ]
-  const filteredReports = $derived(filterSignalRunReports(reports, filter))
+  const filteredReports = $derived(filterSignalRunReports(snapshot.definition, reports, filter))
+  const closestCount = $derived(Math.min(20, rankClosestSignalRunReports(snapshot.definition, reports).length))
   const issueCount = $derived(reports.filter(reportHasDataIssues).length)
+  const conditionCount = $derived(Object.keys(snapshot.definition.conditions).length)
   const active = $derived(starting || progress.status === "running")
   const completed = $derived(progress.status === "idle" ? 0 : progress.completed)
   const total = $derived(progress.status === "idle" ? 0 : progress.total)
@@ -86,6 +94,34 @@
     if (status === "satisfied") return "text-emerald-500"
     if (status === "notSatisfied") return "text-muted-foreground"
     return "text-amber-500"
+  }
+
+  function formatObservedValue(value: number): string {
+    return Number(value.toPrecision(6)).toLocaleString(undefined, { maximumSignificantDigits: 6 })
+  }
+
+  function evidenceLabel(outcome: ConditionOutcome | null): string | null {
+    const evidence = outcome?.evidence
+    if (evidence === null || evidence === undefined) return null
+    if (evidence.type === "state") {
+      return `Observed ${formatObservedValue(evidence.left)} vs ${formatObservedValue(evidence.right)} · ${formatTimestamp(evidence.observedAt)}`
+    }
+    return `Previous ${formatObservedValue(evidence.previousLeft)} vs ${formatObservedValue(evidence.previousRight)} → current ${formatObservedValue(evidence.left)} vs ${formatObservedValue(evidence.right)} · ${formatTimestamp(evidence.observedAt)}`
+  }
+
+  function lastTrueLabel(outcome: ConditionOutcome | null): string | null {
+    if (
+      outcome?.lastTrueBar === null ||
+      outcome?.lastTrueBar === undefined ||
+      outcome.lastTrueBar === outcome.evidence?.observedAt
+    ) {
+      return null
+    }
+    return `Last true ${formatTimestamp(outcome.lastTrueBar)}`
+  }
+
+  function satisfiedConditionCount(report: EvalReport): number {
+    return Object.values(report.conditions).filter(outcome => outcome.status === "satisfied").length
   }
 </script>
 
@@ -164,6 +200,7 @@
         >
           {option.label}
           {#if option.value === "matches"}<span class="ml-1 tabular-nums">{matched}</span>{/if}
+          {#if option.value === "closest"}<span class="ml-1 tabular-nums">{closestCount}</span>{/if}
           {#if option.value === "all"}<span class="ml-1 tabular-nums">{reports.length}</span>{/if}
           {#if option.value === "issues"}<span class="ml-1 tabular-nums">{issueCount}</span>{/if}
         </button>
@@ -186,9 +223,11 @@
           <p class="mt-1 text-xs text-muted-foreground">
             {filter === "matches"
               ? "No evaluated markets have matched this signal."
-              : filter === "issues"
-                ? "No evaluated markets have reported data issues."
-                : "No markets have been evaluated yet."}
+              : filter === "closest"
+                ? "No defensible proximity ranking is available for these condition outcomes."
+                : filter === "issues"
+                  ? "No evaluated markets have reported data issues."
+                  : "No markets have been evaluated yet."}
           </p>
         {/if}
       </div>
@@ -203,6 +242,9 @@
               </Badge>
               {#if reportHasDataIssues(report)}
                 <Badge variant="outline" class="border-amber-500/40 text-amber-500">Data issue</Badge>
+              {/if}
+              {#if filter === "closest"}
+                <Badge variant="secondary">{satisfiedConditionCount(report)} / {conditionCount} conditions</Badge>
               {/if}
               <span class="ml-auto text-xs text-muted-foreground">
                 {report.triggeredAt === null ? "Not triggered" : `Triggered ${formatTimestamp(report.triggeredAt)}`}
@@ -228,13 +270,14 @@
               <h3 class="text-xs font-medium tracking-wide text-muted-foreground uppercase">Condition outcomes</h3>
               <div class="mt-2 divide-y divide-border/60 rounded-md border border-border/70">
                 {#each conditionEvidence(snapshot.definition, report, descriptors) as condition (condition.id)}
-                  <div class="grid gap-1 px-3 py-2 text-xs sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
+                  <div class="grid gap-1 px-3 py-2 text-xs lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
                     <span class="text-foreground">{condition.label}</span>
                     <span class={outcomeTone(condition.outcome)}>{outcomeLabel(condition.outcome)}</span>
-                    {#if condition.outcome?.lastTrueBar}
-                      <span class="text-muted-foreground sm:col-span-2">
-                        Last true {formatTimestamp(condition.outcome.lastTrueBar)}
-                      </span>
+                    {#if evidenceLabel(condition.outcome) !== null}
+                      <span class="text-muted-foreground lg:col-span-2">{evidenceLabel(condition.outcome)}</span>
+                    {/if}
+                    {#if lastTrueLabel(condition.outcome) !== null}
+                      <span class="text-muted-foreground lg:col-span-2">{lastTrueLabel(condition.outcome)}</span>
                     {/if}
                   </div>
                 {/each}
