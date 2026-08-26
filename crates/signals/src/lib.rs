@@ -13,4 +13,4 @@ pub use definition::{
     KindFilter, Node, Operand, Predicate, PriceField, SignalDefinition,
 };
 pub use eval::{CoinData, ConditionOutcome, EvalReport, OutcomeStatus};
-pub use run::{RunScope, evaluate_coin, run_signal};
+pub use run::{RunProgress, RunSummary, evaluate_coin, run_signal};

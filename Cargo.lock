@@ -3663,6 +3663,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 name = "screener"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "domain",
  "hl-feed",
@@ -3673,10 +3674,12 @@ dependencies = [
  "scanner",
  "serde",
  "serde_json",
+ "signals",
  "storage",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "tracing-subscriber",
