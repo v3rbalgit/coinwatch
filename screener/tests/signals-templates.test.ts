@@ -23,6 +23,7 @@ function descriptor(
     label: id,
     kind,
     outputDomain,
+    supportsSignals: true,
     target: "pane",
     params,
     outputs: output === undefined ? [] : [{ key: output, label: output, kind: "line", color: "#fff" }],

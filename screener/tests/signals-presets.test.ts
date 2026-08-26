@@ -28,6 +28,7 @@ const descriptor: IndicatorDescriptor = {
   label: "RSI",
   kind: "series",
   outputDomain: "boundedOscillator",
+  supportsSignals: true,
   target: "pane",
   params: [{ key: "period", label: "Period", default: 14, min: 1, max: 500, step: 1 }],
   outputs: [{ key: "rsi", label: "RSI", kind: "line", color: "#fff" }],

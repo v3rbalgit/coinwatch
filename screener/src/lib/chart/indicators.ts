@@ -49,6 +49,7 @@ export type IndicatorDescriptor = {
   label: string
   kind: IndicatorKind
   outputDomain: ValueDomain
+  supportsSignals: boolean
   target: IndicatorTarget
   params: IndicatorParam[]
   outputs: IndicatorOutput[]

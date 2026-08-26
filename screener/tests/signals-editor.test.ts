@@ -23,9 +23,22 @@ const descriptors: IndicatorDescriptor[] = [
     label: "SMA",
     kind: "series",
     outputDomain: "price",
+    supportsSignals: true,
     target: "overlay",
     params: [{ key: "period", label: "Period", default: 20, min: 1, max: 500, step: 1 }],
     outputs: [{ key: "sma", label: "SMA", kind: "line", color: "#fff" }],
+    guides: [],
+    range: null,
+  },
+  {
+    id: "vwap",
+    label: "VWAP",
+    kind: "series",
+    outputDomain: "price",
+    supportsSignals: false,
+    target: "overlay",
+    params: [],
+    outputs: [{ key: "vwap", label: "VWAP", kind: "line", color: "#fff" }],
     guides: [],
     range: null,
   },
@@ -34,6 +47,7 @@ const descriptors: IndicatorDescriptor[] = [
     label: "RSI Divergence",
     kind: "divergence",
     outputDomain: "boundedOscillator",
+    supportsSignals: true,
     target: "overlay",
     params: [
       { key: "period", label: "Period", default: 14, min: 1, max: 500, step: 1 },
@@ -221,6 +235,22 @@ describe("signal editor model", () => {
       "incompatible"
     )
     expect(draftValidationMessage(incompatible, descriptors)).toContain("incompatible price and volume")
+
+    const cumulative = draft()
+    cumulative.conditions[0] = createConditionDraft(
+      {
+        timeframe: "1h",
+        predicate: {
+          type: "threshold",
+          left: { type: "indicator", instance: { id: "vwap", params: {} }, output: "vwap" },
+          op: "greaterThan",
+          right: { type: "constant", value: 100 },
+        },
+        withinBars: 0,
+      },
+      "cumulative"
+    )
+    expect(draftValidationMessage(cumulative, descriptors)).toContain("stable history anchoring")
   })
 
   it("returns null snapshots for unsavable names, empty drafts, and duplicate IDs", () => {
