@@ -1,6 +1,8 @@
 <script lang="ts">
   import {
+    Brush,
     Check,
+    Equal,
     GripVertical,
     Magnet,
     Maximize2,
@@ -8,6 +10,7 @@
     MoveUpRight,
     RotateCcw,
     Rows3,
+    Rows4,
     Ruler,
     Square,
     Trash2,
@@ -26,8 +29,9 @@
     type ISeriesApi,
     type UTCTimestamp,
   } from "lightweight-charts"
-  import { onMount } from "svelte"
+  import { onMount, untrack } from "svelte"
 
+  import { errorMessage } from "$lib/errors"
   import { formatCompactNumber, formatPrice } from "$lib/format"
 
   import { logicalFor, timeGridOf } from "./drawings/coords"
@@ -120,7 +124,7 @@
     | { outputKey: string; kind: "histogram"; api: ISeriesApi<"Histogram"> }
   type RenderedInstance = { series: RenderedSeries[]; spanLines: ISeriesApi<"Line">[]; spanKey: string }
   let rendered: RenderedInstance[] = []
-  let latestComputed: InstanceOutput[] = []
+  let latestComputed: (InstanceOutput | undefined)[] = []
   let latestChosen: IndicatorInstance[] = []
   let plottedRenderKey = ""
   let plottedRenderSeed = -1
@@ -129,9 +133,16 @@
   let plottedFirstTime = 0
   let lastTime = 0
   let suppressLoadOlder = false
+  // Range events fire on the library's draw frame (rAF); suppress until the frame
+  // after, then expire, so a no-op set cannot leave the flag stuck armed.
+  function suppressNextRangeEvent() {
+    suppressLoadOlder = true
+    requestAnimationFrame(() => requestAnimationFrame(() => (suppressLoadOlder = false)))
+  }
   let hovering = false
   let ready = $state(false)
   let wasmReady = $state(false)
+  let indicatorError = $state("")
   let pickerOpen = $state(false)
   let pickerPanel = $state<HTMLDivElement>()
   let fxButton = $state<HTMLButtonElement>()
@@ -161,6 +172,20 @@
 
   const fmtReadout = (value: number) =>
     Math.abs(value) >= 100 ? value.toFixed(0) : Math.abs(value) >= 1 ? value.toFixed(2) : value.toFixed(4)
+
+  function loadWasm() {
+    indicatorError = ""
+    loadIndicators()
+      .then(() => {
+        const list = indicatorDescriptors()
+        for (const descriptor of list) descriptorsById.set(descriptor.id, descriptor)
+        availableDescriptors = list
+        wasmReady = true
+      })
+      .catch((error: unknown) => {
+        indicatorError = errorMessage(error)
+      })
+  }
 
   function legendFor(bar: Bar): LegendData {
     return {
@@ -282,7 +307,7 @@
 
   function resetChartView() {
     if (!chart || bars.length === 0) return
-    suppressLoadOlder = true
+    suppressNextRangeEvent()
     chart.timeScale().setVisibleLogicalRange({
       from: Math.max(0, bars.length - VISIBLE_BARS),
       to: bars.length + RIGHT_OFFSET,
@@ -292,7 +317,7 @@
 
   function fitAllData() {
     if (!chart) return
-    suppressLoadOlder = true
+    suppressNextRangeEvent()
     chart.timeScale().fitContent()
     chart.priceScale("right").applyOptions({ autoScale: true })
   }
@@ -527,19 +552,11 @@
     })
 
     chart.timeScale().subscribeVisibleLogicalRangeChange(range => {
-      if (suppressLoadOlder) {
-        suppressLoadOlder = false
-        return
-      }
+      if (suppressLoadOlder) return
       if (range && range.from < LOAD_OLDER_THRESHOLD) onLoadOlder?.()
     })
 
-    void loadIndicators().then(() => {
-      const list = indicatorDescriptors()
-      for (const descriptor of list) descriptorsById.set(descriptor.id, descriptor)
-      availableDescriptors = list
-      wasmReady = true
-    })
+    loadWasm()
 
     const resizeObserver = new ResizeObserver(() => {
       if (styleBarEl) {
@@ -592,7 +609,7 @@
     if (seed !== plottedSeed) {
       candles.setData(bars.map(toCandle))
       volume.setData(bars.map(toVolume))
-      suppressLoadOlder = true
+      suppressNextRangeEvent()
       chart?.timeScale().setVisibleLogicalRange({
         from: Math.max(0, bars.length - VISIBLE_BARS),
         to: bars.length + RIGHT_OFFSET,
@@ -606,7 +623,7 @@
       candles.setData(bars.map(toCandle))
       volume.setData(bars.map(toVolume))
       if (range && prepended > 0) {
-        suppressLoadOlder = true
+        suppressNextRangeEvent()
         chart?.timeScale().setVisibleLogicalRange({ from: range.from + prepended, to: range.to + prepended })
       }
     } else {
@@ -639,16 +656,22 @@
     validationPrimitive.setSelected(selectedValidationSpan)
   })
 
+  // Reads bars untracked: focusing must not re-center on every live tick.
   $effect(() => {
     void focusRevision
-    if (!ready || !chart || focusTime === null || bars.length < 2) return
-    const grid = timeGridOf(bars.map(bar => stamp(bar.time)))
-    if (grid === null || focusTime < bars[0].time || focusTime > bars[bars.length - 1].time) return
-    const center = logicalFor(stamp(focusTime), grid)
-    suppressLoadOlder = true
-    chart.timeScale().setVisibleLogicalRange({
-      from: center - FOCUS_HALF_WINDOW,
-      to: center + FOCUS_HALF_WINDOW,
+    const target = focusTime
+    if (!ready || !chart || target === null) return
+    const activeChart = chart
+    untrack(() => {
+      if (bars.length < 2) return
+      const grid = timeGridOf(bars.map(bar => stamp(bar.time)))
+      if (grid === null || target < bars[0].time || target > bars[bars.length - 1].time) return
+      const center = logicalFor(stamp(target), grid)
+      suppressNextRangeEvent()
+      activeChart.timeScale().setVisibleLogicalRange({
+        from: center - FOCUS_HALF_WINDOW,
+        to: center + FOCUS_HALF_WINDOW,
+      })
     })
   })
 
@@ -724,6 +747,12 @@
   // after the pinned RSI/MACD. Rebuild series on instance-set change; otherwise fill
   // from the bars (reseed on coin/tf switch or history prepend, tail per tick).
   const renderKey = (instance: IndicatorInstance) => `${instance.id}:${JSON.stringify(instance.params)}`
+
+  function pivotRightOf(instance: IndicatorInstance | undefined): number {
+    if (!instance) return 0
+    const fallback = descriptorsById.get(instance.id)?.params.find(param => param.key === "pivotRight")?.default ?? 0
+    return Math.round(instance.params.pivotRight ?? fallback)
+  }
 
   $effect(() => {
     if (!ready || !wasmReady || !chart || bars.length === 0) return
@@ -804,13 +833,54 @@
       plottedRenderKey = key
       plottedRenderSeed = -1
     }
-    if (rendered.length === 0) return
+    if (rendered.length === 0) {
+      latestComputed = []
+      latestChosen = []
+      readouts = []
+      return
+    }
 
     const high = Float64Array.from(bars, bar => bar.high)
     const low = Float64Array.from(bars, bar => bar.low)
     const close = Float64Array.from(bars, bar => bar.close)
     const volume = Float64Array.from(bars, bar => bar.volume)
-    const computed = computeIndicators(chosen, { high, low, close, volume })
+    // Divergences confirm on completed bars only; the forming bar would repaint pivots.
+    const divergenceIndexes = chosen.flatMap((instance, index) =>
+      descriptorsById.get(instance.id)?.kind === "divergence" ? [index] : []
+    )
+    const seriesIndexes = chosen.flatMap((instance, index) =>
+      descriptorsById.get(instance.id)?.kind === "divergence" ? [] : [index]
+    )
+    const computed: (InstanceOutput | undefined)[] = new Array<InstanceOutput | undefined>(chosen.length)
+    let completedDivergences: InstanceOutput[] = []
+    try {
+      const seriesComputed = computeIndicators(
+        seriesIndexes.map(index => chosen[index]),
+        { high, low, close, volume }
+      )
+      seriesIndexes.forEach((chosenIndex, position) => {
+        computed[chosenIndex] = seriesComputed[position]
+      })
+      if (divergenceIndexes.length > 0 && bars.length > 1) {
+        const completed = bars.length - 1
+        completedDivergences = computeIndicators(
+          divergenceIndexes.map(index => chosen[index]),
+          {
+            high: high.subarray(0, completed),
+            low: low.subarray(0, completed),
+            close: close.subarray(0, completed),
+            volume: volume.subarray(0, completed),
+          }
+        )
+      }
+      indicatorError = ""
+    } catch (error) {
+      indicatorError = errorMessage(error)
+      return
+    }
+    const divergencesByIndex = new Map(
+      divergenceIndexes.map((chosenIndex, position) => [chosenIndex, completedDivergences[position]])
+    )
     latestComputed = computed
     latestChosen = chosen
     if (!hovering) readouts = readoutsFor(bars.length - 1)
@@ -818,9 +888,8 @@
     const reseed = seed !== plottedRenderSeed || firstTime < plottedRenderFirstTime
     rendered.forEach((item, index) => {
       const output = computed[index]
-      if (!output) return
       for (const line of item.series) {
-        const values = output.outputs.find(series => series.key === line.outputKey)?.values
+        const values = output?.outputs.find(series => series.key === line.outputKey)?.values
         if (!values) continue
         if (line.kind === "histogram") {
           if (reseed) line.api.setData(toHistogram(values))
@@ -830,19 +899,24 @@
           else updateLast(line.api, values)
         }
       }
-      const spanKey = output.divergences
-        .map(span => `${span.direction}:${span.kind}:${span.fromIndex}:${span.toIndex}`)
-        .join("|")
+      const divergences = divergencesByIndex.get(index)?.divergences ?? []
+      const confirmationOffset = pivotRightOf(chosen[index])
+      // Seed + first bar pin the key to this dataset: span indices alone can
+      // collide across reseeds and prepends, leaving stale span lines in place.
+      const spanKey = `${seed}:${firstTime}|`.concat(
+        divergences.map(span => `${span.direction}:${span.kind}:${span.fromIndex}:${span.toIndex}`).join("|")
+      )
       if (spanKey !== item.spanKey) {
         for (const spanLine of item.spanLines) activeChart.removeSeries(spanLine)
-        item.spanLines = output.divergences.flatMap(span => {
+        item.spanLines = divergences.flatMap(span => {
           const from = bars[span.fromIndex]
           const to = bars[span.toIndex]
           if (!from || !to) return []
+          const color = span.direction === "Bullish" ? chartTheme.up : chartTheme.down
           const spanLine = activeChart.addSeries(
             LineSeries,
             {
-              color: span.direction === "Bullish" ? chartTheme.up : chartTheme.down,
+              color,
               lineWidth: 2,
               lineStyle: span.kind === "Regular" ? LineStyle.Solid : LineStyle.Dashed,
               priceLineVisible: false,
@@ -855,7 +929,23 @@
             { time: stamp(from.time), value: from.close },
             { time: stamp(to.time), value: to.close },
           ])
-          return [spanLine]
+          const confirmation = bars[span.toIndex + confirmationOffset]
+          if (!confirmation) return [spanLine]
+          const marker = activeChart.addSeries(
+            LineSeries,
+            {
+              color,
+              lineWidth: 1,
+              priceLineVisible: false,
+              lastValueVisible: false,
+              crosshairMarkerVisible: false,
+              pointMarkersVisible: true,
+              pointMarkersRadius: 3,
+            },
+            0
+          )
+          marker.setData([{ time: stamp(confirmation.time), value: confirmation.close }])
+          return [spanLine, marker]
         })
         item.spanKey = spanKey
       }
@@ -908,6 +998,15 @@
     <button class={toolClass("fib")} title="Fibonacci retracement (f)" onclick={() => selectTool("fib")}>
       <Rows3 class="size-3.5" />
     </button>
+    <button class={toolClass("fibext")} title="Fibonacci extension (e)" onclick={() => selectTool("fibext")}>
+      <Rows4 class="size-3.5" />
+    </button>
+    <button class={toolClass("channel")} title="Parallel channel (c)" onclick={() => selectTool("channel")}>
+      <Equal class="size-3.5" />
+    </button>
+    <button class={toolClass("brush")} title="Brush (b)" onclick={() => selectTool("brush")}>
+      <Brush class="size-3.5" />
+    </button>
     <div class="my-0.5 h-px w-full bg-border"></div>
     <button
       class="flex justify-center rounded py-1.5 {magnet
@@ -951,6 +1050,21 @@
         {#each readouts as readout (readout.label)}
           <span>{readout.label} <span style="color: {readout.color}">{fmtReadout(readout.value)}</span></span>
         {/each}
+      </div>
+    {/if}
+    {#if indicatorError !== ""}
+      <div
+        class="absolute top-8 left-2 z-10 flex items-center gap-2 rounded-md border border-amber-500/40 bg-background/95 px-2 py-1 text-xs text-amber-500 shadow"
+      >
+        <span>Indicators unavailable: {indicatorError}</span>
+        {#if !wasmReady}
+          <button
+            class="rounded border border-border px-1.5 py-0.5 text-foreground hover:bg-accent/70"
+            onclick={loadWasm}
+          >
+            Retry
+          </button>
+        {/if}
       </div>
     {/if}
     {#if pickerOpen}
