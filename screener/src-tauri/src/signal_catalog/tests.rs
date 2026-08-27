@@ -208,7 +208,7 @@ async fn listing_is_resilient_to_unsupported_corrupt_and_invalid_rows() {
             "invalid",
             "Gamma",
             &json!({
-                "version": 2,
+                "version": 3,
                 "direction": "bullish",
                 "root": { "type": "condition", "id": "missing" },
                 "conditions": {},

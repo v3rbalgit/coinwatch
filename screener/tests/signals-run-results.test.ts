@@ -11,7 +11,7 @@ import {
 } from "$lib/signals/run-results"
 
 const definition: SignalDefinition = {
-  version: 2,
+  version: 3,
   direction: "bullish",
   root: {
     type: "all",
@@ -62,7 +62,7 @@ function report(
   return {
     coin,
     satisfied,
-    triggeredAt: satisfied ? "2026-08-26T10:00:00Z" : null,
+    lastEvidenceAt: satisfied ? "2026-08-26T10:00:00Z" : null,
     conditions: {
       trend: { status: "notSatisfied", lastTrueBar: null, evidence: null },
       volume: { status: "satisfied", lastTrueBar: "2026-08-26T08:00:00Z", evidence: null },
@@ -148,7 +148,7 @@ describe("signal run result helpers", () => {
     expect(rankClosestSignalRunReports(definition, [near])).toEqual([])
 
     const eventDefinition: SignalDefinition = {
-      version: 2,
+      version: 3,
       direction: "bullish",
       root: { type: "condition", id: "cross" },
       conditions: {

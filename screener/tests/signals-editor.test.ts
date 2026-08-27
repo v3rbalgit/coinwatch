@@ -43,6 +43,30 @@ const descriptors: IndicatorDescriptor[] = [
     range: null,
   },
   {
+    id: "rsi",
+    label: "RSI",
+    kind: "series",
+    outputDomain: "boundedOscillator",
+    supportsSignals: true,
+    target: "pane",
+    params: [{ key: "period", label: "Period", default: 14, min: 1, max: 500, step: 1 }],
+    outputs: [{ key: "rsi", label: "RSI", kind: "line", color: "#fff" }],
+    guides: [],
+    range: [0, 100],
+  },
+  {
+    id: "williams",
+    label: "Williams %R",
+    kind: "series",
+    outputDomain: "boundedOscillator",
+    supportsSignals: true,
+    target: "pane",
+    params: [{ key: "period", label: "Period", default: 14, min: 1, max: 500, step: 1 }],
+    outputs: [{ key: "williams", label: "%R", kind: "line", color: "#fff" }],
+    guides: [],
+    range: [-100, 0],
+  },
+  {
     id: "rsiDivergence",
     label: "RSI Divergence",
     kind: "divergence",
@@ -235,6 +259,64 @@ describe("signal editor model", () => {
       "incompatible"
     )
     expect(draftValidationMessage(incompatible, descriptors)).toContain("incompatible price and volume")
+
+    const identityAdjusted = draft()
+    identityAdjusted.conditions[0] = createConditionDraft(
+      {
+        timeframe: "1h",
+        predicate: {
+          type: "threshold",
+          left: { type: "indicator", instance: { id: "sma", params: { period: 20 } }, output: "sma" },
+          op: "greaterThan",
+          right: {
+            type: "indicator",
+            instance: { id: "sma", params: { period: 20 } },
+            output: "sma",
+            adjustment: { type: "percent", value: 0 },
+          },
+        },
+        withinBars: 0,
+      },
+      "identityAdjusted"
+    )
+    expect(draftValidationMessage(identityAdjusted, descriptors)).toContain("same source")
+
+    const flipped = draft()
+    flipped.conditions[0] = createConditionDraft(
+      {
+        timeframe: "1h",
+        predicate: {
+          type: "threshold",
+          left: { type: "field", field: "close" },
+          op: "greaterThan",
+          right: {
+            type: "indicator",
+            instance: { id: "sma", params: { period: 20 } },
+            output: "sma",
+            adjustment: { type: "percent", value: -150 },
+          },
+        },
+        withinBars: 0,
+      },
+      "flipped"
+    )
+    expect(draftValidationMessage(flipped, descriptors)).toContain("stay above -100")
+
+    const disjoint = draft()
+    disjoint.conditions[0] = createConditionDraft(
+      {
+        timeframe: "1h",
+        predicate: {
+          type: "threshold",
+          left: { type: "indicator", instance: { id: "rsi", params: { period: 14 } }, output: "rsi" },
+          op: "greaterThan",
+          right: { type: "indicator", instance: { id: "williams", params: { period: 14 } }, output: "williams" },
+        },
+        withinBars: 0,
+      },
+      "disjoint"
+    )
+    expect(draftValidationMessage(disjoint, descriptors)).toContain("never overlap")
 
     const cumulative = draft()
     cumulative.conditions[0] = createConditionDraft(
