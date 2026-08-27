@@ -2,8 +2,9 @@
 
 A real-time **Hyperliquid market screener and mission-control** desktop app — a Tauri v2 +
 SvelteKit front end over a Rust market-data engine. It streams the live perp universe,
-screens it on live metadata (price, 24h change, volume, open interest, funding), and evaluates
-saved or draft multi-timeframe personal signals against the universe or a watchlist.
+screens it on live metadata (price, 24h change, volume, open interest, funding), evaluates
+saved or draft multi-timeframe personal signals against the universe or a watchlist, and
+validates a signal over the open coin chart's history, marking where it would have matched.
 
 Single-user and GUI-first: screen the market, chart it with configurable indicators and
 drawings, and build reusable multi-timeframe signals — a decision-support tool, not an
@@ -25,8 +26,8 @@ A Cargo workspace of focused Rust libraries plus the Tauri app (details in [`DES
 | `storage`                         | SQLite migrations and persistence for candles, watchlists, signals, presets, settings, and logos                |
 | `indicators`                      | Pure indicator/divergence math plus the configured-instance registry and compute engine                         |
 | `indicators-wasm`                 | Thin WASM boundary exposing the shared indicator engine to the chart and builder                                |
-| `signals`                         | Validated signal definitions plus completed-bar, multi-timeframe evaluation and run orchestration               |
-| `screener` (`screener/src-tauri`) | Tauri v2 app: commands expose market/user data and signal runs; mids/candles stream to the UI                   |
+| `signals`                         | Validated signal definitions plus completed-bar, multi-timeframe evaluation, run orchestration, and historical validation |
+| `screener` (`screener/src-tauri`) | Tauri v2 app: commands expose market/user data, signal runs, and historical validation; mids/candles stream to the UI |
 
 Prices stream through the in-memory hot cache over WebSocket (~1s). Candle history accumulates
 in SQLite and is backfilled over REST within Hyperliquid's rate limit; signal runs hydrate the
