@@ -28,7 +28,7 @@ _sqlx mode:
   cargo sqlx migrate run --source crates/storage/migrations
   args=(--workspace)
   if [[ "{{mode}}" == "check" ]]; then args+=(--check); fi
-  cargo sqlx prepare "${args[@]}"
+  cargo sqlx prepare "${args[@]}" -- --all-targets
 
 # Regenerate checked-in .sqlx metadata after migrations or query changes.
 sqlx-prepare: (_sqlx "prepare")
@@ -44,6 +44,18 @@ setup:
 # system WebKitGTK; run `just setup` first.
 run:
   cd screener && pnpm tauri dev
+
+# Frontend release gate: wasm build, type checks, format, lint, tests, bundle.
+quality-frontend:
+  cd screener && pnpm run wasm
+  cd screener && pnpm run check
+  cd screener && pnpm exec prettier --check .
+  cd screener && pnpm exec eslint .
+  cd screener && pnpm exec vitest run
+  cd screener && pnpm exec vite build
+
+# Everything CI runs: Rust gate, SQLx metadata check, frontend gate.
+quality-all: quality sqlx-check quality-frontend
 
 # Full local release gate; clippy subsumes cargo check.
 quality:

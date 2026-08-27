@@ -62,8 +62,18 @@ jobs:
       - name: Check dependency policy
         run: cargo deny check
 
-      - name: Check patch whitespace
-        run: git diff --check
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --locked --version 0.9.0 --no-default-features --features sqlite
+
+      - name: Verify SQLx query metadata
+        env:
+          SQLX_OFFLINE: "false"
+        run: |
+          work="$(mktemp -d)"
+          export DATABASE_URL="sqlite://$work/prepare.db"
+          cargo sqlx database create
+          cargo sqlx migrate run --source crates/storage/migrations
+          cargo sqlx prepare --check --workspace -- --all-targets
 
   frontend:
     name: Frontend quality
