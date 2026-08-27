@@ -3,14 +3,15 @@
 //!
 //! Masks are never combined across timeframes directly — their bar grids do not
 //! align. Each condition resolves on its own timeframe first; only its current
-//! boolean verdict flows through the tree. Insufficient warmup remains an
-//! explicit unknown verdict rather than being mistaken for a negative result.
+//! boolean verdict flows through the tree. Insufficient warmup and undefined
+//! operand values remain explicit unknown verdicts rather than being mistaken
+//! for a negative result.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use domain::{Candle, Timeframe};
+use domain::{Candle, Timeframe, completed_prefix_len};
 use indicators::{Instance, InstanceOutput, Ohlcv, compute};
 use rust_decimal::prelude::ToPrimitive;
 use serde::Serialize;
@@ -39,6 +40,8 @@ pub enum OutcomeStatus {
         /// Completed candles supplied to the evaluator.
         available: usize,
     },
+    /// A needed operand value is non-finite; the predicate is neither held nor refuted.
+    UndefinedOperands,
 }
 
 /// Numeric evidence captured at the bar most relevant to a condition verdict.
@@ -92,7 +95,7 @@ pub struct EvalReport {
     pub satisfied: bool,
     /// Most recent evidence among satisfied positive leaves. `None` is valid when
     /// a signal holds exclusively through negation.
-    pub triggered_at: Option<DateTime<Utc>>,
+    pub last_evidence_at: Option<DateTime<Utc>>,
     /// Verdict per stable condition id.
     pub conditions: BTreeMap<String, ConditionOutcome>,
     /// Timeframes whose conditions had no completed candle data. Their leaves
@@ -240,6 +243,8 @@ impl<'a> TimeframePrepared<'a> {
 struct PreparedCondition {
     requirement: ConditionRequirement,
     mask: Vec<bool>,
+    /// Per-bar flag: every value the bar's verdict depends on is finite.
+    defined: Vec<bool>,
     latest_true: Vec<Option<usize>>,
 }
 
@@ -280,7 +285,7 @@ impl<'a> PreparedEvaluation<'a> {
                 condition: id.clone(),
                 source,
             })?;
-            let mask = build_mask(condition, timeframe, requirement.confirmation_bars);
+            let (mask, defined) = build_mask(condition, timeframe, requirement.confirmation_bars);
             let mut last_true = None;
             let latest_true = mask
                 .iter()
@@ -297,6 +302,7 @@ impl<'a> PreparedEvaluation<'a> {
                 PreparedCondition {
                     requirement,
                     mask,
+                    defined,
                     latest_true,
                 },
             );
@@ -318,16 +324,33 @@ impl<'a> PreparedEvaluation<'a> {
     }
 
     pub(crate) fn lengths_at(&self, evaluated_at: DateTime<Utc>) -> BTreeMap<Timeframe, usize> {
-        let evaluated_ms = evaluated_at.timestamp_millis();
         self.timeframes
             .iter()
-            .map(|(timeframe, prepared)| {
-                let completed = prepared.candles.partition_point(|candle| {
-                    candle.open_time.timestamp_millis().saturating_add(timeframe.duration_ms()) <= evaluated_ms
-                });
-                (*timeframe, completed)
-            })
+            .map(|(timeframe, prepared)| (*timeframe, completed_len(prepared.candles, *timeframe, evaluated_at)))
             .collect()
+    }
+
+    /// Tree verdict without report allocation, for per-instant historical replay.
+    pub(crate) fn truth_at(
+        &self,
+        definition: &SignalDefinition,
+        completed_lengths: &BTreeMap<Timeframe, usize>,
+    ) -> Truth {
+        eval_tree(&definition.root, &|id| {
+            let Some(condition) = definition.conditions.get(id) else {
+                return Truth::Unknown;
+            };
+            if self.unavailable_data.contains_key(&condition.timeframe) {
+                return Truth::Unknown;
+            }
+            match (self.timeframes.get(&condition.timeframe), self.conditions.get(id)) {
+                (Some(timeframe), Some(prepared_condition)) => {
+                    let available = completed_lengths.get(&condition.timeframe).copied().unwrap_or_default();
+                    truth_of(resolve_condition_at(condition, timeframe, prepared_condition, available).status)
+                }
+                _ => Truth::Unknown,
+            }
+        })
     }
 
     pub(crate) fn report_at(
@@ -368,7 +391,7 @@ impl<'a> PreparedEvaluation<'a> {
         if satisfied {
             collect_supporting(&definition.root, &outcomes, &mut supporting);
         }
-        let triggered_at = supporting
+        let last_evidence_at = supporting
             .into_iter()
             .filter_map(|id| outcomes.get(id))
             .filter_map(|outcome| outcome.last_true_bar)
@@ -377,7 +400,7 @@ impl<'a> PreparedEvaluation<'a> {
         EvalReport {
             coin: coin.to_owned(),
             satisfied,
-            triggered_at,
+            last_evidence_at,
             conditions: outcomes,
             missing_data: self.missing_data.clone(),
             unavailable_data: self.unavailable_data.clone(),
@@ -431,18 +454,40 @@ pub(crate) fn evaluate_validated(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Truth {
+pub(crate) enum Truth {
     True,
     False,
     Unknown,
 }
 
+/// Length of the completed prefix in an oldest-first candle series.
+pub(crate) fn completed_len(candles: &[Candle], timeframe: Timeframe, at: DateTime<Utc>) -> usize {
+    completed_prefix_len(candles, timeframe, at.timestamp_millis())
+}
+
+const fn truth_of(status: OutcomeStatus) -> Truth {
+    match status {
+        OutcomeStatus::Satisfied => Truth::True,
+        OutcomeStatus::NotSatisfied => Truth::False,
+        OutcomeStatus::NoData
+        | OutcomeStatus::Unavailable
+        | OutcomeStatus::InsufficientHistory { .. }
+        | OutcomeStatus::UndefinedOperands => Truth::Unknown,
+    }
+}
+
 fn eval_node(node: &Node, outcomes: &BTreeMap<String, ConditionOutcome>) -> Truth {
+    eval_tree(node, &|id| {
+        outcomes.get(id).map_or(Truth::Unknown, |outcome| truth_of(outcome.status))
+    })
+}
+
+fn eval_tree(node: &Node, leaf: &dyn Fn(&str) -> Truth) -> Truth {
     match node {
         Node::All { children } => {
             let mut unknown = false;
             for child in children {
-                match eval_node(child, outcomes) {
+                match eval_tree(child, leaf) {
                     Truth::False => return Truth::False,
                     Truth::Unknown => unknown = true,
                     Truth::True => {}
@@ -453,7 +498,7 @@ fn eval_node(node: &Node, outcomes: &BTreeMap<String, ConditionOutcome>) -> Trut
         Node::Any { children } => {
             let mut unknown = false;
             for child in children {
-                match eval_node(child, outcomes) {
+                match eval_tree(child, leaf) {
                     Truth::True => return Truth::True,
                     Truth::Unknown => unknown = true,
                     Truth::False => {}
@@ -461,7 +506,7 @@ fn eval_node(node: &Node, outcomes: &BTreeMap<String, ConditionOutcome>) -> Trut
             }
             if unknown { Truth::Unknown } else { Truth::False }
         }
-        Node::Not { child } => match eval_node(child, outcomes) {
+        Node::Not { child } => match eval_tree(child, leaf) {
             Truth::True => Truth::False,
             Truth::False => Truth::True,
             Truth::Unknown => Truth::Unknown,
@@ -469,7 +514,7 @@ fn eval_node(node: &Node, outcomes: &BTreeMap<String, ConditionOutcome>) -> Trut
         Node::Xor { children } => {
             let mut true_count = 0;
             for child in children {
-                match eval_node(child, outcomes) {
+                match eval_tree(child, leaf) {
                     Truth::True => true_count += 1,
                     Truth::False => {}
                     Truth::Unknown => return Truth::Unknown,
@@ -477,12 +522,7 @@ fn eval_node(node: &Node, outcomes: &BTreeMap<String, ConditionOutcome>) -> Trut
             }
             if true_count % 2 == 1 { Truth::True } else { Truth::False }
         }
-        Node::Condition { id } => match outcomes.get(id).map(|outcome| outcome.status) {
-            Some(OutcomeStatus::Satisfied) => Truth::True,
-            Some(OutcomeStatus::NotSatisfied) => Truth::False,
-            Some(OutcomeStatus::NoData | OutcomeStatus::Unavailable | OutcomeStatus::InsufficientHistory { .. })
-            | None => Truth::Unknown,
-        },
+        Node::Condition { id } => leaf(id),
     }
 }
 
@@ -515,22 +555,28 @@ fn collect_supporting<'a>(
     }
 }
 
-fn evaluate_condition_at(
+struct ConditionResolution {
+    status: OutcomeStatus,
+    available: usize,
+    last_true_index: Option<usize>,
+}
+
+fn resolve_condition_at(
     condition: &Condition,
     prepared: &TimeframePrepared<'_>,
     prepared_condition: &PreparedCondition,
     available: usize,
-) -> ConditionOutcome {
+) -> ConditionResolution {
     let available = available.min(prepared.candles.len()).min(prepared_condition.mask.len());
     let requirement = prepared_condition.requirement;
     if available < requirement.completed_bars {
-        return ConditionOutcome {
+        return ConditionResolution {
             status: OutcomeStatus::InsufficientHistory {
                 required: requirement.completed_bars,
                 available,
             },
-            last_true_bar: None,
-            evidence: None,
+            available,
+            last_true_index: None,
         };
     }
 
@@ -539,22 +585,50 @@ fn evaluate_condition_at(
         .and_then(|index| prepared_condition.latest_true.get(index).copied().flatten());
     let window_start = available.saturating_sub(condition.within_bars as usize + 1);
     let satisfied = last_true_index.is_some_and(|index| index >= window_start);
-    let last_true_bar = last_true_index
-        .and_then(|index| prepared.candles.get(index))
-        .map(|candle| candle.open_time);
-    let evidence_index = if satisfied {
-        last_true_index
-    } else {
-        available.checked_sub(1)
-    };
-    let evidence = evidence_index.and_then(|index| condition_evidence(condition, prepared, index));
+    let undefined_in_window = prepared_condition
+        .defined
+        .get(window_start..available)
+        .is_some_and(|window| window.iter().any(|defined| !defined));
     let status = if satisfied {
         OutcomeStatus::Satisfied
+    } else if undefined_in_window {
+        OutcomeStatus::UndefinedOperands
     } else {
         OutcomeStatus::NotSatisfied
     };
-    ConditionOutcome {
+    ConditionResolution {
         status,
+        available,
+        last_true_index,
+    }
+}
+
+fn evaluate_condition_at(
+    condition: &Condition,
+    prepared: &TimeframePrepared<'_>,
+    prepared_condition: &PreparedCondition,
+    available: usize,
+) -> ConditionOutcome {
+    let resolution = resolve_condition_at(condition, prepared, prepared_condition, available);
+    if matches!(resolution.status, OutcomeStatus::InsufficientHistory { .. }) {
+        return ConditionOutcome {
+            status: resolution.status,
+            last_true_bar: None,
+            evidence: None,
+        };
+    }
+    let last_true_bar = resolution
+        .last_true_index
+        .and_then(|index| prepared.candles.get(index))
+        .map(|candle| candle.open_time);
+    let evidence_index = if matches!(resolution.status, OutcomeStatus::Satisfied) {
+        resolution.last_true_index
+    } else {
+        resolution.available.checked_sub(1)
+    };
+    let evidence = evidence_index.and_then(|index| condition_evidence(condition, prepared, index));
+    ConditionOutcome {
+        status: resolution.status,
         last_true_bar,
         evidence,
     }
@@ -566,13 +640,7 @@ fn operand_values(
     prepared: &TimeframePrepared<'_>,
     index: usize,
 ) -> Option<(f64, f64)> {
-    let left = resolve_operand(left, prepared)
-        .value_at(index)
-        .filter(|value| value.is_finite())?;
-    let right = resolve_operand(right, prepared)
-        .value_at(index)
-        .filter(|value| value.is_finite())?;
-    Some((left, right))
+    finite_pair(&resolve_operand(left, prepared), &resolve_operand(right, prepared), index)
 }
 
 fn condition_evidence(
@@ -606,7 +674,11 @@ fn condition_evidence(
     }
 }
 
-fn build_mask(condition: &Condition, prepared: &TimeframePrepared<'_>, confirmation_bars: usize) -> Vec<bool> {
+fn build_mask(
+    condition: &Condition,
+    prepared: &TimeframePrepared<'_>,
+    confirmation_bars: usize,
+) -> (Vec<bool>, Vec<bool>) {
     match &condition.predicate {
         Predicate::Threshold { left, right, op } => {
             let left = resolve_operand(left, prepared);
@@ -637,46 +709,48 @@ fn build_mask(condition: &Condition, prepared: &TimeframePrepared<'_>, confirmat
                     *slot = true;
                 }
             }
-            mask
+            let defined = vec![true; prepared.candles.len()];
+            (mask, defined)
         }
     }
 }
 
-fn threshold_mask(op: ComparisonOp, left: &Source<'_>, right: &Source<'_>, len: usize) -> Vec<bool> {
-    // Range is exact-size; `collect` preallocates the complete mask.
-    (0..len)
-        .map(|index| match (left.value_at(index), right.value_at(index)) {
-            (Some(left), Some(right)) if left.is_finite() && right.is_finite() => op.holds(left, right),
-            _ => false,
-        })
-        .collect()
+fn finite_pair(left: &Source<'_>, right: &Source<'_>, index: usize) -> Option<(f64, f64)> {
+    match (left.value_at(index), right.value_at(index)) {
+        (Some(left), Some(right)) if left.is_finite() && right.is_finite() => Some((left, right)),
+        _ => None,
+    }
 }
 
-fn cross_mask(direction: CrossDirection, left: &Source<'_>, right: &Source<'_>, len: usize) -> Vec<bool> {
-    // Range is exact-size; `collect` preallocates the complete mask.
-    (0..len)
-        .map(|index| {
-            let Some(previous) = index.checked_sub(1) else {
-                return false;
-            };
-            let now = (left.value_at(index), right.value_at(index));
-            let before = (left.value_at(previous), right.value_at(previous));
-            match (now, before) {
-                ((Some(now_left), Some(now_right)), (Some(before_left), Some(before_right)))
-                    if now_left.is_finite()
-                        && now_right.is_finite()
-                        && before_left.is_finite()
-                        && before_right.is_finite() =>
-                {
-                    match direction {
-                        CrossDirection::Over => before_left <= before_right && now_left > now_right,
-                        CrossDirection::Under => before_left >= before_right && now_left < now_right,
-                    }
-                }
-                _ => false,
-            }
-        })
-        .collect()
+fn threshold_mask(op: ComparisonOp, left: &Source<'_>, right: &Source<'_>, len: usize) -> (Vec<bool>, Vec<bool>) {
+    let mut mask = Vec::with_capacity(len);
+    let mut defined = Vec::with_capacity(len);
+    for index in 0..len {
+        let pair = finite_pair(left, right, index);
+        defined.push(pair.is_some());
+        mask.push(pair.is_some_and(|(left, right)| op.holds(left, right)));
+    }
+    (mask, defined)
+}
+
+fn cross_mask(direction: CrossDirection, left: &Source<'_>, right: &Source<'_>, len: usize) -> (Vec<bool>, Vec<bool>) {
+    let mut mask = Vec::with_capacity(len);
+    let mut defined = Vec::with_capacity(len);
+    for index in 0..len {
+        let pairs = index.checked_sub(1).and_then(|previous| {
+            let now = finite_pair(left, right, index)?;
+            let before = finite_pair(left, right, previous)?;
+            Some((now, before))
+        });
+        defined.push(pairs.is_some());
+        mask.push(
+            pairs.is_some_and(|((now_left, now_right), (before_left, before_right))| match direction {
+                CrossDirection::Over => before_left <= before_right && now_left > now_right,
+                CrossDirection::Under => before_left >= before_right && now_left < now_right,
+            }),
+        );
+    }
+    (mask, defined)
 }
 
 #[cfg(test)]
@@ -689,7 +763,9 @@ mod tests {
     use rust_decimal::Decimal;
     use serde_json::json;
 
-    use super::{CoinData, ConditionEvidence, ConditionOutcome, OutcomeStatus, evaluate};
+    use super::{
+        CoinData, ConditionEvidence, ConditionOutcome, OutcomeStatus, PreparedEvaluation, completed_len, evaluate,
+    };
     use crate::definition::{
         CandleField, ComparisonOp, Condition, CrossDirection, DEFINITION_VERSION, DefinitionError, Direction,
         DirectionFilter, KindFilter, Node, Operand, OperandAdjustment, Predicate, SignalDefinition,
@@ -850,14 +926,16 @@ mod tests {
             within_bars: 0,
         };
         let signal = definition(vec![("cross", condition)], Node::Condition { id: "cross".to_owned() });
+        let mut closes = vec![100.0; 14];
+        closes.extend([103.0, 110.0]);
         let mut data = CoinData::default();
-        data.insert(Timeframe::Day1, candles(&[100.0, 100.0, 100.0, 103.0, 110.0]));
+        data.insert(Timeframe::Day1, candles(&closes));
 
         let report = evaluate(&signal, "BTC", &data).expect("valid adjusted cross signal");
         assert!(report.satisfied);
         assert_eq!(
             report.conditions["cross"].last_true_bar,
-            Utc.timestamp_opt(4 * 3_600, 0).single()
+            Utc.timestamp_opt(15 * 3_600, 0).single()
         );
     }
 
@@ -886,7 +964,7 @@ mod tests {
                 ],
             },
         );
-        let rising = candles(&(1..=16).map(f64::from).collect::<Vec<_>>());
+        let rising = candles(&(1..=71).map(f64::from).collect::<Vec<_>>());
         let mut data = CoinData::default();
         data.insert(Timeframe::Hour1, rising.clone());
         data.insert(Timeframe::Hour4, rising.clone());
@@ -1017,6 +1095,10 @@ mod tests {
             json!({ "status": "unavailable" })
         );
         assert_eq!(
+            serde_json::to_value(OutcomeStatus::UndefinedOperands).expect("serializable status"),
+            json!({ "status": "undefinedOperands" })
+        );
+        assert_eq!(
             serde_json::to_value(ConditionEvidence::Cross {
                 observed_at: Utc.timestamp_opt(7_200, 0).single().expect("timestamp"),
                 previous_left: 1.0,
@@ -1113,6 +1195,235 @@ mod tests {
     }
 
     #[test]
+    fn completed_len_excludes_forming_trailing_bar() {
+        let series = candles(&[1.0, 1.0, 1.0]);
+        let now = Utc.timestamp_opt(2 * 3_600 + 1_800, 0).single().expect("valid timestamp");
+        assert_eq!(completed_len(&series, Timeframe::Hour1, now), 2);
+    }
+
+    #[test]
+    fn completed_len_includes_bar_at_exact_close_time() {
+        let series = candles(&[1.0, 1.0]);
+        let now = Utc.timestamp_opt(2 * 3_600, 0).single().expect("valid timestamp");
+        assert_eq!(completed_len(&series, Timeframe::Hour1, now), 2);
+    }
+
+    fn random_walk(seed: u64, bars: usize) -> Vec<f64> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut close = 100.0f64;
+        (0..bars)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let step = (state >> 11) as f64 / (1u64 << 53) as f64 - 0.5;
+                close = (close + step * 4.0).max(5.0);
+                close
+            })
+            .collect()
+    }
+
+    fn hour4_candles(closes: &[f64]) -> Vec<Candle> {
+        closes
+            .iter()
+            .enumerate()
+            .map(|(index, &close)| {
+                let open_time = Utc
+                    .timestamp_opt(index as i64 * 4 * 3_600, 0)
+                    .single()
+                    .expect("valid timestamp");
+                Candle {
+                    open_time,
+                    ..candle(0, close)
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn replay_at_truncated_lengths_matches_fresh_prefix_evaluation() {
+        let conditions = vec![
+            (
+                "aboveSma",
+                Condition {
+                    timeframe: Timeframe::Hour1,
+                    predicate: Predicate::Threshold {
+                        left: Operand::Field {
+                            field: CandleField::Close,
+                            adjustment: None,
+                        },
+                        op: ComparisonOp::GreaterThan,
+                        right: indicator_operand(indicator("sma", [("period", 20.0)]), "sma", None),
+                    },
+                    within_bars: 2,
+                },
+            ),
+            (
+                "crossEma",
+                Condition {
+                    timeframe: Timeframe::Hour1,
+                    predicate: Predicate::Cross {
+                        left: Operand::Field {
+                            field: CandleField::Close,
+                            adjustment: None,
+                        },
+                        direction: CrossDirection::Over,
+                        right: indicator_operand(indicator("ema", [("period", 10.0)]), "ema", None),
+                    },
+                    within_bars: 5,
+                },
+            ),
+            (
+                "divergence",
+                Condition {
+                    timeframe: Timeframe::Hour1,
+                    predicate: Predicate::Divergence {
+                        instance: indicator(
+                            "rsiDivergence",
+                            [
+                                ("period", 5.0),
+                                ("pivotLeft", 3.0),
+                                ("pivotRight", 3.0),
+                                ("maxGap", 30.0),
+                            ],
+                        ),
+                        kind: KindFilter::Any,
+                        direction: DirectionFilter::Any,
+                    },
+                    within_bars: 8,
+                },
+            ),
+            (
+                "calmRsi",
+                Condition {
+                    timeframe: Timeframe::Hour4,
+                    predicate: Predicate::Threshold {
+                        left: indicator_operand(indicator("rsi", [("period", 14.0)]), "rsi", None),
+                        op: ComparisonOp::LessThan,
+                        right: Operand::Constant { value: 60.0 },
+                    },
+                    within_bars: 1,
+                },
+            ),
+        ];
+        let signal = SignalDefinition {
+            version: DEFINITION_VERSION,
+            direction: Direction::Bullish,
+            root: Node::Any {
+                children: conditions
+                    .iter()
+                    .map(|(id, _)| Node::Condition { id: (*id).to_owned() })
+                    .collect(),
+            },
+            conditions: conditions
+                .into_iter()
+                .map(|(id, condition)| (id.to_owned(), condition))
+                .collect(),
+        };
+        signal.validate().expect("valid replay fixture");
+
+        for seed in [3u64, 11, 27] {
+            let hour1 = candles(&random_walk(seed, 320));
+            let hour4 = hour4_candles(&random_walk(seed.wrapping_add(99), 90));
+            let mut full = CoinData::default();
+            full.insert(Timeframe::Hour1, hour1.clone());
+            full.insert(Timeframe::Hour4, hour4.clone());
+            let prepared = PreparedEvaluation::build(&signal, &full).expect("prepared replay fixture");
+
+            for len in 1..=hour1.len() {
+                let instant = Utc.timestamp_opt(len as i64 * 3_600, 0).single().expect("valid timestamp");
+                let lengths = prepared.lengths_at(instant);
+                let replay = prepared.report_at(&signal, "BTC", &lengths);
+
+                let mut truncated = CoinData::default();
+                truncated.insert(Timeframe::Hour1, hour1.get(..len).expect("prefix").to_vec());
+                let hour4_len = completed_len(&hour4, Timeframe::Hour4, instant);
+                truncated.insert(Timeframe::Hour4, hour4.get(..hour4_len).expect("prefix").to_vec());
+                let fresh = evaluate(&signal, "BTC", &truncated).expect("fresh prefix evaluation");
+
+                assert_eq!(replay.satisfied, fresh.satisfied, "seed {seed} len {len}");
+                for (id, outcome) in &fresh.conditions {
+                    let replayed = replay.conditions.get(id).expect("replayed condition");
+                    assert_eq!(replayed.status, outcome.status, "seed {seed} len {len} {id}");
+                    assert_eq!(replayed.last_true_bar, outcome.last_true_bar, "seed {seed} len {len} {id}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn undefined_operands_are_unknown_and_cannot_satisfy_negation() {
+        let condition = Condition {
+            timeframe: Timeframe::Hour1,
+            predicate: Predicate::Threshold {
+                left: Operand::Field {
+                    field: CandleField::Close,
+                    adjustment: None,
+                },
+                op: ComparisonOp::GreaterThan,
+                right: indicator_operand(
+                    indicator("sma", [("period", 1.0)]),
+                    "sma",
+                    Some(OperandAdjustment::Percent { value: 1e308 }),
+                ),
+            },
+            within_bars: 0,
+        };
+        let signal = definition(
+            vec![("aboveSma", condition)],
+            Node::Not {
+                child: Box::new(Node::Condition {
+                    id: "aboveSma".to_owned(),
+                }),
+            },
+        );
+        let mut data = CoinData::default();
+        data.insert(Timeframe::Hour1, candles(&[1_000.0, 1_000.0, 1_000.0]));
+
+        let report = evaluate(&signal, "BTC", &data).expect("valid undefined-operand signal");
+        assert_eq!(report.conditions["aboveSma"].status, OutcomeStatus::UndefinedOperands);
+        assert!(!report.satisfied, "undefined operands must not satisfy negation");
+    }
+
+    #[test]
+    fn padded_rsi_requirement_is_depth_insensitive_at_the_final_bar() {
+        let condition = Condition {
+            timeframe: Timeframe::Hour1,
+            predicate: Predicate::Threshold {
+                left: indicator_operand(indicator("rsi", [("period", 14.0)]), "rsi", None),
+                op: ComparisonOp::GreaterThan,
+                right: Operand::Constant { value: 70.0 },
+            },
+            within_bars: 0,
+        };
+        let required = condition.required_completed_bars().expect("padded requirement");
+        assert_eq!(required, 71, "RSI(14) requirement includes convergence padding");
+        let signal = definition(vec![("rsi", condition)], Node::Condition { id: "rsi".to_owned() });
+
+        let final_rsi = |closes: &[f64]| {
+            let mut data = CoinData::default();
+            data.insert(Timeframe::Hour1, candles(closes));
+            let report = evaluate(&signal, "BTC", &data).expect("valid depth fixture");
+            let Some(ConditionEvidence::State { left, .. }) = report.conditions["rsi"].evidence else {
+                panic!("state evidence at the final bar")
+            };
+            (left, report.conditions["rsi"].status)
+        };
+
+        for seed in 1..=8u64 {
+            let closes = random_walk(seed, 400);
+            let (full, full_status) = final_rsi(&closes);
+            let suffix = closes.get(closes.len() - required..).expect("padded suffix");
+            let (shallow, shallow_status) = final_rsi(suffix);
+            let delta = (full - shallow).abs();
+            assert!(delta < 0.5, "seed {seed}: full {full} vs padded suffix {shallow}");
+            if (full - 70.0).abs() >= 0.5 {
+                assert_eq!(full_status, shallow_status, "seed {seed}: verdict flipped off-threshold");
+            }
+        }
+    }
+
+    #[test]
     fn missing_timeframe_is_unknown_and_cannot_satisfy_negation() {
         let signal = definition(
             vec![
@@ -1186,9 +1497,10 @@ mod tests {
 
     #[test]
     fn divergence_filters_kind_and_direction() {
-        // Strict highs at indices 6 and 8: price makes a higher high (6 -> 7)
+        // Strict highs at indices 14 and 16: price makes a higher high (6 -> 7)
         // while RSI(2) makes a lower high (~77 -> ~73), a regular bearish divergence.
-        let closes = [10.0, 10.0, 10.0, 3.0, 3.0, 3.0, 6.0, 3.0, 7.0, 3.0];
+        let mut closes = vec![10.0; 11];
+        closes.extend([3.0, 3.0, 3.0, 6.0, 3.0, 7.0, 3.0]);
         let params = [
             ("period".to_owned(), 2.0),
             ("pivotLeft".to_owned(), 1.0),
@@ -1211,13 +1523,13 @@ mod tests {
         };
         let signal = definition(vec![("div", condition)], Node::Condition { id: "div".to_owned() });
         let mut insufficient = CoinData::default();
-        insufficient.insert(Timeframe::Hour1, candles(closes.get(..8).expect("short divergence fixture")));
+        insufficient.insert(Timeframe::Hour1, candles(closes.get(..16).expect("short divergence fixture")));
         let insufficient_report = evaluate(&signal, "BTC", &insufficient).expect("valid divergence signal");
         assert_eq!(
             insufficient_report.conditions["div"].status,
             OutcomeStatus::InsufficientHistory {
-                required: 9,
-                available: 8,
+                required: 17,
+                available: 16,
             }
         );
 
@@ -1225,6 +1537,9 @@ mod tests {
         data.insert(Timeframe::Hour1, candles(&closes));
         let report = evaluate(&signal, "BTC", &data).expect("valid divergence signal");
         assert!(report.satisfied);
-        assert_eq!(report.conditions["div"].last_true_bar, Utc.timestamp_opt(9 * 3_600, 0).single());
+        assert_eq!(
+            report.conditions["div"].last_true_bar,
+            Utc.timestamp_opt(17 * 3_600, 0).single()
+        );
     }
 }
