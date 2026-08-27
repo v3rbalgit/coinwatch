@@ -16,7 +16,7 @@ import type { SignalDefinition } from "$lib/signals/definition"
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }))
 
 const definition: SignalDefinition = {
-  version: 2,
+  version: 3,
   direction: "bullish",
   root: { type: "condition", id: "price" },
   conditions: {

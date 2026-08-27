@@ -1,5 +1,6 @@
 import type { IndicatorDescriptor, ValueDomain } from "$lib/chart/indicators"
 import type { Operand, OperandAdjustment } from "$lib/signals/definition"
+import { findConditionIdIssue } from "$lib/signals/draft"
 import type { SignalDraft } from "$lib/signals/draft"
 import { draftSnapshot } from "$lib/signals/editor"
 
@@ -47,6 +48,9 @@ function operandValidationMessage(operand: Operand, descriptors: readonly Indica
   if (operand.adjustment !== undefined && !Number.isFinite(operand.adjustment.value)) {
     return "Source adjustments must be finite numbers."
   }
+  if (operand.adjustment?.type === "percent" && operand.adjustment.value <= -100) {
+    return "Percent adjustments must stay above -100."
+  }
   if (operand.type !== "indicator") return null
   const issue = instanceValidationMessage({
     id: operand.instance.id,
@@ -62,9 +66,15 @@ function operandValidationMessage(operand: Operand, descriptors: readonly Indica
     : null
 }
 
+function effectiveAdjustment(adjustment: OperandAdjustment | undefined): OperandAdjustment | undefined {
+  return adjustment?.value === 0 ? undefined : adjustment
+}
+
 function adjustmentsEqual(left: OperandAdjustment | undefined, right: OperandAdjustment | undefined): boolean {
-  if (left === undefined || right === undefined) return left === right
-  return left.type === right.type && left.value === right.value
+  const effectiveLeft = effectiveAdjustment(left)
+  const effectiveRight = effectiveAdjustment(right)
+  if (effectiveLeft === undefined || effectiveRight === undefined) return effectiveLeft === effectiveRight
+  return effectiveLeft.type === effectiveRight.type && effectiveLeft.value === effectiveRight.value
 }
 
 function paramsEquivalent(
@@ -115,6 +125,20 @@ export function operandDomain(operand: Operand, descriptors: readonly IndicatorD
   }
 }
 
+function applyAdjustment(adjustment: OperandAdjustment, value: number): number {
+  return adjustment.type === "absolute" ? value + adjustment.value : value * (1 + adjustment.value / 100)
+}
+
+/** Post-adjustment range; adjustments are monotone (percent > -100), so endpoints map in order. */
+function operandRange(operand: Operand, descriptors: readonly IndicatorDescriptor[]): [number, number] | null {
+  if (operand.type !== "indicator") return null
+  const range = descriptors.find(descriptor => descriptor.id === operand.instance.id)?.range
+  if (range === undefined || range === null) return null
+  const adjustment = operand.adjustment
+  if (adjustment === undefined) return [range[0], range[1]]
+  return [applyAdjustment(adjustment, range[0]), applyAdjustment(adjustment, range[1])]
+}
+
 function domainLabel(domain: ValueDomain): string {
   return {
     price: "price",
@@ -127,12 +151,9 @@ function domainLabel(domain: ValueDomain): string {
 
 export function draftValidationMessage(draft: SignalDraft, descriptors: readonly IndicatorDescriptor[]): string | null {
   if (draft.conditions.length === 0) return "Add at least one condition before saving."
-  const conditionIds = new Set<string>()
+  const idIssue = findConditionIdIssue(draft.conditions)
+  if (idIssue !== null) return `Condition ${idIssue.index + 1} needs a unique stable id.`
   for (const [index, condition] of draft.conditions.entries()) {
-    if (condition.id.length === 0 || conditionIds.has(condition.id)) {
-      return `Condition ${index + 1} needs a unique stable id.`
-    }
-    conditionIds.add(condition.id)
     if (!Number.isInteger(condition.withinBars) || condition.withinBars < 0 || condition.withinBars > 10000) {
       return `Condition ${index + 1} freshness must be a whole number from 0 to 10000.`
     }
@@ -165,6 +186,11 @@ export function draftValidationMessage(draft: SignalDraft, descriptors: readonly
     const rightDomain = operandDomain(predicate.right, descriptors)
     if (leftDomain !== null && rightDomain !== null && leftDomain !== rightDomain) {
       return `Condition ${index + 1} compares incompatible ${domainLabel(leftDomain)} and ${domainLabel(rightDomain)} sources.`
+    }
+    const leftRange = operandRange(predicate.left, descriptors)
+    const rightRange = operandRange(predicate.right, descriptors)
+    if (leftRange !== null && rightRange !== null && (leftRange[1] <= rightRange[0] || rightRange[1] <= leftRange[0])) {
+      return `Condition ${index + 1} compares sources whose value ranges never overlap.`
     }
   }
   return null

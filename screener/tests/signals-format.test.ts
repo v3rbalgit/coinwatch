@@ -82,7 +82,7 @@ describe("signal definition labels", () => {
 
   it("renders a rich boolean tree without flattening it", () => {
     const definition: SignalDefinition = {
-      version: 2,
+      version: 3,
       direction: "bullish",
       root: {
         type: "not",
@@ -151,7 +151,7 @@ describe("signal definition labels", () => {
       withinBars: 3,
     }
     const definition: SignalDefinition = {
-      version: 2,
+      version: 3,
       direction: "bullish",
       root: {
         type: "all",

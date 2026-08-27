@@ -77,13 +77,13 @@ function completeDefinition(): SignalDefinition {
   }
 }
 
-describe("signal definition v2 contract", () => {
+describe("signal definition v3 contract", () => {
   it("round-trips every tagged contract shape without renaming fields", () => {
     const definition = completeDefinition()
     const value = JSON.parse(JSON.stringify(definition))
 
     expect(value).toEqual(definition)
-    expect(value.version).toBe(2)
+    expect(value.version).toBe(3)
     expect(value.root.type).toBe("all")
     expect(value.root.children[1].type).toBe("any")
     expect(value.root.children[1].children[1].type).toBe("not")

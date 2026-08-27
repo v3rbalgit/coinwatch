@@ -10,16 +10,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use domain::Timeframe;
 use indicators::{
     DescriptorKind, DivergenceDirection, DivergenceKind, Instance, InstanceError, ValueDomain, divergence_input,
-    resolve_instance, series_input_requirement, validate_instance,
+    resolve_instance, signal_input_requirement, validate_instance,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Current schema version of serialized signal definitions.
 ///
-/// Version 1 was internal-only. Version 2 is the first builder-ready contract
-/// and moves configured indicators onto the operands that consume them.
-pub const DEFINITION_VERSION: u32 = 2;
+/// Version 1 was internal-only. Version 2 was the first builder-ready contract.
+/// Version 3 keeps the wire shape but tightens validation: two-child XOR,
+/// signal-compatible indicators only, no disjoint-range or identity-adjusted
+/// operand pairs, and percent adjustments above -100.
+pub const DEFINITION_VERSION: u32 = 3;
 
 /// Sanity bound preventing corrupted definitions from requesting unbounded work.
 /// Valid requirements within this bound may be loaded beyond the hot cache.
@@ -37,8 +39,8 @@ pub enum DefinitionError {
     /// An `all` or `any` node has no children.
     #[error("{0} groups need at least one child")]
     EmptyGroup(&'static str),
-    /// An XOR node cannot express exclusivity with fewer than two children.
-    #[error("xor groups need at least two children")]
+    /// An XOR node expresses exclusivity between exactly two children.
+    #[error("xor groups need exactly two children")]
     XorNeedsTwoChildren,
     /// A tree leaf refers to a missing condition.
     #[error("tree references unknown condition '{0}'")]
@@ -69,6 +71,9 @@ pub enum DefinitionError {
     /// An operand adjustment is NaN or infinite.
     #[error("condition '{0}' has a non-finite operand adjustment")]
     NonFiniteAdjustment(String),
+    /// A percent adjustment at or below -100 flips or zeroes the operand's sign.
+    #[error("condition '{0}' has a percent adjustment at or below -100")]
+    PercentAdjustmentTooLow(String),
     /// A divergence predicate was assigned to a numeric-series indicator.
     #[error("condition '{condition}' uses a divergence predicate on series indicator '{indicator}'")]
     DivergenceRequiresDivergenceIndicator {
@@ -119,6 +124,9 @@ pub enum DefinitionError {
         /// Right source family.
         right: ValueDomain,
     },
+    /// The operands' known output ranges never overlap, making the comparison constant.
+    #[error("condition '{0}' compares sources with disjoint value ranges")]
+    DisjointOperandRanges(String),
 }
 
 /// A serialized definition could not be decoded with the current contract.
@@ -185,6 +193,11 @@ impl OperandAdjustment {
         match self {
             Self::Absolute { value } | Self::Percent { value } => value,
         }
+    }
+
+    /// `+0` and `+0%` (either zero sign) leave every value unchanged.
+    const fn is_identity(self) -> bool {
+        self.value().abs().to_bits() == 0
     }
 }
 
@@ -445,7 +458,7 @@ impl Condition {
 
 fn operand_requirement(operand: &Operand) -> Result<usize, InstanceError> {
     match operand {
-        Operand::Indicator { instance, output, .. } => series_input_requirement(instance, output),
+        Operand::Indicator { instance, output, .. } => signal_input_requirement(instance, output),
         Operand::Field { .. } => Ok(1),
         Operand::Constant { .. } => Ok(0),
     }
@@ -470,9 +483,9 @@ pub enum Node {
         /// Child expression.
         child: Box<Node>,
     },
-    /// An odd number of children must hold.
+    /// Exactly one of two children must hold.
     Xor {
-        /// Child expressions (at least two).
+        /// Child expressions (exactly two).
         children: Vec<Node>,
     },
     /// Leaf referencing a condition id.
@@ -571,7 +584,7 @@ fn validate_node(
             }
         }
         Node::Xor { children } => {
-            if children.len() < 2 {
+            if children.len() != 2 {
                 return Err(DefinitionError::XorNeedsTwoChildren);
             }
             for child in children {
@@ -616,6 +629,12 @@ fn validate_condition(id: &str, condition: &Condition) -> Result<(), DefinitionE
                     right,
                 });
             }
+            if let (Some([left_min, left_max]), Some([right_min, right_max])) =
+                (operand_range(left), operand_range(right))
+                && (left_max <= right_min || right_max <= left_min)
+            {
+                return Err(DefinitionError::DisjointOperandRanges(id.to_owned()));
+            }
         }
         Predicate::Divergence { instance, .. } => {
             let descriptor = validate_instance(instance).map_err(|source| DefinitionError::InvalidIndicator {
@@ -639,6 +658,23 @@ fn validate_condition(id: &str, condition: &Condition) -> Result<(), DefinitionE
     Ok(())
 }
 
+/// Post-adjustment range; adjustments are monotone (percent > -100), so endpoints map in order.
+fn operand_range(operand: &Operand) -> Option<[f64; 2]> {
+    let Operand::Indicator { instance, .. } = operand else {
+        return None;
+    };
+    let [min, max] = validate_instance(instance).ok().and_then(|descriptor| descriptor.range)?;
+    match operand.adjustment() {
+        Some(adjustment) => Some([adjustment.apply(min), adjustment.apply(max)]),
+        None => Some([min, max]),
+    }
+}
+
+/// Adjustments that change nothing compare equal to no adjustment at all.
+fn effective_adjustment(adjustment: Option<OperandAdjustment>) -> Option<OperandAdjustment> {
+    adjustment.filter(|adjustment| !adjustment.is_identity())
+}
+
 fn operands_equivalent(id: &str, left: &Operand, right: &Operand) -> Result<bool, DefinitionError> {
     match (left, right) {
         (Operand::Constant { value: left }, Operand::Constant { value: right }) => Ok(left.total_cmp(right).is_eq()),
@@ -651,7 +687,8 @@ fn operands_equivalent(id: &str, left: &Operand, right: &Operand) -> Result<bool
                 field: right_field,
                 adjustment: right_adjustment,
             },
-        ) => Ok(left_field == right_field && left_adjustment == right_adjustment),
+        ) => Ok(left_field == right_field
+            && effective_adjustment(*left_adjustment) == effective_adjustment(*right_adjustment)),
         (
             Operand::Indicator {
                 instance: left_instance,
@@ -664,7 +701,9 @@ fn operands_equivalent(id: &str, left: &Operand, right: &Operand) -> Result<bool
                 adjustment: right_adjustment,
             },
         ) => {
-            if left_output != right_output || left_adjustment != right_adjustment {
+            if left_output != right_output
+                || effective_adjustment(*left_adjustment) != effective_adjustment(*right_adjustment)
+            {
                 return Ok(false);
             }
             let resolve = |instance: &Instance| {
@@ -682,6 +721,11 @@ fn operands_equivalent(id: &str, left: &Operand, right: &Operand) -> Result<bool
 fn validate_operand(id: &str, operand: &Operand) -> Result<Option<ValueDomain>, DefinitionError> {
     if operand.adjustment().is_some_and(|adjustment| !adjustment.value().is_finite()) {
         return Err(DefinitionError::NonFiniteAdjustment(id.to_owned()));
+    }
+    if let Some(OperandAdjustment::Percent { value }) = operand.adjustment()
+        && value <= -100.0
+    {
+        return Err(DefinitionError::PercentAdjustmentTooLow(id.to_owned()));
     }
 
     match operand {
@@ -900,7 +944,7 @@ mod tests {
             },
             within_bars: 3,
         };
-        assert_eq!(divergence.required_completed_bars().expect("divergence history"), 83);
+        assert_eq!(divergence.required_completed_bars().expect("divergence history"), 139);
 
         let signal = SignalDefinition {
             version: DEFINITION_VERSION,
@@ -924,7 +968,7 @@ mod tests {
         };
         let requirements = signal.required_history().expect("valid requirements");
         assert_eq!(requirements.get(&Timeframe::Hour1), Some(&23));
-        assert_eq!(requirements.get(&Timeframe::Day1), Some(&83));
+        assert_eq!(requirements.get(&Timeframe::Day1), Some(&139));
     }
 
     #[test]
@@ -986,23 +1030,25 @@ mod tests {
         };
         assert!(matches!(bad_output.validate(), Err(DefinitionError::UnknownOutput { .. })));
 
-        let mut cumulative = definition(Node::Condition { id: "hot".to_owned() });
-        cumulative.conditions.get_mut("hot").expect("fixture condition").predicate = Predicate::Threshold {
-            left: Operand::Indicator {
-                instance: Instance {
-                    id: "vwap".to_owned(),
-                    params: BTreeMap::new(),
+        for id in ["vwap", "psar", "supertrend"] {
+            let mut unstable = definition(Node::Condition { id: "hot".to_owned() });
+            unstable.conditions.get_mut("hot").expect("fixture condition").predicate = Predicate::Threshold {
+                left: Operand::Indicator {
+                    instance: Instance {
+                        id: id.to_owned(),
+                        params: BTreeMap::new(),
+                    },
+                    output: id.to_owned(),
+                    adjustment: None,
                 },
-                output: "vwap".to_owned(),
-                adjustment: None,
-            },
-            op: ComparisonOp::GreaterThan,
-            right: Operand::Constant { value: 80.0 },
-        };
-        assert!(matches!(
-            cumulative.validate(),
-            Err(DefinitionError::IndicatorNotSignalCompatible { indicator, .. }) if indicator == "vwap"
-        ));
+                op: ComparisonOp::GreaterThan,
+                right: Operand::Constant { value: 80.0 },
+            };
+            assert!(matches!(
+                unstable.validate(),
+                Err(DefinitionError::IndicatorNotSignalCompatible { indicator, .. }) if indicator == id
+            ));
+        }
     }
 
     #[test]
@@ -1047,6 +1093,103 @@ mod tests {
         ));
     }
 
+    fn adjusted_sma(period: f64, adjustment: OperandAdjustment) -> Operand {
+        Operand::Indicator {
+            instance: sma(period),
+            output: "sma".to_owned(),
+            adjustment: Some(adjustment),
+        }
+    }
+
+    fn oscillator_output(id: &str, adjustment: Option<OperandAdjustment>) -> Operand {
+        Operand::Indicator {
+            instance: Instance {
+                id: id.to_owned(),
+                params: BTreeMap::new(),
+            },
+            output: id.to_owned(),
+            adjustment,
+        }
+    }
+
+    #[test]
+    fn rejects_percent_adjustments_at_or_below_minus_one_hundred() {
+        let with_adjustment = |value: f64| {
+            let mut signal = definition(Node::Condition { id: "hot".to_owned() });
+            signal.conditions.get_mut("hot").expect("fixture condition").predicate = Predicate::Threshold {
+                left: adjusted_sma(20.0, OperandAdjustment::Percent { value }),
+                op: ComparisonOp::GreaterThan,
+                right: Operand::Constant { value: 80.0 },
+            };
+            signal
+        };
+        for value in [-100.0, -103.0] {
+            assert!(matches!(
+                with_adjustment(value).validate(),
+                Err(DefinitionError::PercentAdjustmentTooLow(id)) if id == "hot"
+            ));
+        }
+        assert!(with_adjustment(-50.0).validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_identity_adjustments_as_equivalent_operands() {
+        for adjustment in [
+            OperandAdjustment::Absolute { value: 0.0 },
+            OperandAdjustment::Percent { value: 0.0 },
+        ] {
+            let mut signal = definition(Node::Condition { id: "hot".to_owned() });
+            signal.conditions.get_mut("hot").expect("fixture condition").predicate = Predicate::Threshold {
+                left: sma_output(20.0),
+                op: ComparisonOp::GreaterThan,
+                right: adjusted_sma(20.0, adjustment),
+            };
+            assert!(matches!(
+                signal.validate(),
+                Err(DefinitionError::EquivalentOperands(id)) if id == "hot"
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_indicator_operands_with_disjoint_ranges() {
+        let mut disjoint = definition(Node::Condition { id: "hot".to_owned() });
+        disjoint.conditions.get_mut("hot").expect("fixture condition").predicate = Predicate::Threshold {
+            left: oscillator_output("rsi", None),
+            op: ComparisonOp::GreaterThan,
+            right: oscillator_output("williams", None),
+        };
+        assert!(matches!(
+            disjoint.validate(),
+            Err(DefinitionError::DisjointOperandRanges(id)) if id == "hot"
+        ));
+
+        let mut overlapping = definition(Node::Condition { id: "hot".to_owned() });
+        overlapping.conditions.get_mut("hot").expect("fixture condition").predicate = Predicate::Threshold {
+            left: oscillator_output("rsi", None),
+            op: ComparisonOp::GreaterThan,
+            right: oscillator_output("williams", Some(OperandAdjustment::Absolute { value: 100.0 })),
+        };
+        assert!(overlapping.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_xor_groups_without_exactly_two_children() {
+        let leaf = || Node::Condition { id: "hot".to_owned() };
+        let three = definition(Node::Xor {
+            children: vec![leaf(), leaf(), leaf()],
+        });
+        assert!(matches!(three.validate(), Err(DefinitionError::XorNeedsTwoChildren)));
+
+        let one = definition(Node::Xor { children: vec![leaf()] });
+        assert!(matches!(one.validate(), Err(DefinitionError::XorNeedsTwoChildren)));
+
+        let two = definition(Node::Xor {
+            children: vec![leaf(), leaf()],
+        });
+        assert!(two.validate().is_ok());
+    }
+
     #[test]
     fn rejects_non_finite_operand_adjustments() {
         let mut signal = definition(Node::Condition { id: "hot".to_owned() });
@@ -1082,7 +1225,7 @@ mod tests {
         *adjustment = Some(OperandAdjustment::Percent { value: 3.0 });
 
         let value = serde_json::to_value(&signal).expect("serialize definition");
-        assert_eq!(value.pointer("/version"), Some(&json!(2)));
+        assert_eq!(value.pointer("/version"), Some(&json!(3)));
         assert_eq!(value.pointer("/direction"), Some(&json!("bearish")));
         assert_eq!(value.pointer("/root/type"), Some(&json!("condition")));
         assert_eq!(value.pointer("/conditions/hot/timeframe"), Some(&json!("1h")));
@@ -1118,7 +1261,7 @@ mod tests {
             Err(DefinitionDecodeError::InvalidJson(_))
         ));
         assert!(matches!(
-            decode_definition(r#"{"version":2}"#),
+            decode_definition(r#"{"version":3}"#),
             Err(DefinitionDecodeError::InvalidJson(_))
         ));
     }

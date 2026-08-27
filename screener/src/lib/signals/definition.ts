@@ -1,9 +1,11 @@
 import type { IndicatorInstance } from "$lib/chart/indicators"
+import { TIMEFRAMES } from "$lib/timeframes"
+import type { Timeframe } from "$lib/timeframes"
 
-export const SIGNAL_DEFINITION_VERSION = 2
+export const SIGNAL_DEFINITION_VERSION = 3
 
-export type SignalTimeframe = "1h" | "4h" | "1d" | "1w"
-export const SIGNAL_TIMEFRAMES: readonly SignalTimeframe[] = ["1h", "4h", "1d", "1w"]
+export type SignalTimeframe = Timeframe
+export const SIGNAL_TIMEFRAMES: readonly SignalTimeframe[] = TIMEFRAMES
 
 export type SignalDirection = "bullish" | "bearish"
 

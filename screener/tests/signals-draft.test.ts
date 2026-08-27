@@ -50,7 +50,7 @@ describe("flat signal drafts", () => {
     const definition = compileSignalDraft(draft())
 
     expect(definition).toEqual({
-      version: 2,
+      version: 3,
       direction: "bullish",
       root: {
         type: "all",
@@ -113,7 +113,7 @@ describe("flat signal drafts", () => {
 
   it("imports a single condition leaf as a one-card ALL draft", () => {
     const definition: SignalDefinition = {
-      version: 2,
+      version: 3,
       direction: "bearish",
       root: { type: "condition", id: "price" },
       conditions: { price: priceCondition(90) },
