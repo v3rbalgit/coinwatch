@@ -2,12 +2,27 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use chrono::Utc;
 use domain::{Candle, Timeframe};
 use storage::{CandleStore, StoreError};
 use thiserror::Error;
 
 use crate::error::FeedError;
-use crate::rest::{HyperliquidRest, MAX_CANDLE_PAGE};
+use crate::rest::MAX_CANDLE_PAGE;
+
+/// Provider of candle pages ending immediately before an aligned boundary.
+#[async_trait]
+pub trait CandleProvider: Send + Sync {
+    /// Up to `count` candles strictly before `before_ms`, oldest first.
+    async fn candles_before(
+        &self,
+        coin: &str,
+        timeframe: Timeframe,
+        before_ms: i64,
+        count: usize,
+    ) -> Result<Vec<Candle>, FeedError>;
+}
 
 /// A candle-history load failure.
 #[derive(Debug, Error)]
@@ -39,21 +54,21 @@ pub enum HistoryError {
 /// Shared cache-first loader for chart paging and signal hydration.
 pub struct CandleHistory {
     store: Arc<dyn CandleStore>,
-    rest: Arc<HyperliquidRest>,
+    rest: Arc<dyn CandleProvider>,
 }
 
 impl CandleHistory {
-    /// Combine a durable candle cache with the process-wide Hyperliquid client.
+    /// Combine a durable candle cache with a page provider (Hyperliquid in production).
     #[must_use]
-    pub fn new(store: Arc<dyn CandleStore>, rest: Arc<HyperliquidRest>) -> Self {
+    pub fn new(store: Arc<dyn CandleStore>, rest: Arc<dyn CandleProvider>) -> Self {
         Self { store, rest }
     }
 
     /// Load up to `limit` contiguous candles immediately before `before_ms`.
     ///
-    /// Results are oldest-first. SQLite is checked first; missing older prefixes
-    /// are fetched in provider-sized pages, persisted, then read back. A short
-    /// result is a valid provider or listing boundary.
+    /// Results are oldest-first. The cache is consulted between REST pages, so
+    /// only actual gaps are fetched (and persisted). A short result is a valid
+    /// provider or listing boundary.
     pub async fn load_before(
         &self,
         coin: &str,
@@ -67,45 +82,59 @@ impl CandleHistory {
         if !timeframe.is_aligned(before_ms) {
             return Err(HistoryError::UnalignedBoundary { timeframe, before_ms });
         }
+        // A future boundary would fetch and persist the forming bar as final.
+        let before_ms = before_ms.min(timeframe.bar_open_ms(Utc::now().timestamp_millis()));
 
-        let cached = self.store.candles_before(coin, timeframe, before_ms, limit).await?;
-        let cached = contiguous_suffix(&cached, timeframe, before_ms);
-        if cached.len() >= limit {
-            return Ok(cached.to_vec());
-        }
-
-        let mut boundary = cached.first().map_or(before_ms, |candle| candle.open_time.timestamp_millis());
-        let mut missing = limit - cached.len();
+        let duration = timeframe.duration_ms();
+        let mut segments: Vec<Vec<Candle>> = Vec::new();
+        let mut boundary = before_ms;
+        let mut missing = limit;
         while missing > 0 {
-            let requested = missing.min(MAX_CANDLE_PAGE);
+            let cached = self.store.candles_before(coin, timeframe, boundary, missing).await?;
+            let suffix = contiguous_suffix(&cached, timeframe, boundary);
+            if let Some(first) = suffix.first() {
+                boundary = first.open_time.timestamp_millis();
+                missing = missing.saturating_sub(suffix.len());
+                segments.push(suffix.to_vec());
+                continue;
+            }
+            let gap_bars = cached.last().map(|candle| {
+                let span = boundary.saturating_sub(candle.open_time.timestamp_millis());
+                usize::try_from(span / duration).unwrap_or(usize::MAX).saturating_sub(1).max(1)
+            });
+            let requested = gap_bars.unwrap_or(missing).min(missing).min(MAX_CANDLE_PAGE);
             let fetched = self.rest.candles_before(coin, timeframe, boundary, requested).await?;
             if fetched.is_empty() {
                 break;
             }
             let contiguous = contiguous_suffix(&fetched, timeframe, boundary);
+            if contiguous.is_empty() {
+                self.store.save(coin, timeframe, &fetched).await?;
+                break;
+            }
             if contiguous.len() != fetched.len() {
                 return Err(HistoryError::NonContiguousResponse {
                     coin: coin.to_owned(),
                     timeframe,
                 });
             }
-
-            let fetched = contiguous;
-            let fetched_count = fetched.len();
-            let Some(first) = fetched.first() else {
-                break;
-            };
-            let next_boundary = first.open_time.timestamp_millis();
-            self.store.save(coin, timeframe, fetched).await?;
-            boundary = next_boundary;
-            if fetched_count >= missing || fetched_count < requested {
+            self.store.save(coin, timeframe, contiguous).await?;
+            let short_page = contiguous.len() < requested;
+            boundary = contiguous
+                .first()
+                .map_or(boundary, |candle| candle.open_time.timestamp_millis());
+            missing = missing.saturating_sub(contiguous.len());
+            segments.push(contiguous.to_vec());
+            if short_page {
                 break;
             }
-            missing -= fetched_count;
         }
 
-        let cached = self.store.candles_before(coin, timeframe, before_ms, limit).await?;
-        Ok(contiguous_suffix(&cached, timeframe, before_ms).to_vec())
+        let mut candles = Vec::with_capacity(limit.saturating_sub(missing));
+        for segment in segments.into_iter().rev() {
+            candles.extend(segment);
+        }
+        Ok(candles)
     }
 }
 
@@ -140,8 +169,9 @@ mod tests {
     use rust_decimal::Decimal;
     use storage::{CandleSeries, CandleStore, StoreError};
 
-    use super::{CandleHistory, HistoryError, contiguous_suffix};
+    use super::{CandleHistory, CandleProvider, HistoryError, contiguous_suffix};
     use crate::HyperliquidRest;
+    use crate::error::FeedError;
 
     struct CachedStore {
         candles: Mutex<BTreeMap<i64, Candle>>,
@@ -201,6 +231,59 @@ mod tests {
         Arc::new(HyperliquidRest::new(reqwest::Client::new(), 1100))
     }
 
+    struct UnusedProvider;
+
+    #[async_trait]
+    impl CandleProvider for UnusedProvider {
+        async fn candles_before(
+            &self,
+            _coin: &str,
+            _timeframe: Timeframe,
+            _before_ms: i64,
+            _count: usize,
+        ) -> Result<Vec<Candle>, FeedError> {
+            panic!("this test must be served entirely from the cache")
+        }
+    }
+
+    struct ScriptedProvider {
+        pages: Mutex<Vec<(i64, usize, Vec<Candle>)>>,
+        requests: Mutex<Vec<(i64, usize)>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(pages: Vec<(i64, usize, Vec<Candle>)>) -> Self {
+            Self {
+                pages: Mutex::new(pages),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CandleProvider for ScriptedProvider {
+        async fn candles_before(
+            &self,
+            _coin: &str,
+            _timeframe: Timeframe,
+            before_ms: i64,
+            count: usize,
+        ) -> Result<Vec<Candle>, FeedError> {
+            self.requests
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((before_ms, count));
+            let mut pages = self.pages.lock().unwrap_or_else(PoisonError::into_inner);
+            let position = pages
+                .iter()
+                .position(|(expected_before, expected_count, _)| {
+                    *expected_before == before_ms && *expected_count == count
+                })
+                .unwrap_or_else(|| panic!("unscripted provider request ({before_ms}, {count})"));
+            Ok(pages.remove(position).2)
+        }
+    }
+
     fn candle(hour: i64) -> Candle {
         Candle {
             open_time: DateTime::<Utc>::from_timestamp_millis(hour * Timeframe::Hour1.duration_ms())
@@ -225,7 +308,7 @@ mod tests {
     #[tokio::test]
     async fn complete_cache_does_not_fetch_or_write() {
         let store = Arc::new(CachedStore::new((0..5).map(candle)));
-        let history = CandleHistory::new(store.clone(), rest());
+        let history = CandleHistory::new(store.clone(), Arc::new(UnusedProvider));
 
         let candles = history
             .load_before("BTC", Timeframe::Hour1, 5 * Timeframe::Hour1.duration_ms(), 3)
@@ -236,6 +319,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "live network"]
     async fn cache_misses_page_persist_and_become_cache_hits() {
         let store = Arc::new(CachedStore::new(Vec::new()));
         let history = CandleHistory::new(store.clone(), rest());
@@ -259,9 +343,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn head_gap_fetches_only_the_gap_then_reuses_the_cache() {
+        let hour = Timeframe::Hour1.duration_ms();
+        let store = Arc::new(CachedStore::new((0..8).map(candle)));
+        let provider = Arc::new(ScriptedProvider::new(vec![(10 * hour, 2, vec![candle(8), candle(9)])]));
+        let history = CandleHistory::new(store.clone(), provider.clone());
+
+        let candles = history
+            .load_before("BTC", Timeframe::Hour1, 10 * hour, 10)
+            .await
+            .expect("gap-filled history");
+
+        assert_eq!(candles, (0..10).map(candle).collect::<Vec<_>>());
+        assert_eq!(
+            provider.requests.lock().unwrap_or_else(PoisonError::into_inner).as_slice(),
+            &[(10 * hour, 2)]
+        );
+        assert_eq!(store.writes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn short_head_page_is_persisted_and_returned_short() {
+        let hour = Timeframe::Hour1.duration_ms();
+        let store = Arc::new(CachedStore::new(Vec::new()));
+        let provider = Arc::new(ScriptedProvider::new(vec![(10 * hour, 5, vec![candle(6), candle(7)])]));
+        let history = CandleHistory::new(store.clone(), provider);
+
+        let candles = history
+            .load_before("BTC", Timeframe::Hour1, 10 * hour, 5)
+            .await
+            .expect("short history at a provider hole");
+
+        assert!(candles.is_empty());
+        assert_eq!(store.writes.load(Ordering::Relaxed), 1);
+        let stored = store.candles.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(stored.keys().copied().collect::<Vec<_>>(), vec![6 * hour, 7 * hour]);
+    }
+
+    #[tokio::test]
+    async fn future_boundaries_are_clamped_to_the_last_completed_bar() {
+        let week = Timeframe::Week1.duration_ms();
+        let forming_open = Timeframe::Week1.bar_open_ms(Utc::now().timestamp_millis());
+        let store = Arc::new(CachedStore::new(Vec::new()));
+        let provider = Arc::new(ScriptedProvider::new(vec![(forming_open, 2, Vec::new())]));
+        let history = CandleHistory::new(store, provider.clone());
+
+        let candles = history
+            .load_before("BTC", Timeframe::Week1, forming_open + week, 2)
+            .await
+            .expect("clamped history");
+
+        assert!(candles.is_empty());
+        assert_eq!(
+            provider.requests.lock().unwrap_or_else(PoisonError::into_inner).as_slice(),
+            &[(forming_open, 2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn interior_gap_inside_a_page_remains_a_hard_error() {
+        let hour = Timeframe::Hour1.duration_ms();
+        let store = Arc::new(CachedStore::new(Vec::new()));
+        let provider = Arc::new(ScriptedProvider::new(vec![(10 * hour, 5, vec![candle(7), candle(9)])]));
+        let history = CandleHistory::new(store, provider);
+
+        assert!(matches!(
+            history.load_before("BTC", Timeframe::Hour1, 10 * hour, 5).await,
+            Err(HistoryError::NonContiguousResponse { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn unaligned_boundaries_are_rejected() {
         let store = Arc::new(CachedStore::new(Vec::new()));
-        let history = CandleHistory::new(store, rest());
+        let history = CandleHistory::new(store, Arc::new(UnusedProvider));
 
         assert!(matches!(
             history.load_before("BTC", Timeframe::Hour1, 1, 3).await,
