@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -33,6 +33,8 @@ const WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 const RECONNECT_BASE: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
+/// A session at least this old failed on its own, not as part of a failure streak.
+const STABLE_SESSION: Duration = Duration::from_secs(60);
 const UNIVERSE_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Streams live Hyperliquid market data (prices + candles) into a shared
@@ -87,13 +89,18 @@ impl HyperliquidAdapter {
 async fn ws_loop(feed: MarketFeed, store: Arc<MarketStore>, intervals: Vec<Timeframe>) {
     let mut backoff = RECONNECT_BASE;
     loop {
+        let started = Instant::now();
         let result = run_session(&feed, &store, &intervals).await;
         let session_was_live = store.status().connection == ConnectionState::Live;
         match result {
             Ok(()) => backoff = RECONNECT_BASE,
             Err(error) => {
                 tracing::warn!(%error, ?backoff, "websocket session ended, reconnecting");
-                backoff = (backoff * 2).min(RECONNECT_MAX);
+                backoff = if started.elapsed() >= STABLE_SESSION {
+                    RECONNECT_BASE
+                } else {
+                    (backoff * 2).min(RECONNECT_MAX)
+                };
             }
         }
         if session_was_live {
