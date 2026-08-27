@@ -19,4 +19,4 @@ pub use historical::{
     HistoricalMatchSpan, HistoricalProgress, HistoricalRange, HistoricalValidation, HistoricalValidationError,
     evaluate_historical, validate_historical,
 };
-pub use run::{RunProgress, RunSummary, evaluate_coin, run_signal};
+pub use run::{RunProgress, RunSummary, run_signal};

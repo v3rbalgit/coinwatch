@@ -14,14 +14,7 @@ use domain::{Candle, Timeframe};
 use hl_feed::{CandleHistory, MarketStore};
 
 use crate::definition::{DefinitionError, SignalDefinition};
-use crate::eval::{CoinData, EvalReport, evaluate_validated};
-
-/// Length of the completed prefix in an oldest-first candle series.
-fn completed_len(candles: &[Candle], timeframe: Timeframe, now: DateTime<Utc>) -> usize {
-    let now_ms = now.timestamp_millis();
-    candles
-        .partition_point(|candle| candle.open_time.timestamp_millis().saturating_add(timeframe.duration_ms()) <= now_ms)
-}
+use crate::eval::{CoinData, EvalReport, completed_len, evaluate_validated};
 
 async fn hydrate_timeframe(
     data: &mut CoinData,
@@ -72,19 +65,6 @@ async fn hydrate_coin_data(
         }
     }
     data
-}
-
-/// Validate and evaluate a signal on one coin using lazily hydrated completed bars.
-pub async fn evaluate_coin(
-    store: &MarketStore,
-    history: &CandleHistory,
-    definition: &SignalDefinition,
-    coin: &str,
-    now: DateTime<Utc>,
-) -> Result<EvalReport, DefinitionError> {
-    let requirements = definition.required_history()?;
-    let data = hydrate_coin_data(store, history, coin, &requirements, now).await;
-    evaluate_validated(definition, coin, &data)
 }
 
 /// One completed coin evaluation within a batch run.
@@ -160,12 +140,12 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{DateTime, TimeZone, Utc};
     use domain::{Candle, Timeframe};
-    use hl_feed::{CandleHistory, HyperliquidRest, MarketStore};
+    use hl_feed::{CandleHistory, CandleProvider, FeedError, MarketStore};
     use indicators::Instance;
     use rust_decimal::Decimal;
     use storage::{CandleSeries, CandleStore, StoreError};
 
-    use super::{RunSummary, completed_len, hydrate_timeframe, run_signal};
+    use super::{RunSummary, hydrate_timeframe, run_signal};
     use crate::definition::{
         ComparisonOp, Condition, DEFINITION_VERSION, Direction, Node, Operand, Predicate, SignalDefinition,
     };
@@ -264,10 +244,23 @@ mod tests {
         }
     }
 
+    struct UnusedProvider;
+
+    #[async_trait]
+    impl CandleProvider for UnusedProvider {
+        async fn candles_before(
+            &self,
+            _coin: &str,
+            _timeframe: Timeframe,
+            _before_ms: i64,
+            _count: usize,
+        ) -> Result<Vec<Candle>, FeedError> {
+            panic!("run hydration must be served from the cache in this test")
+        }
+    }
+
     fn history(store: Arc<CachedStore>) -> CandleHistory {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let rest = Arc::new(HyperliquidRest::new(reqwest::Client::new(), 1100));
-        CandleHistory::new(store, rest)
+        CandleHistory::new(store, Arc::new(UnusedProvider))
     }
 
     fn hot_candles() -> Arc<Vec<Candle>> {
@@ -276,20 +269,6 @@ mod tests {
 
     fn during_forming_bar() -> DateTime<Utc> {
         Utc.timestamp_opt(10 * 3_600 + 1_800, 0).single().expect("valid timestamp")
-    }
-
-    #[test]
-    fn excludes_forming_trailing_bar() {
-        let candles = vec![candle(0), candle(1), candle(2)];
-        let now = Utc.timestamp_opt(2 * 3_600 + 1_800, 0).single().expect("valid timestamp");
-        assert_eq!(completed_len(&candles, Timeframe::Hour1, now), 2);
-    }
-
-    #[test]
-    fn includes_bar_at_exact_close_time() {
-        let candles = vec![candle(0), candle(1)];
-        let now = Utc.timestamp_opt(2 * 3_600, 0).single().expect("valid timestamp");
-        assert_eq!(completed_len(&candles, Timeframe::Hour1, now), 2);
     }
 
     #[tokio::test]

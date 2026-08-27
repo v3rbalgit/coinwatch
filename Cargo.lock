@@ -3968,9 +3968,7 @@ dependencies = [
  "domain",
  "hl-feed",
  "indicators",
- "reqwest",
  "rust_decimal",
- "rustls",
  "serde",
  "serde_json",
  "storage",
@@ -4275,6 +4273,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -17,8 +17,6 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
-reqwest = { workspace = true }
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
 storage = { workspace = true }
 tokio = { workspace = true }
 

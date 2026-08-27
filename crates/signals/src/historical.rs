@@ -5,6 +5,7 @@
 //! evaluation advances on the definition's finest completed-bar grid and returns
 //! matched-state transitions with their evidence.
 
+use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -14,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::definition::{DefinitionError, SignalDefinition};
-use crate::eval::{CoinData, EvalReport, OutcomeStatus, PreparedEvaluation};
+use crate::eval::{CoinData, EvalReport, OutcomeStatus, PreparedEvaluation, Truth};
 
 /// Inclusive evaluation bounds expressed as UTC instants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,16 +59,29 @@ pub struct HistoricalValidation {
     pub spans: Vec<HistoricalMatchSpan>,
 }
 
-/// Cache-hydration progress for one signal timeframe.
+/// Progress through one historical validation: hydration, then evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HistoricalProgress {
-    /// Number of timeframes hydrated, including this one.
-    pub completed: usize,
-    /// Fixed number of timeframes required by the definition.
-    pub total: usize,
-    /// Timeframe just hydrated.
-    pub timeframe: Timeframe,
+pub enum HistoricalProgress {
+    /// One signal timeframe hydrated from the shared cache.
+    Hydrated {
+        /// Number of timeframes hydrated, including this one.
+        completed: usize,
+        /// Fixed number of timeframes required by the definition.
+        total: usize,
+        /// Timeframe just hydrated.
+        timeframe: Timeframe,
+    },
+    /// A batch of anchor instants evaluated.
+    Evaluated {
+        /// Number of instants evaluated so far.
+        completed: usize,
+        /// Fixed number of instants in the range.
+        total: usize,
+    },
 }
+
+/// Instants between evaluation progress callbacks.
+const EVALUATION_PROGRESS_INTERVAL: usize = 256;
 
 /// Historical validation failures preserve the timeframe and required depth.
 #[derive(Debug, Error)]
@@ -78,6 +92,12 @@ pub enum HistoricalValidationError {
     /// The range is empty or reversed.
     #[error("historical validation range start must be before its end")]
     InvalidRange,
+    /// The range lies entirely after the last completed anchor bar.
+    #[error("historical validation range ends before any {timeframe:?} candle completes")]
+    RangeBeyondCompleted {
+        /// Anchor timeframe whose completed bars bound the range.
+        timeframe: Timeframe,
+    },
     /// Timestamp or candle-count arithmetic exceeded supported bounds.
     #[error("historical validation range is outside the supported candle bounds")]
     RangeOverflow,
@@ -117,7 +137,7 @@ pub enum HistoricalValidationError {
         message: String,
     },
     /// The progress consumer stopped accepting updates.
-    #[error("historical validation stopped before evaluation")]
+    #[error("historical validation stopped before completion")]
     Stopped,
 }
 
@@ -127,11 +147,11 @@ fn utc_millis(timestamp_ms: i64) -> Result<DateTime<Utc>, HistoricalValidationEr
         .ok_or(HistoricalValidationError::RangeOverflow)
 }
 
-fn anchor_timeframe(definition: &SignalDefinition) -> Result<Timeframe, HistoricalValidationError> {
-    definition
-        .required_history()?
-        .into_keys()
+fn anchor_timeframe(requirements: &BTreeMap<Timeframe, usize>) -> Result<Timeframe, HistoricalValidationError> {
+    requirements
+        .keys()
         .next()
+        .copied()
         .ok_or(HistoricalValidationError::InvalidRange)
 }
 
@@ -151,6 +171,25 @@ fn first_and_pre_range_evaluation(
     };
     let pre_range_ms = first_ms.checked_sub(duration).ok_or(HistoricalValidationError::RangeOverflow)?;
     Ok((utc_millis(first_ms)?, utc_millis(pre_range_ms)?))
+}
+
+/// Clamp the range end to the last completed anchor close at `now`.
+fn clamp_to_completed(
+    range: HistoricalRange,
+    anchor: Timeframe,
+    now: DateTime<Utc>,
+) -> Result<HistoricalRange, HistoricalValidationError> {
+    let last_completed_close_ms = anchor.bar_open_ms(now.timestamp_millis());
+    if range.end.timestamp_millis() <= last_completed_close_ms {
+        return Ok(range);
+    }
+    if range.start.timestamp_millis() >= last_completed_close_ms {
+        return Err(HistoricalValidationError::RangeBeyondCompleted { timeframe: anchor });
+    }
+    Ok(HistoricalRange {
+        start: range.start,
+        end: utc_millis(last_completed_close_ms)?,
+    })
 }
 
 fn bars_between(
@@ -191,6 +230,72 @@ fn ensure_known_report(definition: &SignalDefinition, report: &EvalReport) -> Re
     Ok(())
 }
 
+/// Anchor instants in range; errors when any referenced timeframe's data ends
+/// before the last evaluated instant, which would silently freeze stale state.
+fn coverage_and_points(
+    data: &CoinData,
+    requirements: &BTreeMap<Timeframe, usize>,
+    anchor: Timeframe,
+    first_evaluation: DateTime<Utc>,
+    pre_range_evaluation: DateTime<Utc>,
+    range_end: DateTime<Utc>,
+) -> Result<usize, HistoricalValidationError> {
+    let duration = anchor.duration_ms();
+    let first_ms = first_evaluation.timestamp_millis();
+    let end_ms = range_end.timestamp_millis();
+    let (points, last_instant_ms) = if first_ms > end_ms {
+        (0, pre_range_evaluation.timestamp_millis())
+    } else {
+        let steps = end_ms.checked_sub(first_ms).ok_or(HistoricalValidationError::RangeOverflow)? / duration;
+        let final_ms = steps
+            .checked_mul(duration)
+            .and_then(|offset| first_ms.checked_add(offset))
+            .ok_or(HistoricalValidationError::RangeOverflow)?;
+        let points = steps
+            .checked_add(1)
+            .ok_or(HistoricalValidationError::RangeOverflow)
+            .and_then(|points| usize::try_from(points).map_err(|_| HistoricalValidationError::RangeOverflow))?;
+        (points, final_ms)
+    };
+    for &timeframe in requirements.keys() {
+        series_covers(data, timeframe, last_instant_ms)?;
+    }
+    Ok(points)
+}
+
+fn series_covers(data: &CoinData, timeframe: Timeframe, instant_ms: i64) -> Result<(), HistoricalValidationError> {
+    let duration = timeframe.duration_ms();
+    let needed_close_ms = timeframe.bar_open_ms(instant_ms);
+    let candles = data.get(timeframe).unwrap_or_default();
+    let Some(last) = candles.last() else {
+        return Err(HistoricalValidationError::MissingData { timeframe });
+    };
+    let last_close_ms = last
+        .open_time
+        .timestamp_millis()
+        .checked_add(duration)
+        .ok_or(HistoricalValidationError::RangeOverflow)?;
+    if last_close_ms < needed_close_ms {
+        let missing_ms = needed_close_ms
+            .checked_sub(last_close_ms)
+            .ok_or(HistoricalValidationError::RangeOverflow)?;
+        let missing = u64::try_from(missing_ms)
+            .ok()
+            .map(|elapsed| elapsed.div_ceil(duration.unsigned_abs()))
+            .and_then(|bars| usize::try_from(bars).ok())
+            .ok_or(HistoricalValidationError::RangeOverflow)?;
+        return Err(HistoricalValidationError::InsufficientHistory {
+            timeframe,
+            required: candles
+                .len()
+                .checked_add(missing)
+                .ok_or(HistoricalValidationError::RangeOverflow)?,
+            available: candles.len(),
+        });
+    }
+    Ok(())
+}
+
 /// Evaluate already-hydrated completed candles over a historical range.
 pub fn evaluate_historical(
     definition: &SignalDefinition,
@@ -199,25 +304,32 @@ pub fn evaluate_historical(
     range: HistoricalRange,
 ) -> Result<HistoricalValidation, HistoricalValidationError> {
     definition.validate()?;
-    evaluate_historical_validated(definition, coin, data, range)
+    evaluate_historical_validated(definition, coin, data, range, &mut |_| ControlFlow::Continue(()))
 }
 
-fn evaluate_historical_validated(
+fn evaluate_historical_validated<F>(
     definition: &SignalDefinition,
     coin: &str,
     data: &CoinData,
     range: HistoricalRange,
-) -> Result<HistoricalValidation, HistoricalValidationError> {
+    on_progress: &mut F,
+) -> Result<HistoricalValidation, HistoricalValidationError>
+where
+    F: FnMut(HistoricalProgress) -> ControlFlow<()>,
+{
     if range.start >= range.end {
         return Err(HistoricalValidationError::InvalidRange);
     }
-    let anchor = anchor_timeframe(definition)?;
+    let requirements = definition.required_history()?;
+    let anchor = anchor_timeframe(&requirements)?;
     let (first_evaluation, pre_range_evaluation) = first_and_pre_range_evaluation(range, anchor)?;
     let prepared = PreparedEvaluation::build(definition, data)?;
 
     let pre_lengths = prepared.lengths_at(pre_range_evaluation);
     let pre_report = prepared.report_at(definition, coin, &pre_lengths);
     ensure_known_report(definition, &pre_report)?;
+    let total_points =
+        coverage_and_points(data, &requirements, anchor, first_evaluation, pre_range_evaluation, range.end)?;
 
     struct ActiveSpan {
         started_at: DateTime<Utc>,
@@ -235,21 +347,20 @@ fn evaluate_historical_validated(
     let mut evaluated_at = first_evaluation;
     while evaluated_at <= range.end {
         let lengths = prepared.lengths_at(evaluated_at);
-        let report = prepared.report_at(definition, coin, &lengths);
-        ensure_known_report(definition, &report)?;
+        let satisfied = prepared.truth_at(definition, &lengths) == Truth::True;
         evaluated_points += 1;
 
-        match (active.take(), report.satisfied) {
+        match (active.take(), satisfied) {
             (None, true) => {
                 active = Some(ActiveSpan {
                     started_at: evaluated_at,
                     active_at_start: false,
-                    evidence: report,
+                    evidence: prepared.report_at(definition, coin, &lengths),
                 });
             }
             (Some(mut current), true) => {
                 if current.active_at_start && evaluated_at == range.start {
-                    current.evidence = report;
+                    current.evidence = prepared.report_at(definition, coin, &lengths);
                 }
                 active = Some(current);
             }
@@ -265,6 +376,16 @@ fn evaluate_historical_validated(
                 }
             }
             (None, false) => {}
+        }
+
+        if evaluated_points % EVALUATION_PROGRESS_INTERVAL == 0
+            && on_progress(HistoricalProgress::Evaluated {
+                completed: evaluated_points,
+                total: total_points,
+            })
+            .is_break()
+        {
+            return Err(HistoricalValidationError::Stopped);
         }
 
         let Some(next) = evaluated_at.checked_add_signed(Duration::milliseconds(anchor.duration_ms())) else {
@@ -300,6 +421,7 @@ pub async fn validate_historical<F>(
     definition: &SignalDefinition,
     coin: &str,
     range: HistoricalRange,
+    now: DateTime<Utc>,
     mut on_progress: F,
 ) -> Result<HistoricalValidation, HistoricalValidationError>
 where
@@ -309,11 +431,8 @@ where
         return Err(HistoricalValidationError::InvalidRange);
     }
     let requirements = definition.required_history()?;
-    let anchor = requirements
-        .keys()
-        .next()
-        .copied()
-        .ok_or(HistoricalValidationError::InvalidRange)?;
+    let anchor = anchor_timeframe(&requirements)?;
+    let range = clamp_to_completed(range, anchor, now)?;
     let (_, pre_range_evaluation) = first_and_pre_range_evaluation(range, anchor)?;
     let total = requirements.len();
     let mut data = CoinData::default();
@@ -335,7 +454,7 @@ where
             });
         }
         data.insert(timeframe, candles);
-        if on_progress(HistoricalProgress {
+        if on_progress(HistoricalProgress::Hydrated {
             completed: completed + 1,
             total,
             timeframe,
@@ -346,7 +465,7 @@ where
         }
     }
 
-    evaluate_historical_validated(definition, coin, &data, range)
+    evaluate_historical_validated(definition, coin, &data, range, &mut on_progress)
 }
 
 #[cfg(test)]
@@ -358,11 +477,29 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{DateTime, TimeZone, Utc};
     use domain::{Candle, Timeframe};
-    use hl_feed::{CandleHistory, HyperliquidRest};
+    use hl_feed::{CandleHistory, CandleProvider, FeedError};
+
+    struct UnusedProvider;
+
+    #[async_trait]
+    impl CandleProvider for UnusedProvider {
+        async fn candles_before(
+            &self,
+            _coin: &str,
+            _timeframe: Timeframe,
+            _before_ms: i64,
+            _count: usize,
+        ) -> Result<Vec<Candle>, FeedError> {
+            panic!("validation hydration must be served from the cache in this test")
+        }
+    }
     use rust_decimal::Decimal;
     use storage::{CandleSeries, CandleStore, StoreError};
 
-    use super::{HistoricalRange, HistoricalValidationError, evaluate_historical, validate_historical};
+    use super::{
+        HistoricalRange, HistoricalValidationError, evaluate_historical, evaluate_historical_validated,
+        validate_historical,
+    };
     use crate::definition::{
         CandleField, ComparisonOp, Condition, DEFINITION_VERSION, Direction, Node, Operand, Predicate, SignalDefinition,
     };
@@ -626,8 +763,7 @@ mod tests {
             requests: Mutex::new(Vec::new()),
         });
         let persistence: Arc<dyn CandleStore> = store.clone();
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let history = CandleHistory::new(persistence, Arc::new(HyperliquidRest::new(reqwest::Client::new(), 1_100)));
+        let history = CandleHistory::new(persistence, Arc::new(UnusedProvider));
         let mut progress = Vec::new();
 
         let result = validate_historical(
@@ -638,6 +774,7 @@ mod tests {
                 start: at_hour(2),
                 end: at_hour(5),
             },
+            at_hour(5),
             |update| {
                 progress.push(update);
                 ControlFlow::Continue(())
@@ -655,6 +792,153 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn future_range_end_is_clamped_to_the_last_completed_anchor_close() {
+        let signal = definition(
+            vec![("price", threshold_condition(Timeframe::Hour1, 100.0))],
+            Node::Condition { id: "price".to_owned() },
+        );
+        let store = Arc::new(CachedStore {
+            candles: HashMap::from([(
+                Timeframe::Hour1,
+                (0..5).map(|index| candle(Timeframe::Hour1, index, 110.0)).collect(),
+            )]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let persistence: Arc<dyn CandleStore> = store.clone();
+        let history = CandleHistory::new(persistence, Arc::new(UnusedProvider));
+
+        let result = validate_historical(
+            &history,
+            &signal,
+            "BTC",
+            HistoricalRange {
+                start: at_hour(2),
+                end: at_hour(8),
+            },
+            at_hour(5),
+            |_| ControlFlow::Continue(()),
+        )
+        .await
+        .expect("clamped historical validation");
+
+        assert_eq!(result.range.end, at_hour(5));
+        assert_eq!(
+            store.requests.lock().unwrap_or_else(PoisonError::into_inner).as_slice(),
+            &[(Timeframe::Hour1, at_hour(5).timestamp_millis(), 5)]
+        );
+    }
+
+    #[tokio::test]
+    async fn fully_future_range_is_rejected_before_any_fetch() {
+        let signal = definition(
+            vec![("price", threshold_condition(Timeframe::Hour1, 100.0))],
+            Node::Condition { id: "price".to_owned() },
+        );
+        let store = Arc::new(CachedStore {
+            candles: HashMap::new(),
+            requests: Mutex::new(Vec::new()),
+        });
+        let persistence: Arc<dyn CandleStore> = store.clone();
+        let history = CandleHistory::new(persistence, Arc::new(UnusedProvider));
+
+        let result = validate_historical(
+            &history,
+            &signal,
+            "BTC",
+            HistoricalRange {
+                start: at_hour(6),
+                end: at_hour(8),
+            },
+            at_hour(5),
+            |_| ControlFlow::Continue(()),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(HistoricalValidationError::RangeBeyondCompleted {
+                timeframe: Timeframe::Hour1
+            })
+        ));
+        assert!(store.requests.lock().unwrap_or_else(PoisonError::into_inner).is_empty());
+    }
+
+    #[test]
+    fn truncated_higher_timeframe_data_is_rejected_instead_of_freezing_stale_state() {
+        let signal = definition(
+            vec![
+                ("hourly", threshold_condition(Timeframe::Hour1, 100.0)),
+                ("fourHourly", threshold_condition(Timeframe::Hour4, 100.0)),
+            ],
+            Node::All {
+                children: vec![
+                    Node::Condition {
+                        id: "hourly".to_owned(),
+                    },
+                    Node::Condition {
+                        id: "fourHourly".to_owned(),
+                    },
+                ],
+            },
+        );
+        let mut data = CoinData::default();
+        data.insert(
+            Timeframe::Hour1,
+            (-1..12).map(|index| candle(Timeframe::Hour1, index, 110.0)).collect(),
+        );
+        data.insert(
+            Timeframe::Hour4,
+            vec![candle(Timeframe::Hour4, -1, 110.0), candle(Timeframe::Hour4, 0, 110.0)],
+        );
+
+        let result = evaluate_historical(
+            &signal,
+            "BTC",
+            &data,
+            HistoricalRange {
+                start: at_hour(1),
+                end: at_hour(12),
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(HistoricalValidationError::InsufficientHistory {
+                timeframe: Timeframe::Hour4,
+                required: 4,
+                available: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn evaluation_stops_when_the_progress_consumer_breaks_mid_range() {
+        let signal = definition(
+            vec![("price", threshold_condition(Timeframe::Hour1, 100.0))],
+            Node::Condition { id: "price".to_owned() },
+        );
+        let bars = 600i64;
+        let mut data = CoinData::default();
+        data.insert(
+            Timeframe::Hour1,
+            (-1..bars).map(|index| candle(Timeframe::Hour1, index, 110.0)).collect(),
+        );
+        let range = HistoricalRange {
+            start: at_hour(1),
+            end: at_hour(bars),
+        };
+
+        signal.validate().expect("valid fixture definition");
+        let mut updates = 0usize;
+        let result = evaluate_historical_validated(&signal, "BTC", &data, range, &mut |_| {
+            updates += 1;
+            ControlFlow::Break(())
+        });
+        assert!(matches!(result, Err(HistoricalValidationError::Stopped)));
+        assert_eq!(updates, 1);
+    }
+
     #[test]
     fn serialized_contract_uses_camel_case_timestamps_and_span_flags() {
         let signal = definition(
@@ -664,7 +948,11 @@ mod tests {
         let mut data = CoinData::default();
         data.insert(
             Timeframe::Hour1,
-            vec![candle(Timeframe::Hour1, -1, 110.0), candle(Timeframe::Hour1, 0, 110.0)],
+            vec![
+                candle(Timeframe::Hour1, -1, 110.0),
+                candle(Timeframe::Hour1, 0, 110.0),
+                candle(Timeframe::Hour1, 1, 110.0),
+            ],
         );
         let result = evaluate_historical(
             &signal,
