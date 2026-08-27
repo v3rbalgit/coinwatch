@@ -35,7 +35,8 @@ pub enum SyncPhase {
 }
 
 /// A granular snapshot of what the market engine is doing, surfaced in the UI.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Serialized field names are the frontend `status` event contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MarketStatus {
     /// WebSocket connection state.
     pub connection: ConnectionState,
@@ -73,6 +74,17 @@ impl Default for MarketStatus {
 struct CandleBuffer {
     candles: Arc<Vec<Candle>>,
     needs_repair: bool,
+    repair_epoch: u64,
+}
+
+impl CandleBuffer {
+    fn health(&self) -> SeriesHealth {
+        SeriesHealth {
+            latest_open_ms: self.candles.last().map(|candle| candle.open_time.timestamp_millis()),
+            needs_repair: self.needs_repair,
+            repair_epoch: self.repair_epoch,
+        }
+    }
 }
 
 impl Default for CandleBuffer {
@@ -80,6 +92,7 @@ impl Default for CandleBuffer {
         Self {
             candles: Arc::new(Vec::new()),
             needs_repair: false,
+            repair_epoch: 0,
         }
     }
 }
@@ -100,12 +113,19 @@ pub(crate) struct SeriesHealth {
     pub latest_open_ms: Option<i64>,
     /// Whether a disconnect or alignment gap requires a full REST repair.
     pub needs_repair: bool,
+    /// Bumped by every repair mark; a reconcile observing an older epoch keeps the mark.
+    pub repair_epoch: u64,
 }
 
 impl SeriesHealth {
-    /// Whether the series is safe to expose at this instant.
+    /// Whether the series is safe to expose at this instant. A buffer one bar
+    /// ahead of `now_ms` (clock skew, a boundary crossed mid-run) is current too.
     pub(crate) fn is_current(self, timeframe: Timeframe, now_ms: i64) -> bool {
-        !self.needs_repair && self.latest_open_ms == Some(timeframe.bar_open_ms(now_ms))
+        !self.needs_repair
+            && self.latest_open_ms.is_some_and(|open_ms| {
+                let expected = timeframe.bar_open_ms(now_ms);
+                open_ms == expected || open_ms == expected.saturating_add(timeframe.duration_ms())
+            })
     }
 }
 
@@ -119,6 +139,9 @@ pub struct MarketStore {
     /// The coin whose live candles the UI wants forwarded (the open detail page).
     active_coin: RwLock<Option<String>>,
 }
+
+/// Trailing bars still replaceable by a late final streamed update.
+const LATE_REPLACE_WINDOW: usize = 3;
 
 fn trim_to_window(candles: &mut Vec<Candle>) {
     if candles.len() > CANDLE_WINDOW {
@@ -179,11 +202,7 @@ impl MarketStore {
     #[must_use]
     pub fn current_candles(&self, coin: &str, timeframe: Timeframe, now_ms: i64) -> Option<Arc<Vec<Candle>>> {
         let entry = self.candles.get(&(coin.to_owned(), timeframe))?;
-        let health = SeriesHealth {
-            latest_open_ms: entry.candles.last().map(|candle| candle.open_time.timestamp_millis()),
-            needs_repair: entry.needs_repair,
-        };
-        health.is_current(timeframe, now_ms).then(|| Arc::clone(&entry.candles))
+        entry.health().is_current(timeframe, now_ms).then(|| Arc::clone(&entry.candles))
     }
 
     /// Latest-open and gap state for REST reconciliation planning.
@@ -192,11 +211,9 @@ impl MarketStore {
             SeriesHealth {
                 latest_open_ms: None,
                 needs_repair: false,
+                repair_epoch: 0,
             },
-            |entry| SeriesHealth {
-                latest_open_ms: entry.candles.last().map(|candle| candle.open_time.timestamp_millis()),
-                needs_repair: entry.needs_repair,
-            },
+            |entry| entry.health(),
         )
     }
 
@@ -234,13 +251,10 @@ impl MarketStore {
     pub(crate) fn set_candles(&self, coin: String, timeframe: Timeframe, mut candles: Vec<Candle>) {
         trim_to_window(&mut candles);
         let needs_repair = !candles_are_contiguous(&candles, timeframe);
-        self.candles.insert(
-            (coin, timeframe),
-            CandleBuffer {
-                candles: Arc::new(candles),
-                needs_repair,
-            },
-        );
+        let mut entry = self.candles.entry((coin, timeframe)).or_default();
+        let state = entry.value_mut();
+        state.candles = Arc::new(candles);
+        state.needs_repair = needs_repair;
     }
 
     /// Reconcile a REST snapshot with the hot buffer. Incremental snapshots replace
@@ -249,42 +263,49 @@ impl MarketStore {
         &self,
         coin: String,
         timeframe: Timeframe,
-        candles: Vec<Candle>,
+        mut candles: Vec<Candle>,
         mode: ReconcileMode,
+        observed_epoch: u64,
     ) {
-        if mode == ReconcileMode::Replace {
-            self.set_candles(coin, timeframe, candles);
-            return;
-        }
-        if candles.is_empty() {
+        if candles.is_empty() && mode == ReconcileMode::Merge {
             return;
         }
 
         let mut entry = self.candles.entry((coin, timeframe)).or_default();
         let state = entry.value_mut();
-        let buffer = Arc::make_mut(&mut state.candles);
-        for candle in candles {
-            let open_ms = candle.open_time.timestamp_millis();
-            let index = buffer.partition_point(|existing| existing.open_time.timestamp_millis() < open_ms);
-            if index == buffer.len() {
-                push_capped(buffer, candle);
-            } else {
-                match buffer.get_mut(index) {
-                    Some(existing) if existing.open_time.timestamp_millis() == open_ms => *existing = candle,
-                    _ => buffer.insert(index, candle),
+        match mode {
+            ReconcileMode::Replace => {
+                trim_to_window(&mut candles);
+                state.candles = Arc::new(candles);
+            }
+            ReconcileMode::Merge => {
+                let buffer = Arc::make_mut(&mut state.candles);
+                for candle in candles {
+                    let open_ms = candle.open_time.timestamp_millis();
+                    let index = buffer.partition_point(|existing| existing.open_time.timestamp_millis() < open_ms);
+                    if index == buffer.len() {
+                        push_capped(buffer, candle);
+                    } else {
+                        match buffer.get_mut(index) {
+                            Some(existing) if existing.open_time.timestamp_millis() == open_ms => *existing = candle,
+                            _ => buffer.insert(index, candle),
+                        }
+                    }
                 }
+                trim_to_window(buffer);
             }
         }
-        trim_to_window(buffer);
-        state.needs_repair = !candles_are_contiguous(buffer, timeframe);
+        // A repair mark that landed while this snapshot was in flight survives it.
+        state.needs_repair = !candles_are_contiguous(&state.candles, timeframe) || state.repair_epoch != observed_epoch;
     }
 
     /// Merge a streamed candle: update the forming bar in place when its open time
-    /// matches the last cached bar, otherwise append it and retain any gap marker
-    /// until REST reconciliation succeeds.
+    /// matches the last cached bar, replace a just-closed bar whose final update
+    /// arrived late, otherwise append it and retain any gap marker until REST
+    /// reconciliation succeeds.
     pub(crate) fn merge_candle(&self, coin: &str, timeframe: Timeframe, candle: Candle) {
         enum Merge {
-            Replace,
+            ReplaceAt(usize),
             Append { gap: bool },
             Ignore,
         }
@@ -294,22 +315,33 @@ impl MarketStore {
         let buffer = Arc::make_mut(&mut state.candles);
         let candle_open_ms = candle.open_time.timestamp_millis();
         let merge = match buffer.last() {
-            Some(last) if last.open_time == candle.open_time => Merge::Replace,
+            Some(last) if last.open_time == candle.open_time => Merge::ReplaceAt(buffer.len() - 1),
             Some(last) if candle.open_time > last.open_time => {
                 let expected = last.open_time.timestamp_millis().saturating_add(timeframe.duration_ms());
                 Merge::Append {
                     gap: candle_open_ms != expected,
                 }
             }
-            Some(_) => Merge::Ignore,
+            Some(_) => {
+                let index = buffer.partition_point(|existing| existing.open_time < candle.open_time);
+                match buffer.get(index) {
+                    Some(existing)
+                        if existing.open_time == candle.open_time
+                            && buffer.len().saturating_sub(index) <= LATE_REPLACE_WINDOW =>
+                    {
+                        Merge::ReplaceAt(index)
+                    }
+                    _ => Merge::Ignore,
+                }
+            }
             None => Merge::Append {
                 gap: !timeframe.is_aligned(candle_open_ms),
             },
         };
         match merge {
-            Merge::Replace => {
-                if let Some(last) = buffer.last_mut() {
-                    *last = candle;
+            Merge::ReplaceAt(index) => {
+                if let Some(slot) = buffer.get_mut(index) {
+                    *slot = candle;
                 }
             }
             Merge::Append { gap } => {
@@ -326,13 +358,16 @@ impl MarketStore {
         for mut entry in self.candles.iter_mut() {
             if timeframes.contains(&entry.key().1) {
                 entry.needs_repair = true;
+                entry.repair_epoch = entry.repair_epoch.wrapping_add(1);
             }
         }
     }
 
-    /// Replace the cached universe.
+    /// Replace the cached universe and its status count together.
     pub(crate) fn set_universe(&self, universe: Vec<UniverseCoin>) {
+        let count = universe.len();
         *self.universe.write().unwrap_or_else(PoisonError::into_inner) = universe;
+        self.status.send_modify(|status| status.universe = count);
     }
 
     /// Update the WebSocket connection state.
@@ -348,11 +383,6 @@ impl MarketStore {
     /// Update the REST sync phase.
     pub(crate) fn set_phase(&self, phase: SyncPhase) {
         self.status.send_modify(|status| status.phase = phase);
-    }
-
-    /// Update the universe size.
-    pub(crate) fn set_universe_size(&self, universe: usize) {
-        self.status.send_modify(|status| status.universe = universe);
     }
 
     /// Update backfill progress: sets completed / total, errors, and rate.
@@ -410,6 +440,7 @@ mod tests {
             Timeframe::Hour1,
             vec![candle(1), candle(2)],
             ReconcileMode::Merge,
+            0,
         );
         assert!(!store.series_health("BTC", Timeframe::Hour1).needs_repair);
         assert!(store.current_candles("BTC", Timeframe::Hour1, 2 * 3_600_000).is_some());
@@ -441,8 +472,80 @@ mod tests {
         store.merge_candle("BTC", Timeframe::Hour1, candle(0));
         assert!(store.current_candles("BTC", Timeframe::Hour1, 0).is_none());
 
-        store.reconcile_candles("BTC".to_owned(), Timeframe::Hour1, vec![candle(0)], ReconcileMode::Replace);
+        store.reconcile_candles(
+            "BTC".to_owned(),
+            Timeframe::Hour1,
+            vec![candle(0)],
+            ReconcileMode::Replace,
+            store.series_health("BTC", Timeframe::Hour1).repair_epoch,
+        );
         assert!(store.current_candles("BTC", Timeframe::Hour1, 0).is_some());
+    }
+
+    #[test]
+    fn a_repair_mark_survives_a_reconcile_that_was_planned_before_it() {
+        let store = MarketStore::new();
+        store.set_candles("BTC".to_owned(), Timeframe::Hour1, vec![candle(0), candle(1)]);
+        let planned_epoch = store.series_health("BTC", Timeframe::Hour1).repair_epoch;
+        store.mark_streamed_for_reconciliation(&[Timeframe::Hour1]);
+
+        store.reconcile_candles(
+            "BTC".to_owned(),
+            Timeframe::Hour1,
+            vec![candle(0), candle(1)],
+            ReconcileMode::Replace,
+            planned_epoch,
+        );
+        assert!(store.series_health("BTC", Timeframe::Hour1).needs_repair);
+
+        let fresh_epoch = store.series_health("BTC", Timeframe::Hour1).repair_epoch;
+        store.reconcile_candles(
+            "BTC".to_owned(),
+            Timeframe::Hour1,
+            vec![candle(0), candle(1)],
+            ReconcileMode::Replace,
+            fresh_epoch,
+        );
+        assert!(!store.series_health("BTC", Timeframe::Hour1).needs_repair);
+    }
+
+    #[test]
+    fn late_final_update_of_a_recently_closed_bar_replaces_it() {
+        let store = MarketStore::new();
+        store.merge_candle("BTC", Timeframe::Hour1, candle(0));
+        store.merge_candle("BTC", Timeframe::Hour1, candle(1));
+        let mut late = candle(0);
+        late.close = Decimal::TWO;
+
+        store.merge_candle("BTC", Timeframe::Hour1, late);
+
+        let candles = store.candles("BTC", Timeframe::Hour1).expect("buffer");
+        assert_eq!(candles.first().expect("closed bar").close, Decimal::TWO);
+        assert!(!store.series_health("BTC", Timeframe::Hour1).needs_repair);
+    }
+
+    #[test]
+    fn updates_older_than_the_replace_window_are_ignored() {
+        let store = MarketStore::new();
+        for hour in 0..5 {
+            store.merge_candle("BTC", Timeframe::Hour1, candle(hour));
+        }
+        let mut stale = candle(0);
+        stale.close = Decimal::TWO;
+
+        store.merge_candle("BTC", Timeframe::Hour1, stale);
+
+        let candles = store.candles("BTC", Timeframe::Hour1).expect("buffer");
+        assert_eq!(candles.first().expect("old bar").close, Decimal::ONE);
+    }
+
+    #[test]
+    fn a_buffer_one_bar_ahead_of_now_is_current() {
+        let store = MarketStore::new();
+        store.set_candles("BTC".to_owned(), Timeframe::Hour1, vec![candle(0), candle(1)]);
+
+        assert!(store.current_candles("BTC", Timeframe::Hour1, 30 * 60_000).is_some());
+        assert!(store.current_candles("BTC", Timeframe::Hour1, 3 * 3_600_000).is_none());
     }
 
     #[test]

@@ -32,7 +32,7 @@ impl WeightLimiter {
                 let now = Instant::now();
                 prune(&mut events, now);
                 let used: u32 = events.iter().map(|&(_, w)| w).sum();
-                if used == 0 || used + weight <= self.budget {
+                if used == 0 || used.saturating_add(weight) <= self.budget {
                     events.push_back((now, weight));
                     return;
                 }
@@ -54,10 +54,10 @@ fn prune(events: &mut VecDeque<(Instant, u32)>, now: Instant) {
 }
 
 fn wait_until_room(events: &VecDeque<(Instant, u32)>, used: u32, weight: u32, budget: u32, now: Instant) -> Duration {
-    let need = (used + weight).saturating_sub(budget);
+    let need = used.saturating_add(weight).saturating_sub(budget);
     let mut freed = 0u32;
     for &(at, w) in events {
-        freed += w;
+        freed = freed.saturating_add(w);
         if freed >= need {
             return WINDOW.saturating_sub(now.duration_since(at)).max(Duration::from_millis(1));
         }
