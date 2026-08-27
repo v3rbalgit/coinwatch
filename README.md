@@ -13,25 +13,31 @@ auto-trader.
 > **History:** Coinwatch began as a Python CEX collector (archived on
 > [`v1-python`](../../tree/v1-python), tag `v1.0-python`), then a Rust backtest-research
 > engine (preserved on [`experiment/backtest-research`](../../tree/experiment/backtest-research)).
-> This branch is the real-time screener. See [`DESIGN.md`](DESIGN.md) for the architecture.
+> This branch is the real-time screener. See the [design document](docs/design.md) for the architecture.
 
 ## Architecture
 
-A Cargo workspace of focused Rust libraries plus the Tauri app (details in [`DESIGN.md`](DESIGN.md)):
+A Cargo workspace of focused Rust libraries plus the Tauri app (details in the [design document](docs/design.md)):
 
-| Crate                             | Responsibility                                                                                                  |
-| --------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `domain`                          | Shared market types (`Candle`, `Timeframe`)                                                                     |
-| `hl-feed`                         | Hyperliquid engine: WebSocket prices/candles, REST backfill, the in-memory `MarketStore`, and rate-limited sync |
-| `storage`                         | SQLite migrations and persistence for candles, watchlists, signals, presets, settings, and logos                |
-| `indicators`                      | Pure indicator/divergence math plus the configured-instance registry and compute engine                         |
-| `indicators-wasm`                 | Thin WASM boundary exposing the shared indicator engine to the chart and builder                                |
+| Crate                             | Responsibility                                                                                                            |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `domain`                          | Shared market types (`Candle`, `Timeframe`)                                                                               |
+| `hl-feed`                         | Hyperliquid engine: WebSocket prices/candles, REST backfill, the in-memory `MarketStore`, and rate-limited sync           |
+| `storage`                         | SQLite migrations and persistence for candles, watchlists, signals, presets, settings, and logos                          |
+| `indicators`                      | Pure indicator/divergence math plus the configured-instance registry and compute engine                                   |
+| `indicators-wasm`                 | Thin WASM boundary exposing the shared indicator engine to the chart and builder                                          |
 | `signals`                         | Validated signal definitions plus completed-bar, multi-timeframe evaluation, run orchestration, and historical validation |
-| `screener` (`screener/src-tauri`) | Tauri v2 app: commands expose market/user data, signal runs, and historical validation; mids/candles stream to the UI |
+| `screener` (`screener/src-tauri`) | Tauri v2 app: commands expose market/user data, signal runs, and historical validation; mids/candles stream to the UI     |
 
 Prices stream through the in-memory hot cache over WebSocket (~1s). Candle history accumulates
 in SQLite and is backfilled over REST within Hyperliquid's rate limit; signal runs hydrate the
 exact completed-bar history required by each definition.
+
+## Documentation
+
+- [Design and roadmap](docs/design.md)
+- [Backlog and deferred decisions](docs/backlog.md)
+- [Competitive landscape and positioning](docs/competitive-landscape.md)
 
 ## Prerequisites
 

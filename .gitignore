@@ -1,9 +1,7 @@
 # Rust
 /target/
 
-# Research spike outputs (regenerable data artifacts)
-research/**/out/
-research/data/
+# Local data artifacts
 *.duckdb
 *.parquet
 
@@ -13,7 +11,6 @@ research/data/
 # Env / secrets
 .env
 .env.*
-!.env.example
 *creds*
 
 # Editors / OS
