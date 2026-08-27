@@ -1,5 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core"
 
+import { errorMessage } from "$lib/errors"
+import { hasString, isRecord } from "$lib/ipc/guards"
 import { createSignalChannelClient } from "$lib/signals/channel-client"
 import type { SignalChannelTransport } from "$lib/signals/channel-client"
 import type { SignalDefinition, SignalTimeframe } from "$lib/signals/definition"
@@ -29,6 +31,7 @@ export interface HistoricalValidation {
 export type SignalValidationFailure =
   | { type: "invalidDefinition"; message: string }
   | { type: "invalidRange" }
+  | { type: "rangeBeyondCompleted"; timeframe: SignalTimeframe }
   | { type: "historyUnavailable"; timeframe: SignalTimeframe; message: string }
   | { type: "insufficientHistory"; timeframe: SignalTimeframe; required: number; available: number }
   | { type: "internal"; message: string }
@@ -39,13 +42,20 @@ export type SignalValidationEvent =
       event: "hydrated"
       data: { validationId: number; completed: number; total: number; timeframe: SignalTimeframe }
     }
+  | { event: "evaluated"; data: { validationId: number; completed: number; total: number } }
   | { event: "completed"; data: { validationId: number; result: HistoricalValidation } }
   | { event: "cancelled"; data: { validationId: number } }
   | { event: "failed"; data: { validationId: number; failure: SignalValidationFailure } }
 
 export type SignalValidationProgress =
   | { status: "idle" }
-  | { status: "running"; validationId: number; completed: number; total: number }
+  | {
+      status: "running"
+      phase: "hydrating" | "evaluating"
+      validationId: number
+      completed: number
+      total: number
+    }
   | { status: "completed"; validationId: number; completed: number; total: number }
   | { status: "cancelled"; validationId: number; completed: number; total: number }
   | {
@@ -68,6 +78,7 @@ export function reduceSignalValidationProgress(
     if (state.status === "running") return state
     return {
       status: "running",
+      phase: "hydrating",
       validationId: event.data.validationId,
       completed: 0,
       total: event.data.total,
@@ -77,8 +88,10 @@ export function reduceSignalValidationProgress(
 
   switch (event.event) {
     case "hydrated":
+    case "evaluated":
       return {
         status: "running",
+        phase: event.event === "hydrated" ? "hydrating" : "evaluating",
         validationId: state.validationId,
         completed: event.data.completed,
         total: event.data.total,
@@ -114,6 +127,8 @@ export function signalValidationFailureMessage(failure: SignalValidationFailure)
       return failure.message
     case "invalidRange":
       return "Choose a start date before the end date."
+    case "rangeBeyondCompleted":
+      return `The range ends before any ${failure.timeframe} candle completes. Pick an earlier range.`
     case "historyUnavailable":
       return `${failure.timeframe} candle history is unavailable: ${failure.message}`
     case "insufficientHistory":
@@ -141,6 +156,39 @@ export const tauriSignalValidationTransport: SignalValidationTransport = {
   cancel(validationId) {
     return invoke<boolean>("cancel_signal_validation", { validationId })
   },
+}
+
+export type StartSignalValidationError =
+  { type: "alreadyActive" } | { type: "idExhausted" } | { type: "emptyCoin" } | { type: "eventStream"; message: string }
+
+export function isStartSignalValidationError(value: unknown): value is StartSignalValidationError {
+  if (!isRecord(value) || !hasString(value, "type")) return false
+  switch (value.type) {
+    case "alreadyActive":
+    case "idExhausted":
+    case "emptyCoin":
+      return true
+    case "eventStream":
+      return hasString(value, "message")
+    default:
+      return false
+  }
+}
+
+export function startSignalValidationErrorMessage(error: unknown): string {
+  if (!isStartSignalValidationError(error)) {
+    return errorMessage(error)
+  }
+  switch (error.type) {
+    case "alreadyActive":
+      return "A historical validation is already running. Wait for it to finish or cancel it."
+    case "idExhausted":
+      return "Historical validations are exhausted for this session. Restart the app."
+    case "emptyCoin":
+      return "Pick a coin to validate against."
+    case "eventStream":
+      return `The validation could not stream events: ${error.message}`
+  }
 }
 
 export class SignalValidationAlreadyActiveError extends Error {

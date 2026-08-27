@@ -1,7 +1,9 @@
+import { errorMessage } from "$lib/errors"
 import type { SignalDefinition } from "$lib/signals/definition"
 import {
   idleSignalValidationProgress,
   reduceSignalValidationProgress,
+  startSignalValidationErrorMessage,
   type HistoricalRange,
   type HistoricalValidation,
   type SignalValidationClient,
@@ -110,11 +112,10 @@ export function createHistoricalValidationWorkspace(
       state.selectedSpan = null
       state.visible = true
       state.panelOpen = false
-      // Invoke with standalone plain values; reading them back through deep `$state`
-      // would pass Svelte proxies across Tauri's structured-clone boundary.
+      // Invoke with standalone plain values, decoupled from later `$state` edits.
       await client.start(definition, coin, range, event => applyEvent(state, event))
     } catch (error) {
-      recordStartFailure(state, error instanceof Error ? error.message : String(error))
+      recordStartFailure(state, startSignalValidationErrorMessage(error))
     } finally {
       state.starting = false
     }
@@ -129,7 +130,7 @@ export function createHistoricalValidationWorkspace(
       if (!accepted) state.cancellationPending = false
     } catch (error) {
       state.cancellationPending = false
-      state.error = error instanceof Error ? error.message : String(error)
+      state.error = errorMessage(error)
     }
   }
 

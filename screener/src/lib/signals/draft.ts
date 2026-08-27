@@ -108,14 +108,29 @@ export function createConditionDraft(condition: Condition, id = newConditionId()
   return { id, ...copyCondition(condition) }
 }
 
+/** The one condition-id rule shared by compile, save gating, and validation messages. */
+export function findConditionIdIssue(
+  conditions: readonly ConditionDraft[]
+): { index: number; reason: "empty" | "duplicate" } | null {
+  const ids = new Set<string>()
+  for (const [index, condition] of conditions.entries()) {
+    if (condition.id.length === 0) return { index, reason: "empty" }
+    if (ids.has(condition.id)) return { index, reason: "duplicate" }
+    ids.add(condition.id)
+  }
+  return null
+}
+
 export function compileSignalDraft(draft: SignalDraft): SignalDefinition {
   if (draft.conditions.length === 0) throw new Error("A signal draft needs at least one condition")
 
-  const ids = new Set<string>()
-  for (const condition of draft.conditions) {
-    if (condition.id.length === 0) throw new Error("A signal condition needs a stable id")
-    if (ids.has(condition.id)) throw new Error(`Duplicate signal condition id '${condition.id}'`)
-    ids.add(condition.id)
+  const issue = findConditionIdIssue(draft.conditions)
+  if (issue !== null) {
+    throw new Error(
+      issue.reason === "empty"
+        ? "A signal condition needs a stable id"
+        : `Duplicate signal condition id '${draft.conditions[issue.index]?.id ?? ""}'`
+    )
   }
 
   const children: SignalNode[] = draft.conditions.map(condition => ({

@@ -5,6 +5,7 @@
   import ConditionOutcomes from "$lib/components/signals/condition-outcomes.svelte"
   import Badge from "$lib/components/ui/badge.svelte"
   import Button from "$lib/components/ui/button.svelte"
+  import { formatTimestamp } from "$lib/format"
   import type { HistoricalValidation } from "$lib/signals/historical"
   import type { HistoricalValidationSnapshot } from "$lib/signals/historical-workspace"
 
@@ -26,11 +27,6 @@
 
   const selectedSpan = $derived(selected === null ? undefined : result.spans[selected])
   const onsetCount = $derived(result.spans.filter(span => !span.activeAtStart).length)
-
-  function formatTimestamp(value: string): string {
-    const parsed = new Date(value)
-    return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString()
-  }
 
   function spanLabel(index: number): string {
     const span = result.spans[index]

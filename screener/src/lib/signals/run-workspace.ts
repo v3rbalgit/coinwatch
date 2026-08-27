@@ -1,5 +1,6 @@
+import { errorMessage } from "$lib/errors"
 import type { SignalDefinition } from "$lib/signals/definition"
-import { idleSignalRunProgress, reduceSignalRunProgress } from "$lib/signals/run"
+import { idleSignalRunProgress, reduceSignalRunProgress, startSignalRunErrorMessage } from "$lib/signals/run"
 import type { EvalReport, SignalRunClient, SignalRunEvent, SignalRunProgress, SignalRunScope } from "$lib/signals/run"
 import { rankClosestSignalRunReports } from "$lib/signals/run-results"
 import type { SignalRunResultFilter } from "$lib/signals/run-results"
@@ -110,7 +111,7 @@ export function createSignalRunWorkspace(
     try {
       await runClient.start(snapshot.definition, snapshot.scope, event => applyWorkspaceEvent(state, event))
     } catch (error) {
-      recordStartFailure(state, error instanceof Error ? error.message : String(error))
+      recordStartFailure(state, startSignalRunErrorMessage(error))
     } finally {
       state.starting = false
     }
@@ -125,7 +126,7 @@ export function createSignalRunWorkspace(
       if (!accepted) state.cancellationPending = false
     } catch (error) {
       state.cancellationPending = false
-      state.error = error instanceof Error ? error.message : String(error)
+      state.error = errorMessage(error)
     }
   }
 

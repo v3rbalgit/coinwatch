@@ -15,6 +15,7 @@
   import ConditionOutcomes from "$lib/components/signals/condition-outcomes.svelte"
   import Badge from "$lib/components/ui/badge.svelte"
   import Button from "$lib/components/ui/button.svelte"
+  import { formatTimestamp } from "$lib/format"
   import type { EvalReport, SignalRunProgress } from "$lib/signals/run"
   import { filterSignalRunReports, rankClosestSignalRunReports, reportHasDataIssues } from "$lib/signals/run-results"
   import type { SignalRunResultFilter } from "$lib/signals/run-results"
@@ -62,12 +63,6 @@
   const matched = $derived(progress.status === "idle" ? 0 : progress.matched)
   const percentage = $derived(total === 0 ? 0 : Math.min(100, Math.round((completed / total) * 100)))
   const displayedError = $derived(progress.status === "failed" ? progress.message : error)
-
-  function formatTimestamp(value: string | null): string {
-    if (value === null) return "—"
-    const parsed = new Date(value)
-    return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString()
-  }
 
   function satisfiedConditionCount(report: EvalReport): number {
     return Object.values(report.conditions).filter(outcome => outcome.status === "satisfied").length
@@ -196,7 +191,9 @@
                 <Badge variant="secondary">{satisfiedConditionCount(report)} / {conditionCount} conditions</Badge>
               {/if}
               <span class="ml-auto text-xs text-muted-foreground">
-                {report.triggeredAt === null ? "Not triggered" : `Triggered ${formatTimestamp(report.triggeredAt)}`}
+                {report.lastEvidenceAt === null
+                  ? "No supporting evidence"
+                  : `Last evidence ${formatTimestamp(report.lastEvidenceAt)}`}
               </span>
               <a
                 class="inline-flex shrink-0 items-center gap-1 text-xs font-medium text-primary hover:underline"

@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { IndicatorDescriptor } from "$lib/chart/indicators"
+  import { formatTimestamp } from "$lib/format"
   import type { SignalDefinition } from "$lib/signals/definition"
   import type { ConditionOutcome, EvalReport } from "$lib/signals/run"
   import { conditionEvidence } from "$lib/signals/run-results"
@@ -16,12 +17,6 @@
     heading?: boolean
   } = $props()
 
-  function formatTimestamp(value: string | null): string {
-    if (value === null) return "—"
-    const parsed = new Date(value)
-    return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString()
-  }
-
   function outcomeLabel(outcome: ConditionOutcome | null): string {
     if (outcome === null) return "No outcome"
     switch (outcome.status) {
@@ -35,6 +30,8 @@
         return "Unavailable"
       case "insufficientHistory":
         return `Needs ${outcome.required} bars · ${outcome.available} available`
+      case "undefinedOperands":
+        return "No defined value"
     }
   }
 

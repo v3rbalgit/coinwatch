@@ -14,6 +14,7 @@
   import UnavailableSignalView from "$lib/components/signals/unavailable-signal-view.svelte"
   import Button from "$lib/components/ui/button.svelte"
   import ConfirmDialog from "$lib/components/ui/confirm-dialog.svelte"
+  import { errorMessage } from "$lib/errors"
   import { createSignal, deleteSignal, listSignals, updateSignal } from "$lib/signals/catalog"
   import type { SignalCatalogEntry } from "$lib/signals/catalog"
   import { compileSignalDraft, definitionToSignalDraft } from "$lib/signals/draft"
@@ -155,14 +156,9 @@
     if (presetResult.status === "fulfilled") presets = presetResult.value
     else errors.push(indicatorPresetErrorMessage(presetResult.reason))
     if (descriptorResult.status === "fulfilled") descriptors = descriptorResult.value
-    else
-      errors.push(
-        descriptorResult.reason instanceof Error ? descriptorResult.reason.message : String(descriptorResult.reason)
-      )
+    else errors.push(errorMessage(descriptorResult.reason))
     if (watchlistResult.status === "fulfilled") watchlists = watchlistResult.value
-    else
-      watchlistError =
-        watchlistResult.reason instanceof Error ? watchlistResult.reason.message : String(watchlistResult.reason)
+    else watchlistError = errorMessage(watchlistResult.reason)
     error = errors.join(" ")
     if (catalogResult.status === "fulfilled") reconcileSession()
     loading = false
@@ -227,7 +223,7 @@
       case "rich":
         runCandidate = {
           name: session.entry.name,
-          definition: snapshotSignalDefinition(session.entry.definition),
+          definition: $state.snapshot(session.entry.definition),
           source: "saved",
         }
         break
