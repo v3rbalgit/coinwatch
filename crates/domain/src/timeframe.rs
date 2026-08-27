@@ -81,6 +81,15 @@ mod tests {
     use super::Timeframe;
 
     #[test]
+    fn ord_and_all_follow_ascending_duration() {
+        for pair in Timeframe::ALL.windows(2) {
+            assert!(pair[0] < pair[1]);
+            assert!(pair[0].duration_ms() < pair[1].duration_ms());
+            assert_eq!(pair[1].duration_ms() % pair[0].duration_ms(), 0);
+        }
+    }
+
+    #[test]
     fn hl_codes_round_trip() {
         for (timeframe, code) in [
             (Timeframe::Hour1, "1h"),
