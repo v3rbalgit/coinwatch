@@ -11,6 +11,7 @@ async-trait = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]

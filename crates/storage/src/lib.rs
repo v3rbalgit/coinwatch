@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::DateTime;
@@ -138,10 +139,22 @@ impl TryFrom<CandleRow> for Candle {
     }
 }
 
-fn candles_oldest_first(rows: Vec<CandleRow>) -> Result<Vec<Candle>, StoreError> {
-    let mut candles = rows.into_iter().map(Candle::try_from).collect::<Result<Vec<_>, _>>()?;
+/// Newest-first rows to oldest-first candles, truncated at the first invalid
+/// row so one corrupt value cannot poison every read of the series.
+fn candles_oldest_first(rows: Vec<CandleRow>) -> Vec<Candle> {
+    let mut candles = Vec::with_capacity(rows.len());
+    for row in rows {
+        let open_time = row.open_time;
+        match Candle::try_from(row) {
+            Ok(candle) => candles.push(candle),
+            Err(error) => {
+                tracing::warn!(open_time, %error, "truncating candle read at invalid row");
+                break;
+            }
+        }
+    }
     candles.reverse();
-    Ok(candles)
+    candles
 }
 
 /// A durable candle cache the sync seeds from on startup and writes through.
@@ -190,7 +203,8 @@ impl SqliteStore {
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal);
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(30));
         let pool = SqlitePool::connect_with(options).await?;
         Ok(Self { pool })
     }
@@ -476,7 +490,7 @@ impl CandleStore for SqliteStore {
         .fetch_all(&self.pool)
         .await?;
 
-        candles_oldest_first(rows)
+        Ok(candles_oldest_first(rows))
     }
 
     async fn load_recent(&self, limit: usize) -> Result<Vec<CandleSeries>, StoreError> {
@@ -508,7 +522,7 @@ impl CandleStore for SqliteStore {
             )
             .fetch_all(&self.pool)
             .await?;
-            let candles = candles_oldest_first(rows)?;
+            let candles = candles_oldest_first(rows);
             if !candles.is_empty() {
                 series.push(CandleSeries {
                     coin: group.coin,
@@ -604,6 +618,38 @@ mod tests {
                 candles
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_row_truncates_reads_instead_of_poisoning_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cw.db");
+        let store = SqliteStore::open(&path).await.expect("open");
+        let btc = (1..=3)
+            .map(|hour| candle(hour, "100", "101", "99", "100", "10"))
+            .collect::<Vec<_>>();
+        let eth = vec![candle(1, "300", "301", "299", "300", "30")];
+        store.save("BTC", Timeframe::Hour1, &btc).await.expect("save BTC");
+        store.save("ETH", Timeframe::Hour1, &eth).await.expect("save ETH");
+        let corrupt_open = 2 * 3_600_000i64;
+        sqlx::query!(
+            "UPDATE candles SET open = 'garbage' WHERE coin = 'BTC' AND open_time = ?",
+            corrupt_open,
+        )
+        .execute(&store.pool)
+        .await
+        .expect("corrupt row");
+
+        let loaded = store.load_recent(100).await.expect("load survives corruption");
+        let btc_series = loaded.iter().find(|series| series.coin == "BTC").expect("BTC series");
+        assert_eq!(btc_series.candles, btc.get(2..).expect("newest valid rows"));
+        assert!(loaded.iter().any(|series| series.coin == "ETH"));
+
+        let paged = store
+            .candles_before("BTC", Timeframe::Hour1, 4 * 3_600_000, 10)
+            .await
+            .expect("paged read survives corruption");
+        assert_eq!(paged, btc.get(2..).expect("newest valid rows"));
     }
 
     #[tokio::test]
