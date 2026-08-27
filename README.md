@@ -11,9 +11,9 @@ drawings, and build reusable multi-timeframe signals — a decision-support tool
 auto-trader.
 
 > **History:** Coinwatch began as a Python CEX collector (archived on
-> [`v1-python`](../../tree/v1-python), tag `v1.0-python`), then a Rust backtest-research
-> engine (preserved on [`experiment/backtest-research`](../../tree/experiment/backtest-research)).
-> This branch is the real-time screener. See the [design document](docs/design.md) for the architecture.
+> [`v1-python`](../../tree/v1-python), tag `v1.0-python`), then explored a Rust backtest-research
+> engine before pivoting to this real-time screener. See the [design document](docs/design.md) for
+> the current architecture.
 
 ## Architecture
 

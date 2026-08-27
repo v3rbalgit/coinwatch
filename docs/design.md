@@ -1,7 +1,6 @@
 # Coinwatch — Design
 
-> The real-time Hyperliquid screener. This supersedes the earlier backtest-research design
-> (preserved on `experiment/backtest-research`); that history is not the current direction.
+> The real-time Hyperliquid screener. This supersedes the earlier backtest-research direction.
 
 ## Product
 
@@ -214,5 +213,5 @@ always-on alerts or multiple clients.
 
 ## History
 
-Python CEX collector (`v1-python`) → Rust backtest-research engine
-(`experiment/backtest-research`) → this real-time screener.
+Python CEX collector (`v1-python`) → exploratory Rust backtest-research engine → this real-time
+screener.
