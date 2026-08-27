@@ -1,6 +1,10 @@
-export type ChartTimeframe = "1h" | "4h" | "1d" | "1w"
+import { isRecord } from "$lib/ipc/guards"
+import { TIMEFRAMES } from "$lib/timeframes"
+import type { Timeframe } from "$lib/timeframes"
 
-export const CHART_TIMEFRAMES: readonly ChartTimeframe[] = ["1h", "4h", "1d", "1w"]
+export type ChartTimeframe = Timeframe
+
+export const CHART_TIMEFRAMES: readonly ChartTimeframe[] = TIMEFRAMES
 export const CHART_CHROME_SETTINGS_KEY = "chart.chrome"
 export const PRICE_PANE_LAYOUT_ID = "price"
 
@@ -71,7 +75,7 @@ interface PersistedPaneLayoutEntry {
 }
 
 function isPersistedSettings(value: unknown): value is PersistedSettings {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
+  return isRecord(value)
 }
 
 function parsePersistedSettings(raw: string | null, name: PersistedSettingsName): PersistedSettings | null {
@@ -102,7 +106,7 @@ function decodeChartViewSettings(value: PersistedSettings | null): ChartViewSett
 }
 
 function isPersistedToolbarPosition(value: unknown): value is PersistedToolbarPosition {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
+  return isRecord(value)
 }
 
 function decodeToolbarPosition(value: unknown): ToolbarPosition | null {
@@ -125,7 +129,7 @@ function decodeChartChromeBase(value: PersistedSettings): ChartChromeBase | null
 }
 
 function isPersistedPaneLayoutEntry(value: unknown): value is PersistedPaneLayoutEntry {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
+  return isRecord(value)
 }
 
 function decodePaneLayoutEntry(value: unknown): PaneLayoutEntry | null {

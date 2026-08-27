@@ -1,10 +1,8 @@
-import { invoke } from "@tauri-apps/api/core"
+import { watchlists } from "$lib/ipc/screener"
+import type { ListView } from "$lib/ipc/screener"
 
-export interface SignalWatchlist {
-  name: string
-  coins: string[]
-}
+export type SignalWatchlist = ListView
 
 export function listSignalWatchlists(): Promise<SignalWatchlist[]> {
-  return invoke<SignalWatchlist[]>("lists")
+  return watchlists()
 }

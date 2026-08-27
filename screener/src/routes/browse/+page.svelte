@@ -1,7 +1,5 @@
 <script lang="ts">
   import { Check, ChevronDown, EllipsisVertical, ExternalLink, Plus, X } from "@lucide/svelte"
-  import { invoke } from "@tauri-apps/api/core"
-  import { listen } from "@tauri-apps/api/event"
   import { DropdownMenu } from "bits-ui"
   import { onMount } from "svelte"
 
@@ -12,27 +10,25 @@
   import CoinIcon from "$lib/components/ui/coin-icon.svelte"
   import Input from "$lib/components/ui/input.svelte"
   import Skeleton from "$lib/components/ui/skeleton.svelte"
-  import { formatCompactNumber, formatPrice } from "$lib/format"
-
-  type Row = {
-    coin: string
-    price: number
-    prev_day: number
-    volume_usd: number
-    open_interest_usd: number
-    funding: number
-  }
-  type ListView = { name: string; coins: string[] }
+  import { formatCompactNumber, formatPrice, prevDayChangePct } from "$lib/format"
+  import { onMid } from "$lib/ipc/events"
+  import {
+    addToList,
+    createList,
+    deleteList as deleteListCommand,
+    logos,
+    openOnHyperliquid,
+    removeFromList,
+    screenerRows,
+    watchlists,
+  } from "$lib/ipc/screener"
+  import type { ListView, ScreenerRow as Row } from "$lib/ipc/screener"
 
   let rows = $state<Row[]>([])
   let lists = $state<ListView[]>([])
   let logoMap = $state<Record<string, string>>({})
-  let activeList = $state<string | null>(browseView.activeList)
   let loading = $state(true)
   let error = $state("")
-  let query = $state(browseView.query)
-  let sortKey = $state<SortKey>(browseView.sortKey)
-  let sortDir = $state<1 | -1>(browseView.sortDir)
   const livePrices = $state<Record<string, number>>({})
   let live = $state(false)
 
@@ -41,18 +37,9 @@
   let creatingCoin = $state<string | null>(null)
   let newListName = $state("")
 
-  // Persist the view (sort / filter / list) module-level so it survives navigating
-  // into a coin and back — the page remounts on goto, losing component-local state.
-  $effect(() => {
-    browseView.sortKey = sortKey
-    browseView.sortDir = sortDir
-    browseView.query = query
-    browseView.activeList = activeList
-  })
-
   async function loadRows() {
     try {
-      rows = await invoke<Row[]>("screener_rows")
+      rows = await screenerRows()
       error = ""
     } catch (e) {
       error = String(e)
@@ -61,19 +48,19 @@
     }
   }
   async function loadLists() {
-    lists = await invoke<ListView[]>("lists")
+    lists = await watchlists()
   }
   async function loadLogos() {
-    logoMap = await invoke<Record<string, string>>("logos")
+    logoMap = await logos()
   }
   void loadRows()
   void loadLists()
   void loadLogos()
 
   onMount(() => {
-    const unlisten = listen<{ coin: string; price: number }>("mid", event => {
+    const unlisten = onMid(event => {
       live = true
-      livePrices[event.payload.coin] = event.payload.price
+      livePrices[event.coin] = event.price
     })
     const reload = setInterval(loadRows, 5000)
     // Pick up logos as the background cache task fills them in this session.
@@ -101,37 +88,37 @@
     return map
   })
   const activeCoins = $derived(
-    activeList === null ? null : new Set(lists.find(l => l.name === activeList)?.coins ?? [])
+    browseView.activeList === null ? null : new Set(lists.find(l => l.name === browseView.activeList)?.coins ?? [])
   )
 
   function sortBy(key: SortKey) {
-    if (sortKey === key) sortDir = sortDir === 1 ? -1 : 1
+    if (browseView.sortKey === key) browseView.sortDir = browseView.sortDir === 1 ? -1 : 1
     else {
-      sortKey = key
-      sortDir = -1
+      browseView.sortKey = key
+      browseView.sortDir = -1
     }
   }
 
-  const change = (row: Row, price: number) => (row.prev_day > 0 ? (price / row.prev_day - 1) * 100 : 0)
+  const change = (row: Row, price: number) => prevDayChangePct(row.prev_day, price)
 
-  // Depends only on rows/query/list/sort — never livePrices — so a price tick
+  // Depends only on rows and the browse view — never livePrices — so a price tick
   // updates only the affected cells rather than re-sorting the whole table.
   const sorted = $derived.by(() => {
-    const q = query.trim().toLowerCase()
+    const q = browseView.query.trim().toLowerCase()
     const coins = activeCoins
     const list = rows.filter(r => (!q || r.coin.toLowerCase().includes(q)) && (!coins || coins.has(r.coin)))
     list.sort((a, b) => {
-      if (sortKey === "coin") return a.coin.localeCompare(b.coin) * sortDir
-      const av = sortKey === "change_24h_pct" ? change(a, a.price) : a[sortKey]
-      const bv = sortKey === "change_24h_pct" ? change(b, b.price) : b[sortKey]
-      return (av - bv) * sortDir
+      if (browseView.sortKey === "coin") return a.coin.localeCompare(b.coin) * browseView.sortDir
+      const av = browseView.sortKey === "change_24h_pct" ? change(a, a.price) : a[browseView.sortKey]
+      const bv = browseView.sortKey === "change_24h_pct" ? change(b, b.price) : b[browseView.sortKey]
+      return (av - bv) * browseView.sortDir
     })
     return list
   })
 
   async function toggleMembership(list: string, coin: string) {
-    if (coinLists.get(coin)?.has(list)) await invoke("remove_from_list", { list, coin })
-    else await invoke("add_to_list", { list, coin })
+    if (coinLists.get(coin)?.has(list)) await removeFromList(list, coin)
+    else await addToList(list, coin)
     await loadLists()
   }
   function startNewList(coin: string | null) {
@@ -143,15 +130,15 @@
     const name = newListName.trim()
     creating = false
     if (!name) return
-    if (creatingCoin) await invoke("add_to_list", { list: name, coin: creatingCoin })
-    else await invoke("create_list", { name })
+    if (creatingCoin) await addToList(name, creatingCoin)
+    else await createList(name)
     creatingCoin = null
     await loadLists()
-    activeList = name
+    browseView.activeList = name
   }
   async function deleteList(name: string) {
-    await invoke("delete_list", { name })
-    if (activeList === name) activeList = null
+    await deleteListCommand(name)
+    if (browseView.activeList === name) browseView.activeList = null
     await loadLists()
   }
   const cols: { key: SortKey; label: string; num: boolean }[] = [
@@ -179,19 +166,19 @@
         <DropdownMenu.Trigger
           class="flex h-8 items-center gap-1.5 rounded-md border border-border px-2.5 text-sm font-semibold text-primary hover:bg-accent/50"
         >
-          {activeList ?? "All"}
+          {browseView.activeList ?? "All"}
           <ChevronDown class="size-4 text-muted-foreground" />
         </DropdownMenu.Trigger>
         <DropdownMenu.Portal>
           <DropdownMenu.Content class={menuContent} align="start" sideOffset={4}>
-            <DropdownMenu.Item class={menuItem} onSelect={() => (activeList = null)}>
-              <Check class="size-3.5 {activeList === null ? 'opacity-100' : 'opacity-0'}" />
+            <DropdownMenu.Item class={menuItem} onSelect={() => (browseView.activeList = null)}>
+              <Check class="size-3.5 {browseView.activeList === null ? 'opacity-100' : 'opacity-0'}" />
               <span class="flex-1">All</span>
               <span class="text-xs text-muted-foreground">{rows.length}</span>
             </DropdownMenu.Item>
             {#each lists as list (list.name)}
-              <DropdownMenu.Item class={menuItem} onSelect={() => (activeList = list.name)}>
-                <Check class="size-3.5 {activeList === list.name ? 'opacity-100' : 'opacity-0'}" />
+              <DropdownMenu.Item class={menuItem} onSelect={() => (browseView.activeList = list.name)}>
+                <Check class="size-3.5 {browseView.activeList === list.name ? 'opacity-100' : 'opacity-0'}" />
                 <span class="flex-1">{list.name}</span>
                 <span class="text-xs text-muted-foreground">{list.coins.length}</span>
                 <button
@@ -234,7 +221,7 @@
 
     <div class="flex items-center gap-3">
       {#if live}<Badge variant="success">● live</Badge>{/if}
-      <Input placeholder="Filter coin…" bind:value={query} class="h-8 w-44" />
+      <Input placeholder="Filter coin…" bind:value={browseView.query} class="h-8 w-44" />
       <span class="text-xs text-muted-foreground tabular-nums">{sorted.length} / {rows.length}</span>
     </div>
   </header>
@@ -266,7 +253,7 @@
                   : ''}"
                 onclick={() => sortBy(c.key)}
               >
-                {c.label}{sortKey === c.key ? (sortDir === 1 ? " ▲" : " ▼") : ""}
+                {c.label}{browseView.sortKey === c.key ? (browseView.sortDir === 1 ? " ▲" : " ▼") : ""}
               </th>
             {/each}
             <th class="w-8"></th>
@@ -303,12 +290,12 @@
               </td>
               <td class="py-1.5 pr-3 pl-1 text-right">
                 <div class="flex items-center justify-end gap-0.5" onclick={e => e.stopPropagation()} role="none">
-                  {#if activeList !== null}
+                  {#if browseView.activeList !== null}
                     <button
                       class="rounded p-1 text-muted-foreground hover:text-destructive"
-                      aria-label="Remove from {activeList}"
+                      aria-label="Remove from {browseView.activeList}"
                       onclick={() => {
-                        if (activeList !== null) void toggleMembership(activeList, row.coin)
+                        if (browseView.activeList !== null) void toggleMembership(browseView.activeList, row.coin)
                       }}
                     >
                       <X class="size-4" />
@@ -345,10 +332,7 @@
                           </DropdownMenu.Item>
                         </DropdownMenu.Group>
                         <DropdownMenu.Separator class="my-1 h-px bg-border" />
-                        <DropdownMenu.Item
-                          class={menuItem}
-                          onSelect={() => invoke("open_on_hyperliquid", { coin: row.coin })}
-                        >
+                        <DropdownMenu.Item class={menuItem} onSelect={() => openOnHyperliquid(row.coin)}>
                           <ExternalLink class="size-3.5" />
                           Open on Hyperliquid
                         </DropdownMenu.Item>

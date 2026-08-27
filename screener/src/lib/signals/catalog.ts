@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core"
 
+import { hasNumber, hasString, isRecord } from "$lib/ipc/guards"
 import type { SignalDefinition } from "$lib/signals/definition"
-import { hasNumber, hasString, isStringRecord } from "$lib/signals/ipc"
 
 export type SignalCatalogIssue =
   { type: "unsupportedVersion"; version: number } | { type: "invalidDefinition"; message: string }
@@ -28,7 +28,7 @@ export type SignalCatalogError =
   | { type: "storage" }
 
 export function isSignalCatalogError(value: unknown): value is SignalCatalogError {
-  if (!isStringRecord(value) || !hasString(value, "type")) return false
+  if (!isRecord(value) || !hasString(value, "type")) return false
   switch (value.type) {
     case "invalidName":
     case "storage":
@@ -45,7 +45,7 @@ export function isSignalCatalogError(value: unknown): value is SignalCatalogErro
 }
 
 export function isSignalCatalogIssue(value: unknown): value is SignalCatalogIssue {
-  if (!isStringRecord(value) || !hasString(value, "type")) return false
+  if (!isRecord(value) || !hasString(value, "type")) return false
   switch (value.type) {
     case "unsupportedVersion":
       return hasNumber(value, "version")

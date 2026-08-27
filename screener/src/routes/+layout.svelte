@@ -1,24 +1,14 @@
 <script lang="ts">
   import "../app.css"
 
-  import { listen } from "@tauri-apps/api/event"
   import { onMount, type Snippet } from "svelte"
 
   import { page } from "$app/state"
+  import { onStatus, type EngineStatus } from "$lib/ipc/events"
 
   const { children }: { children: Snippet } = $props()
 
-  type Status = {
-    connection: string
-    phase: string
-    universe: number
-    backfill_done: number
-    backfill_total: number
-    backfill_errors: number
-    streaming: number
-    fetch_rate: number
-  }
-  let status = $state<Status>({
+  let status = $state<EngineStatus>({
     connection: "connecting",
     phase: "loading",
     universe: 0,
@@ -52,8 +42,8 @@
   )
 
   onMount(() => {
-    const unlisten = listen<Status>("status", event => {
-      status = event.payload
+    const unlisten = onStatus(payload => {
+      status = payload
     })
     return () => void unlisten.then(off => off())
   })

@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core"
 
-import { hasString, isStringRecord } from "$lib/signals/ipc"
+import { hasString, isRecord } from "$lib/ipc/guards"
 
 export type IndicatorPresetIssue = { type: "invalidPreset"; message: string }
 
@@ -28,7 +28,7 @@ export type IndicatorPresetError =
   | { type: "storage" }
 
 export function isIndicatorPresetError(value: unknown): value is IndicatorPresetError {
-  if (!isStringRecord(value) || !hasString(value, "type")) return false
+  if (!isRecord(value) || !hasString(value, "type")) return false
   switch (value.type) {
     case "invalidName":
     case "storage":
@@ -45,7 +45,7 @@ export function isIndicatorPresetError(value: unknown): value is IndicatorPreset
 }
 
 export function isIndicatorPresetIssue(value: unknown): value is IndicatorPresetIssue {
-  return isStringRecord(value) && value.type === "invalidPreset" && hasString(value, "message")
+  return isRecord(value) && value.type === "invalidPreset" && hasString(value, "message")
 }
 
 export function listIndicatorPresets(): Promise<IndicatorPresetEntry[]> {
