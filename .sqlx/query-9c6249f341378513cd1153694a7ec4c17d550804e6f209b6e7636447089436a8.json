@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE candles SET open = 'garbage' WHERE coin = 'BTC' AND open_time = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "9c6249f341378513cd1153694a7ec4c17d550804e6f209b6e7636447089436a8"
+}

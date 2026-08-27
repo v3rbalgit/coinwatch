@@ -4,16 +4,15 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use domain::{Candle, Timeframe};
-use hl_feed::{CandleHistory, HyperliquidRest, MarketStore};
+use hl_feed::{CandleHistory, CandleProvider, FeedError, MarketStore};
 use serde_json::json;
 use signals::{ConditionOutcome, EvalReport, OutcomeStatus, SignalDefinition};
 use storage::{CandleSeries, CandleStore, StoreError};
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tokio::sync::watch;
 
-use super::{
-    ActiveRunGuard, ScopeError, SignalRunEvent, SignalRunScope, SignalRunState, StartRunError, execute_run, run_worker,
-};
+use super::{SignalRunEvent, SignalRunScope, SignalRunState, StartRunError, execute_run, run_worker};
+use crate::task_lifecycle::{BeginError, HasTaskState, TaskGuard};
 
 struct NoopStore;
 
@@ -38,15 +37,28 @@ impl CandleStore for NoopStore {
     }
 }
 
+struct UnusedProvider;
+
+#[async_trait]
+impl CandleProvider for UnusedProvider {
+    async fn candles_before(
+        &self,
+        _coin: &str,
+        _timeframe: Timeframe,
+        _before_ms: i64,
+        _count: usize,
+    ) -> Result<Vec<Candle>, FeedError> {
+        panic!("run hydration must not reach the network in tests")
+    }
+}
+
 fn history() -> Arc<CandleHistory> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let rest = Arc::new(HyperliquidRest::new(reqwest::Client::new(), 1100));
-    Arc::new(CandleHistory::new(Arc::new(NoopStore), rest))
+    Arc::new(CandleHistory::new(Arc::new(NoopStore), Arc::new(UnusedProvider)))
 }
 
 fn definition() -> SignalDefinition {
     serde_json::from_value(json!({
-        "version": 2,
+        "version": 3,
         "direction": "bullish",
         "root": { "type": "condition", "id": "trend" },
         "conditions": {
@@ -83,7 +95,7 @@ async fn one_active_run_is_cancelled_by_matching_id_and_releases_on_finish() {
     let first = state.begin(first_cancel).expect("first run starts");
     let (blocked_cancel, _blocked_cancellation) = watch::channel(false);
 
-    assert_eq!(state.begin(blocked_cancel), Err(StartRunError::AlreadyActive));
+    assert_eq!(state.begin(blocked_cancel), Err(BeginError::AlreadyActive));
     assert!(!state.cancel(first + 1));
     assert!(state.cancel(first));
     first_cancellation.changed().await.expect("cancellation sender remains active");
@@ -100,7 +112,7 @@ fn active_guard_releases_the_run_slot_on_drop() {
     let (first_cancel, _first_cancellation) = watch::channel(false);
     let first = state.begin(first_cancel).expect("first run starts");
     {
-        let _guard = ActiveRunGuard {
+        let _guard = TaskGuard {
             state: Arc::clone(&state),
             id: first,
             active: true,
@@ -255,11 +267,24 @@ fn explicit_scope_rejects_empty_and_duplicate_coins() {
     let store = MarketStore::new();
     assert_eq!(
         SignalRunScope::Coins(vec![String::new()]).resolve(&store),
-        Err(ScopeError::EmptyCoin)
+        Err(StartRunError::EmptyCoin)
     );
     assert_eq!(
         SignalRunScope::Coins(vec!["BTC".to_owned(), "BTC".to_owned()]).resolve(&store),
-        Err(ScopeError::DuplicateCoin("BTC".to_owned()))
+        Err(StartRunError::DuplicateCoin { coin: "BTC".to_owned() })
+    );
+}
+
+#[test]
+fn start_error_serialization_matches_the_frontend_contract() {
+    assert_eq!(
+        serde_json::to_value(StartRunError::AlreadyActive).expect("serializable start error"),
+        json!({ "type": "alreadyActive" })
+    );
+    assert_eq!(
+        serde_json::to_value(StartRunError::DuplicateCoin { coin: "BTC".to_owned() })
+            .expect("serializable start error"),
+        json!({ "type": "duplicateCoin", "coin": "BTC" })
     );
 }
 
@@ -268,7 +293,7 @@ fn evaluated_event_serialization_matches_the_frontend_contract() {
     let report = EvalReport {
         coin: "BTC".to_owned(),
         satisfied: false,
-        triggered_at: None,
+        last_evidence_at: None,
         conditions: BTreeMap::from([(
             "trend".to_owned(),
             ConditionOutcome {
@@ -301,7 +326,7 @@ fn evaluated_event_serialization_matches_the_frontend_contract() {
                 "report": {
                     "coin": "BTC",
                     "satisfied": false,
-                    "triggeredAt": null,
+                    "lastEvidenceAt": null,
                     "conditions": {
                         "trend": {
                             "status": "insufficientHistory",

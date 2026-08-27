@@ -9,6 +9,8 @@ use storage::{IndicatorPresetRecord, SqliteStore, StoreError};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::naming::normalized_name;
+
 const ID_GENERATION_ATTEMPTS: usize = 2;
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -50,12 +52,7 @@ pub(crate) enum IndicatorPresetError {
 }
 
 fn normalize_name(name: String) -> Result<String, IndicatorPresetError> {
-    let name = name.trim();
-    if name.is_empty() {
-        Err(IndicatorPresetError::InvalidName)
-    } else {
-        Ok(name.to_owned())
-    }
+    normalized_name(&name).ok_or(IndicatorPresetError::InvalidName)
 }
 
 fn map_store_error(error: StoreError) -> IndicatorPresetError {

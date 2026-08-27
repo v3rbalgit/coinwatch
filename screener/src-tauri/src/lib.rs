@@ -2,13 +2,15 @@
 //!
 //! The market sync engine keeps a hot [`MarketStore`] cache warm from Hyperliquid.
 //! Commands expose live metadata, candle history, user data, and personal signal
-//! evaluation. Live mids stream over the WebSocket and are relayed to the frontend
-//! as `mid` events.
+//! evaluation. Live mids, the active coin's candles, and engine status are relayed
+//! to the frontend as `mid`, `candle`, and `status` events.
 
 mod indicator_presets;
+mod naming;
 mod signal_catalog;
 mod signal_runs;
 mod signal_validation;
+mod task_lifecycle;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,8 +18,8 @@ use std::time::Duration;
 
 use domain::{Candle, Timeframe};
 use hl_feed::{
-    CandleHistory, ConnectionState, HyperliquidAdapter, HyperliquidRest, MarketEvent, MarketStatus, MarketStore,
-    SyncConfig, SyncPhase, spawn_sync,
+    CandleHistory, CandleProvider, HyperliquidAdapter, HyperliquidRest, MarketEvent, MarketStore, SyncConfig,
+    spawn_sync,
 };
 use rust_decimal::prelude::ToPrimitive;
 use serde::Serialize;
@@ -68,34 +70,6 @@ fn screener_rows(store: tauri::State<'_, Arc<MarketStore>>) -> Vec<ScreenerRow> 
 struct MidPayload {
     coin: String,
     price: f64,
-}
-
-/// The market engine status forwarded to the frontend as a `status` event.
-#[derive(Clone, Serialize)]
-struct StatusPayload {
-    connection: ConnectionState,
-    phase: SyncPhase,
-    universe: usize,
-    backfill_done: usize,
-    backfill_total: usize,
-    backfill_errors: usize,
-    streaming: usize,
-    fetch_rate: u32,
-}
-
-impl From<&MarketStatus> for StatusPayload {
-    fn from(status: &MarketStatus) -> Self {
-        Self {
-            connection: status.connection,
-            phase: status.phase,
-            universe: status.universe,
-            backfill_done: status.backfill_done,
-            backfill_total: status.backfill_total,
-            backfill_errors: status.backfill_errors,
-            streaming: status.streaming,
-            fetch_rate: status.fetch_rate,
-        }
-    }
 }
 
 /// A candle in the shape lightweight-charts expects: epoch-second time, numeric OHLCV.
@@ -312,7 +286,11 @@ pub fn run() {
         .setup(move |app| {
             // Client clones share one pool; Hyperliquid requests add the shared
             // weight limiter while logo downloads use the same HTTP transport directly.
-            let http = reqwest::Client::new();
+            // Timeouts keep a half-open connection from wedging sync, paging, and logos.
+            let http = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(30))
+                .build()?;
             let rest = Arc::new(HyperliquidRest::new(http.clone(), sync_config.weight_budget_per_min));
 
             // The local database holds candles + watchlists. Open it synchronously so
@@ -325,7 +303,8 @@ pub fn run() {
                 Ok(store) => {
                     let store = Arc::new(store);
                     let persistence: Arc<dyn CandleStore> = store.clone();
-                    let history = Arc::new(CandleHistory::new(Arc::clone(&persistence), Arc::clone(&rest)));
+                    let provider: Arc<dyn CandleProvider> = rest.clone();
+                    let history = Arc::new(CandleHistory::new(Arc::clone(&persistence), provider));
                     app.manage(Arc::clone(&store));
                     app.manage(history);
                     let logo_db = Arc::clone(&store);
@@ -344,7 +323,7 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 let mut status = status_store.watch_status();
                 loop {
-                    let payload = StatusPayload::from(&status.borrow_and_update().clone());
+                    let payload = status.borrow_and_update().clone();
                     let _ = status_handle.emit("status", payload);
                     if status.changed().await.is_err() {
                         break;
