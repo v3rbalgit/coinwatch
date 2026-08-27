@@ -4,30 +4,18 @@ import type { SignalDefinition } from "$lib/signals/definition"
 import {
   createSignalValidationClient,
   idleSignalValidationProgress,
+  isStartSignalValidationError,
   reduceSignalValidationProgress,
   signalValidationFailureMessage,
+  startSignalValidationErrorMessage,
   type HistoricalRange,
   type SignalValidationEvent,
   type SignalValidationTransport,
 } from "$lib/signals/historical"
 
-const definition: SignalDefinition = {
-  version: 2,
-  direction: "bullish",
-  root: { type: "condition", id: "price" },
-  conditions: {
-    price: {
-      timeframe: "1h",
-      predicate: {
-        type: "threshold",
-        left: { type: "field", field: "close" },
-        op: "greaterThan",
-        right: { type: "constant", value: 100 },
-      },
-      withinBars: 0,
-    },
-  },
-}
+import { thresholdDefinition } from "./signals-fixture"
+
+const definition = thresholdDefinition()
 
 const range: HistoricalRange = {
   start: "2026-08-25T00:00:00Z",
@@ -74,6 +62,36 @@ function fakeTransport(): FakeTransport {
     },
   }
 }
+
+describe("validation start errors and progress phases", () => {
+  it("narrows every structured start error without accepting malformed values", () => {
+    expect(isStartSignalValidationError({ type: "alreadyActive" })).toBe(true)
+    expect(isStartSignalValidationError({ type: "idExhausted" })).toBe(true)
+    expect(isStartSignalValidationError({ type: "emptyCoin" })).toBe(true)
+    expect(isStartSignalValidationError({ type: "eventStream", message: "closed" })).toBe(true)
+    expect(isStartSignalValidationError({ type: "eventStream" })).toBe(false)
+    expect(isStartSignalValidationError("already active")).toBe(false)
+    expect(startSignalValidationErrorMessage(new Error("boom"))).toBe("boom")
+  })
+
+  it("tracks the hydrating and evaluating phases through progress events", () => {
+    let progress = reduceSignalValidationProgress(idleSignalValidationProgress(), {
+      event: "started",
+      data: { validationId: 3, total: 2 },
+    })
+    expect(progress).toMatchObject({ status: "running", phase: "hydrating", completed: 0, total: 2 })
+    progress = reduceSignalValidationProgress(progress, {
+      event: "hydrated",
+      data: { validationId: 3, completed: 2, total: 2, timeframe: "1h" },
+    })
+    expect(progress).toMatchObject({ status: "running", phase: "hydrating", completed: 2 })
+    progress = reduceSignalValidationProgress(progress, {
+      event: "evaluated",
+      data: { validationId: 3, completed: 256, total: 500 },
+    })
+    expect(progress).toMatchObject({ status: "running", phase: "evaluating", completed: 256, total: 500 })
+  })
+})
 
 describe("historical signal validation client", () => {
   it("reduces hydration progress and preserves a typed failure", () => {

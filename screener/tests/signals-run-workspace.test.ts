@@ -1,28 +1,13 @@
 import { describe, expect, it } from "vitest"
 
-import type { SignalDefinition } from "$lib/signals/definition"
 import { createSignalRunClient } from "$lib/signals/run"
 import type { SignalRunEvent, SignalRunTransport } from "$lib/signals/run"
 import { createSignalRunWorkspace, snapshotSignalDefinition } from "$lib/signals/run-workspace"
 import type { SignalRunSnapshot } from "$lib/signals/run-workspace"
 
-const definition: SignalDefinition = {
-  version: 2,
-  direction: "bullish",
-  root: { type: "condition", id: "price" },
-  conditions: {
-    price: {
-      timeframe: "1h",
-      predicate: {
-        type: "threshold",
-        left: { type: "field", field: "close" },
-        op: "greaterThan",
-        right: { type: "constant", value: 100 },
-      },
-      withinBars: 0,
-    },
-  },
-}
+import { thresholdDefinition } from "./signals-fixture"
+
+const definition = thresholdDefinition()
 
 function snapshot(name = "Trend"): SignalRunSnapshot {
   return {
@@ -85,7 +70,7 @@ const evaluated: SignalRunEvent = {
     report: {
       coin: "BTC",
       satisfied: true,
-      triggeredAt: "2026-08-26T09:00:00Z",
+      lastEvidenceAt: "2026-08-26T09:00:00Z",
       conditions: {
         price: { status: "satisfied", lastTrueBar: "2026-08-26T09:00:00Z", evidence: null },
       },
@@ -188,7 +173,7 @@ describe("signal run workspace", () => {
         report: {
           coin: "BTC",
           satisfied: false,
-          triggeredAt: null,
+          lastEvidenceAt: null,
           conditions: {
             price: {
               status: "notSatisfied",

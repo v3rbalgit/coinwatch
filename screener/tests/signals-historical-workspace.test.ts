@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest"
 
-import type { SignalDefinition } from "$lib/signals/definition"
 import type {
   HistoricalRange,
   HistoricalValidation,
@@ -12,23 +11,9 @@ import {
   type HistoricalValidationSnapshot,
 } from "$lib/signals/historical-workspace"
 
-const definition: SignalDefinition = {
-  version: 2,
-  direction: "bullish",
-  root: { type: "condition", id: "price" },
-  conditions: {
-    price: {
-      timeframe: "1h",
-      predicate: {
-        type: "threshold",
-        left: { type: "field", field: "close" },
-        op: "greaterThan",
-        right: { type: "constant", value: 100 },
-      },
-      withinBars: 0,
-    },
-  },
-}
+import { thresholdDefinition } from "./signals-fixture"
+
+const definition = thresholdDefinition()
 
 const range: HistoricalRange = {
   start: "2026-08-25T00:00:00Z",
@@ -61,7 +46,7 @@ function completedResult(): HistoricalValidation {
         evidence: {
           coin: "BTC",
           satisfied: true,
-          triggeredAt: "2026-08-25T07:00:00Z",
+          lastEvidenceAt: "2026-08-25T07:00:00Z",
           conditions: {
             price: {
               status: "satisfied",
