@@ -7,6 +7,7 @@ import type {
   SignalDefinition,
   SignalNode,
 } from "$lib/signals/definition"
+import { TIMEFRAME_HOURS } from "$lib/timeframes"
 
 export interface DefinitionLine {
   depth: number
@@ -16,13 +17,6 @@ export interface DefinitionLine {
 export interface DefinitionPreview {
   heading: string
   lines: string[]
-}
-
-const timeframeHours: Readonly<Record<Condition["timeframe"], number>> = {
-  "1h": 1,
-  "4h": 4,
-  "1d": 24,
-  "1w": 168,
 }
 
 function formatNumber(value: number): string {
@@ -104,7 +98,7 @@ export function predicateLabel(predicate: Predicate, descriptors: readonly Indic
 }
 
 export function recencyDurationLabel(timeframe: Condition["timeframe"], bars: number): string {
-  const hours = timeframeHours[timeframe] * bars
+  const hours = TIMEFRAME_HOURS[timeframe] * bars
   if (hours % 168 === 0) {
     const weeks = hours / 168
     return `${weeks} ${weeks === 1 ? "week" : "weeks"}`
@@ -190,7 +184,8 @@ export function definitionLines(
   return lines
 }
 
-function directConditionIds(node: SignalNode): { mode: "all" | "any"; ids: string[] } | null {
+/** Condition ids under a flat root (a bare condition or one all/any of conditions). */
+export function directConditionIds(node: SignalNode): { mode: "all" | "any"; ids: string[] } | null {
   if (node.type === "condition") return { mode: "all", ids: [node.id] }
   if (node.type !== "all" && node.type !== "any") return null
   const ids: string[] = []

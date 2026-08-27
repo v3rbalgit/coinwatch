@@ -1,4 +1,5 @@
 import { indicatorDescriptors, loadIndicators } from "$lib/chart/indicators"
+import { errorMessage } from "$lib/errors"
 import { listSignals } from "$lib/signals/catalog"
 import type { SignalDefinition } from "$lib/signals/definition"
 import { compileSignalDraft } from "$lib/signals/draft"
@@ -40,7 +41,7 @@ export async function loadHistoricalSignalOptions(): Promise<HistoricalSignalOpt
       try {
         definition = compileSignalDraft(session.draft)
       } catch (error) {
-        issue = error instanceof Error ? error.message : String(error)
+        issue = errorMessage(error)
       }
     }
     options.unshift({

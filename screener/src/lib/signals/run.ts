@@ -1,5 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core"
 
+import { errorMessage } from "$lib/errors"
+import { hasString, isRecord } from "$lib/ipc/guards"
 import { createSignalChannelClient } from "$lib/signals/channel-client"
 import type { SignalChannelTransport } from "$lib/signals/channel-client"
 import type { SignalDefinition, SignalTimeframe } from "$lib/signals/definition"
@@ -26,12 +28,13 @@ export type ConditionOutcome = {
   | { status: "noData" }
   | { status: "unavailable" }
   | { status: "insufficientHistory"; required: number; available: number }
+  | { status: "undefinedOperands" }
 )
 
 export interface EvalReport {
   coin: string
   satisfied: boolean
-  triggeredAt: string | null
+  lastEvidenceAt: string | null
   conditions: Record<string, ConditionOutcome>
   missingData: SignalTimeframe[]
   unavailableData: Partial<Record<SignalTimeframe, string>>
@@ -122,6 +125,47 @@ export const tauriSignalRunTransport: SignalRunTransport = {
   cancel(runId) {
     return invoke<boolean>("cancel_signal_run", { runId })
   },
+}
+
+export type StartSignalRunError =
+  | { type: "alreadyActive" }
+  | { type: "idExhausted" }
+  | { type: "emptyCoin" }
+  | { type: "duplicateCoin"; coin: string }
+  | { type: "eventStream"; message: string }
+
+export function isStartSignalRunError(value: unknown): value is StartSignalRunError {
+  if (!isRecord(value) || !hasString(value, "type")) return false
+  switch (value.type) {
+    case "alreadyActive":
+    case "idExhausted":
+    case "emptyCoin":
+      return true
+    case "duplicateCoin":
+      return hasString(value, "coin")
+    case "eventStream":
+      return hasString(value, "message")
+    default:
+      return false
+  }
+}
+
+export function startSignalRunErrorMessage(error: unknown): string {
+  if (!isStartSignalRunError(error)) {
+    return errorMessage(error)
+  }
+  switch (error.type) {
+    case "alreadyActive":
+      return "A signal run is already active. Wait for it to finish or cancel it."
+    case "idExhausted":
+      return "Signal runs are exhausted for this session. Restart the app."
+    case "emptyCoin":
+      return "The run scope contains an empty coin symbol."
+    case "duplicateCoin":
+      return `The run scope lists '${error.coin}' more than once.`
+    case "eventStream":
+      return `The run could not stream events: ${error.message}`
+  }
 }
 
 export class SignalRunAlreadyActiveError extends Error {

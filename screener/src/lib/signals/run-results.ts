@@ -1,6 +1,6 @@
 import type { IndicatorDescriptor } from "$lib/chart/indicators"
 import type { SignalDefinition, SignalNode } from "$lib/signals/definition"
-import { conditionLabel } from "$lib/signals/format"
+import { conditionLabel, directConditionIds } from "$lib/signals/format"
 import type { ConditionOutcome, EvalReport } from "$lib/signals/run"
 
 export type SignalRunResultFilter = "matches" | "closest" | "all" | "issues"
@@ -55,20 +55,15 @@ export function reportHasDataIssues(report: EvalReport): boolean {
   if (report.missingData.length > 0 || Object.keys(report.unavailableData).length > 0) return true
   return Object.values(report.conditions).some(
     outcome =>
-      outcome.status === "noData" || outcome.status === "unavailable" || outcome.status === "insufficientHistory"
+      outcome.status === "noData" ||
+      outcome.status === "unavailable" ||
+      outcome.status === "insufficientHistory" ||
+      outcome.status === "undefinedOperands"
   )
 }
 
 function directPositiveConditionIds(definition: SignalDefinition): string[] {
-  const { root } = definition
-  if (root.type === "condition") return [root.id]
-  if (root.type !== "all" && root.type !== "any") return []
-  const ids: string[] = []
-  for (const child of root.children) {
-    if (child.type !== "condition") return []
-    ids.push(child.id)
-  }
-  return ids
+  return directConditionIds(definition.root)?.ids ?? []
 }
 
 function normalizedThresholdDistance(
