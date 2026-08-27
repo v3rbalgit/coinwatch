@@ -8,6 +8,8 @@ use storage::{SignalRecord, SqliteStore, StoreError};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::naming::normalized_name;
+
 const ID_GENERATION_ATTEMPTS: usize = 2;
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -48,12 +50,7 @@ pub(crate) enum SignalCatalogError {
 }
 
 fn normalize_name(name: String) -> Result<String, SignalCatalogError> {
-    let name = name.trim();
-    if name.is_empty() {
-        Err(SignalCatalogError::InvalidName)
-    } else {
-        Ok(name.to_owned())
-    }
+    normalized_name(&name).ok_or(SignalCatalogError::InvalidName)
 }
 
 fn map_store_error(error: StoreError) -> SignalCatalogError {

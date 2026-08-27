@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::ops::ControlFlow;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 use chrono::Utc;
 use hl_feed::{CandleHistory, MarketStore};
@@ -12,6 +12,8 @@ use tauri::ipc::Channel;
 use thiserror::Error;
 use tokio::sync::watch;
 
+use crate::task_lifecycle::{BeginError, HasTaskState, SingleTaskState, run_supervised, send_event};
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", content = "coins", rename_all = "camelCase")]
 pub(crate) enum SignalRunScope {
@@ -20,17 +22,17 @@ pub(crate) enum SignalRunScope {
 }
 
 impl SignalRunScope {
-    fn resolve(self, store: &MarketStore) -> Result<Vec<String>, ScopeError> {
+    fn resolve(self, store: &MarketStore) -> Result<Vec<String>, StartRunError> {
         match self {
             Self::Universe => Ok(store.universe().into_iter().map(|coin| coin.coin).collect()),
             Self::Coins(coins) => {
                 let mut seen = HashSet::with_capacity(coins.len());
                 for coin in &coins {
                     if coin.is_empty() {
-                        return Err(ScopeError::EmptyCoin);
+                        return Err(StartRunError::EmptyCoin);
                     }
                     if !seen.insert(coin.clone()) {
-                        return Err(ScopeError::DuplicateCoin(coin.clone()));
+                        return Err(StartRunError::DuplicateCoin { coin: coin.clone() });
                     }
                 }
                 Ok(coins)
@@ -76,101 +78,43 @@ pub(crate) enum SignalRunEvent {
     },
 }
 
-struct ActiveSignalRun {
-    id: u32,
-    cancel: watch::Sender<bool>,
-}
-
 #[derive(Default)]
-struct SignalRunInner {
-    next_id: u32,
-    active: Option<ActiveSignalRun>,
+pub(crate) struct SignalRunState(SingleTaskState);
+
+impl HasTaskState for SignalRunState {
+    fn task_state(&self) -> &SingleTaskState {
+        &self.0
+    }
 }
 
-#[derive(Default)]
-pub(crate) struct SignalRunState {
-    inner: Mutex<SignalRunInner>,
-}
-
-#[derive(Debug, PartialEq, Eq, Error)]
-enum ScopeError {
-    #[error("an explicit signal-run scope contains an empty coin symbol")]
-    EmptyCoin,
-    #[error("an explicit signal-run scope contains duplicate coin '{0}'")]
-    DuplicateCoin(String),
-}
-
-#[derive(Debug, PartialEq, Eq, Error)]
-enum StartRunError {
+/// Why a signal run could not start; serialized for the frontend to branch on.
+#[derive(Debug, PartialEq, Eq, Error, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub(crate) enum StartRunError {
     #[error("a signal run is already active")]
     AlreadyActive,
     #[error("signal run ID space is exhausted")]
     IdExhausted,
+    #[error("an explicit signal-run scope contains an empty coin symbol")]
+    EmptyCoin,
+    #[error("an explicit signal-run scope contains duplicate coin '{coin}'")]
+    DuplicateCoin { coin: String },
+    #[error("failed to start signal run event stream: {message}")]
+    EventStream { message: String },
 }
 
-impl SignalRunState {
-    fn begin(&self, cancel: watch::Sender<bool>) -> Result<u32, StartRunError> {
-        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        if inner.active.is_some() {
-            return Err(StartRunError::AlreadyActive);
+impl From<BeginError> for StartRunError {
+    fn from(error: BeginError) -> Self {
+        match error {
+            BeginError::AlreadyActive => Self::AlreadyActive,
+            BeginError::IdExhausted => Self::IdExhausted,
         }
-        let id = inner.next_id.checked_add(1).ok_or(StartRunError::IdExhausted)?;
-        inner.next_id = id;
-        inner.active = Some(ActiveSignalRun { id, cancel });
-        Ok(id)
-    }
-
-    fn cancel(&self, id: u32) -> bool {
-        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        inner
-            .active
-            .as_ref()
-            .filter(|run| run.id == id)
-            .is_some_and(|run| run.cancel.send(true).is_ok())
-    }
-
-    fn finish(&self, id: u32) {
-        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        if inner.active.as_ref().is_some_and(|run| run.id == id) {
-            inner.active = None;
-        }
-    }
-}
-
-struct ActiveRunGuard {
-    state: Arc<SignalRunState>,
-    id: u32,
-    active: bool,
-}
-
-impl ActiveRunGuard {
-    fn finish(&mut self) {
-        if self.active {
-            self.state.finish(self.id);
-            self.active = false;
-        }
-    }
-}
-
-impl Drop for ActiveRunGuard {
-    fn drop(&mut self) {
-        self.finish();
     }
 }
 
 enum RunOutcome {
     Cancelled,
     Finished(Result<RunSummary, DefinitionError>),
-}
-
-fn send_event(events: &Channel<SignalRunEvent>, event: SignalRunEvent) -> bool {
-    match events.send(event) {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::debug!(%error, "failed to send signal run event");
-            false
-        }
-    }
 }
 
 async fn run_worker(
@@ -201,6 +145,7 @@ async fn run_worker(
                     total: progress.total,
                     report: progress.report,
                 },
+                "signal run",
             );
             cancellation_observed = *callback_cancellation.borrow();
             if delivered && !cancellation_observed {
@@ -259,35 +204,18 @@ async fn execute_run(
     cancellation: watch::Receiver<bool>,
     events: Channel<SignalRunEvent>,
 ) {
-    let mut guard = ActiveRunGuard {
+    run_supervised(
         state,
-        id: run_id,
-        active: true,
-    };
-    let worker = tokio::spawn(run_worker(
         run_id,
-        store,
-        history,
-        definition,
-        coins,
-        cancellation,
         events.clone(),
-    ));
-    let terminal = match worker.await {
-        Ok(terminal) => terminal,
-        Err(error) => {
-            tracing::error!(run_id, %error, "signal run worker failed");
-            SignalRunEvent::Failed {
-                run_id,
-                message: error.to_string(),
-            }
-        }
-    };
-
-    // Release the slot before notifying the frontend so its terminal handler can
-    // immediately start another run. Drop remains the panic-safe fallback.
-    guard.finish();
-    send_event(&events, terminal);
+        run_worker(run_id, store, history, definition, coins, cancellation, events),
+        "signal run",
+        |message| {
+            tracing::error!(run_id, %message, "signal run worker failed");
+            SignalRunEvent::Failed { run_id, message }
+        },
+    )
+    .await;
 }
 
 #[tauri::command]
@@ -298,14 +226,16 @@ pub(crate) fn start_signal_run(
     definition: SignalDefinition,
     scope: SignalRunScope,
     on_event: Channel<SignalRunEvent>,
-) -> Result<u32, String> {
-    let coins = scope.resolve(store.inner()).map_err(|error| error.to_string())?;
+) -> Result<u32, StartRunError> {
+    let coins = scope.resolve(store.inner())?;
     let total = coins.len();
     let (cancel, cancellation) = watch::channel(false);
-    let run_id = state.begin(cancel).map_err(|error| error.to_string())?;
+    let run_id = state.begin(cancel)?;
     if let Err(error) = on_event.send(SignalRunEvent::Started { run_id, total }) {
         state.finish(run_id);
-        return Err(format!("failed to start signal run event stream: {error}"));
+        return Err(StartRunError::EventStream {
+            message: error.to_string(),
+        });
     }
 
     tauri::async_runtime::spawn(execute_run(

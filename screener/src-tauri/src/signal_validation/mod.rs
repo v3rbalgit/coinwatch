@@ -2,8 +2,9 @@
 
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
+use chrono::Utc;
 use domain::Timeframe;
 use hl_feed::CandleHistory;
 use serde::Serialize;
@@ -15,6 +16,8 @@ use tauri::ipc::Channel;
 use thiserror::Error;
 use tokio::sync::watch;
 
+use crate::task_lifecycle::{BeginError, HasTaskState, SingleTaskState, run_supervised, send_event};
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub(crate) enum SignalValidationFailure {
@@ -22,6 +25,9 @@ pub(crate) enum SignalValidationFailure {
         message: String,
     },
     InvalidRange,
+    RangeBeyondCompleted {
+        timeframe: Timeframe,
+    },
     HistoryUnavailable {
         timeframe: Timeframe,
         message: String,
@@ -43,6 +49,7 @@ impl From<HistoricalValidationError> for SignalValidationFailure {
                 message: error.to_string(),
             },
             HistoricalValidationError::InvalidRange => Self::InvalidRange,
+            HistoricalValidationError::RangeBeyondCompleted { timeframe } => Self::RangeBeyondCompleted { timeframe },
             HistoricalValidationError::History { timeframe, source } => Self::HistoryUnavailable {
                 timeframe,
                 message: source.to_string(),
@@ -91,6 +98,11 @@ pub(crate) enum SignalValidationEvent {
         total: usize,
         timeframe: Timeframe,
     },
+    Evaluated {
+        validation_id: u32,
+        completed: usize,
+        total: usize,
+    },
     Completed {
         validation_id: u32,
         result: HistoricalValidation,
@@ -104,88 +116,34 @@ pub(crate) enum SignalValidationEvent {
     },
 }
 
-struct ActiveValidation {
-    id: u32,
-    cancel: watch::Sender<bool>,
-}
-
 #[derive(Default)]
-struct SignalValidationInner {
-    next_id: u32,
-    active: Option<ActiveValidation>,
+pub(crate) struct SignalValidationState(SingleTaskState);
+
+impl HasTaskState for SignalValidationState {
+    fn task_state(&self) -> &SingleTaskState {
+        &self.0
+    }
 }
 
-#[derive(Default)]
-pub(crate) struct SignalValidationState {
-    inner: Mutex<SignalValidationInner>,
-}
-
-#[derive(Debug, PartialEq, Eq, Error)]
-enum StartValidationError {
+/// Why a validation could not start; serialized for the frontend to branch on.
+#[derive(Debug, PartialEq, Eq, Error, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub(crate) enum StartValidationError {
     #[error("historical signal validation is already active")]
     AlreadyActive,
     #[error("historical signal validation ID space is exhausted")]
     IdExhausted,
     #[error("a coin symbol is required for historical signal validation")]
     EmptyCoin,
+    #[error("failed to start historical signal validation event stream: {message}")]
+    EventStream { message: String },
 }
 
-impl SignalValidationState {
-    fn begin(&self, cancel: watch::Sender<bool>) -> Result<u32, StartValidationError> {
-        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        if inner.active.is_some() {
-            return Err(StartValidationError::AlreadyActive);
-        }
-        let id = inner.next_id.checked_add(1).ok_or(StartValidationError::IdExhausted)?;
-        inner.next_id = id;
-        inner.active = Some(ActiveValidation { id, cancel });
-        Ok(id)
-    }
-
-    fn cancel(&self, id: u32) -> bool {
-        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        inner
-            .active
-            .as_ref()
-            .filter(|validation| validation.id == id)
-            .is_some_and(|validation| validation.cancel.send(true).is_ok())
-    }
-
-    fn finish(&self, id: u32) {
-        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        if inner.active.as_ref().is_some_and(|validation| validation.id == id) {
-            inner.active = None;
-        }
-    }
-}
-
-struct ActiveValidationGuard {
-    state: Arc<SignalValidationState>,
-    id: u32,
-    active: bool,
-}
-
-impl ActiveValidationGuard {
-    fn finish(&mut self) {
-        if self.active {
-            self.state.finish(self.id);
-            self.active = false;
-        }
-    }
-}
-
-impl Drop for ActiveValidationGuard {
-    fn drop(&mut self) {
-        self.finish();
-    }
-}
-
-fn send_event(events: &Channel<SignalValidationEvent>, event: SignalValidationEvent) -> bool {
-    match events.send(event) {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::debug!(%error, "failed to send historical signal validation event");
-            false
+impl From<BeginError> for StartValidationError {
+    fn from(error: BeginError) -> Self {
+        match error {
+            BeginError::AlreadyActive => Self::AlreadyActive,
+            BeginError::IdExhausted => Self::IdExhausted,
         }
     }
 }
@@ -205,30 +163,55 @@ async fn validation_worker(
     events: Channel<SignalValidationEvent>,
 ) -> SignalValidationEvent {
     let progress_events = events.clone();
-    let validation = validate_historical(&history, &definition, &coin, range, |progress: HistoricalProgress| {
-        if send_event(
-            &progress_events,
-            SignalValidationEvent::Hydrated {
-                validation_id,
-                completed: progress.completed,
-                total: progress.total,
-                timeframe: progress.timeframe,
+    let mut cancellation_observed = false;
+    let callback_cancellation = cancellation.clone();
+    let outcome = {
+        let validation = validate_historical(
+            &history,
+            &definition,
+            &coin,
+            range,
+            Utc::now(),
+            |progress: HistoricalProgress| {
+                let event = match progress {
+                    HistoricalProgress::Hydrated {
+                        completed,
+                        total,
+                        timeframe,
+                    } => SignalValidationEvent::Hydrated {
+                        validation_id,
+                        completed,
+                        total,
+                        timeframe,
+                    },
+                    HistoricalProgress::Evaluated { completed, total } => SignalValidationEvent::Evaluated {
+                        validation_id,
+                        completed,
+                        total,
+                    },
+                };
+                let delivered = send_event(&progress_events, event, "historical signal validation");
+                cancellation_observed = *callback_cancellation.borrow();
+                if delivered && !cancellation_observed {
+                    ControlFlow::Continue(())
+                } else {
+                    ControlFlow::Break(())
+                }
             },
-        ) {
-            ControlFlow::Continue(())
-        } else {
-            ControlFlow::Break(())
+        );
+        tokio::pin!(validation);
+        tokio::select! {
+            biased;
+            _ = cancellation.changed() => ValidationOutcome::Cancelled,
+            result = &mut validation => ValidationOutcome::Finished(result),
         }
-    });
-    tokio::pin!(validation);
-    let outcome = tokio::select! {
-        biased;
-        _ = cancellation.changed() => ValidationOutcome::Cancelled,
-        result = &mut validation => ValidationOutcome::Finished(result),
     };
 
     match outcome {
         ValidationOutcome::Cancelled => SignalValidationEvent::Cancelled { validation_id },
+        ValidationOutcome::Finished(Err(HistoricalValidationError::Stopped)) if cancellation_observed => {
+            SignalValidationEvent::Cancelled { validation_id }
+        }
         ValidationOutcome::Finished(Ok(result)) => SignalValidationEvent::Completed { validation_id, result },
         ValidationOutcome::Finished(Err(error)) => SignalValidationEvent::Failed {
             validation_id,
@@ -247,35 +230,21 @@ async fn execute_validation(
     cancellation: watch::Receiver<bool>,
     events: Channel<SignalValidationEvent>,
 ) {
-    let mut guard = ActiveValidationGuard {
+    run_supervised(
         state,
-        id: validation_id,
-        active: true,
-    };
-    let worker = tokio::spawn(validation_worker(
         validation_id,
-        history,
-        definition,
-        coin,
-        range,
-        cancellation,
         events.clone(),
-    ));
-    let terminal = match worker.await {
-        Ok(terminal) => terminal,
-        Err(error) => {
-            tracing::error!(validation_id, %error, "historical signal validation worker failed");
+        validation_worker(validation_id, history, definition, coin, range, cancellation, events),
+        "historical signal validation",
+        |message| {
+            tracing::error!(validation_id, %message, "historical signal validation worker failed");
             SignalValidationEvent::Failed {
                 validation_id,
-                failure: SignalValidationFailure::Internal {
-                    message: error.to_string(),
-                },
+                failure: SignalValidationFailure::Internal { message },
             }
-        }
-    };
-
-    guard.finish();
-    send_event(&events, terminal);
+        },
+    )
+    .await;
 }
 
 #[tauri::command]
@@ -286,9 +255,9 @@ pub(crate) fn start_signal_validation(
     coin: String,
     range: HistoricalRange,
     on_event: Channel<SignalValidationEvent>,
-) -> Result<u32, String> {
+) -> Result<u32, StartValidationError> {
     if coin.trim().is_empty() {
-        return Err(StartValidationError::EmptyCoin.to_string());
+        return Err(StartValidationError::EmptyCoin);
     }
     let total = definition
         .conditions
@@ -297,10 +266,12 @@ pub(crate) fn start_signal_validation(
         .collect::<BTreeSet<_>>()
         .len();
     let (cancel, cancellation) = watch::channel(false);
-    let validation_id = state.begin(cancel).map_err(|error| error.to_string())?;
+    let validation_id = state.begin(cancel)?;
     if let Err(error) = on_event.send(SignalValidationEvent::Started { validation_id, total }) {
         state.finish(validation_id);
-        return Err(format!("failed to start historical signal validation event stream: {error}"));
+        return Err(StartValidationError::EventStream {
+            message: error.to_string(),
+        });
     }
 
     tauri::async_runtime::spawn(execute_validation(
