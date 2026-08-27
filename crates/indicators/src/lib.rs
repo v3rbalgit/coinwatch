@@ -11,6 +11,7 @@ mod cci;
 mod divergence;
 mod donchian;
 mod engine;
+mod extremes;
 mod macd;
 mod mfi;
 mod obv;
@@ -29,5 +30,5 @@ pub use divergence::{DivergenceDirection, DivergenceKind};
 pub use engine::{
     Descriptor, DescriptorKind, DivergenceInput, Instance, InstanceError, InstanceOutput, Ohlcv, Output, OutputKind,
     OutputSeries, Param, Target, ValueDomain, compute, descriptors, divergence_input, resolve_instance,
-    series_input_requirement, validate_instance,
+    series_input_requirement, signal_input_requirement, validate_instance,
 };

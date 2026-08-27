@@ -1,5 +1,7 @@
 //! Stochastic oscillator (%K / %D), bounded 0–100.
 
+use crate::extremes::window_extremes;
+
 /// Stochastic oscillator aligned index-for-index with the input.
 ///
 /// `%K = 100 · (close − lowest_low) / (highest_high − lowest_low)` over the
@@ -31,8 +33,7 @@ pub fn stochastic(high: &[f64], low: &[f64], close: &[f64], period: usize, smoot
         let Some(&close) = close.get(slot) else {
             break;
         };
-        let highest = highs.iter().copied().fold(f64::MIN, f64::max);
-        let lowest = lows.iter().copied().fold(f64::MAX, f64::min);
+        let (highest, lowest) = window_extremes(highs, lows);
         let range = highest - lowest;
         let value = if range > 0.0 {
             100.0 * (close - lowest) / range

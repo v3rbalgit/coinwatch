@@ -120,9 +120,7 @@ describe("wasm indicator boundary", () => {
     expect(computeOne("macdDivergence", {}, values).divergences).toEqual([])
   })
 
-  it("returns an empty result for an unknown indicator", () => {
-    const output = computeOne("nope", {}, rising)
-    expect(output.outputs).toEqual([])
-    expect(output.divergences).toEqual([])
+  it("rejects an unknown indicator instead of silently rendering nothing", () => {
+    expect(() => computeOne("nope", {}, rising)).toThrow("unknown indicator 'nope'")
   })
 })
