@@ -1,5 +1,7 @@
 //! Williams %R (a momentum oscillator), bounded −100–0.
 
+use crate::extremes::window_extremes;
+
 /// Williams %R over `period`, aligned index-for-index with the input:
 /// `%R = -100 · (highest_high − close) / (highest_high − lowest_low)`. A flat
 /// window (zero range) yields −50. `high`/`low`/`close` are expected to be equal
@@ -15,8 +17,7 @@ pub fn williams_r(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Ve
         let Some(&close) = close.get(slot) else {
             break;
         };
-        let highest = highs.iter().copied().fold(f64::MIN, f64::max);
-        let lowest = lows.iter().copied().fold(f64::MAX, f64::min);
+        let (highest, lowest) = window_extremes(highs, lows);
         let range = highest - lowest;
         let value = if range > 0.0 {
             -100.0 * (highest - close) / range

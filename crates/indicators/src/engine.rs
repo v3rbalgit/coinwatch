@@ -106,8 +106,9 @@ impl IndicatorId {
         }
     }
 
+    /// Anchor- and path-dependent indicators never converge under finite history.
     const fn supports_signals(self) -> bool {
-        !matches!(self, Self::Vwap | Self::Obv)
+        !matches!(self, Self::Vwap | Self::Obv | Self::Psar | Self::Supertrend)
     }
 
     const fn output_domain(self) -> ValueDomain {
@@ -357,12 +358,23 @@ fn out(key: &str, series: &[Option<f64>]) -> OutputSeries {
     }
 }
 
-fn get(params: &BTreeMap<String, f64>, key: &str, default: f64) -> f64 {
-    params.get(key).copied().unwrap_or(default)
+/// Descriptor defaults are the single source; compute never carries its own literals.
+fn get(descriptor: &Descriptor, params: &BTreeMap<String, f64>, key: &str) -> f64 {
+    params.get(key).copied().unwrap_or_else(|| {
+        descriptor
+            .params
+            .iter()
+            .find(|param| param.key == key)
+            .map_or(f64::NAN, |param| param.default)
+    })
 }
 
-fn period(params: &BTreeMap<String, f64>, key: &str, default: f64) -> usize {
-    get(params, key, default).max(1.0) as usize
+fn period(descriptor: &Descriptor, params: &BTreeMap<String, f64>, key: &str) -> usize {
+    get(descriptor, params, key).max(1.0) as usize
+}
+
+fn descriptor_of(indicator: IndicatorId) -> Option<&'static Descriptor> {
+    descriptors().iter().find(|descriptor| descriptor.id == indicator.as_ref())
 }
 
 /// Compute one instance's output series over `data`. Unknown ids yield no outputs.
@@ -370,32 +382,40 @@ fn compute_one(instance: &Instance, data: &Ohlcv) -> Vec<OutputSeries> {
     let Ok(indicator) = instance.id.parse::<IndicatorId>() else {
         return Vec::new();
     };
+    let Some(descriptor) = descriptor_of(indicator) else {
+        return Vec::new();
+    };
     let params = &instance.params;
     let (high, low, close, volume) = (data.high, data.low, data.close, data.volume);
     match indicator {
-        IndicatorId::Sma => vec![out("sma", &sma(close, period(params, "period", 20.0)))],
-        IndicatorId::Ema => vec![out("ema", &ema(close, period(params, "period", 20.0)))],
-        IndicatorId::Wma => vec![out("wma", &wma(close, period(params, "period", 20.0)))],
+        IndicatorId::Sma => vec![out("sma", &sma(close, period(descriptor, params, "period")))],
+        IndicatorId::Ema => vec![out("ema", &ema(close, period(descriptor, params, "period")))],
+        IndicatorId::Wma => vec![out("wma", &wma(close, period(descriptor, params, "period")))],
         IndicatorId::Bollinger => {
             let Bollinger { middle, upper, lower } =
-                bollinger(close, period(params, "period", 20.0), get(params, "mult", 2.0));
+                bollinger(close, period(descriptor, params, "period"), get(descriptor, params, "mult"));
             vec![out("upper", &upper), out("middle", &middle), out("lower", &lower)]
         }
         IndicatorId::Vwap => vec![out("vwap", &vwap(high, low, close, volume))],
         IndicatorId::Donchian => {
-            let Donchian { upper, middle, lower } = donchian(high, low, period(params, "period", 20.0));
+            let Donchian { upper, middle, lower } = donchian(high, low, period(descriptor, params, "period"));
             vec![out("upper", &upper), out("middle", &middle), out("lower", &lower)]
         }
         IndicatorId::Supertrend => {
-            let Supertrend { line, .. } =
-                supertrend(high, low, close, period(params, "period", 10.0), get(params, "mult", 3.0));
+            let Supertrend { line, .. } = supertrend(
+                high,
+                low,
+                close,
+                period(descriptor, params, "period"),
+                get(descriptor, params, "mult"),
+            );
             vec![out("supertrend", &line)]
         }
         IndicatorId::Psar => vec![out(
             "psar",
-            &psar(high, low, get(params, "step", 0.02), get(params, "max", 0.2)),
+            &psar(high, low, get(descriptor, params, "step"), get(descriptor, params, "max")),
         )],
-        IndicatorId::Rsi => vec![out("rsi", &rsi(close, period(params, "period", 14.0)))],
+        IndicatorId::Rsi => vec![out("rsi", &rsi(close, period(descriptor, params, "period")))],
         IndicatorId::Macd => {
             let Macd {
                 macd: line,
@@ -403,35 +423,40 @@ fn compute_one(instance: &Instance, data: &Ohlcv) -> Vec<OutputSeries> {
                 histogram,
             } = macd(
                 close,
-                period(params, "fast", 12.0),
-                period(params, "slow", 26.0),
-                period(params, "signal", 9.0),
+                period(descriptor, params, "fast"),
+                period(descriptor, params, "slow"),
+                period(descriptor, params, "signal"),
             );
             vec![out("macd", &line), out("signal", &signal), out("histogram", &histogram)]
         }
         IndicatorId::Stochastic => {
-            let Stochastic { k, d } =
-                stochastic(high, low, close, period(params, "period", 14.0), period(params, "smoothD", 3.0));
+            let Stochastic { k, d } = stochastic(
+                high,
+                low,
+                close,
+                period(descriptor, params, "period"),
+                period(descriptor, params, "smoothD"),
+            );
             vec![out("k", &k), out("d", &d)]
         }
         IndicatorId::Williams => vec![out(
             "williams",
-            &williams_r(high, low, close, period(params, "period", 14.0)),
+            &williams_r(high, low, close, period(descriptor, params, "period")),
         )],
-        IndicatorId::Cci => vec![out("cci", &cci(high, low, close, period(params, "period", 20.0)))],
+        IndicatorId::Cci => vec![out("cci", &cci(high, low, close, period(descriptor, params, "period")))],
         IndicatorId::Mfi => vec![out(
             "mfi",
-            &mfi(high, low, close, volume, period(params, "period", 14.0)),
+            &mfi(high, low, close, volume, period(descriptor, params, "period")),
         )],
         IndicatorId::Adx => {
             let Adx {
                 adx: line,
                 plus_di,
                 minus_di,
-            } = adx(high, low, close, period(params, "period", 14.0));
+            } = adx(high, low, close, period(descriptor, params, "period"));
             vec![out("adx", &line), out("plusDi", &plus_di), out("minusDi", &minus_di)]
         }
-        IndicatorId::Atr => vec![out("atr", &atr(high, low, close, period(params, "period", 14.0)))],
+        IndicatorId::Atr => vec![out("atr", &atr(high, low, close, period(descriptor, params, "period")))],
         IndicatorId::Obv => vec![out("obv", &obv(close, volume))],
         IndicatorId::RsiDivergence | IndicatorId::MacdDivergence => Vec::new(),
     }
@@ -447,16 +472,19 @@ fn compute_divergences(instance: &Instance, data: &Ohlcv) -> Vec<DivergenceSpan>
     let Some(divergence) = indicator.divergence_oscillator() else {
         return Vec::new();
     };
+    let Some(descriptor) = descriptor_of(indicator) else {
+        return Vec::new();
+    };
     let params = &instance.params;
     let close = data.close;
     let oscillator = match divergence {
-        DivergenceOscillator::Rsi => rsi(close, period(params, "period", 14.0)),
+        DivergenceOscillator::Rsi => rsi(close, period(descriptor, params, "period")),
         DivergenceOscillator::Macd => {
             macd(
                 close,
-                period(params, "fast", 12.0),
-                period(params, "slow", 26.0),
-                period(params, "signal", 9.0),
+                period(descriptor, params, "fast"),
+                period(descriptor, params, "slow"),
+                period(descriptor, params, "signal"),
             )
             .macd
         }
@@ -464,9 +492,9 @@ fn compute_divergences(instance: &Instance, data: &Ohlcv) -> Vec<DivergenceSpan>
     detect_divergences(
         close,
         &oscillator,
-        period(params, "pivotLeft", 5.0),
-        period(params, "pivotRight", 5.0),
-        period(params, "maxGap", 60.0),
+        period(descriptor, params, "pivotLeft"),
+        period(descriptor, params, "pivotRight"),
+        period(descriptor, params, "maxGap"),
     )
     .into_iter()
     .map(|divergence| DivergenceSpan {
@@ -684,6 +712,53 @@ pub fn series_input_requirement(instance: &Instance, output: &str) -> Result<usi
     }
 }
 
+/// Wilder/EMA seed error decays to at most `e^-4` after this many periods.
+const CONVERGENCE_PERIODS: usize = 4;
+
+const fn rsi_signal_bars(period: usize) -> usize {
+    period + 1 + CONVERGENCE_PERIODS * period
+}
+
+fn macd_slow(instance: &Instance, descriptor: &Descriptor) -> Result<usize, InstanceError> {
+    Ok(resolved_period(instance, descriptor, "fast")?.max(resolved_period(instance, descriptor, "slow")?))
+}
+
+/// [`series_input_requirement`] plus convergence padding for exponentially seeded outputs.
+pub fn signal_input_requirement(instance: &Instance, output: &str) -> Result<usize, InstanceError> {
+    let base = series_input_requirement(instance, output)?;
+    let (indicator, descriptor) = validated_instance(instance)?;
+    let padding = match indicator {
+        IndicatorId::Ema | IndicatorId::Rsi | IndicatorId::Atr | IndicatorId::Adx => {
+            CONVERGENCE_PERIODS * resolved_period(instance, descriptor, "period")?
+        }
+        IndicatorId::Macd => {
+            let slow = macd_slow(instance, descriptor)?;
+            match output {
+                "macd" => CONVERGENCE_PERIODS * slow,
+                "signal" | "histogram" => {
+                    CONVERGENCE_PERIODS * (slow + resolved_period(instance, descriptor, "signal")?)
+                }
+                _ => return Err(unknown_output(instance, output)),
+            }
+        }
+        IndicatorId::Sma
+        | IndicatorId::Wma
+        | IndicatorId::Bollinger
+        | IndicatorId::Vwap
+        | IndicatorId::Donchian
+        | IndicatorId::Supertrend
+        | IndicatorId::Psar
+        | IndicatorId::Stochastic
+        | IndicatorId::Williams
+        | IndicatorId::Cci
+        | IndicatorId::Mfi
+        | IndicatorId::Obv
+        | IndicatorId::RsiDivergence
+        | IndicatorId::MacdDivergence => 0,
+    };
+    Ok(base + padding)
+}
+
 /// Parameters needed to derive an exact divergence-condition history requirement.
 pub fn divergence_input(instance: &Instance) -> Result<DivergenceInput, InstanceError> {
     let (indicator, descriptor) = validated_instance(instance)?;
@@ -691,9 +766,10 @@ pub fn divergence_input(instance: &Instance) -> Result<DivergenceInput, Instance
         .divergence_oscillator()
         .ok_or_else(|| InstanceError::NotDivergence(instance.id.clone()))?;
     let oscillator = match divergence {
-        DivergenceOscillator::Rsi => resolved_period(instance, descriptor, "period")? + 1,
+        DivergenceOscillator::Rsi => rsi_signal_bars(resolved_period(instance, descriptor, "period")?),
         DivergenceOscillator::Macd => {
-            resolved_period(instance, descriptor, "fast")?.max(resolved_period(instance, descriptor, "slow")?)
+            let slow = macd_slow(instance, descriptor)?;
+            slow + CONVERGENCE_PERIODS * slow
         }
     };
     Ok(DivergenceInput {
@@ -935,11 +1011,39 @@ mod tests {
 
     use super::{
         DescriptorKind, IndicatorId, Instance, InstanceError, Ohlcv, ValueDomain, compute, descriptors,
-        divergence_input, resolve_instance, series_input_requirement, validate_instance,
+        divergence_input, resolve_instance, series_input_requirement, signal_input_requirement, validate_instance,
     };
 
     fn series() -> Vec<f64> {
         (1..=60).map(f64::from).collect()
+    }
+
+    #[test]
+    fn compute_defaults_come_from_the_descriptor_registry() {
+        let values = series();
+        let data = data(&values);
+        for descriptor in descriptors() {
+            let bare = Instance {
+                id: descriptor.id.clone(),
+                params: BTreeMap::new(),
+            };
+            let explicit = Instance {
+                id: descriptor.id.clone(),
+                params: descriptor
+                    .params
+                    .iter()
+                    .map(|param| (param.key.clone(), param.default))
+                    .collect(),
+            };
+            let bare_out = compute(&[bare], &data);
+            let explicit_out = compute(&[explicit], &data);
+            assert_eq!(
+                format!("{bare_out:?}"),
+                format!("{explicit_out:?}"),
+                "descriptor '{}' defaults drifted from compute",
+                descriptor.id
+            );
+        }
     }
 
     fn data(values: &[f64]) -> Ohlcv<'_> {
@@ -995,6 +1099,8 @@ mod tests {
         assert!(supports_signals("rsi"));
         assert!(!supports_signals("vwap"));
         assert!(!supports_signals("obv"));
+        assert!(!supports_signals("psar"));
+        assert!(!supports_signals("supertrend"));
     }
 
     #[test]
@@ -1128,10 +1234,30 @@ mod tests {
         assert_eq!(series_input_requirement(&adx, "adx").expect("ADX"), 28);
 
         let divergence = divergence_input(&instance("rsiDivergence", &[])).expect("divergence input");
-        assert_eq!(divergence.oscillator, 15);
+        assert_eq!(divergence.oscillator, 71);
         assert_eq!(divergence.pivot_left, 5);
         assert_eq!(divergence.pivot_right, 5);
         assert_eq!(divergence.max_gap, 60);
+    }
+
+    #[test]
+    fn signal_requirements_pad_exponentially_seeded_indicators() {
+        let padded = |id: &str, params: &[(&str, f64)], output: &str| {
+            signal_input_requirement(&instance(id, params), output).expect("signal requirement")
+        };
+        assert_eq!(padded("sma", &[("period", 20.0)], "sma"), 20);
+        assert_eq!(padded("stochastic", &[], "d"), 16);
+        assert_eq!(padded("ema", &[("period", 20.0)], "ema"), 100);
+        assert_eq!(padded("rsi", &[("period", 14.0)], "rsi"), 71);
+        assert_eq!(padded("atr", &[("period", 14.0)], "atr"), 70);
+        assert_eq!(padded("adx", &[("period", 14.0)], "adx"), 84);
+        assert_eq!(padded("adx", &[("period", 14.0)], "plusDi"), 71);
+        assert_eq!(padded("macd", &[], "macd"), 130);
+        assert_eq!(padded("macd", &[], "signal"), 174);
+        assert_eq!(padded("macd", &[], "histogram"), 174);
+
+        let divergence = divergence_input(&instance("macdDivergence", &[])).expect("divergence input");
+        assert_eq!(divergence.oscillator, 130);
     }
 
     #[test]

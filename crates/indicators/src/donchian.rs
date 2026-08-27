@@ -1,5 +1,7 @@
 //! Donchian Channel (a price-pane overlay): rolling highest-high / lowest-low.
 
+use crate::extremes::window_extremes;
+
 /// Donchian Channel aligned index-for-index with the input: for each window of
 /// `period` bars, the upper band is the highest high, the lower band the lowest
 /// low, and the middle their average. `high`/`low` are expected to be equal length.
@@ -26,8 +28,7 @@ pub fn donchian(high: &[f64], low: &[f64], period: usize) -> Donchian {
         return channel;
     }
     for (index, (highs, lows)) in high.windows(period).zip(low.windows(period)).enumerate() {
-        let upper = highs.iter().copied().fold(f64::MIN, f64::max);
-        let lower = lows.iter().copied().fold(f64::MAX, f64::min);
+        let (upper, lower) = window_extremes(highs, lows);
         let slot = index + period - 1;
         if let Some(cell) = channel.upper.get_mut(slot) {
             *cell = Some(upper);
