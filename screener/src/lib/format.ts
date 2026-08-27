@@ -12,3 +12,15 @@ export function formatCompactNumber(value: number): string {
   if (value >= 1e3) return `${(value / 1e3).toFixed(0)}k`
   return value.toFixed(0)
 }
+
+/** Percent change from the previous-day reference price; 0 when unknown. */
+export function prevDayChangePct(prevDay: number, price: number): number {
+  return prevDay > 0 ? (price / prevDay - 1) * 100 : 0
+}
+
+/** Locale-formatted timestamp; an em dash when absent, verbatim when unparsable. */
+export function formatTimestamp(value: string | null): string {
+  if (value === null) return "\u2014"
+  const parsed = new Date(value)
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString()
+}

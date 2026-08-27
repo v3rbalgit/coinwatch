@@ -1,5 +1,7 @@
 import type { UTCTimestamp } from "lightweight-charts"
 
+import { isRecord } from "$lib/ipc/guards"
+
 /** crypto.randomUUID is secure-context-only; the fallback covers plain-http testing. */
 function newDrawingId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID()
@@ -72,10 +74,6 @@ export function pointsRequired(tool: DrawingTool): number {
 
 export function newDrawing(tool: DrawingTool, points: DrawingPoint[], text?: string): Drawing {
   return { id: newDrawingId(), tool, points, ...(text !== undefined ? { text } : {}) }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null
 }
 
 function parsePoint(value: unknown): DrawingPoint | null {

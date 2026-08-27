@@ -1,8 +1,9 @@
 import type { IndicatorDescriptor } from "$lib/chart/indicators"
+import { errorMessage } from "$lib/errors"
 import type { SignalCatalogEntry, SignalCatalogError } from "$lib/signals/catalog"
 import { isSignalCatalogError } from "$lib/signals/catalog"
 import type { Operand, Predicate, SignalDirection } from "$lib/signals/definition"
-import { compileSignalDraft, definitionToSignalDraft } from "$lib/signals/draft"
+import { compileSignalDraft, definitionToSignalDraft, findConditionIdIssue } from "$lib/signals/draft"
 import type { SignalDraft } from "$lib/signals/draft"
 import { createIndicatorInstance } from "$lib/signals/instances"
 import type { IndicatorPresetError } from "$lib/signals/presets"
@@ -25,20 +26,18 @@ export type SignalEditorSession =
   | { type: "rich"; entry: ReadySignalCatalogEntry }
   | { type: "unavailable"; entry: UnavailableSignalCatalogEntry }
 
-function descriptorById(descriptors: readonly IndicatorDescriptor[], id: string): IndicatorDescriptor {
-  const descriptor = descriptors.find(candidate => candidate.id === id)
-  if (descriptor === undefined) throw new Error(`Indicator descriptor '${id}' is unavailable`)
+/** Preferred defaults; any compatible descriptor substitutes when a domain filter excludes them. */
+export const PREFERRED_SERIES_DEFAULT = "sma"
+export const PREFERRED_DIVERGENCE_DEFAULT = "rsiDivergence"
+
+function descriptorByPreference(descriptors: readonly IndicatorDescriptor[], preferred: string): IndicatorDescriptor {
+  const descriptor = descriptors.find(candidate => candidate.id === preferred) ?? descriptors[0]
+  if (descriptor === undefined) throw new Error("No compatible indicator descriptor is available")
   return descriptor
 }
 
 function hasStableConditionIds(draft: SignalDraft): boolean {
-  if (draft.conditions.length === 0) return false
-  const ids = new Set<string>()
-  for (const condition of draft.conditions) {
-    if (condition.id.length === 0 || ids.has(condition.id)) return false
-    ids.add(condition.id)
-  }
-  return true
+  return draft.conditions.length > 0 && findConditionIdIssue(draft.conditions) === null
 }
 
 export function draftSnapshot(name: string, draft: SignalDraft): string | null {
@@ -84,9 +83,9 @@ export function createDefaultOperand(type: OperandType, descriptors: readonly In
     case "constant":
       return { type: "constant", value: 0 }
     case "indicator": {
-      const descriptor = descriptorById(
-        descriptors.filter(candidate => candidate.kind === "series"),
-        "sma"
+      const descriptor = descriptorByPreference(
+        descriptors.filter(candidate => candidate.kind === "series" && candidate.outputs.length > 0),
+        PREFERRED_SERIES_DEFAULT
       )
       const output = descriptor.outputs[0]
       if (output === undefined) throw new Error(`Indicator '${descriptor.id}' has no numeric output`)
@@ -122,7 +121,10 @@ export function createDefaultPredicate(
         direction: direction === "bullish" ? "over" : "under",
       }
     case "divergence": {
-      const descriptor = descriptorById(descriptors, "rsiDivergence")
+      const descriptor = descriptorByPreference(
+        descriptors.filter(candidate => candidate.kind === "divergence"),
+        PREFERRED_DIVERGENCE_DEFAULT
+      )
       return {
         type: "divergence",
         instance: createIndicatorInstance(descriptor),
@@ -135,12 +137,8 @@ export function createDefaultPredicate(
   }
 }
 
-function unknownErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
-}
-
 export function signalCatalogErrorMessage(error: unknown): string {
-  if (!isSignalCatalogError(error)) return unknownErrorMessage(error)
+  if (!isSignalCatalogError(error)) return errorMessage(error)
   const typed: SignalCatalogError = error
   switch (typed.type) {
     case "invalidName":
@@ -159,7 +157,7 @@ export function signalCatalogErrorMessage(error: unknown): string {
 }
 
 export function indicatorPresetErrorMessage(error: unknown): string {
-  if (!isIndicatorPresetError(error)) return unknownErrorMessage(error)
+  if (!isIndicatorPresetError(error)) return errorMessage(error)
   const typed: IndicatorPresetError = error
   switch (typed.type) {
     case "invalidName":
