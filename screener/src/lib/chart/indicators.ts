@@ -5,9 +5,20 @@ import init, {
 
 let ready: Promise<void> | undefined
 
-/** Load the wasm engine once; safe to await repeatedly. */
+/** Load the wasm engine once; safe to await repeatedly. A failed load is
+ * forgotten so a later call retries instead of replaying the rejection. */
 export function loadIndicators(): Promise<void> {
-  ready ??= init().then(() => undefined)
+  if (ready === undefined) {
+    const loading = init().then(
+      () => undefined,
+      (error: unknown) => {
+        ready = undefined
+        throw error
+      }
+    )
+    ready = loading
+    return loading
+  }
   return ready
 }
 

@@ -1,7 +1,5 @@
 <script lang="ts">
   import { ArrowLeft, Ban, CalendarRange, Eye, EyeOff, ListTree, LoaderCircle, RotateCcw, Trash2 } from "@lucide/svelte"
-  import { invoke } from "@tauri-apps/api/core"
-  import { listen } from "@tauri-apps/api/event"
   import { onMount } from "svelte"
 
   import { goto } from "$app/navigation"
@@ -36,7 +34,12 @@
   import Button from "$lib/components/ui/button.svelte"
   import CoinIcon from "$lib/components/ui/coin-icon.svelte"
   import Skeleton from "$lib/components/ui/skeleton.svelte"
-  import { formatCompactNumber, formatPrice } from "$lib/format"
+  import { errorMessage } from "$lib/errors"
+  import { formatCompactNumber, formatPrice, prevDayChangePct } from "$lib/format"
+  import { onCandle, onMid } from "$lib/ipc/events"
+  import { isRecord } from "$lib/ipc/guards"
+  import { coinCandles, coinHistory, getSetting, screenerRows, setActiveCoin, setSetting } from "$lib/ipc/screener"
+  import type { ScreenerRow } from "$lib/ipc/screener"
   import { signalValidationFailureMessage, type HistoricalRange } from "$lib/signals/historical"
   import { loadHistoricalSignalOptions, type HistoricalSignalOption } from "$lib/signals/historical-options"
   import {
@@ -49,16 +52,6 @@
     startHistoricalValidation,
   } from "$lib/signals/historical-workspace.svelte"
 
-  type Row = {
-    coin: string
-    price: number
-    prev_day: number
-    volume_usd: number
-    open_interest_usd: number
-    funding: number
-  }
-  type CandleEvent = { coin: string; timeframe: string; candle: Bar }
-
   const initialViewSettings = defaultChartViewSettings()
   const initialChromeSettings = defaultChartChromeSettings()
   const coin = $derived(page.params.coin ?? "")
@@ -69,15 +62,18 @@
   let paneLayout = $state<PaneLayoutEntry[]>(initialChromeSettings.paneLayout.map(entry => ({ ...entry })))
   let settingsCoin = $state("")
   let viewLoadRevision = 0
-  let chromeRevision = 0
+  // Clicks racing the initial load are overlaid on it, so persists never write unloaded defaults.
+  let chromeLoaded = false
+  const pendingChrome: Partial<ChartChromeSettings> = {}
   let viewSaveQueue = Promise.resolve()
   let chromeSaveQueue = Promise.resolve()
   let bars = $state<Bar[]>([])
   let seed = $state(0)
-  let meta = $state<Row | null>(null)
+  let meta = $state<ScreenerRow | null>(null)
   let livePrice = $state<number | null>(null)
   // Seed the chart with the core momentum and divergence set; the user toggles
   // additional instances through the chart picker.
+  let instancesTouched = false
   let indicatorInstances = $state<IndicatorInstance[]>([
     { id: "rsi", params: {} },
     { id: "macd", params: {} },
@@ -86,6 +82,8 @@
   ])
   // Drawings persist per coin (a trendline on BTC is meaningless on ETH).
   let chartDrawings = $state<Drawing[]>([])
+  let foreignDrawings: unknown[] = []
+  let candlesError = $state("")
   let validationDialogOpen = $state(false)
   let validationOptions = $state<HistoricalSignalOption[]>([])
   let validationOptionsLoading = $state(false)
@@ -121,25 +119,43 @@
 
   async function loadCandles() {
     const [c, t] = [coin, tf]
-    const data = await invoke<Bar[]>("coin_candles", { coin: c, timeframe: t })
-    // Ignore a stale response if the coin/timeframe changed while it was in flight.
-    if (c === coin && t === tf) {
-      bars = data
-      seed += 1
+    try {
+      const data = await coinCandles(c, t)
+      // Ignore a stale response if the coin/timeframe changed while it was in flight.
+      if (c === coin && t === tf) {
+        bars = data
+        barsKey = `${c}|${t}`
+        seed += 1
+        candlesError = ""
+      }
+    } catch (error) {
+      if (c === coin && t === tf) {
+        candlesError = errorMessage(error)
+      }
     }
   }
 
-  let loadingOlder = false
+  // Which (coin, timeframe) the current bars belong to; live merges apply only when it matches.
+  let barsKey = ""
+
+  let olderInFlight: Promise<boolean> | null = null
   let exhausted = false
   // Page older history in on scroll-back; the backend serves the cache and fetches
-  // from Hyperliquid + stores on a miss, so depth accumulates.
-  async function loadOlder(): Promise<boolean> {
+  // from Hyperliquid + stores on a miss, so depth accumulates. Concurrent callers
+  // share the in-flight load instead of reading busy as a failure.
+  function loadOlder(): Promise<boolean> {
+    olderInFlight ??= loadOlderPage().finally(() => {
+      olderInFlight = null
+    })
+    return olderInFlight
+  }
+
+  async function loadOlderPage(): Promise<boolean> {
     const oldest = bars[0]?.time
-    if (loadingOlder || exhausted || oldest === undefined) return false
-    loadingOlder = true
+    if (exhausted || oldest === undefined) return false
     const [c, t] = [coin, tf]
     try {
-      const older = await invoke<Bar[]>("coin_history", { coin: c, timeframe: t, beforeSeconds: oldest })
+      const older = await coinHistory(c, t, oldest)
       if (c !== coin || t !== tf) return false
       const fresh = older.filter(bar => bar.time < oldest)
       if (fresh.length === 0) {
@@ -151,12 +167,10 @@
     } catch (error) {
       console.error("failed to load older chart history", error)
       return false
-    } finally {
-      loadingOlder = false
     }
   }
   async function loadMeta() {
-    const rows = await invoke<Row[]>("screener_rows")
+    const rows = await screenerRows()
     meta = rows.find(row => row.coin === coin) ?? null
   }
 
@@ -168,7 +182,7 @@
       validationOptions = await loadHistoricalSignalOptions()
       validationDescriptors = [...indicatorDescriptors()]
     } catch (error) {
-      validationOptionsError = error instanceof Error ? error.message : String(error)
+      validationOptionsError = errorMessage(error)
       validationOptions = []
     } finally {
       validationOptionsLoading = false
@@ -218,15 +232,17 @@
 
   // The chart's visible indicators persist globally in SQLite.
   function persistInstances(next: IndicatorInstance[]) {
+    instancesTouched = true
     indicatorInstances = next
-    invoke("set_setting", { key: "chart.indicators", value: JSON.stringify(next) }).catch(error =>
+    setSetting("chart.indicators", JSON.stringify(next)).catch(error =>
       console.error("failed to save chart indicators", error)
     )
   }
 
-  // Drawings persist per coin under their own key.
+  // Drawings persist per coin under their own key; foreign entries from newer
+  // builds ride along untouched so this build's persists cannot destroy them.
   function persistDrawings(next: readonly Drawing[]) {
-    invoke("set_setting", { key: `chart.drawings.${coin}`, value: serializeDrawings(next) }).catch(error =>
+    setSetting(`chart.drawings.${coin}`, serializeDrawings(next, foreignDrawings)).catch(error =>
       console.error("failed to save chart drawings", error)
     )
   }
@@ -236,7 +252,7 @@
     const key = chartViewSettingsKey(coin)
     const value = serializeChartViewSettings(settings)
     viewSaveQueue = viewSaveQueue
-      .then(() => invoke<void>("set_setting", { key, value }))
+      .then(() => setSetting(key, value))
       .catch(error => console.error("failed to save chart view settings", error))
   }
 
@@ -253,27 +269,28 @@
   }
 
   function persistChromeSettings(settings: ChartChromeSettings) {
+    if (!chromeLoaded) return
     const value = serializeChartChromeSettings(settings)
     chromeSaveQueue = chromeSaveQueue
-      .then(() => invoke<void>("set_setting", { key: CHART_CHROME_SETTINGS_KEY, value }))
+      .then(() => setSetting(CHART_CHROME_SETTINGS_KEY, value))
       .catch(error => console.error("failed to save chart chrome settings", error))
   }
 
   function changeMagnet(enabled: boolean) {
-    chromeRevision += 1
     magnet = enabled
+    if (!chromeLoaded) pendingChrome.magnet = enabled
     persistChromeSettings({ magnet: enabled, toolbarPosition: styleBarPosition, paneLayout })
   }
 
   function changeStyleBarPosition(position: ToolbarPosition) {
-    chromeRevision += 1
     styleBarPosition = position
+    if (!chromeLoaded) pendingChrome.toolbarPosition = position
     persistChromeSettings({ magnet, toolbarPosition: position, paneLayout })
   }
 
   function changePaneLayout(next: PaneLayoutEntry[]) {
-    chromeRevision += 1
     paneLayout = next
+    if (!chromeLoaded) pendingChrome.paneLayout = next
     persistChromeSettings({ magnet, toolbarPosition: styleBarPosition, paneLayout: next })
   }
 
@@ -281,7 +298,7 @@
     let settings = defaultChartViewSettings()
     try {
       await viewSaveQueue
-      const saved = await invoke<string | null>("get_setting", { key: chartViewSettingsKey(active) })
+      const saved = await getSetting(chartViewSettingsKey(active))
       settings = parseChartViewSettings(saved)
     } catch (error) {
       console.error("failed to load chart view settings", error)
@@ -291,8 +308,6 @@
     logScale = settings.logScale
     settingsCoin = active
   }
-
-  const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null
 
   function parseInstances(value: unknown): IndicatorInstance[] | null {
     if (!Array.isArray(value)) return null
@@ -321,9 +336,9 @@
   // Stream only the viewed coin's live candles from the backend.
   $effect(() => {
     if (!coin) return
-    void invoke("set_active_coin", { coin })
+    void setActiveCoin(coin)
     return () => {
-      void invoke("set_active_coin", { coin: null })
+      void setActiveCoin(null)
     }
   })
 
@@ -334,6 +349,7 @@
     const revision = ++viewLoadRevision
     settingsCoin = ""
     bars = []
+    barsKey = ""
     if (active) void loadViewSettings(active, revision)
   })
 
@@ -342,6 +358,7 @@
     void tf
     if (coin && settingsCoin === coin) {
       exhausted = false
+      candlesError = ""
       void loadCandles()
     }
   })
@@ -350,7 +367,7 @@
     if (!validationForCoin || validationResult === null || validationDescriptors.length > 0) return
     void loadIndicators()
       .then(() => (validationDescriptors = [...indicatorDescriptors()]))
-      .catch(error => (validationNavigationError = error instanceof Error ? error.message : String(error)))
+      .catch(error => (validationNavigationError = errorMessage(error)))
   })
 
   // Load this coin's saved drawings; clear first so the previous coin's don't linger.
@@ -358,48 +375,58 @@
     const active = coin
     if (!active) return
     chartDrawings = []
-    void invoke<string | null>("get_setting", { key: `chart.drawings.${active}` })
+    foreignDrawings = []
+    void getSetting(`chart.drawings.${active}`)
       .then(saved => {
-        if (active === coin) chartDrawings = parseDrawingsPayload(saved).drawings
+        if (active !== coin) return
+        const payload = parseDrawingsPayload(saved)
+        chartDrawings = payload.drawings
+        foreignDrawings = payload.foreign
       })
       .catch(error => console.error("failed to load chart drawings", error))
   })
 
   onMount(() => {
     void loadMeta()
-    const chromeLoadRevision = chromeRevision
-    void invoke<string | null>("get_setting", { key: CHART_CHROME_SETTINGS_KEY })
+    void getSetting(CHART_CHROME_SETTINGS_KEY)
       .then(saved => {
-        if (chromeRevision !== chromeLoadRevision) return
         const settings = parseChartChromeSettings(saved)
-        magnet = settings.magnet
-        styleBarPosition = settings.toolbarPosition
-        paneLayout = settings.paneLayout
+        magnet = pendingChrome.magnet ?? settings.magnet
+        styleBarPosition = pendingChrome.toolbarPosition ?? settings.toolbarPosition
+        paneLayout = pendingChrome.paneLayout ?? settings.paneLayout
+        chromeLoaded = true
+        if (Object.keys(pendingChrome).length > 0) {
+          persistChromeSettings({ magnet, toolbarPosition: styleBarPosition, paneLayout })
+        }
       })
-      .catch(error => console.error("failed to load chart chrome settings", error))
-    void invoke<string | null>("get_setting", { key: "chart.indicators" })
+      .catch(error => {
+        console.error("failed to load chart chrome settings", error)
+        chromeLoaded = true
+      })
+    void getSetting("chart.indicators")
       .then(saved => {
         const parsed = saved === null ? null : parseInstances(JSON.parse(saved))
         // An empty saved set is valid (the user turned everything off) — restore it as
         // empty rather than falling back to the seed default.
-        if (parsed) indicatorInstances = parsed
+        if (parsed && !instancesTouched) indicatorInstances = parsed
       })
       .catch(error => console.error("failed to load chart indicators", error))
     const reload = setInterval(loadMeta, 5000)
-    const unMid = listen<{ coin: string; price: number }>("mid", event => {
-      if (event.payload.coin !== coin) return
-      livePrice = event.payload.price
+    const unMid = onMid(event => {
+      if (event.coin !== coin) return
+      livePrice = event.price
+      if (barsKey !== `${coin}|${tf}`) return
       const last = bars.at(-1)
       if (!last) return
-      const close = event.payload.price
+      const close = event.price
       bars = [
         ...bars.slice(0, -1),
         { ...last, close, high: Math.max(last.high, close), low: Math.min(last.low, close) },
       ]
     })
-    const unCandle = listen<CandleEvent>("candle", event => {
-      if (event.payload.coin !== coin || event.payload.timeframe !== tf) return
-      mergeBar(event.payload.candle)
+    const unCandle = onCandle(event => {
+      if (event.coin !== coin || event.timeframe !== tf || barsKey !== `${coin}|${tf}`) return
+      mergeBar(event.candle)
     })
     return () => {
       clearInterval(reload)
@@ -409,7 +436,7 @@
   })
 
   const price = $derived(livePrice ?? meta?.price ?? 0)
-  const change = $derived(meta && meta.prev_day > 0 ? (price / meta.prev_day - 1) * 100 : 0)
+  const change = $derived(meta ? prevDayChangePct(meta.prev_day, price) : 0)
   const hasPrice = $derived(livePrice !== null || meta !== null)
 </script>
 
@@ -488,8 +515,9 @@
         <span class="font-medium text-foreground">Validating {validationSnapshot.name}</span>
         {#if historicalValidationWorkspace.progress.status === "running"}
           <span class="text-muted-foreground">
-            Loaded {historicalValidationWorkspace.progress.completed} / {historicalValidationWorkspace.progress.total}
-            timeframes
+            {historicalValidationWorkspace.progress.phase === "hydrating"
+              ? `Loaded ${historicalValidationWorkspace.progress.completed} / ${historicalValidationWorkspace.progress.total} timeframes`
+              : `Checked ${historicalValidationWorkspace.progress.completed} / ${historicalValidationWorkspace.progress.total} candles`}
           </span>
         {:else}
           <span class="text-muted-foreground">Preparing completed-candle history…</span>
@@ -581,7 +609,12 @@
       onPaneLayoutChange={changePaneLayout}
       onLoadOlder={loadOlder}
     />
-    {#if settingsCoin !== coin || bars.length === 0}
+    {#if candlesError !== "" && bars.length === 0}
+      <div class="absolute inset-0 flex flex-col items-center justify-center gap-2 text-sm text-muted-foreground">
+        <span>Chart candles failed to load: {candlesError}</span>
+        <Button variant="outline" size="sm" onclick={() => void loadCandles()}>Retry</Button>
+      </div>
+    {:else if settingsCoin !== coin || bars.length === 0}
       <div class="absolute inset-0 flex items-center justify-center gap-2 text-sm text-muted-foreground">
         <LoaderCircle class="size-4 animate-spin" />
         Loading chart…
