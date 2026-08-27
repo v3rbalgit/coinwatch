@@ -4,11 +4,13 @@
 //! interval that has not advanced after a bar boundary. Configured live intervals
 //! normally update first over the WebSocket in [`stream`](crate::stream).
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use domain::{Candle, Timeframe};
 use serde::Deserialize;
 
 use crate::error::FeedError;
+use crate::history::CandleProvider;
 use crate::ratelimit::WeightLimiter;
 
 const INFO_URL: &str = "https://api.hyperliquid.xyz/info";
@@ -107,6 +109,19 @@ impl HyperliquidRest {
         coins.sort_by(|a, b| b.day_volume_usd.total_cmp(&a.day_volume_usd));
         coins.truncate(limit);
         Ok(coins)
+    }
+}
+
+#[async_trait]
+impl CandleProvider for HyperliquidRest {
+    async fn candles_before(
+        &self,
+        coin: &str,
+        timeframe: Timeframe,
+        before_ms: i64,
+        count: usize,
+    ) -> Result<Vec<Candle>, FeedError> {
+        HyperliquidRest::candles_before(self, coin, timeframe, before_ms, count).await
     }
 }
 
@@ -232,6 +247,7 @@ mod tests {
     use super::{HyperliquidRest, candle_weight};
 
     #[tokio::test]
+    #[ignore = "live network"]
     async fn fetches_live_btc_candles() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let rest = HyperliquidRest::new(reqwest::Client::new(), 1100);
@@ -256,6 +272,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "live network"]
     async fn fetches_ranked_universe() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let rest = HyperliquidRest::new(reqwest::Client::new(), 1100);

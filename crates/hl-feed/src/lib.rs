@@ -21,7 +21,7 @@ mod sync;
 pub use error::FeedError;
 pub use event::{CandleEvent, MarketEvent, MidEvent};
 pub use feed::MarketFeed;
-pub use history::{CandleHistory, HistoryError};
+pub use history::{CandleHistory, CandleProvider, HistoryError};
 pub use rest::{HyperliquidRest, UniverseCoin};
 pub use store::{ConnectionState, MarketStatus, MarketStore, SyncPhase};
 pub use stream::HyperliquidAdapter;
@@ -46,6 +46,7 @@ mod tests {
 
     /// Live smoke test: connect and confirm mid events flow through the feed.
     #[tokio::test]
+    #[ignore = "live network"]
     async fn receives_live_mids() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut adapter = HyperliquidAdapter::new(MarketStore::new(), Vec::new());
