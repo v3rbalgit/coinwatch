@@ -9,11 +9,12 @@ A single-user, GUI-first **mission-control screener** for Hyperliquid perps: str
 universe, screen it on live metadata, chart any instrument, and define and run reusable
 multi-timeframe personal signals. It is decision support, not an auto-trader.
 
-The current product layers are the **live screener**, the **coin-detail chart**, and the
-**personal signal catalog and run workspace**. On-demand runs are primarily an authoring and
-diagnostic tool. The product payoff is **alerting**: encode opportunities that would otherwise
-require watching charts, validate that the definitions behave as intended, then let standing
-alerts bring the user back only when action may be warranted.
+The current product layers are the **live screener**, the **coin-detail chart and historical
+validation overlay**, and the **personal signal catalog and run workspace**. On-demand runs and
+historical validation are primarily authoring and diagnostic tools. The product payoff is
+**alerting**: encode opportunities that would otherwise require watching charts, validate that the
+definitions behave as intended, then let standing alerts bring the user back only when action may
+be warranted.
 
 The core workflow is:
 
@@ -33,7 +34,7 @@ hl-feed          the Hyperliquid engine — WS + REST + in-memory cache + sync
 storage          SQLite candles and user data behind a CandleStore trait
 indicators       indicator/divergence math, descriptors, validation, and compute engine
 indicators-wasm  wasm-bindgen chart boundary over the shared indicator engine
-signals          validated definitions, history requirements, evaluation, and run orchestration
+signals          validated definitions, exact history, current and historical evaluation
 screener/        Tauri commands/event channels and the SvelteKit UI
 ```
 
@@ -43,6 +44,7 @@ then hydrates older completed candles through `CandleHistory` when necessary.
 
 ```text
 Hyperliquid ──WS (allMids + fastAssetCtxs + candle)──▶ MarketStore ──▶ Browse · chart
+            │                                               └─completed streamed bars──▶ SQLite history
             └─REST (metaAndAssetCtxs + candleSnapshot)──┬────────────▶ SQLite history
                                                         └────────────▶ signal hydration
 SQLite user data ──▶ watchlists · signal catalog · presets ──────────▶ Signals workspace
@@ -63,17 +65,20 @@ SQLite user data ──▶ watchlists · signal catalog · presets ────�
 - **`store`** — `MarketStore`: candle buffers per (coin, timeframe), the volume-ranked
   universe, and a granular `MarketStatus` (connection state, sync phase, universe size,
   backfill progress, fetch rate) published on a `watch` channel.
-- **`sync`** — refreshes the universe each cycle and backfills each (coin, timeframe) **once**;
-  the WebSocket then keeps the streamed timeframes live. Hybrid candles: WS for the
-  live/short timeframes, REST for history.
+- **`sync`** — refreshes the universe each cycle and re-plans fetches from per-series health:
+  the initial backfill runs once per (coin, timeframe) and is not re-downloaded while current;
+  the WebSocket then keeps the streamed timeframes live, REST advances non-streamed timeframes
+  one bar at a time after a boundary grace, fully repairs gapped or disconnected series, and
+  writes streamed series' freshly completed bars through to SQLite each cycle.
 - **`event` / `feed`** — typed market events and a broadcast `MarketFeed` the UI and future
   consumers subscribe to.
 
 ## Key decisions
 
 - **One WS session** for prices and candles, not two connections.
-- **Hybrid candles**: the WebSocket keeps short timeframes live; REST backfills history once,
-  paced to the weight limit and tracked so it isn't re-downloaded every cycle.
+- **Hybrid candles**: the WebSocket keeps short timeframes live; REST backfills history,
+  paced to the weight limit, and stays the liveness mechanism for the slow timeframes,
+  whose bars complete rarely enough that one small fetch per close is nearly free.
 - **Metadata-first Browse workspace**: it needs one `metaAndAssetCtxs` call, so it is usable
   immediately; chart depth and signal evidence improve as candle history accumulates.
 - **Granular status** on a `watch` channel, surfaced plainly in the UI.
@@ -97,7 +102,8 @@ Definitions are named and stored in a personal catalog; current drafts and saved
 can run against the complete universe or an existing watchlist. A run is a **current cross-sectional
 scan**: it produces one report per market from the latest completed candles, not a list of every
 historical occurrence. Runs stream progress, per-market condition evidence, and data issues, with
-only the latest run retained in frontend memory.
+only the latest run retained in frontend memory. At most one run and one historical validation
+execute at a time; starting another requires the previous to finish or be cancelled.
 
 The generic evaluator remains expressive, but the authoring UI should present trading intent rather
 than raw evaluator structure:
@@ -113,11 +119,13 @@ than raw evaluator structure:
   approximate wall-clock duration for the selected timeframe.
 
 The builder should retain broad source combinations while preventing or warning about nonsense.
-Indicator outputs need domain metadata such as price, volume, percentage, bounded oscillator,
-unbounded oscillator, and unitless. Source pickers can then recommend or allow compatible operands,
-reject constant-versus-constant predicates, and warn about equivalent sources that make comparisons
-tautological or crosses impossible. An advanced escape hatch is appropriate only where the units
-remain meaningful.
+Indicator outputs carry domain metadata — price, price-delta (volatility), volume, bounded
+oscillator, and unbounded oscillator; constants are domainless and compatible with any side.
+Source pickers recommend or allow compatible operands, reject constant-versus-constant predicates
+and disjoint-range comparisons, and reject equivalent sources that make comparisons tautological
+or crosses impossible. Cumulative VWAP and OBV plus path-dependent Parabolic SAR and Supertrend
+remain available as chart indicators but are excluded from signal definitions: their values
+depend on where the supplied candle buffer begins and do not converge under finite history.
 
 Every definition should have a prominent plain-language preview, for example:
 
@@ -139,37 +147,58 @@ more aggressive mode.
 
 ### Historical chart validation
 
-A signal should be runnable over the open coin chart and a selected history range. Coinwatch marks
-bars where the complete definition would have entered a matched state; selecting a marker reveals
-the condition values and evidence at that time. This answers “would it have alerted where I expected
-it to?” before the user trusts the definition as a standing alert.
+A saved signal or a materially changed current draft can run over the open coin chart and a preset
+or custom history range. Coinwatch hydrates the selected range plus each timeframe's exact warm-up
+through the shared SQLite/cache/provider history path; validation does not expand the chart's visible
+history merely because older candles were fetched.
 
-This is **historical validation**, not yet a trading backtest: it does not claim PnL without explicit
-entry, exit, sizing, fee, and execution assumptions. Multi-timeframe evaluation must align completed
-higher-timeframe bars onto the chart timeline, and divergence markers must remain on their
-confirmation bars so the display never introduces look-ahead.
+Evaluation advances on the definition's finest referenced completed-candle grid. At each point,
+every condition sees only candles that had completed by then, including the latest completed
+higher-timeframe candle. Divergences become visible on their confirmation bars, never on the earlier
+pivot bars. Results are false-to-true onset markers and contiguous matched-state spans for the
+complete definition, with the same condition evidence used by current signal runs. A signal already
+active at the range start is distinguished from an onset at the start.
+
+Selecting an occurrence pages older chart candles only when necessary, focuses the chart, and shows
+the observed condition values. The chart keeps one non-persisted validation overlay: it can be
+hidden, replaced, or removed without modifying the saved signal or chart settings. Historical
+validation reports signal state and evidence; trade execution assumptions are outside this contract.
 
 ### Alerting
 
-Running a signal manually is the seed; standing **alerts** are the product payoff. An alert applies a
-signal to a coin, watchlist, or universe scope and evaluates when any relevant completed timeframe
-closes. The default lifecycle is edge-triggered and deduplicated per alert and market:
+Running and historically validating a signal are the seed; standing **alerts** are the product
+payoff. Creating or updating an alert captures a validated definition snapshot and applies it to a
+coin, watchlist, or universe scope. Later edits to the source signal do not silently change a
+standing alert: the alert remains on its snapshot until the user explicitly updates and revalidates
+it. Watchlist and universe membership are resolved dynamically when the alert evaluates.
 
-1. False or unknown becomes true: notify once.
+The completed-bar MVP evaluates once whenever the definition's finest referenced timeframe closes.
+All conditions use their latest completed candles at that instant, so a higher-timeframe condition
+cannot observe a forming bar and coincident timeframe-close events cannot produce duplicate
+evaluations. Lifecycle state is persisted per alert and market:
+
+1. No known prior state or a known false state becomes true: notify once.
 2. True remains true: do not repeat.
 3. True becomes false: rearm.
-4. A later false-to-true transition: notify again.
+4. An unavailable or unknown evaluation neither notifies nor changes the last known lifecycle state.
+5. A later known false-to-true transition: notify again.
 
-Optional repeat-while-true, setup-cleared, cooldown, and intrabar policies can follow after the
-basic lifecycle is trustworthy. Delivery starts with local desktop/in-app notifications, then adds
-Telegram, Discord, email, and push as deployment needs grow. Always-on remote delivery is where a
-server-backed deployment (the Postgres seam below) starts to matter.
+The local MVP evaluates while Coinwatch is running. On startup it reconciles the latest completed
+state with persisted lifecycle state instead of replaying every missed interval: a previously true
+alert does not notify again merely because the app restarted, while a persisted false state that is
+now true produces one notification. Notifications first appear in-app and through the local desktop
+notification system; selecting one opens the affected coin and its signal evidence.
+
+Optional repeat-while-true, setup-cleared, cooldown, intrabar, and missed-interval replay policies can
+follow after the basic lifecycle is trustworthy. Telegram, Discord, email, and push can follow as
+deployment needs grow. Always-on remote delivery is where a server-backed deployment (the Postgres
+seam below) starts to matter.
 
 Implementation sequence:
 
-1. Improve signal-authoring semantics, source compatibility, and diagnostic evidence.
-2. Add historical validation markers and evidence to the coin-detail chart.
-3. Build the completed-bar, false-to-true alerting MVP and its first notification channel.
+1. **Completed** — improve signal-authoring semantics, source compatibility, and diagnostic evidence.
+2. **Completed** — add causal historical validation spans and evidence to the coin-detail chart.
+3. **Next** — build the persisted completed-bar, false-to-true alerting MVP and local notifications.
 
 ## Persistence & deployment
 
@@ -177,9 +206,11 @@ Single-user and local. A `CandleStore` **trait seam** with a **local SQLite** im
 (via `sqlx`) is in place: the DB is the accumulating candle cache, while the in-memory store keeps
 a bounded hot window. Charts lazy-page older history and signal runs hydrate their exact completed-
 bar requirements, so restarts reuse persisted candles instead of re-backfilling everything. SQLite
-also stores watchlists, chart settings, saved signals, indicator presets, and cached logos. The trait
-keeps candle persistence swappable: a **Postgres** implementation can drop in later if the app grows
-into a server-backed deployment for always-on alerts or multiple clients.
+also stores watchlists, chart settings, saved signals, indicator presets, and cached logos, and will
+store standing-alert snapshots plus their per-market lifecycle state. Historical validation results
+and overlays remain ephemeral frontend state. The trait keeps candle persistence swappable: a
+**Postgres** implementation can drop in later if the app grows into a server-backed deployment for
+always-on alerts or multiple clients.
 
 ## History
 
