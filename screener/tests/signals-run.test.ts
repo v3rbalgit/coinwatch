@@ -1,38 +1,25 @@
 import { describe, expect, it } from "vitest"
 
-import type { SignalDefinition } from "$lib/signals/definition"
 import {
   createSignalRunClient,
   idleSignalRunProgress,
+  isStartSignalRunError,
   reduceSignalRunProgress,
   SignalRunAlreadyActiveError,
   SignalRunProtocolError,
+  startSignalRunErrorMessage,
 } from "$lib/signals/run"
 import type { EvalReport, SignalRunEvent, SignalRunScope, SignalRunTransport } from "$lib/signals/run"
 
-const definition: SignalDefinition = {
-  version: 2,
-  direction: "bullish",
-  root: { type: "condition", id: "price" },
-  conditions: {
-    price: {
-      timeframe: "1h",
-      predicate: {
-        type: "threshold",
-        left: { type: "field", field: "close" },
-        op: "greaterThan",
-        right: { type: "constant", value: 100 },
-      },
-      withinBars: 0,
-    },
-  },
-}
+import { thresholdDefinition } from "./signals-fixture"
+
+const definition = thresholdDefinition()
 
 function report(satisfied: boolean): EvalReport {
   return {
     coin: "BTC",
     satisfied,
-    triggeredAt: satisfied ? "2026-01-01T00:00:00Z" : null,
+    lastEvidenceAt: satisfied ? "2026-01-01T00:00:00Z" : null,
     conditions: {
       price: { status: satisfied ? "satisfied" : "notSatisfied", lastTrueBar: null, evidence: null },
     },
@@ -82,6 +69,26 @@ function fakeTransport(): FakeTransport {
     },
   }
 }
+
+describe("start error narrowing", () => {
+  it("narrows every structured start error without accepting malformed values", () => {
+    expect(isStartSignalRunError({ type: "alreadyActive" })).toBe(true)
+    expect(isStartSignalRunError({ type: "idExhausted" })).toBe(true)
+    expect(isStartSignalRunError({ type: "emptyCoin" })).toBe(true)
+    expect(isStartSignalRunError({ type: "duplicateCoin", coin: "BTC" })).toBe(true)
+    expect(isStartSignalRunError({ type: "eventStream", message: "closed" })).toBe(true)
+    expect(isStartSignalRunError({ type: "duplicateCoin" })).toBe(false)
+    expect(isStartSignalRunError({ type: "eventStream" })).toBe(false)
+    expect(isStartSignalRunError("a signal run is already active")).toBe(false)
+    expect(isStartSignalRunError(null)).toBe(false)
+  })
+
+  it("maps structured errors to friendly copy and falls back for unknown values", () => {
+    expect(startSignalRunErrorMessage({ type: "duplicateCoin", coin: "BTC" })).toContain("'BTC'")
+    expect(startSignalRunErrorMessage(new Error("boom"))).toBe("boom")
+    expect(startSignalRunErrorMessage("raw")).toBe("raw")
+  })
+})
 
 describe("signal run contract", () => {
   it("serializes universe and explicit-coin scopes exactly", () => {
