@@ -2,8 +2,8 @@
 //!
 //! The market sync engine keeps a hot [`MarketStore`] cache warm from Hyperliquid.
 //! Commands expose live metadata, candle history, user data, and personal signal
-//! evaluation. Live mids, the active coin's candles, and engine status are relayed
-//! to the frontend as `mid`, `candle`, and `status` events.
+//! evaluation. Live mids, active-coin candles, candle snapshot invalidations, and
+//! engine status are relayed to the frontend as typed events.
 
 mod indicator_presets;
 mod naming;
@@ -16,10 +16,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Utc;
 use domain::{Candle, Timeframe};
 use hl_feed::{
-    CandleHistory, CandleProvider, HyperliquidAdapter, HyperliquidRest, MarketEvent, MarketStore, SyncConfig,
-    spawn_sync,
+    CandleHealth, CandleHistory, CandleProvider, HyperliquidAdapter, HyperliquidRest, MarketEvent, MarketStore,
+    SyncConfig, spawn_sync,
 };
 use rust_decimal::prelude::ToPrimitive;
 use serde::Serialize;
@@ -98,16 +99,30 @@ impl From<&Candle> for CandlePayload {
     }
 }
 
-/// Cached candles for a (coin, timeframe), oldest first, for the detail chart.
+/// Cached chart candles together with their authoritative trust state.
+#[derive(Clone, Serialize)]
+struct CandleSnapshotPayload {
+    candles: Vec<CandlePayload>,
+    health: CandleHealth,
+    revision: u64,
+}
+
+/// Cached candles and health for a (coin, timeframe), oldest first.
 #[tauri::command]
-fn coin_candles(store: tauri::State<'_, Arc<MarketStore>>, coin: String, timeframe: String) -> Vec<CandlePayload> {
+fn coin_candles(store: tauri::State<'_, Arc<MarketStore>>, coin: String, timeframe: String) -> CandleSnapshotPayload {
     let Some(timeframe) = Timeframe::from_hl(&timeframe) else {
-        return Vec::new();
+        return CandleSnapshotPayload {
+            candles: Vec::new(),
+            health: CandleHealth::Loading,
+            revision: 0,
+        };
     };
-    store
-        .candles(&coin, timeframe)
-        .map(|candles| candles.iter().map(CandlePayload::from).collect())
-        .unwrap_or_default()
+    let snapshot = store.candle_snapshot(&coin, timeframe, Utc::now().timestamp_millis());
+    CandleSnapshotPayload {
+        candles: snapshot.candles.iter().map(CandlePayload::from).collect(),
+        health: snapshot.health,
+        revision: snapshot.revision,
+    }
 }
 
 /// Older candles to load per scroll-back page — ~2x the chart's ~150-bar visible
@@ -155,6 +170,28 @@ struct CandleEventPayload {
     coin: String,
     timeframe: String,
     candle: CandlePayload,
+    health: CandleHealth,
+    revision: u64,
+}
+
+/// A REST or health transition invalidated the active chart's snapshot.
+#[derive(Clone, Serialize)]
+struct CandleSnapshotUpdatePayload {
+    coin: String,
+    timeframe: String,
+    health: CandleHealth,
+    revision: u64,
+}
+
+fn emit_candle_snapshot_update(handle: &tauri::AppHandle, store: &MarketStore, coin: &str, timeframe: Timeframe) {
+    let snapshot = store.candle_snapshot(coin, timeframe, Utc::now().timestamp_millis());
+    let payload = CandleSnapshotUpdatePayload {
+        coin: coin.to_owned(),
+        timeframe: timeframe.as_hl().to_owned(),
+        health: snapshot.health,
+        revision: snapshot.revision,
+    };
+    let _ = handle.emit("candle-snapshot-updated", payload);
 }
 
 /// Set (or clear) the coin whose live candles are streamed to the UI (the open detail page).
@@ -271,6 +308,7 @@ pub fn run() {
     let store = MarketStore::new();
     let sync_store = Arc::clone(&store);
     let status_store = Arc::clone(&store);
+    let candle_update_store = Arc::clone(&store);
     let adapter_store = Arc::clone(&store);
     let logo_market_store = Arc::clone(&store);
     let sync_config = SyncConfig {
@@ -333,6 +371,39 @@ pub fn run() {
                 }
             });
 
+            // Relay REST reconciliations and health transitions for the active chart.
+            let candle_update_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut updates = candle_update_store.subscribe_candle_updates();
+                loop {
+                    match updates.recv().await {
+                        Ok(update) => {
+                            if candle_update_store.active_coin().as_deref() == Some(update.coin.as_str()) {
+                                emit_candle_snapshot_update(
+                                    &candle_update_handle,
+                                    &candle_update_store,
+                                    &update.coin,
+                                    update.timeframe,
+                                );
+                            }
+                        }
+                        Err(RecvError::Lagged(_)) => {
+                            if let Some(coin) = candle_update_store.active_coin() {
+                                for timeframe in Timeframe::ALL {
+                                    emit_candle_snapshot_update(
+                                        &candle_update_handle,
+                                        &candle_update_store,
+                                        &coin,
+                                        timeframe,
+                                    );
+                                }
+                            }
+                        }
+                        Err(RecvError::Closed) => break,
+                    }
+                }
+            });
+
             // Stream live mids and relay them to the UI as `mid` events.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -352,10 +423,17 @@ pub fn run() {
                             }
                             MarketEvent::Candle(candle) => {
                                 if event_store.active_coin().as_deref() == Some(candle.coin.as_str()) {
+                                    let snapshot = event_store.candle_snapshot(
+                                        &candle.coin,
+                                        candle.timeframe,
+                                        Utc::now().timestamp_millis(),
+                                    );
                                     let payload = CandleEventPayload {
                                         coin: candle.coin.clone(),
                                         timeframe: candle.timeframe.as_hl().to_owned(),
                                         candle: CandlePayload::from(&candle.candle),
+                                        health: snapshot.health,
+                                        revision: snapshot.revision,
                                     };
                                     let _ = handle.emit("candle", payload);
                                 }
@@ -398,4 +476,44 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod candle_contract_tests {
+    use super::{CandleHealth, CandlePayload, CandleSnapshotPayload, CandleSnapshotUpdatePayload};
+
+    #[test]
+    fn candle_snapshot_contract_serializes_health_and_revision() {
+        let snapshot = CandleSnapshotPayload {
+            candles: vec![CandlePayload {
+                time: 1,
+                open: 2.0,
+                high: 3.0,
+                low: 1.0,
+                close: 2.5,
+                volume: 4.0,
+            }],
+            health: CandleHealth::Verifying,
+            revision: 7,
+        };
+        assert_eq!(
+            serde_json::to_value(snapshot).expect("serializable snapshot"),
+            serde_json::json!({
+                "candles": [{ "time": 1, "open": 2.0, "high": 3.0, "low": 1.0, "close": 2.5, "volume": 4.0 }],
+                "health": "verifying",
+                "revision": 7,
+            })
+        );
+
+        let update = CandleSnapshotUpdatePayload {
+            coin: "BTC".to_owned(),
+            timeframe: "1h".to_owned(),
+            health: CandleHealth::Ready,
+            revision: 8,
+        };
+        assert_eq!(
+            serde_json::to_value(update).expect("serializable update"),
+            serde_json::json!({ "coin": "BTC", "timeframe": "1h", "health": "ready", "revision": 8 })
+        );
+    }
 }

@@ -4,6 +4,12 @@
 
   import { goto } from "$app/navigation"
   import { page } from "$app/state"
+  import {
+    candleHealthMessage,
+    candleSnapshotDecision,
+    type CandleHealth,
+    type CandleLoadRequest,
+  } from "$lib/chart/candle-snapshot"
   import Chart from "$lib/chart/Chart.svelte"
   import { parseDrawingsPayload, serializeDrawings, type Drawing } from "$lib/chart/drawings/types"
   import {
@@ -36,7 +42,7 @@
   import Skeleton from "$lib/components/ui/skeleton.svelte"
   import { errorMessage } from "$lib/errors"
   import { formatCompactNumber, formatPrice, prevDayChangePct } from "$lib/format"
-  import { onCandle, onMid } from "$lib/ipc/events"
+  import { onCandle, onCandleSnapshotUpdated, onMid } from "$lib/ipc/events"
   import { isRecord } from "$lib/ipc/guards"
   import { coinCandles, coinHistory, getSetting, screenerRows, setActiveCoin, setSetting } from "$lib/ipc/screener"
   import type { ScreenerRow } from "$lib/ipc/screener"
@@ -68,6 +74,12 @@
   let viewSaveQueue = Promise.resolve()
   let chromeSaveQueue = Promise.resolve()
   let bars = $state<Bar[]>([])
+  // Snapshot revisions prevent REST/IPC responses from replacing newer live bars.
+  let barsKey = ""
+  let candleHealth = $state<CandleHealth>("loading")
+  let candleRevision = 0
+  let candleLoadSequence = 0
+  let candleSeriesGeneration = 0
   let seed = $state(0)
   let meta = $state<ScreenerRow | null>(null)
   let livePrice = $state<number | null>(null)
@@ -117,26 +129,38 @@
     return historicalValidationWorkspace.error || validationNavigationError
   })
 
-  async function loadCandles() {
-    const [c, t] = [coin, tf]
+  async function loadCandles(minimumRevision = 0) {
+    const seriesKey = `${coin}|${tf}`
+    const request: CandleLoadRequest = {
+      seriesKey,
+      sequence: ++candleLoadSequence,
+      minimumRevision,
+    }
     try {
-      const data = await coinCandles(c, t)
-      // Ignore a stale response if the coin/timeframe changed while it was in flight.
-      if (c === coin && t === tf) {
-        bars = data
-        barsKey = `${c}|${t}`
+      const snapshot = await coinCandles(coin, tf)
+      const decision = candleSnapshotDecision(
+        request,
+        `${coin}|${tf}`,
+        candleLoadSequence,
+        candleRevision,
+        snapshot.revision
+      )
+      if (decision === "apply") {
+        bars = snapshot.candles
+        barsKey = seriesKey
+        candleHealth = snapshot.health
+        candleRevision = snapshot.revision
         seed += 1
         candlesError = ""
+      } else if (decision === "retry") {
+        void loadCandles(Math.max(request.minimumRevision, candleRevision))
       }
     } catch (error) {
-      if (c === coin && t === tf) {
+      if (request.seriesKey === `${coin}|${tf}` && request.sequence === candleLoadSequence) {
         candlesError = errorMessage(error)
       }
     }
   }
-
-  // Which (coin, timeframe) the current bars belong to; live merges apply only when it matches.
-  let barsKey = ""
 
   let olderInFlight: Promise<boolean> | null = null
   let exhausted = false
@@ -153,10 +177,10 @@
   async function loadOlderPage(): Promise<boolean> {
     const oldest = bars[0]?.time
     if (exhausted || oldest === undefined) return false
-    const [c, t] = [coin, tf]
+    const [c, t, generation] = [coin, tf, candleSeriesGeneration]
     try {
       const older = await coinHistory(c, t, oldest)
-      if (c !== coin || t !== tf) return false
+      if (c !== coin || t !== tf || generation !== candleSeriesGeneration) return false
       const fresh = older.filter(bar => bar.time < oldest)
       if (fresh.length === 0) {
         exhausted = true
@@ -350,6 +374,10 @@
     settingsCoin = ""
     bars = []
     barsKey = ""
+    candleHealth = "loading"
+    candleRevision = 0
+    candleLoadSequence += 1
+    candleSeriesGeneration += 1
     if (active) void loadViewSettings(active, revision)
   })
 
@@ -359,6 +387,12 @@
     if (coin && settingsCoin === coin) {
       exhausted = false
       candlesError = ""
+      bars = []
+      barsKey = ""
+      candleHealth = "loading"
+      candleRevision = 0
+      candleLoadSequence += 1
+      candleSeriesGeneration += 1
       void loadCandles()
     }
   })
@@ -413,28 +447,35 @@
       .catch(error => console.error("failed to load chart indicators", error))
     const reload = setInterval(loadMeta, 5000)
     const unMid = onMid(event => {
-      if (event.coin !== coin) return
-      livePrice = event.price
-      if (barsKey !== `${coin}|${tf}`) return
-      const last = bars.at(-1)
-      if (!last) return
-      const close = event.price
-      bars = [
-        ...bars.slice(0, -1),
-        { ...last, close, high: Math.max(last.high, close), low: Math.min(last.low, close) },
-      ]
+      if (event.coin === coin) livePrice = event.price
     })
     const unCandle = onCandle(event => {
-      if (event.coin !== coin || event.timeframe !== tf || barsKey !== `${coin}|${tf}`) return
+      const activeKey = `${coin}|${tf}`
+      if (event.coin !== coin || event.timeframe !== tf || event.revision <= candleRevision) return
+      candleHealth = event.health
+      if (barsKey !== activeKey) {
+        void loadCandles(event.revision)
+        return
+      }
+      candleRevision = event.revision
+      if (event.health !== "ready") return
       mergeBar(event.candle)
+    })
+    const unSnapshot = onCandleSnapshotUpdated(event => {
+      const activeKey = `${coin}|${tf}`
+      if (event.coin !== coin || event.timeframe !== tf || event.revision < candleRevision) return
+      candleHealth = event.health
+      if (event.revision > candleRevision || barsKey !== activeKey) void loadCandles(event.revision)
     })
     return () => {
       clearInterval(reload)
       void unMid.then(off => off())
       void unCandle.then(off => off())
+      void unSnapshot.then(off => off())
     }
   })
 
+  const candleStatusMessage = $derived(candleHealthMessage(candleHealth))
   const price = $derived(livePrice ?? meta?.price ?? 0)
   const change = $derived(meta ? prevDayChangePct(meta.prev_day, price) : 0)
   const hasPrice = $derived(livePrice !== null || meta !== null)
@@ -618,7 +659,18 @@
     {:else if settingsCoin !== coin || bars.length === 0}
       <div class="absolute inset-0 flex items-center justify-center gap-2 text-sm text-muted-foreground">
         <LoaderCircle class="size-4 animate-spin" />
-        Loading chart…
+        {candleStatusMessage || "Loading chart…"}
+      </div>
+    {/if}
+    {#if bars.length > 0 && (candlesError !== "" || candleHealth !== "ready")}
+      <div
+        class="absolute top-3 left-1/2 z-10 flex -translate-x-1/2 items-center gap-2 rounded-md border border-border bg-background/90 px-3 py-2 text-xs text-muted-foreground shadow-sm backdrop-blur"
+        role="status"
+      >
+        <span>{candlesError !== "" ? `Chart refresh failed: ${candlesError}` : candleStatusMessage}</span>
+        {#if candlesError !== ""}
+          <Button variant="outline" size="sm" onclick={() => void loadCandles(candleRevision)}>Retry</Button>
+        {/if}
       </div>
     {/if}
     {#if validationForCoin && validationSnapshot && validationResult && historicalValidationWorkspace.panelOpen && validationDescriptors.length > 0}

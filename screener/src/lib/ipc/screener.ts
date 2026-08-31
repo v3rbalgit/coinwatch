@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core"
 
+import type { CandleSnapshot } from "$lib/chart/candle-snapshot"
 import type { Bar } from "$lib/chart/types"
 
 /** One `screener_rows` row; field names mirror the Rust `ScreenerRow` payload. */
@@ -51,8 +52,8 @@ export function setActiveCoin(coin: string | null): Promise<void> {
   return invoke<void>("set_active_coin", { coin })
 }
 
-export function coinCandles(coin: string, timeframe: string): Promise<Bar[]> {
-  return invoke<Bar[]>("coin_candles", { coin, timeframe })
+export function coinCandles(coin: string, timeframe: string): Promise<CandleSnapshot> {
+  return invoke<CandleSnapshot>("coin_candles", { coin, timeframe })
 }
 
 export function coinHistory(coin: string, timeframe: string, beforeSeconds: number): Promise<Bar[]> {
