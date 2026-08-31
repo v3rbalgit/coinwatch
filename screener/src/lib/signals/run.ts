@@ -1,6 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core"
 
 import { errorMessage } from "$lib/errors"
+import type { CandleHealth } from "$lib/ipc/candles"
 import { hasString, isRecord } from "$lib/ipc/guards"
 import { createSignalChannelClient } from "$lib/signals/channel-client"
 import type { SignalChannelTransport } from "$lib/signals/channel-client"
@@ -25,18 +26,20 @@ export type ConditionOutcome = {
 } & (
   | { status: "satisfied" }
   | { status: "notSatisfied" }
-  | { status: "noData" }
+  | { status: "noData"; reason: CandleHealth }
   | { status: "unavailable" }
   | { status: "insufficientHistory"; required: number; available: number }
   | { status: "undefinedOperands" }
 )
 
+export type EvaluationVerdict = "matched" | "notMatched" | "unknown"
+
 export interface EvalReport {
   coin: string
-  satisfied: boolean
+  verdict: EvaluationVerdict
   lastEvidenceAt: string | null
   conditions: Record<string, ConditionOutcome>
-  missingData: SignalTimeframe[]
+  pendingData: Partial<Record<SignalTimeframe, CandleHealth>>
   unavailableData: Partial<Record<SignalTimeframe, string>>
 }
 
@@ -48,25 +51,26 @@ export type SignalRunEvent =
     }
   | {
       event: "completed"
-      data: { runId: number; completed: number; total: number; matched: number }
+      data: { runId: number; completed: number; total: number; matched: number; unknown: number }
     }
   | {
       event: "cancelled"
-      data: { runId: number; completed: number; total: number; matched: number }
+      data: { runId: number; completed: number; total: number; matched: number; unknown: number }
     }
   | { event: "failed"; data: { runId: number; message: string } }
 
 export type SignalRunProgress =
   | { status: "idle" }
-  | { status: "running"; runId: number; completed: number; total: number; matched: number }
-  | { status: "completed"; runId: number; completed: number; total: number; matched: number }
-  | { status: "cancelled"; runId: number; completed: number; total: number; matched: number }
+  | { status: "running"; runId: number; completed: number; total: number; matched: number; unknown: number }
+  | { status: "completed"; runId: number; completed: number; total: number; matched: number; unknown: number }
+  | { status: "cancelled"; runId: number; completed: number; total: number; matched: number; unknown: number }
   | {
       status: "failed"
       runId: number
       completed: number
       total: number
       matched: number
+      unknown: number
       message: string
     }
 
@@ -83,6 +87,7 @@ export function reduceSignalRunProgress(state: SignalRunProgress, event: SignalR
       completed: 0,
       total: event.data.total,
       matched: 0,
+      unknown: 0,
     }
   }
   if (state.status !== "running" || state.runId !== event.data.runId) return state
@@ -94,7 +99,8 @@ export function reduceSignalRunProgress(state: SignalRunProgress, event: SignalR
         runId: state.runId,
         completed: event.data.completed,
         total: event.data.total,
-        matched: state.matched + (event.data.report.satisfied ? 1 : 0),
+        matched: state.matched + (event.data.report.verdict === "matched" ? 1 : 0),
+        unknown: state.unknown + (event.data.report.verdict === "unknown" ? 1 : 0),
       }
     case "completed":
       return { status: "completed", ...event.data }
@@ -107,6 +113,7 @@ export function reduceSignalRunProgress(state: SignalRunProgress, event: SignalR
         completed: state.completed,
         total: state.total,
         matched: state.matched,
+        unknown: state.unknown,
         message: event.data.message,
       }
   }

@@ -2,8 +2,8 @@
 //!
 //! The hot cache includes the still-forming trailing bar. Runs expose only its
 //! completed prefix, sharing the `Arc` when it is deep enough and loading only a
-//! missing older prefix otherwise. A series is omitted while its expected current
-//! bar is missing or a gap is being reconciled, avoiding repainting and stale matches.
+//! missing older prefix otherwise. Store-gated series retain their authoritative
+//! pending reason in the report instead of being mistaken for a negative result.
 
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use domain::{Candle, Timeframe};
-use hl_feed::{CandleHistory, MarketStore};
+use hl_feed::{CandleHealth, CandleHistory, MarketStore};
 
 use crate::definition::{DefinitionError, SignalDefinition};
 use crate::eval::{CoinData, EvalReport, completed_len, evaluate_validated};
@@ -40,7 +40,7 @@ async fn hydrate_timeframe(
         .await
     {
         Ok(mut older) => {
-            // History ends at the first hot bar; `current_candles` guarantees
+            // History ends at the first hot bar; the ready store snapshot guarantees
             // that the remaining hot prefix is aligned and contiguous.
             let (completed_candles, _) = candles.split_at(completed);
             older.extend_from_slice(completed_candles);
@@ -60,8 +60,12 @@ async fn hydrate_coin_data(
     let mut data = CoinData::default();
     let now_ms = now.timestamp_millis();
     for (&timeframe, &required) in requirements {
-        if let Some(candles) = store.current_candles(coin, timeframe, now_ms) {
-            hydrate_timeframe(&mut data, history, coin, timeframe, required, candles, now).await;
+        let snapshot = store.candle_snapshot(coin, timeframe, now_ms);
+        match snapshot.health {
+            CandleHealth::Ready => {
+                hydrate_timeframe(&mut data, history, coin, timeframe, required, snapshot.candles, now).await;
+            }
+            reason => data.mark_pending(timeframe, reason),
         }
     }
     data
@@ -134,22 +138,23 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::ops::ControlFlow;
     use std::sync::{Arc, Mutex, PoisonError};
 
     use async_trait::async_trait;
     use chrono::{DateTime, TimeZone, Utc};
     use domain::{Candle, Timeframe};
-    use hl_feed::{CandleHistory, CandleProvider, FeedError, MarketStore};
+    use hl_feed::{CandleHealth, CandleHistory, CandleProvider, FeedError, MarketStore};
     use indicators::Instance;
     use rust_decimal::Decimal;
     use storage::{CandleSeries, CandleStore, StoreError};
 
-    use super::{RunSummary, hydrate_timeframe, run_signal};
+    use super::{RunSummary, hydrate_coin_data, hydrate_timeframe, run_signal};
     use crate::definition::{
         ComparisonOp, Condition, DEFINITION_VERSION, Direction, Node, Operand, Predicate, SignalDefinition,
     };
-    use crate::eval::{CoinData, OutcomeStatus, evaluate};
+    use crate::eval::{CoinData, EvaluationVerdict, OutcomeStatus, evaluate};
 
     struct CachedStore {
         candles: Vec<Candle>,
@@ -292,6 +297,40 @@ mod tests {
 
         assert_eq!(report.conditions["trend"].status, OutcomeStatus::Satisfied);
         assert!(store.requests.lock().unwrap_or_else(PoisonError::into_inner).is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_health_reasons_survive_reports_and_recovery() {
+        let cache = Arc::new(CachedStore::new(Vec::new(), true));
+        let history = history(cache.clone());
+        let signal = definition(1.0);
+        let requirements = signal.required_history().expect("valid requirements");
+        let now = during_forming_bar();
+
+        let loading_store = MarketStore::new();
+        let loading = hydrate_coin_data(&loading_store, &history, "BTC", &requirements, now).await;
+        let loading_report = evaluate(&signal, "BTC", &loading).expect("valid loading report");
+        assert_eq!(
+            loading_report.pending_data,
+            BTreeMap::from([(Timeframe::Hour1, CandleHealth::Loading)])
+        );
+        assert_eq!(loading_report.verdict, EvaluationVerdict::Unknown);
+
+        for reason in [CandleHealth::Stale, CandleHealth::Verifying, CandleHealth::Repairing] {
+            let mut pending = CoinData::default();
+            pending.mark_pending(Timeframe::Hour1, reason);
+            let report = evaluate(&signal, "BTC", &pending).expect("valid pending report");
+            assert_eq!(report.pending_data, BTreeMap::from([(Timeframe::Hour1, reason)]));
+            assert_eq!(report.conditions["trend"].status, OutcomeStatus::NoData { reason });
+            assert_eq!(report.verdict, EvaluationVerdict::Unknown);
+        }
+
+        let mut recovered = CoinData::default();
+        recovered.insert(Timeframe::Hour1, (5..10).map(candle).collect());
+        let recovered_report = evaluate(&signal, "BTC", &recovered).expect("valid recovered report");
+        assert!(recovered_report.pending_data.is_empty());
+        assert_eq!(recovered_report.verdict, EvaluationVerdict::Matched);
+        assert!(cache.requests.lock().unwrap_or_else(PoisonError::into_inner).is_empty());
     }
 
     #[tokio::test]

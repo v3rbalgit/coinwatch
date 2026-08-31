@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use domain::Timeframe;
 use hl_feed::CandleHistory;
 use serde::Serialize;
@@ -37,6 +37,11 @@ pub(crate) enum SignalValidationFailure {
         required: usize,
         available: usize,
     },
+    UndefinedOperands {
+        condition: String,
+        timeframe: Timeframe,
+        evaluated_at: DateTime<Utc>,
+    },
     Internal {
         message: String,
     },
@@ -62,6 +67,15 @@ impl From<HistoricalValidationError> for SignalValidationFailure {
                 timeframe,
                 required,
                 available,
+            },
+            HistoricalValidationError::UndefinedOperands {
+                condition,
+                timeframe,
+                evaluated_at,
+            } => Self::UndefinedOperands {
+                condition,
+                timeframe,
+                evaluated_at,
             },
             HistoricalValidationError::MissingData { timeframe } => Self::HistoryUnavailable {
                 timeframe,

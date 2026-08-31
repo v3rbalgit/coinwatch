@@ -1,14 +1,4 @@
-import type { Bar } from "./types"
-
-/** Backend trust state for one chart candle snapshot. */
-export type CandleHealth = "loading" | "ready" | "stale" | "verifying" | "repairing"
-
-/** Cached chart bars with the health and revision that produced them. */
-export type CandleSnapshot = {
-  candles: Bar[]
-  health: CandleHealth
-  revision: number
-}
+import type { CandleHealth } from "$lib/ipc/candles"
 
 /** Identity captured when an asynchronous candle load begins. */
 export type CandleLoadRequest = {

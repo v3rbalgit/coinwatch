@@ -69,12 +69,12 @@ const evaluated: SignalRunEvent = {
     total: 2,
     report: {
       coin: "BTC",
-      satisfied: true,
+      verdict: "matched",
       lastEvidenceAt: "2026-08-26T09:00:00Z",
       conditions: {
         price: { status: "satisfied", lastTrueBar: "2026-08-26T09:00:00Z", evidence: null },
       },
-      missingData: [],
+      pendingData: {},
       unavailableData: {},
     },
   },
@@ -127,6 +127,7 @@ describe("signal run workspace", () => {
       completed: 0,
       total: 2,
       matched: 0,
+      unknown: 0,
     })
     expect(workspace.state.error).toContain("started as 7 but command returned 8")
     expect(workspace.isActive()).toBe(false)
@@ -148,7 +149,7 @@ describe("signal run workspace", () => {
     expect(workspace.state.cancellationPending).toBe(true)
 
     fake.emit(evaluated)
-    fake.emit({ event: "cancelled", data: { runId: 7, completed: 1, total: 2, matched: 1 } })
+    fake.emit({ event: "cancelled", data: { runId: 7, completed: 1, total: 2, matched: 1, unknown: 0 } })
     expect(workspace.state.cancellationPending).toBe(false)
     expect(workspace.state.progress.status).toBe("cancelled")
     expect(workspace.state.reports.map(report => report.coin)).toEqual(["BTC"])
@@ -172,7 +173,7 @@ describe("signal run workspace", () => {
         total: 1,
         report: {
           coin: "BTC",
-          satisfied: false,
+          verdict: "notMatched",
           lastEvidenceAt: null,
           conditions: {
             price: {
@@ -181,12 +182,12 @@ describe("signal run workspace", () => {
               evidence: { type: "state", observedAt: "2026-08-26T09:00:00Z", left: 90, right: 100 },
             },
           },
-          missingData: [],
+          pendingData: {},
           unavailableData: {},
         },
       },
     })
-    fake.emit({ event: "completed", data: { runId: 7, completed: 1, total: 1, matched: 0 } })
+    fake.emit({ event: "completed", data: { runId: 7, completed: 1, total: 1, matched: 0, unknown: 0 } })
     expect(workspace.state.filter).toBe("closest")
   })
 
@@ -197,14 +198,14 @@ describe("signal run workspace", () => {
     const workspace = createSignalRunWorkspace(createSignalRunClient(fake.transport))
     const first = workspace.start(snapshot("First"))
     fake.emit({ event: "started", data: { runId: 7, total: 1 } })
-    fake.emit({ ...evaluated, data: { ...evaluated.data, total: 1 } })
+    fake.emit({ event: "evaluated", data: { ...evaluated.data, total: 1 } })
 
     await workspace.start(snapshot("Blocked"))
     expect(fake.starts()).toBe(1)
     expect(workspace.state.snapshot?.name).toBe("First")
     expect(workspace.state.view).toBe("results")
 
-    fake.emit({ event: "completed", data: { runId: 7, completed: 1, total: 1, matched: 1 } })
+    fake.emit({ event: "completed", data: { runId: 7, completed: 1, total: 1, matched: 1, unknown: 0 } })
     if (resolveStart === undefined) throw new Error("missing start resolver")
     resolveStart(7)
     await first

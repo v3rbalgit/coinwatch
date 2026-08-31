@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use domain::{Candle, Timeframe};
-use hl_feed::{CandleHistory, CandleProvider, FeedError, MarketStore};
+use hl_feed::{CandleHealth, CandleHistory, CandleProvider, FeedError, MarketStore};
 use serde_json::json;
-use signals::{ConditionOutcome, EvalReport, OutcomeStatus, SignalDefinition};
+use signals::{ConditionOutcome, EvalReport, EvaluationVerdict, OutcomeStatus, SignalDefinition};
 use storage::{CandleSeries, CandleStore, StoreError};
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tokio::sync::watch;
@@ -193,6 +193,7 @@ async fn worker_streams_each_coin_and_returns_one_terminal_event() {
             completed: 1,
             total: 1,
             matched: 0,
+            unknown: 1,
         }
     ));
 }
@@ -223,6 +224,7 @@ async fn worker_honors_cancellation_before_evaluating_a_coin() {
             completed: 0,
             total: 1,
             matched: 0,
+            unknown: 0,
         }
     ));
 }
@@ -258,6 +260,7 @@ async fn worker_honors_cancellation_requested_by_a_progress_consumer() {
             completed: 1,
             total: 2,
             matched: 0,
+            unknown: 1,
         }
     ));
 }
@@ -292,7 +295,7 @@ fn start_error_serialization_matches_the_frontend_contract() {
 fn evaluated_event_serialization_matches_the_frontend_contract() {
     let report = EvalReport {
         coin: "BTC".to_owned(),
-        satisfied: false,
+        verdict: EvaluationVerdict::Unknown,
         last_evidence_at: None,
         conditions: BTreeMap::from([(
             "trend".to_owned(),
@@ -305,7 +308,7 @@ fn evaluated_event_serialization_matches_the_frontend_contract() {
                 evidence: None,
             },
         )]),
-        missing_data: vec![Timeframe::Week1],
+        pending_data: BTreeMap::from([(Timeframe::Week1, CandleHealth::Stale)]),
         unavailable_data: BTreeMap::from([(Timeframe::Hour4, "provider unavailable".to_owned())]),
     };
 
@@ -325,7 +328,7 @@ fn evaluated_event_serialization_matches_the_frontend_contract() {
                 "total": 10,
                 "report": {
                     "coin": "BTC",
-                    "satisfied": false,
+                    "verdict": "unknown",
                     "lastEvidenceAt": null,
                     "conditions": {
                         "trend": {
@@ -336,7 +339,9 @@ fn evaluated_event_serialization_matches_the_frontend_contract() {
                             "evidence": null,
                         }
                     },
-                    "missingData": ["1w"],
+                    "pendingData": {
+                        "1w": "stale",
+                    },
                     "unavailableData": {
                         "4h": "provider unavailable",
                     }
@@ -361,6 +366,7 @@ fn scope_and_terminal_event_serialization_are_stable() {
             completed: 3,
             total: 10,
             matched: 1,
+            unknown: 2,
         })
         .expect("serializable run event"),
         json!({
@@ -370,6 +376,7 @@ fn scope_and_terminal_event_serialization_are_stable() {
                 "completed": 3,
                 "total": 10,
                 "matched": 1,
+                "unknown": 2,
             }
         })
     );

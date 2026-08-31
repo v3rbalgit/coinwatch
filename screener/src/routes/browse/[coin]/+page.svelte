@@ -4,12 +4,7 @@
 
   import { goto } from "$app/navigation"
   import { page } from "$app/state"
-  import {
-    candleHealthMessage,
-    candleSnapshotDecision,
-    type CandleHealth,
-    type CandleLoadRequest,
-  } from "$lib/chart/candle-snapshot"
+  import { candleHealthMessage, candleSnapshotDecision, type CandleLoadRequest } from "$lib/chart/candle-snapshot"
   import Chart from "$lib/chart/Chart.svelte"
   import { parseDrawingsPayload, serializeDrawings, type Drawing } from "$lib/chart/drawings/types"
   import {
@@ -42,6 +37,7 @@
   import Skeleton from "$lib/components/ui/skeleton.svelte"
   import { errorMessage } from "$lib/errors"
   import { formatCompactNumber, formatPrice, prevDayChangePct } from "$lib/format"
+  import type { CandleHealth } from "$lib/ipc/candles"
   import { onCandle, onCandleSnapshotUpdated, onMid } from "$lib/ipc/events"
   import { isRecord } from "$lib/ipc/guards"
   import { coinCandles, coinHistory, getSetting, screenerRows, setActiveCoin, setSetting } from "$lib/ipc/screener"

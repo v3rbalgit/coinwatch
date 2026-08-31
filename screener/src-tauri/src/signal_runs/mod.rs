@@ -7,7 +7,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use hl_feed::{CandleHistory, MarketStore};
 use serde::{Deserialize, Serialize};
-use signals::{DefinitionError, EvalReport, RunSummary, SignalDefinition, run_signal};
+use signals::{DefinitionError, EvalReport, EvaluationVerdict, RunSummary, SignalDefinition, run_signal};
 use tauri::ipc::Channel;
 use thiserror::Error;
 use tokio::sync::watch;
@@ -64,12 +64,14 @@ pub(crate) enum SignalRunEvent {
         completed: usize,
         total: usize,
         matched: usize,
+        unknown: usize,
     },
     Cancelled {
         run_id: u32,
         completed: usize,
         total: usize,
         matched: usize,
+        unknown: usize,
     },
     // Progress is already streamed to the frontend; failure adds only the terminal cause.
     Failed {
@@ -129,13 +131,16 @@ async fn run_worker(
     let total = coins.len();
     let mut completed = 0;
     let mut matched = 0;
+    let mut unknown = 0;
     let mut cancellation_observed = false;
     let callback_cancellation = cancellation.clone();
     let outcome = {
         let run = run_signal(&store, &history, &definition, &coins, Utc::now(), |progress| {
             completed = progress.completed;
-            if progress.report.satisfied {
-                matched += 1;
+            match progress.report.verdict {
+                EvaluationVerdict::Matched => matched += 1,
+                EvaluationVerdict::Unknown => unknown += 1,
+                EvaluationVerdict::NotMatched => {}
             }
             let delivered = send_event(
                 &events,
@@ -170,12 +175,14 @@ async fn run_worker(
             completed,
             total,
             matched,
+            unknown,
         },
         RunOutcome::Finished(Ok(summary)) if summary.stopped && cancellation_observed => SignalRunEvent::Cancelled {
             run_id,
             completed: summary.completed,
             total: summary.total,
             matched,
+            unknown,
         },
         RunOutcome::Finished(Ok(summary)) if summary.stopped => SignalRunEvent::Failed {
             run_id,
@@ -186,6 +193,7 @@ async fn run_worker(
             completed: summary.completed,
             total: summary.total,
             matched,
+            unknown,
         },
         RunOutcome::Finished(Err(error)) => SignalRunEvent::Failed {
             run_id,

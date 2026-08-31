@@ -1,8 +1,8 @@
 import { listen } from "@tauri-apps/api/event"
 import type { UnlistenFn } from "@tauri-apps/api/event"
 
-import type { CandleHealth } from "$lib/chart/candle-snapshot"
 import type { Bar } from "$lib/chart/types"
+import type { CandleHealth } from "$lib/ipc/candles"
 
 export type MidEvent = { coin: string; price: number }
 

@@ -45,7 +45,7 @@ function completedResult(): HistoricalValidation {
         activeAtEnd: false,
         evidence: {
           coin: "BTC",
-          satisfied: true,
+          verdict: "matched",
           lastEvidenceAt: "2026-08-25T07:00:00Z",
           conditions: {
             price: {
@@ -59,7 +59,7 @@ function completedResult(): HistoricalValidation {
               },
             },
           },
-          missingData: [],
+          pendingData: {},
           unavailableData: {},
         },
       },
