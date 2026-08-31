@@ -1,12 +1,12 @@
 //! The Hyperliquid WebSocket adapter: one session streaming prices and candles.
 //!
-//! Subscribes to `allMids` + `fastAssetCtxs` (prices) and, once the universe is
-//! known, `candle` streams for the configured timeframes. Prices publish as
+//! Subscribes to `allMids` + `fastAssetCtxs` (prices) and reconciles `candle`
+//! streams with the current universe for the configured timeframes. Prices publish as
 //! [`MarketEvent::Mid`] and candles as [`MarketEvent::Candle`] onto the shared
 //! [`MarketFeed`]; candles are also merged into the [`MarketStore`] for reads.
 //! Reconnects with exponential backoff, re-subscribing each session.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -36,6 +36,9 @@ const RECONNECT_MAX: Duration = Duration::from_secs(30);
 /// A session at least this old failed on its own, not as part of a failure streak.
 const STABLE_SESSION: Duration = Duration::from_secs(60);
 const UNIVERSE_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+const WS_SUBSCRIPTION_LIMIT: usize = 1_000;
+const BASE_SUBSCRIPTIONS: [Subscription; 2] = [Subscription::AllMids, Subscription::FastAssetCtxs];
+const BASE_SUBSCRIPTION_COUNT: usize = BASE_SUBSCRIPTIONS.len();
 
 /// Streams live Hyperliquid market data (prices + candles) into a shared
 /// [`MarketFeed`] and [`MarketStore`]. Construct, take a [`feed`](Self::feed) to
@@ -92,6 +95,7 @@ async fn ws_loop(feed: MarketFeed, store: Arc<MarketStore>, intervals: Vec<Timef
         let started = Instant::now();
         let result = run_session(&feed, &store, &intervals).await;
         let session_was_live = store.status().connection == ConnectionState::Live;
+        let capacity_exceeded = matches!(&result, Err(FeedError::SubscriptionLimit { .. }));
         match result {
             Ok(()) => backoff = RECONNECT_BASE,
             Err(error) => {
@@ -104,30 +108,52 @@ async fn ws_loop(feed: MarketFeed, store: Arc<MarketStore>, intervals: Vec<Timef
             }
         }
         if session_was_live {
-            store.mark_streamed_for_reconciliation(&intervals);
+            store.mark_streamed_for_verification(&intervals);
         }
+        store.set_streaming(0);
         store.set_connection(ConnectionState::Reconnecting);
-        tokio::time::sleep(backoff).await;
+        if capacity_exceeded {
+            tracing::error!("websocket reconnect paused until subscription capacity is available");
+            wait_for_subscription_capacity(&store, &intervals).await;
+            backoff = RECONNECT_BASE;
+        } else {
+            tokio::time::sleep(backoff).await;
+        }
+    }
+}
+
+async fn wait_for_subscription_capacity(store: &MarketStore, intervals: &[Timeframe]) {
+    loop {
+        let desired = desired_candle_subscriptions(store, intervals);
+        if validate_subscription_capacity(desired.len()).is_ok() {
+            return;
+        }
+        tokio::time::sleep(UNIVERSE_CHECK_INTERVAL).await;
     }
 }
 
 async fn run_session(feed: &MarketFeed, store: &MarketStore, intervals: &[Timeframe]) -> Result<(), FeedError> {
     let (stream, _) = connect_async(WS_URL).await?;
     let (mut write, mut read) = stream.split();
-    store.set_connection(ConnectionState::Live);
-    tracing::info!("websocket connected");
+    let mut candle_subscriptions = BTreeSet::new();
+    let mut desired = desired_candle_subscriptions(store, intervals);
+    let (_, initial_subscriptions) = candle_subscription_changes(&candle_subscriptions, &desired)?;
 
-    for subscription in [Subscription::AllMids, Subscription::FastAssetCtxs] {
-        let subscribe = serde_json::to_string(&Subscribe {
-            method: "subscribe",
-            subscription,
-        })?;
-        write.send(Message::Text(subscribe.into())).await?;
+    for subscription in &BASE_SUBSCRIPTIONS {
+        let payload = subscription_payload(SubscriptionMethod::Subscribe, subscription)?;
+        write.send(Message::Text(payload.into())).await?;
     }
+    for subscription in &initial_subscriptions {
+        let payload = subscription_payload(SubscriptionMethod::Subscribe, subscription)?;
+        write.send(Message::Text(payload.into())).await?;
+    }
+    candle_subscriptions = desired;
+    store.set_streaming(candle_subscriptions.len());
+    store.set_connection(ConnectionState::Live);
+    tracing::info!(streams = candle_subscriptions.len(), "websocket connected");
 
     let mut ping = tokio::time::interval(PING_INTERVAL);
     let mut universe_check = tokio::time::interval(UNIVERSE_CHECK_INTERVAL);
-    let mut candles_subscribed = false;
 
     loop {
         tokio::select! {
@@ -144,27 +170,69 @@ async fn run_session(feed: &MarketFeed, store: &MarketStore, intervals: &[Timefr
                 let ping = serde_json::json!({ "method": "ping" }).to_string();
                 write.send(Message::Text(ping.into())).await?;
             }
-            _ = universe_check.tick(), if !candles_subscribed => {
-                let coins = store.universe();
-                if !coins.is_empty() {
-                    for coin in &coins {
-                        for &interval in intervals {
-                            let subscription = Subscription::Candle {
-                                coin: coin.coin.clone(),
-                                interval: interval.as_hl().to_owned(),
-                            };
-                            let subscribe = serde_json::to_string(&Subscribe { method: "subscribe", subscription })?;
-                            write.send(Message::Text(subscribe.into())).await?;
-                        }
-                    }
-                    let streams = coins.len().saturating_mul(intervals.len());
-                    candles_subscribed = true;
-                    store.set_streaming(streams);
-                    tracing::debug!(streams, "subscribed candle streams");
+            _ = universe_check.tick() => {
+                desired = desired_candle_subscriptions(store, intervals);
+                let (removed, added) = candle_subscription_changes(&candle_subscriptions, &desired)?;
+                if removed.is_empty() && added.is_empty() {
+                    continue;
                 }
+                for subscription in &removed {
+                    let payload = subscription_payload(SubscriptionMethod::Unsubscribe, subscription)?;
+                    write.send(Message::Text(payload.into())).await?;
+                }
+                for subscription in &added {
+                    let payload = subscription_payload(SubscriptionMethod::Subscribe, subscription)?;
+                    write.send(Message::Text(payload.into())).await?;
+                }
+                candle_subscriptions = desired;
+                store.set_streaming(candle_subscriptions.len());
+                tracing::debug!(
+                    added = added.len(),
+                    removed = removed.len(),
+                    streams = candle_subscriptions.len(),
+                    "reconciled candle streams"
+                );
             }
         }
     }
+}
+
+fn desired_candle_subscriptions(store: &MarketStore, intervals: &[Timeframe]) -> BTreeSet<Subscription> {
+    store
+        .universe()
+        .into_iter()
+        .flat_map(|coin| {
+            intervals.iter().map(move |interval| Subscription::Candle {
+                coin: coin.coin.clone(),
+                interval: interval.as_hl().to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn candle_subscription_changes(
+    current: &BTreeSet<Subscription>,
+    desired: &BTreeSet<Subscription>,
+) -> Result<(Vec<Subscription>, Vec<Subscription>), FeedError> {
+    validate_subscription_capacity(desired.len())?;
+    let removed = current.difference(desired).cloned().collect();
+    let added = desired.difference(current).cloned().collect();
+    Ok((removed, added))
+}
+
+const fn validate_subscription_capacity(candle_subscriptions: usize) -> Result<(), FeedError> {
+    let requested = candle_subscriptions.saturating_add(BASE_SUBSCRIPTION_COUNT);
+    if requested > WS_SUBSCRIPTION_LIMIT {
+        return Err(FeedError::SubscriptionLimit {
+            requested,
+            limit: WS_SUBSCRIPTION_LIMIT,
+        });
+    }
+    Ok(())
+}
+
+fn subscription_payload(method: SubscriptionMethod, subscription: &Subscription) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&SubscriptionRequest { method, subscription })
 }
 
 fn publish_frame(text: &str, feed: &MarketFeed, store: &MarketStore) {
@@ -243,12 +311,19 @@ fn decode_fast_asset_ctxs(data: &str) -> Option<HashMap<String, FastPrices>> {
 }
 
 #[derive(Serialize)]
-struct Subscribe {
-    method: &'static str,
-    subscription: Subscription,
+struct SubscriptionRequest<'a> {
+    method: SubscriptionMethod,
+    subscription: &'a Subscription,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum SubscriptionMethod {
+    Subscribe,
+    Unsubscribe,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum Subscription {
     AllMids,
@@ -298,7 +373,39 @@ struct WsCandle {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_fast_asset_ctxs;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    use domain::Timeframe;
+
+    use super::{
+        BASE_SUBSCRIPTION_COUNT, Subscription, SubscriptionMethod, UNIVERSE_CHECK_INTERVAL, WS_SUBSCRIPTION_LIMIT,
+        candle_subscription_changes, decode_fast_asset_ctxs, subscription_payload, validate_subscription_capacity,
+        wait_for_subscription_capacity,
+    };
+    use crate::error::FeedError;
+    use crate::{MarketStore, UniverseCoin};
+
+    fn candle_subscription(coin: &str, timeframe: Timeframe) -> Subscription {
+        Subscription::Candle {
+            coin: coin.to_owned(),
+            interval: timeframe.as_hl().to_owned(),
+        }
+    }
+
+    fn universe(count: usize) -> Vec<UniverseCoin> {
+        (0..count)
+            .map(|index| UniverseCoin {
+                coin: format!("COIN{index}"),
+                day_volume_usd: 0.0,
+                mark_px: None,
+                price_decimals: 0,
+                prev_day_px: None,
+                funding: None,
+                open_interest: None,
+            })
+            .collect()
+    }
 
     #[test]
     fn decodes_fast_asset_ctxs_frame() {
@@ -309,5 +416,93 @@ mod tests {
         assert_eq!(btc.mid_px.as_deref(), Some("65339.5"));
         let doge = prices.get("DOGE").expect("DOGE present");
         assert!(doge.mark_px.is_none() && doge.mid_px.is_none());
+    }
+
+    #[test]
+    fn candle_subscription_changes_follow_universe_additions_and_removals() {
+        let current = BTreeSet::from([
+            candle_subscription("BTC", Timeframe::Hour1),
+            candle_subscription("ETH", Timeframe::Hour1),
+        ]);
+        let desired = BTreeSet::from([
+            candle_subscription("ETH", Timeframe::Hour1),
+            candle_subscription("SOL", Timeframe::Hour1),
+        ]);
+
+        let (removed, added) = candle_subscription_changes(&current, &desired).expect("capacity available");
+
+        assert_eq!(removed, vec![candle_subscription("BTC", Timeframe::Hour1)]);
+        assert_eq!(added, vec![candle_subscription("SOL", Timeframe::Hour1)]);
+    }
+
+    #[test]
+    fn a_new_session_resubscribes_the_complete_desired_set() {
+        let desired = BTreeSet::from([
+            candle_subscription("BTC", Timeframe::Hour1),
+            candle_subscription("BTC", Timeframe::Hour4),
+        ]);
+
+        let (removed, first_session) =
+            candle_subscription_changes(&BTreeSet::new(), &desired).expect("capacity available");
+        let (_, reconnected_session) =
+            candle_subscription_changes(&BTreeSet::new(), &desired).expect("capacity available");
+
+        assert!(removed.is_empty());
+        assert_eq!(first_session, desired.iter().cloned().collect::<Vec<_>>());
+        assert_eq!(reconnected_session, first_session);
+    }
+
+    #[test]
+    fn subscription_capacity_is_rejected_before_building_requests() {
+        let candle_capacity = WS_SUBSCRIPTION_LIMIT - BASE_SUBSCRIPTION_COUNT;
+        assert!(validate_subscription_capacity(candle_capacity).is_ok());
+        let desired: BTreeSet<Subscription> = (0..=candle_capacity)
+            .map(|index| candle_subscription(&format!("COIN{index}"), Timeframe::Hour1))
+            .collect();
+
+        let error = candle_subscription_changes(&BTreeSet::new(), &desired)
+            .expect_err("capacity must be enforced before returning additions");
+
+        assert!(matches!(
+            error,
+            FeedError::SubscriptionLimit {
+                requested,
+                limit: WS_SUBSCRIPTION_LIMIT,
+            } if requested == WS_SUBSCRIPTION_LIMIT + 1
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capacity_pause_resumes_after_the_universe_fits() {
+        let candle_capacity = WS_SUBSCRIPTION_LIMIT - BASE_SUBSCRIPTION_COUNT;
+        let store = MarketStore::new();
+        store.set_universe(universe(candle_capacity + 1));
+        let wait_store = Arc::clone(&store);
+        let waiting = tokio::spawn(async move {
+            wait_for_subscription_capacity(&wait_store, &[Timeframe::Hour1]).await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+
+        store.set_universe(universe(candle_capacity));
+        tokio::time::advance(UNIVERSE_CHECK_INTERVAL).await;
+
+        waiting.await.expect("capacity wait task completes");
+    }
+
+    #[test]
+    fn unsubscribe_payload_matches_the_original_subscription() {
+        let subscription = candle_subscription("BTC", Timeframe::Hour1);
+        let payload =
+            subscription_payload(SubscriptionMethod::Unsubscribe, &subscription).expect("serializable subscription");
+        let value: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "method": "unsubscribe",
+                "subscription": { "type": "candle", "coin": "BTC", "interval": "1h" }
+            })
+        );
     }
 }

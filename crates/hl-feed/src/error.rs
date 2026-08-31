@@ -24,6 +24,14 @@ pub enum FeedError {
     /// A requested candle range cannot be represented in epoch milliseconds.
     #[error("candle request range is outside the supported timestamp range")]
     CandleRange,
+    /// Desired WebSocket subscriptions exceed Hyperliquid's per-IP capacity.
+    #[error("websocket subscription limit exceeded: requested {requested}, limit {limit}")]
+    SubscriptionLimit {
+        /// Total base and candle subscriptions requested.
+        requested: usize,
+        /// Hyperliquid's maximum subscriptions per IP.
+        limit: usize,
+    },
 }
 
 impl From<tungstenite::Error> for FeedError {
