@@ -9,6 +9,7 @@ import type {
   SignalDirection,
   SignalNode,
 } from "$lib/signals/definition"
+import { canonicalPredicate } from "$lib/signals/predicate-shape"
 
 export type FlatMatch = "all" | "any"
 
@@ -71,27 +72,28 @@ function copyOperand(operand: Operand): Operand {
 }
 
 function copyPredicate(predicate: Predicate): Predicate {
-  switch (predicate.type) {
+  const canonical = canonicalPredicate(predicate)
+  switch (canonical.type) {
     case "threshold":
       return {
         type: "threshold",
-        left: copyOperand(predicate.left),
-        op: predicate.op,
-        right: copyOperand(predicate.right),
+        left: copyOperand(canonical.left),
+        op: canonical.op,
+        right: copyOperand(canonical.right),
       }
     case "cross":
       return {
         type: "cross",
-        left: copyOperand(predicate.left),
-        right: copyOperand(predicate.right),
-        direction: predicate.direction,
+        left: copyOperand(canonical.left),
+        right: copyOperand(canonical.right),
+        direction: canonical.direction,
       }
     case "divergence":
       return {
         type: "divergence",
-        instance: copyInstance(predicate.instance),
-        kind: predicate.kind,
-        direction: predicate.direction,
+        instance: copyInstance(canonical.instance),
+        kind: canonical.kind,
+        direction: canonical.direction,
       }
   }
 }

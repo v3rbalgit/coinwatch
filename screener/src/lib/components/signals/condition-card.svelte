@@ -29,12 +29,15 @@
     { value: "divergence", label: "Divergence" },
   ]
   const comparisonOps: readonly { value: ComparisonOp; label: string }[] = [
-    { value: "lessThan", label: "<" },
-    { value: "lessOrEqual", label: "≤" },
-    { value: "greaterThan", label: ">" },
-    { value: "greaterOrEqual", label: "≥" },
+    { value: "lessThan", label: "is below" },
+    { value: "lessOrEqual", label: "is at or below" },
+    { value: "greaterThan", label: "is above" },
+    { value: "greaterOrEqual", label: "is at or above" },
   ]
-  const crossDirections: readonly CrossDirection[] = ["over", "under"]
+  const crossDirections: readonly { value: CrossDirection; label: string }[] = [
+    { value: "over", label: "crosses above" },
+    { value: "under", label: "crosses below" },
+  ]
   const divergenceKinds: readonly DivergenceKindFilter[] = ["any", "regular", "hidden"]
   const divergenceDirections: readonly DivergenceDirectionFilter[] = ["any", "bullish", "bearish"]
 
@@ -98,7 +101,7 @@
 
   function changeCrossDirection(value: string) {
     if (condition.predicate.type !== "cross") return
-    const next = crossDirections.find(candidate => candidate === value)
+    const next = crossDirections.find(candidate => candidate.value === value)?.value
     if (next !== undefined) replacePredicate({ ...condition.predicate, direction: next })
   }
 
@@ -216,14 +219,15 @@
 
   <div class="p-4">
     {#if condition.predicate.type === "threshold"}
-      <div class="grid items-start gap-3 xl:grid-cols-[minmax(0,1fr)_6rem_minmax(0,1fr)]">
+      <div class="grid items-start gap-3 xl:grid-cols-[minmax(0,1fr)_10rem_minmax(0,1fr)]">
         <OperandEditor
           operand={condition.predicate.left}
           requiredDomain={operandDomain(condition.predicate.right, descriptors)}
           {descriptors}
           {presets}
           {busy}
-          label="Left source"
+          label="Subject"
+          allowConstant={false}
           onChange={(left: Operand) =>
             condition.predicate.type === "threshold" && replacePredicate({ ...condition.predicate, left })}
           {onCreatePreset}
@@ -231,7 +235,7 @@
           {onDeletePreset}
         />
         <label class="space-y-1 text-xs text-muted-foreground">
-          <span>Operator</span>
+          <span>Relationship</span>
           <Select value={condition.predicate.op} onValueChange={changeComparison} disabled={busy}>
             {#each comparisonOps as operator (operator.value)}
               <option value={operator.value}>{operator.label}</option>
@@ -244,7 +248,7 @@
           {descriptors}
           {presets}
           {busy}
-          label="Right source"
+          label="Reference"
           onChange={(right: Operand) =>
             condition.predicate.type === "threshold" && replacePredicate({ ...condition.predicate, right })}
           {onCreatePreset}
@@ -288,14 +292,15 @@
         </div>
       </details>
     {:else if condition.predicate.type === "cross"}
-      <div class="grid items-start gap-3 xl:grid-cols-[minmax(0,1fr)_7rem_minmax(0,1fr)]">
+      <div class="grid items-start gap-3 xl:grid-cols-[minmax(0,1fr)_10rem_minmax(0,1fr)]">
         <OperandEditor
           operand={condition.predicate.left}
           requiredDomain={operandDomain(condition.predicate.right, descriptors)}
           {descriptors}
           {presets}
           {busy}
-          label="Crossing source"
+          label="Subject"
+          allowConstant={false}
           onChange={(left: Operand) =>
             condition.predicate.type === "cross" && replacePredicate({ ...condition.predicate, left })}
           {onCreatePreset}
@@ -303,10 +308,10 @@
           {onDeletePreset}
         />
         <label class="space-y-1 text-xs text-muted-foreground">
-          <span>Direction</span>
+          <span>Relationship</span>
           <Select value={condition.predicate.direction} onValueChange={changeCrossDirection} disabled={busy}>
-            {#each crossDirections as crossDirection (crossDirection)}
-              <option value={crossDirection}>{crossDirection}</option>
+            {#each crossDirections as crossDirection (crossDirection.value)}
+              <option value={crossDirection.value}>{crossDirection.label}</option>
             {/each}
           </Select>
         </label>
@@ -316,7 +321,7 @@
           {descriptors}
           {presets}
           {busy}
-          label="Reference source"
+          label="Reference"
           onChange={(right: Operand) =>
             condition.predicate.type === "cross" && replacePredicate({ ...condition.predicate, right })}
           {onCreatePreset}

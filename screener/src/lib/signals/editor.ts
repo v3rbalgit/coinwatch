@@ -8,11 +8,12 @@ import type { SignalDraft } from "$lib/signals/draft"
 import { createIndicatorInstance } from "$lib/signals/instances"
 import type { IndicatorPresetError } from "$lib/signals/presets"
 import { isIndicatorPresetError } from "$lib/signals/presets"
+import type { OperandType } from "$lib/signals/source-catalog"
 
 export type ReadySignalCatalogEntry = Extract<SignalCatalogEntry, { status: "ready" }>
 export type UnavailableSignalCatalogEntry = Extract<SignalCatalogEntry, { status: "unavailable" }>
-export type OperandType = Operand["type"]
 export type PredicateType = Predicate["type"]
+export type { OperandType } from "$lib/signals/source-catalog"
 
 export type SignalEditorSession =
   | { type: "empty" }

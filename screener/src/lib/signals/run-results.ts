@@ -1,5 +1,5 @@
 import type { IndicatorDescriptor } from "$lib/chart/indicators"
-import type { SignalDefinition, SignalNode } from "$lib/signals/definition"
+import type { Condition, SignalDefinition, SignalNode } from "$lib/signals/definition"
 import { conditionLabel, directConditionIds } from "$lib/signals/format"
 import type { ConditionOutcome, EvalReport } from "$lib/signals/run"
 
@@ -7,6 +7,7 @@ export type SignalRunResultFilter = "matches" | "closest" | "all" | "issues"
 
 export interface SignalRunConditionEvidence {
   id: string
+  condition: Condition | null
   label: string
   outcome: ConditionOutcome | null
 }
@@ -44,11 +45,15 @@ export function conditionEvidence(
   report: EvalReport,
   descriptors: readonly IndicatorDescriptor[]
 ): SignalRunConditionEvidence[] {
-  return orderedConditionIds(definition).map(id => ({
-    id,
-    label: conditionLabel(definition.conditions[id], descriptors),
-    outcome: report.conditions[id] ?? null,
-  }))
+  return orderedConditionIds(definition).map(id => {
+    const condition = definition.conditions[id] ?? null
+    return {
+      id,
+      condition,
+      label: condition === null ? `Missing condition ${id}` : conditionLabel(condition, descriptors),
+      outcome: report.conditions[id] ?? null,
+    }
+  })
 }
 
 export function reportHasDataIssues(report: EvalReport): boolean {

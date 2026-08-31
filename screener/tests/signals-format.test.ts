@@ -1,15 +1,17 @@
 import { describe, expect, it } from "vitest"
 
 import type { IndicatorDescriptor } from "$lib/chart/indicators"
-import type { SignalDefinition } from "$lib/signals/definition"
+import type { Predicate, SignalDefinition } from "$lib/signals/definition"
 import {
   conditionLabel,
   conditionSentence,
+  crossEvidenceLabel,
   definitionLines,
   definitionPreview,
   operandLabel,
   predicateLabel,
   recencyDurationLabel,
+  thresholdEvidenceLabel,
 } from "$lib/signals/format"
 
 const descriptors: IndicatorDescriptor[] = [
@@ -24,6 +26,18 @@ const descriptors: IndicatorDescriptor[] = [
     outputs: [{ key: "ema", label: "EMA", kind: "line", color: "#fff" }],
     guides: [],
     range: null,
+  },
+  {
+    id: "rsi",
+    label: "RSI",
+    kind: "series",
+    outputDomain: "boundedOscillator",
+    supportsSignals: true,
+    target: "pane",
+    params: [{ key: "period", label: "Period", default: 14, min: 1, max: 500, step: 1 }],
+    outputs: [{ key: "rsi", label: "RSI", kind: "line", color: "#fff" }],
+    guides: [30, 70],
+    range: [0, 100],
   },
   {
     id: "rsiDivergence",
@@ -63,6 +77,35 @@ describe("signal definition labels", () => {
         descriptors
       )
     ).toBe("Close +5 ≥ 100")
+    const constantFirstRsi: Extract<Predicate, { type: "threshold" }> = {
+      type: "threshold",
+      left: { type: "constant", value: 30 },
+      op: "lessThan",
+      right: {
+        type: "indicator",
+        instance: { id: "rsi", params: { period: 14 } },
+        output: "rsi",
+      },
+    }
+    expect(predicateLabel(constantFirstRsi, descriptors)).toBe("RSI (Period 14) > 30")
+    expect(thresholdEvidenceLabel(constantFirstRsi, 30, 54.2711, descriptors)).toBe(
+      "Observed RSI (Period 14): 54.2711 · Threshold: 30"
+    )
+    expect(
+      crossEvidenceLabel(
+        {
+          type: "cross",
+          left: { type: "constant", value: 50 },
+          right: { type: "field", field: "close" },
+          direction: "under",
+        },
+        50,
+        49,
+        50,
+        51,
+        descriptors
+      )
+    ).toBe("Previous Close: 49 · Threshold: 50 → current Close: 51 · Threshold: 50")
     expect(
       conditionLabel(
         {
@@ -124,7 +167,7 @@ describe("signal definition labels", () => {
       { depth: 2, label: "1h · Close > 100 · latest completed candle" },
       {
         depth: 2,
-        label: "4h · Close crosses over 90 · confirmed up to 1 completed bar ago (~4 hours)",
+        label: "4h · Close crosses above 90 · confirmed up to 1 completed bar ago (~4 hours)",
       },
     ])
   })
@@ -165,7 +208,7 @@ describe("signal definition labels", () => {
 
     expect(conditionSentence(state, descriptors)).toBe("Latest completed 1h candle: Close is below 100.")
     expect(conditionSentence(event, descriptors)).toBe(
-      "On 4h candles: Close crossed over EMA (Period 20) no more than 3 completed bars ago (~12 hours)."
+      "On 4h candles: Close crossed above EMA (Period 20) no more than 3 completed bars ago (~12 hours)."
     )
     expect(definitionPreview(definition, descriptors)).toEqual({
       heading: "Require all conditions:",

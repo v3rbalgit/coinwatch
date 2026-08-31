@@ -126,6 +126,41 @@ describe("flat signal drafts", () => {
     })
   })
 
+  it("imports constant-first predicates in source-first form without changing their meaning", () => {
+    const definition: SignalDefinition = {
+      version: 3,
+      direction: "bullish",
+      root: { type: "condition", id: "rsi" },
+      conditions: {
+        rsi: {
+          timeframe: "1h",
+          predicate: {
+            type: "threshold",
+            left: { type: "constant", value: 30 },
+            op: "lessThan",
+            right: { type: "indicator", instance: { id: "rsi", params: { period: 14 } }, output: "rsi" },
+          },
+          withinBars: 0,
+        },
+      },
+    }
+
+    const restored = definitionToSignalDraft(definition)
+    expect(restored?.conditions[0]?.predicate).toEqual({
+      type: "threshold",
+      left: { type: "indicator", instance: { id: "rsi", params: { period: 14 } }, output: "rsi" },
+      op: "greaterThan",
+      right: { type: "constant", value: 30 },
+    })
+    if (restored === null) throw new Error("expected flat definition")
+    const compiled = compileSignalDraft(restored)
+    expect(compiled.conditions.rsi).toEqual({
+      timeframe: "1h",
+      predicate: restored.conditions[0]?.predicate,
+      withinBars: 0,
+    })
+  })
+
   it("rejects empty and duplicate condition IDs before IPC", () => {
     expect(() => compileSignalDraft({ direction: "bullish", match: "all", conditions: [] })).toThrow(
       "at least one condition"

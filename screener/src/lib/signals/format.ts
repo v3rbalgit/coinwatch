@@ -7,6 +7,7 @@ import type {
   SignalDefinition,
   SignalNode,
 } from "$lib/signals/definition"
+import { crossShape, presentationValues, thresholdShape } from "$lib/signals/predicate-shape"
 import { TIMEFRAME_HOURS } from "$lib/timeframes"
 
 export interface DefinitionLine {
@@ -64,30 +65,48 @@ export function operandLabel(operand: Operand, descriptors: readonly IndicatorDe
   }
 }
 
-function comparisonSymbol(predicate: Extract<Predicate, { type: "threshold" }>): string {
+function comparisonSymbol(op: Extract<Predicate, { type: "threshold" }>["op"]): string {
   return {
     lessThan: "<",
     lessOrEqual: "≤",
     greaterThan: ">",
     greaterOrEqual: "≥",
-  }[predicate.op]
+  }[op]
 }
 
-function comparisonPhrase(predicate: Extract<Predicate, { type: "threshold" }>): string {
+function comparisonPhrase(op: Extract<Predicate, { type: "threshold" }>["op"]): string {
   return {
     lessThan: "is below",
     lessOrEqual: "is at or below",
     greaterThan: "is above",
     greaterOrEqual: "is at or above",
-  }[predicate.op]
+  }[op]
+}
+
+function crossPhrase(direction: Extract<Predicate, { type: "cross" }>["direction"]): string {
+  return direction === "over" ? "crosses above" : "crosses below"
+}
+
+function crossedPhrase(direction: Extract<Predicate, { type: "cross" }>["direction"]): string {
+  return direction === "over" ? "crossed above" : "crossed below"
 }
 
 export function predicateLabel(predicate: Predicate, descriptors: readonly IndicatorDescriptor[]): string {
   switch (predicate.type) {
-    case "threshold":
-      return `${operandLabel(predicate.left, descriptors)} ${comparisonSymbol(predicate)} ${operandLabel(predicate.right, descriptors)}`
-    case "cross":
-      return `${operandLabel(predicate.left, descriptors)} crosses ${predicate.direction} ${operandLabel(predicate.right, descriptors)}`
+    case "threshold": {
+      const shape = thresholdShape(predicate)
+      if (shape === null) {
+        return `${operandLabel(predicate.left, descriptors)} ${comparisonSymbol(predicate.op)} ${operandLabel(predicate.right, descriptors)}`
+      }
+      return `${operandLabel(shape.subject, descriptors)} ${comparisonSymbol(shape.op)} ${operandLabel(shape.reference, descriptors)}`
+    }
+    case "cross": {
+      const shape = crossShape(predicate)
+      if (shape === null) {
+        return `${operandLabel(predicate.left, descriptors)} ${crossPhrase(predicate.direction)} ${operandLabel(predicate.right, descriptors)}`
+      }
+      return `${operandLabel(shape.subject, descriptors)} ${crossPhrase(shape.direction)} ${operandLabel(shape.reference, descriptors)}`
+    }
     case "divergence": {
       const kind = predicate.kind === "any" ? "Any" : predicate.kind === "regular" ? "Regular" : "Hidden"
       const direction =
@@ -95,6 +114,51 @@ export function predicateLabel(predicate: Predicate, descriptors: readonly Indic
       return `${kind} ${direction} ${instanceLabel(predicate.instance, descriptors)}`
     }
   }
+}
+
+export function formatObservedValue(value: number): string {
+  return Number(value.toPrecision(6)).toLocaleString(undefined, { maximumSignificantDigits: 6 })
+}
+
+function evidenceOperandLabel(
+  operand: Operand,
+  descriptors: readonly IndicatorDescriptor[],
+  constantLabel: string
+): string {
+  return operand.type === "constant" ? constantLabel : operandLabel(operand, descriptors)
+}
+
+export function thresholdEvidenceLabel(
+  predicate: Extract<Predicate, { type: "threshold" }>,
+  left: number,
+  right: number,
+  descriptors: readonly IndicatorDescriptor[]
+): string {
+  const shape = thresholdShape(predicate)
+  if (shape === null) return `Observed ${formatObservedValue(left)} · ${formatObservedValue(right)}`
+  const values = presentationValues(shape.reversed, left, right)
+  const subject = operandLabel(shape.subject, descriptors)
+  const reference = evidenceOperandLabel(shape.reference, descriptors, "Threshold")
+  return `Observed ${subject}: ${formatObservedValue(values.subject)} · ${reference}: ${formatObservedValue(values.reference)}`
+}
+
+export function crossEvidenceLabel(
+  predicate: Extract<Predicate, { type: "cross" }>,
+  previousLeft: number,
+  previousRight: number,
+  left: number,
+  right: number,
+  descriptors: readonly IndicatorDescriptor[]
+): string {
+  const shape = crossShape(predicate)
+  if (shape === null) {
+    return `Previous ${formatObservedValue(previousLeft)} · ${formatObservedValue(previousRight)} → current ${formatObservedValue(left)} · ${formatObservedValue(right)}`
+  }
+  const previous = presentationValues(shape.reversed, previousLeft, previousRight)
+  const current = presentationValues(shape.reversed, left, right)
+  const subject = operandLabel(shape.subject, descriptors)
+  const reference = evidenceOperandLabel(shape.reference, descriptors, "Threshold")
+  return `Previous ${subject}: ${formatObservedValue(previous.subject)} · ${reference}: ${formatObservedValue(previous.reference)} → current ${subject}: ${formatObservedValue(current.subject)} · ${reference}: ${formatObservedValue(current.reference)}`
 }
 
 export function recencyDurationLabel(timeframe: Condition["timeframe"], bars: number): string {
@@ -123,13 +187,21 @@ export function conditionLabel(condition: Condition, descriptors: readonly Indic
 export function conditionSentence(condition: Condition, descriptors: readonly IndicatorDescriptor[]): string {
   const predicate = condition.predicate
   if (predicate.type === "threshold") {
-    const relationship = `${operandLabel(predicate.left, descriptors)} ${comparisonPhrase(predicate)} ${operandLabel(predicate.right, descriptors)}`
+    const shape = thresholdShape(predicate)
+    const relationship =
+      shape === null
+        ? `${operandLabel(predicate.left, descriptors)} ${comparisonPhrase(predicate.op)} ${operandLabel(predicate.right, descriptors)}`
+        : `${operandLabel(shape.subject, descriptors)} ${comparisonPhrase(shape.op)} ${operandLabel(shape.reference, descriptors)}`
     return condition.withinBars === 0
       ? `Latest completed ${condition.timeframe} candle: ${relationship}.`
       : `On ${condition.timeframe} candles: ${relationship} at least once no more than ${condition.withinBars} completed ${condition.withinBars === 1 ? "bar" : "bars"} ago (~${recencyDurationLabel(condition.timeframe, condition.withinBars)}).`
   }
   if (predicate.type === "cross") {
-    const event = `${operandLabel(predicate.left, descriptors)} crossed ${predicate.direction} ${operandLabel(predicate.right, descriptors)}`
+    const shape = crossShape(predicate)
+    const event =
+      shape === null
+        ? `${operandLabel(predicate.left, descriptors)} ${crossedPhrase(predicate.direction)} ${operandLabel(predicate.right, descriptors)}`
+        : `${operandLabel(shape.subject, descriptors)} ${crossedPhrase(shape.direction)} ${operandLabel(shape.reference, descriptors)}`
     return condition.withinBars === 0
       ? `Latest completed ${condition.timeframe} candle: ${event}.`
       : `On ${condition.timeframe} candles: ${event} no more than ${condition.withinBars} completed ${condition.withinBars === 1 ? "bar" : "bars"} ago (~${recencyDurationLabel(condition.timeframe, condition.withinBars)}).`

@@ -1,7 +1,8 @@
 <script lang="ts">
   import type { IndicatorDescriptor } from "$lib/chart/indicators"
   import { formatTimestamp } from "$lib/format"
-  import type { SignalDefinition } from "$lib/signals/definition"
+  import type { Condition, SignalDefinition } from "$lib/signals/definition"
+  import { crossEvidenceLabel, formatObservedValue, thresholdEvidenceLabel } from "$lib/signals/format"
   import type { ConditionOutcome, EvalReport } from "$lib/signals/run"
   import { conditionEvidence } from "$lib/signals/run-results"
 
@@ -42,17 +43,28 @@
     return "text-amber-500"
   }
 
-  function formatObservedValue(value: number): string {
-    return Number(value.toPrecision(6)).toLocaleString(undefined, { maximumSignificantDigits: 6 })
-  }
-
-  function evidenceLabel(outcome: ConditionOutcome | null): string | null {
+  function evidenceLabel(condition: Condition | null, outcome: ConditionOutcome | null): string | null {
     const evidence = outcome?.evidence
     if (evidence === null || evidence === undefined) return null
     if (evidence.type === "state") {
-      return `Observed ${formatObservedValue(evidence.left)} vs ${formatObservedValue(evidence.right)} · ${formatTimestamp(evidence.observedAt)}`
+      const observed =
+        condition?.predicate.type === "threshold"
+          ? thresholdEvidenceLabel(condition.predicate, evidence.left, evidence.right, descriptors)
+          : `Observed ${formatObservedValue(evidence.left)} · ${formatObservedValue(evidence.right)}`
+      return `${observed} · ${formatTimestamp(evidence.observedAt)}`
     }
-    return `Previous ${formatObservedValue(evidence.previousLeft)} vs ${formatObservedValue(evidence.previousRight)} → current ${formatObservedValue(evidence.left)} vs ${formatObservedValue(evidence.right)} · ${formatTimestamp(evidence.observedAt)}`
+    const observed =
+      condition?.predicate.type === "cross"
+        ? crossEvidenceLabel(
+            condition.predicate,
+            evidence.previousLeft,
+            evidence.previousRight,
+            evidence.left,
+            evidence.right,
+            descriptors
+          )
+        : `Previous ${formatObservedValue(evidence.previousLeft)} · ${formatObservedValue(evidence.previousRight)} → current ${formatObservedValue(evidence.left)} · ${formatObservedValue(evidence.right)}`
+    return `${observed} · ${formatTimestamp(evidence.observedAt)}`
   }
 
   function lastTrueLabel(outcome: ConditionOutcome | null): string | null {
@@ -71,15 +83,15 @@
   <h3 class="text-xs font-medium tracking-wide text-muted-foreground uppercase">Condition outcomes</h3>
 {/if}
 <div class="{heading ? 'mt-2' : ''} divide-y divide-border/60 rounded-md border border-border/70">
-  {#each conditionEvidence(definition, report, descriptors) as condition (condition.id)}
+  {#each conditionEvidence(definition, report, descriptors) as item (item.id)}
     <div class="grid gap-1 px-3 py-2 text-xs lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
-      <span class="text-foreground">{condition.label}</span>
-      <span class={outcomeTone(condition.outcome)}>{outcomeLabel(condition.outcome)}</span>
-      {#if evidenceLabel(condition.outcome) !== null}
-        <span class="text-muted-foreground lg:col-span-2">{evidenceLabel(condition.outcome)}</span>
+      <span class="text-foreground">{item.label}</span>
+      <span class={outcomeTone(item.outcome)}>{outcomeLabel(item.outcome)}</span>
+      {#if evidenceLabel(item.condition, item.outcome) !== null}
+        <span class="text-muted-foreground lg:col-span-2">{evidenceLabel(item.condition, item.outcome)}</span>
       {/if}
-      {#if lastTrueLabel(condition.outcome) !== null}
-        <span class="text-muted-foreground lg:col-span-2">{lastTrueLabel(condition.outcome)}</span>
+      {#if lastTrueLabel(item.outcome) !== null}
+        <span class="text-muted-foreground lg:col-span-2">{lastTrueLabel(item.outcome)}</span>
       {/if}
     </div>
   {/each}

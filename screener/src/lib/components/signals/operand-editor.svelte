@@ -3,23 +3,15 @@
   import IndicatorEditor from "$lib/components/signals/indicator-editor.svelte"
   import NumberField from "$lib/components/ui/number-field.svelte"
   import Select from "$lib/components/ui/select.svelte"
-  import type { CandleField, Operand, OperandAdjustment } from "$lib/signals/definition"
+  import type { Operand, OperandAdjustment } from "$lib/signals/definition"
   import { createDefaultOperand } from "$lib/signals/editor"
-  import type { OperandType } from "$lib/signals/editor"
   import type { IndicatorPresetEntry } from "$lib/signals/presets"
-
-  const operandTypes: readonly { value: OperandType; label: string }[] = [
-    { value: "field", label: "OHLCV field" },
-    { value: "indicator", label: "Indicator" },
-    { value: "constant", label: "Constant" },
-  ]
-  const candleFields: readonly { value: CandleField; label: string; domain: ValueDomain }[] = [
-    { value: "open", label: "Open", domain: "price" },
-    { value: "high", label: "High", domain: "price" },
-    { value: "low", label: "Low", domain: "price" },
-    { value: "close", label: "Close", domain: "price" },
-    { value: "volume", label: "Volume", domain: "volume" },
-  ]
+  import {
+    CANDLE_FIELD_SOURCE_DESCRIPTORS,
+    compatibleSignalIndicators,
+    OPERAND_TYPE_DESCRIPTORS,
+  } from "$lib/signals/source-catalog"
+  import type { OperandType } from "$lib/signals/source-catalog"
 
   const {
     operand,
@@ -28,6 +20,7 @@
     busy = false,
     label,
     requiredDomain = null,
+    allowConstant = true,
     onChange,
     onCreatePreset,
     onUpdatePreset,
@@ -39,26 +32,19 @@
     busy?: boolean
     label: string
     requiredDomain?: ValueDomain | null
+    allowConstant?: boolean
     onChange: (operand: Operand) => void
     onCreatePreset: (indicatorId: string, name: string, params: Record<string, number>) => void
     onUpdatePreset: (id: string, name: string, params: Record<string, number>) => void
     onDeletePreset: (id: string) => void
   } = $props()
 
-  const seriesDescriptors = $derived(
-    descriptors.filter(descriptor => descriptor.kind === "series" && descriptor.supportsSignals)
-  )
   const compatibleSeriesDescriptors = $derived(
-    seriesDescriptors.filter(
-      descriptor =>
-        requiredDomain === null ||
-        descriptor.outputDomain === requiredDomain ||
-        (operand.type === "indicator" && descriptor.id === operand.instance.id)
-    )
+    compatibleSignalIndicators(descriptors, requiredDomain, operand.type === "indicator" ? operand.instance.id : null)
   )
 
   function changeType(value: string) {
-    const type = operandTypes.find(candidate => candidate.value === value)?.value
+    const type = OPERAND_TYPE_DESCRIPTORS.find(candidate => candidate.value === value)?.value
     if (type === "field" && requiredDomain === "volume") {
       onChange({ type: "field", field: "volume" })
     } else if (type !== undefined) {
@@ -67,15 +53,18 @@
   }
 
   function typeUnavailable(type: OperandType): boolean {
+    const descriptor = OPERAND_TYPE_DESCRIPTORS.find(candidate => candidate.value === type)
+    if (!allowConstant && descriptor?.subjectEligible === false) return true
     if (type === "field") {
       return requiredDomain !== null && requiredDomain !== "price" && requiredDomain !== "volume"
     }
-    return type === "indicator" && compatibleSeriesDescriptors.length === 0
+    if (type === "indicator") return compatibleSeriesDescriptors.length === 0
+    return false
   }
 
   function changeField(value: string) {
     if (operand.type !== "field") return
-    const field = candleFields.find(candidate => candidate.value === value)?.value
+    const field = CANDLE_FIELD_SOURCE_DESCRIPTORS.find(candidate => candidate.value === value)?.value
     if (field !== undefined) onChange({ ...operand, field })
   }
 
@@ -108,9 +97,9 @@
   <legend class="px-1 text-xs font-medium tracking-wide text-muted-foreground uppercase">{label}</legend>
 
   <label class="block space-y-1 text-xs text-muted-foreground">
-    <span>Source</span>
+    <span>Type</span>
     <Select value={operand.type} onValueChange={changeType} disabled={busy}>
-      {#each operandTypes as option (option.value)}
+      {#each OPERAND_TYPE_DESCRIPTORS as option (option.value)}
         <option value={option.value} disabled={typeUnavailable(option.value)}>{option.label}</option>
       {/each}
     </Select>
@@ -120,7 +109,7 @@
     <label class="block space-y-1 text-xs text-muted-foreground">
       <span>Field</span>
       <Select value={operand.field} onValueChange={changeField} disabled={busy}>
-        {#each candleFields as field (field.value)}
+        {#each CANDLE_FIELD_SOURCE_DESCRIPTORS as field (field.value)}
           <option value={field.value} disabled={requiredDomain !== null && field.domain !== requiredDomain}>
             {field.label}
           </option>
