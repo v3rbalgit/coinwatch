@@ -296,6 +296,9 @@ async fn execute_fetch(
     else {
         return true;
     };
+    // A planned fetch means the current chart snapshot is reduced-trust even
+    // before REST completes; reconciliation emits a second update on change.
+    store.notify_candle_update(&coin, timeframe);
     match rest.recent_candles(&coin, timeframe, limit).await {
         Ok(candles) if candles.is_empty() => {
             tracing::warn!(coin = %coin, timeframe = timeframe.as_hl(), "candle fetch returned no rows");
