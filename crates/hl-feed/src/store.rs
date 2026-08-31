@@ -1,5 +1,6 @@
 //! In-memory hot cache of live Hyperliquid market state.
 
+use std::collections::HashSet;
 use std::sync::{Arc, PoisonError, RwLock};
 
 use chrono::{DateTime, Utc};
@@ -36,6 +37,18 @@ pub enum SyncPhase {
     Live,
 }
 
+/// Durability of the SQLite store backing history and user-authored data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageMode {
+    /// The application has not finished opening storage yet.
+    Initializing,
+    /// Data is backed by the normal on-disk database.
+    Persistent,
+    /// The on-disk database failed to open and this session uses an in-memory fallback.
+    Temporary,
+}
+
 /// A granular snapshot of what the market engine is doing, surfaced in the UI.
 /// Serialized field names are the frontend `status` event contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -56,6 +69,16 @@ pub struct MarketStatus {
     pub streaming: usize,
     /// Recent candle-fetch rate, in fetches per minute.
     pub fetch_rate: u32,
+    /// Whether storage is durable or limited to this process.
+    pub storage_mode: StorageMode,
+    /// Storage failures observed during this process.
+    pub storage_failures: u64,
+    /// Most recent unresolved storage failure.
+    pub last_storage_error: Option<String>,
+    /// Universe or candle-reconciliation failures observed during this process.
+    pub reconciliation_failures: u64,
+    /// Most recent unresolved universe or candle-reconciliation failure.
+    pub last_reconciliation_error: Option<String>,
 }
 
 impl Default for MarketStatus {
@@ -69,6 +92,11 @@ impl Default for MarketStatus {
             backfill_errors: 0,
             streaming: 0,
             fetch_rate: 0,
+            storage_mode: StorageMode::Initializing,
+            storage_failures: 0,
+            last_storage_error: None,
+            reconciliation_failures: 0,
+            last_reconciliation_error: None,
         }
     }
 }
@@ -360,6 +388,8 @@ impl MarketStore {
 
     /// Set (or clear) the coin whose live candles are forwarded to the UI.
     pub fn set_active_coin(&self, coin: Option<String>) {
+        let universe = self.universe.read().unwrap_or_else(PoisonError::into_inner);
+        let coin = coin.filter(|coin| universe.is_empty() || universe.iter().any(|market| market.coin == *coin));
         *self.active_coin.write().unwrap_or_else(PoisonError::into_inner) = coin;
     }
 
@@ -529,6 +559,18 @@ impl MarketStore {
         true
     }
 
+    /// Merge a streamed candle only while its market belongs to the current universe.
+    /// Holding the universe read lock through the write prevents a late frame from
+    /// recreating a buffer while a universe refresh evicts it.
+    pub(crate) fn merge_active_candle(&self, coin: &str, timeframe: Timeframe, candle: Candle) -> bool {
+        let universe = self.universe.read().unwrap_or_else(PoisonError::into_inner);
+        if !universe.iter().any(|market| market.coin == coin) {
+            return false;
+        }
+        self.merge_candle(coin, timeframe, candle);
+        true
+    }
+
     /// Merge a streamed candle: update the forming bar in place when its open time
     /// matches the last cached bar, replace a just-closed bar whose final update
     /// arrived late, otherwise append it and retain any gap marker until REST
@@ -623,10 +665,24 @@ impl MarketStore {
         }
     }
 
-    /// Replace the cached universe and its status count together.
+    /// Replace the cached universe, evict inactive hot series, and update its status count.
+    /// Persisted candles intentionally remain available for history and relisting.
     pub(crate) fn set_universe(&self, universe: Vec<UniverseCoin>) {
+        let active: HashSet<String> = universe.iter().map(|market| market.coin.clone()).collect();
         let count = universe.len();
-        *self.universe.write().unwrap_or_else(PoisonError::into_inner) = universe;
+        let mut current = self.universe.write().unwrap_or_else(PoisonError::into_inner);
+        *current = universe;
+        self.candles.retain(|(coin, _), _| active.contains(coin));
+        if self
+            .active_coin
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|coin| !active.contains(coin))
+        {
+            *self.active_coin.write().unwrap_or_else(PoisonError::into_inner) = None;
+        }
+        drop(current);
         self.status.send_modify(|status| status.universe = count);
     }
 
@@ -654,6 +710,38 @@ impl MarketStore {
             status.fetch_rate = fetch_rate;
         });
     }
+
+    /// Record whether this process is using durable or temporary storage.
+    pub fn set_storage_mode(&self, mode: StorageMode, error: Option<String>) {
+        self.status.send_modify(|status| {
+            status.storage_mode = mode;
+            status.last_storage_error = error;
+            if status.last_storage_error.is_some() {
+                status.storage_failures = status.storage_failures.saturating_add(1);
+            }
+        });
+    }
+
+    /// Record a failed storage operation without changing its durability mode.
+    pub(crate) fn record_storage_failure(&self, error: impl Into<String>) {
+        self.status.send_modify(|status| {
+            status.storage_failures = status.storage_failures.saturating_add(1);
+            status.last_storage_error = Some(error.into());
+        });
+    }
+
+    /// Record a failed universe or candle reconciliation for diagnostics and UI state.
+    pub(crate) fn record_reconciliation_failure(&self, error: impl Into<String>) {
+        self.status.send_modify(|status| {
+            status.reconciliation_failures = status.reconciliation_failures.saturating_add(1);
+            status.last_reconciliation_error = Some(error.into());
+        });
+    }
+
+    /// Clear the current reconciliation failure after a successful retry cycle begins.
+    pub(crate) fn clear_reconciliation_error(&self) {
+        self.status.send_modify(|status| status.last_reconciliation_error = None);
+    }
 }
 
 #[cfg(test)]
@@ -664,7 +752,8 @@ mod tests {
     use domain::{Candle, Timeframe, completed_prefix_len};
     use rust_decimal::Decimal;
 
-    use super::{CANDLE_WINDOW, CandleHealth, CandleIntegrity, MarketStore, ReconcileMode};
+    use super::{CANDLE_WINDOW, CandleHealth, CandleIntegrity, MarketStore, ReconcileMode, StorageMode};
+    use crate::UniverseCoin;
 
     fn candle(hour: i64) -> Candle {
         Candle {
@@ -675,6 +764,66 @@ mod tests {
             close: Decimal::ONE,
             volume: Decimal::ZERO,
         }
+    }
+
+    fn market(coin: &str) -> UniverseCoin {
+        UniverseCoin {
+            coin: coin.to_owned(),
+            day_volume_usd: 0.0,
+            mark_px: None,
+            price_decimals: 0,
+            prev_day_px: None,
+            funding: None,
+            open_interest: None,
+        }
+    }
+
+    #[test]
+    fn universe_changes_evict_inactive_hot_series_and_late_stream_frames() {
+        let store = MarketStore::new();
+        store.set_universe(vec![market("BTC"), market("ETH")]);
+        store.set_candles("BTC".to_owned(), Timeframe::Hour1, vec![candle(0)]);
+        store.set_candles("ETH".to_owned(), Timeframe::Hour1, vec![candle(0)]);
+        store.set_active_coin(Some("ETH".to_owned()));
+
+        store.set_universe(vec![market("BTC")]);
+
+        assert!(store.candles("BTC", Timeframe::Hour1).is_some());
+        assert!(store.candles("ETH", Timeframe::Hour1).is_none());
+        assert!(store.active_coin().is_none());
+        assert_eq!(store.status().universe, 1);
+        store.set_active_coin(Some("ETH".to_owned()));
+        assert!(store.active_coin().is_none());
+        assert!(!store.merge_active_candle("ETH", Timeframe::Hour1, candle(1)));
+        assert!(store.candles("ETH", Timeframe::Hour1).is_none());
+    }
+
+    #[test]
+    fn status_retains_failure_diagnostics_for_the_session() {
+        let store = MarketStore::new();
+        assert_eq!(store.status().storage_mode, StorageMode::Initializing);
+
+        store.set_storage_mode(StorageMode::Temporary, Some("disk unavailable".to_owned()));
+        let temporary = store.status();
+        assert_eq!(temporary.storage_mode, StorageMode::Temporary);
+        assert_eq!(temporary.storage_failures, 1);
+        assert_eq!(temporary.last_storage_error.as_deref(), Some("disk unavailable"));
+        let serialized = serde_json::to_value(&temporary).expect("serializable status");
+        assert_eq!(serialized["storage_mode"], "temporary");
+        assert_eq!(serialized["storage_failures"], 1);
+        assert_eq!(serialized["last_storage_error"], "disk unavailable");
+
+        store.set_storage_mode(StorageMode::Persistent, None);
+        store.record_storage_failure("write failed");
+        let failed = store.status();
+        assert_eq!(failed.storage_failures, 2);
+        assert_eq!(failed.last_storage_error.as_deref(), Some("write failed"));
+
+        store.record_reconciliation_failure("BTC 1h is stale");
+        assert_eq!(store.status().reconciliation_failures, 1);
+        assert_eq!(store.status().last_reconciliation_error.as_deref(), Some("BTC 1h is stale"));
+        store.clear_reconciliation_error();
+        assert!(store.status().last_reconciliation_error.is_none());
     }
 
     #[test]

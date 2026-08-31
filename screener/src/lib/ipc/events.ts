@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core"
 import { listen } from "@tauri-apps/api/event"
 import type { UnlistenFn } from "@tauri-apps/api/event"
 
@@ -22,15 +23,20 @@ export type CandleSnapshotUpdate = {
 }
 
 /** Engine status snapshot; field names mirror the Rust `MarketStatus`. */
-export type EngineStatus = {
-  connection: string
-  phase: string
+export type MarketEngineStatus = {
+  connection: "connecting" | "live" | "reconnecting"
+  phase: "loading" | "backfilling" | "live"
   universe: number
   backfill_done: number
   backfill_total: number
   backfill_errors: number
   streaming: number
   fetch_rate: number
+  storage_mode: "initializing" | "persistent" | "temporary"
+  storage_failures: number
+  last_storage_error: string | null
+  reconciliation_failures: number
+  last_reconciliation_error: string | null
 }
 
 export function onMid(handler: (event: MidEvent) => void): Promise<UnlistenFn> {
@@ -45,6 +51,10 @@ export function onCandleSnapshotUpdated(handler: (event: CandleSnapshotUpdate) =
   return listen<CandleSnapshotUpdate>("candle-snapshot-updated", event => handler(event.payload))
 }
 
-export function onStatus(handler: (status: EngineStatus) => void): Promise<UnlistenFn> {
-  return listen<EngineStatus>("status", event => handler(event.payload))
+export function marketStatus(): Promise<MarketEngineStatus> {
+  return invoke<MarketEngineStatus>("market_status")
+}
+
+export function onStatus(handler: (status: MarketEngineStatus) => void): Promise<UnlistenFn> {
+  return listen<MarketEngineStatus>("status", event => handler(event.payload))
 }

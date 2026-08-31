@@ -23,7 +23,9 @@ pub use event::{CandleEvent, MarketEvent, MidEvent};
 pub use feed::MarketFeed;
 pub use history::{CandleHistory, CandleProvider, HistoryError};
 pub use rest::{HyperliquidRest, UniverseCoin};
-pub use store::{CandleHealth, CandleSnapshot, CandleUpdate, ConnectionState, MarketStatus, MarketStore, SyncPhase};
+pub use store::{
+    CandleHealth, CandleSnapshot, CandleUpdate, ConnectionState, MarketStatus, MarketStore, StorageMode, SyncPhase,
+};
 pub use stream::HyperliquidAdapter;
 pub use sync::{SyncConfig, spawn_sync};
 

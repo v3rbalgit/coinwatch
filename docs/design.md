@@ -56,14 +56,16 @@ SQLite user data ──▶ watchlists · signal catalog · presets ────�
   `MarketEvent::Mid` / `MarketEvent::Candle` on a shared `MarketFeed` and merges candles into
   the store. Reconnects with exponential backoff.
 - **`rest`** — `metaAndAssetCtxs` (universe + funding / OI / mark / prev-day) and
-  `candleSnapshot` (candle-history backfill).
+  `candleSnapshot` (candle-history backfill). History uses a 2,000-row operational request
+  ceiling, but advances from the actual oldest returned row so provider truncation remains safe.
 - **`ratelimit`** — a weight-aware sliding-window limiter. Every REST call declares its
   Hyperliquid request weight (`candleSnapshot` ≈ 20 + candles/60, `metaAndAssetCtxs` = 20)
   and blocks until the trailing-60s total is within budget (default 1100/min, under HL's
   1200/min per-IP cap). One limiter is shared across all REST callers.
 - **`store`** — `MarketStore`: candle buffers per (coin, timeframe), the volume-ranked
   universe, and a granular `MarketStatus` (connection state, sync phase, universe size,
-  backfill progress, fetch rate) published on a `watch` channel.
+  backfill progress, failure diagnostics, fetch rate, and storage durability) published on
+  a `watch` channel. Hot buffers are retained only for the current universe.
 - **`sync`** — refreshes the universe each cycle and re-plans fetches from per-series health:
   the initial backfill runs once per (coin, timeframe) and is not re-downloaded while current;
   the WebSocket then keeps the streamed timeframes live, REST advances non-streamed timeframes
@@ -81,6 +83,19 @@ SQLite user data ──▶ watchlists · signal catalog · presets ────�
 - **Metadata-first Browse workspace**: it needs one `metaAndAssetCtxs` call, so it is usable
   immediately; chart depth and signal evidence improve as candle history accumulates.
 - **Granular status** on a `watch` channel, surfaced plainly in the UI.
+
+### Candle retention and degraded storage
+
+- The hot `MarketStore` contains only markets in the latest successful active-universe snapshot.
+  Removed or delisted markets are evicted, and late WebSocket frames cannot recreate them.
+- SQLite candle rows are retained across universe removals and relistings. Hyperliquid does not
+  provide a historical candle archive, so automatic deletion would discard data that may not be
+  recoverable from its rolling API. Any future pruning must be an explicit user data policy.
+- If the file database cannot open, the application uses a migrated in-memory SQLite store so
+  live sync and history remain functional for the session. `MarketStatus` and the sidebar mark
+  this mode as temporary; user-authored changes and accumulated candles will not survive restart.
+- Runtime persistence and reconciliation failures remain visible through cumulative counters,
+  the latest unresolved error, and the existing status event instead of a second health registry.
 
 ## Roadmap: chart, signal authoring, validation & alerting
 

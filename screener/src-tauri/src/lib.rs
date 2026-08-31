@@ -19,8 +19,8 @@ use std::time::Duration;
 use chrono::Utc;
 use domain::{Candle, Timeframe};
 use hl_feed::{
-    CandleHealth, CandleHistory, CandleProvider, HyperliquidAdapter, HyperliquidRest, MarketEvent, MarketStore,
-    SyncConfig, spawn_sync,
+    CandleHealth, CandleHistory, CandleProvider, HyperliquidAdapter, HyperliquidRest, MarketEvent, MarketStatus,
+    MarketStore, StorageMode, SyncConfig, spawn_sync,
 };
 use rust_decimal::prelude::ToPrimitive;
 use serde::Serialize;
@@ -30,6 +30,12 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::signal_runs::SignalRunState;
 use crate::signal_validation::SignalValidationState;
+
+/// Current engine status for frontend initialization before subsequent events arrive.
+#[tauri::command]
+fn market_status(store: tauri::State<'_, Arc<MarketStore>>) -> MarketStatus {
+    store.status()
+}
 
 /// One screener row: live metadata from `metaAndAssetCtxs`. Reads memory only —
 /// no network, no database — so it returns instantly.
@@ -335,28 +341,40 @@ pub fn run() {
 
             // The local database holds candles + watchlists. Open it synchronously so
             // the list commands have their managed state before the UI can call them.
-            let data_dir = app.path().app_data_dir().unwrap_or_else(|_| std::env::temp_dir());
-            let _ = std::fs::create_dir_all(&data_dir);
-            let db_path = data_dir.join("coinwatch.db");
-
-            match tauri::async_runtime::block_on(SqliteStore::open(&db_path)) {
-                Ok(store) => {
-                    let store = Arc::new(store);
-                    let persistence: Arc<dyn CandleStore> = store.clone();
-                    let provider: Arc<dyn CandleProvider> = rest.clone();
-                    let history = Arc::new(CandleHistory::new(Arc::clone(&persistence), provider));
-                    app.manage(Arc::clone(&store));
-                    app.manage(history);
-                    let logo_db = Arc::clone(&store);
-                    // Keep the hot cache warm from Hyperliquid — the whole tradable universe.
-                    tauri::async_runtime::spawn(async move {
-                        let _sync = spawn_sync(sync_store, sync_config, persistence, rest);
-                    });
-                    // Cache coin logos locally so they load instantly and offline.
-                    tauri::async_runtime::spawn(cache_logos(logo_market_store, logo_db, http));
+            let persistent_database = match app.path().app_data_dir() {
+                Ok(data_dir) => {
+                    if let Err(error) = std::fs::create_dir_all(&data_dir) {
+                        tracing::warn!(path = %data_dir.display(), %error, "failed to create the application data directory");
+                    }
+                    tauri::async_runtime::block_on(SqliteStore::open(&data_dir.join("coinwatch.db")))
+                        .map_err(|error| error.to_string())
                 }
-                Err(error) => tracing::error!(%error, "failed to open the local database; market sync disabled"),
-            }
+                Err(error) => Err(format!("failed to resolve the application data directory: {error}")),
+            };
+
+            let (database, storage_mode, storage_error) = match persistent_database {
+                Ok(database) => (database, StorageMode::Persistent, None),
+                Err(error) => {
+                    tracing::error!(%error, "failed to open the local database; using temporary storage");
+                    let temporary = tauri::async_runtime::block_on(SqliteStore::temporary())?;
+                    (temporary, StorageMode::Temporary, Some(error))
+                }
+            };
+            sync_store.set_storage_mode(storage_mode, storage_error);
+            let database = Arc::new(database);
+            let persistence: Arc<dyn CandleStore> = database.clone();
+            let provider: Arc<dyn CandleProvider> = rest.clone();
+            let history =
+                Arc::new(CandleHistory::new(Arc::clone(&persistence), provider).with_status(Arc::clone(&sync_store)));
+            app.manage(Arc::clone(&database));
+            app.manage(history);
+            let logo_db = Arc::clone(&database);
+            // Keep the hot cache warm from Hyperliquid — the whole tradable universe.
+            tauri::async_runtime::spawn(async move {
+                let _sync = spawn_sync(sync_store, sync_config, persistence, rest);
+            });
+            // Cache coin logos locally so they load instantly and offline.
+            tauri::async_runtime::spawn(cache_logos(logo_market_store, logo_db, http));
 
             // Relay sync status (connecting / backfilling / live) to the UI.
             let status_handle = app.handle().clone();
@@ -447,6 +465,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            market_status,
             screener_rows,
             open_on_hyperliquid,
             lists,

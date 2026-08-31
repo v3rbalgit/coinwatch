@@ -9,7 +9,8 @@ use storage::{CandleStore, StoreError};
 use thiserror::Error;
 
 use crate::error::FeedError;
-use crate::rest::MAX_CANDLE_PAGE;
+use crate::rest::CANDLE_PAGE_SIZE;
+use crate::store::MarketStore;
 
 /// Provider of candle pages ending immediately before an aligned boundary.
 #[async_trait]
@@ -55,13 +56,32 @@ pub enum HistoryError {
 pub struct CandleHistory {
     store: Arc<dyn CandleStore>,
     rest: Arc<dyn CandleProvider>,
+    status: Option<Arc<MarketStore>>,
 }
 
 impl CandleHistory {
     /// Combine a durable candle cache with a page provider (Hyperliquid in production).
     #[must_use]
     pub fn new(store: Arc<dyn CandleStore>, rest: Arc<dyn CandleProvider>) -> Self {
-        Self { store, rest }
+        Self {
+            store,
+            rest,
+            status: None,
+        }
+    }
+
+    /// Report storage failures through the same market status contract as background sync.
+    #[must_use]
+    pub fn with_status(mut self, status: Arc<MarketStore>) -> Self {
+        self.status = Some(status);
+        self
+    }
+
+    fn store_error(&self, error: StoreError) -> HistoryError {
+        if let Some(status) = &self.status {
+            status.record_storage_failure(error.to_string());
+        }
+        HistoryError::Store(error)
     }
 
     /// Load up to `limit` contiguous candles immediately before `before_ms`.
@@ -90,7 +110,11 @@ impl CandleHistory {
         let mut boundary = before_ms;
         let mut missing = limit;
         while missing > 0 {
-            let cached = self.store.candles_before(coin, timeframe, boundary, missing).await?;
+            let cached = self
+                .store
+                .candles_before(coin, timeframe, boundary, missing)
+                .await
+                .map_err(|error| self.store_error(error))?;
             let suffix = contiguous_suffix(&cached, timeframe, boundary);
             if let Some(first) = suffix.first() {
                 boundary = first.open_time.timestamp_millis();
@@ -102,14 +126,17 @@ impl CandleHistory {
                 let span = boundary.saturating_sub(candle.open_time.timestamp_millis());
                 usize::try_from(span / duration).unwrap_or(usize::MAX).saturating_sub(1).max(1)
             });
-            let requested = gap_bars.unwrap_or(missing).min(missing).min(MAX_CANDLE_PAGE);
+            let requested = gap_bars.unwrap_or(missing).min(missing).min(CANDLE_PAGE_SIZE);
             let fetched = self.rest.candles_before(coin, timeframe, boundary, requested).await?;
             if fetched.is_empty() {
                 break;
             }
             let contiguous = contiguous_suffix(&fetched, timeframe, boundary);
             if contiguous.is_empty() {
-                self.store.save(coin, timeframe, &fetched).await?;
+                self.store
+                    .save(coin, timeframe, &fetched)
+                    .await
+                    .map_err(|error| self.store_error(error))?;
                 break;
             }
             if contiguous.len() != fetched.len() {
@@ -118,16 +145,15 @@ impl CandleHistory {
                     timeframe,
                 });
             }
-            self.store.save(coin, timeframe, contiguous).await?;
-            let short_page = contiguous.len() < requested;
+            self.store
+                .save(coin, timeframe, contiguous)
+                .await
+                .map_err(|error| self.store_error(error))?;
             boundary = contiguous
                 .first()
                 .map_or(boundary, |candle| candle.open_time.timestamp_millis());
             missing = missing.saturating_sub(contiguous.len());
             segments.push(contiguous.to_vec());
-            if short_page {
-                break;
-            }
         }
 
         let mut candles = Vec::with_capacity(limit.saturating_sub(missing));
@@ -170,8 +196,8 @@ mod tests {
     use storage::{CandleSeries, CandleStore, StoreError};
 
     use super::{CandleHistory, CandleProvider, HistoryError, contiguous_suffix};
-    use crate::HyperliquidRest;
     use crate::error::FeedError;
+    use crate::{HyperliquidRest, MarketStore, StorageMode};
 
     struct CachedStore {
         candles: Mutex<BTreeMap<i64, Candle>>,
@@ -223,6 +249,29 @@ mod tests {
                 .collect();
             candles.reverse();
             Ok(candles)
+        }
+    }
+
+    struct FailingStore;
+
+    #[async_trait]
+    impl CandleStore for FailingStore {
+        async fn load_recent(&self, _limit: usize) -> Result<Vec<CandleSeries>, StoreError> {
+            Err(StoreError::InvalidCandleRow(0))
+        }
+
+        async fn save(&self, _coin: &str, _timeframe: Timeframe, _candles: &[Candle]) -> Result<(), StoreError> {
+            Err(StoreError::InvalidCandleRow(0))
+        }
+
+        async fn candles_before(
+            &self,
+            _coin: &str,
+            _timeframe: Timeframe,
+            _before_ms: i64,
+            _limit: usize,
+        ) -> Result<Vec<Candle>, StoreError> {
+            Err(StoreError::InvalidCandleRow(0))
         }
     }
 
@@ -319,6 +368,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_failures_update_the_shared_storage_status() {
+        let status = MarketStore::new();
+        status.set_storage_mode(StorageMode::Persistent, None);
+        let history =
+            CandleHistory::new(Arc::new(FailingStore), Arc::new(UnusedProvider)).with_status(Arc::clone(&status));
+
+        let error = history
+            .load_before("BTC", Timeframe::Hour1, 5 * Timeframe::Hour1.duration_ms(), 3)
+            .await
+            .expect_err("cache read must fail");
+
+        assert!(matches!(error, HistoryError::Store(StoreError::InvalidCandleRow(0))));
+        assert_eq!(status.status().storage_failures, 1);
+        assert!(status.status().last_storage_error.is_some());
+    }
+
+    #[tokio::test]
     #[ignore = "live network"]
     async fn cache_misses_page_persist_and_become_cache_hits() {
         let store = Arc::new(CachedStore::new(Vec::new()));
@@ -332,14 +398,38 @@ mod tests {
             .expect("paged history");
         assert_eq!(candles.len(), 600);
         assert_eq!(contiguous_suffix(&candles, timeframe, before_ms).len(), 600);
-        assert_eq!(store.writes.load(Ordering::Relaxed), 2);
+        assert_eq!(store.writes.load(Ordering::Relaxed), 1);
 
         let cached = history
             .load_before("BTC", timeframe, before_ms, 600)
             .await
             .expect("cached paged history");
         assert_eq!(cached, candles);
-        assert_eq!(store.writes.load(Ordering::Relaxed), 2);
+        assert_eq!(store.writes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_truncation_continues_from_the_oldest_returned_row() {
+        let hour = Timeframe::Hour1.duration_ms();
+        let store = Arc::new(CachedStore::new(Vec::new()));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            (1_200 * hour, 1_200, (700..1_200).map(candle).collect()),
+            (700 * hour, 700, (200..700).map(candle).collect()),
+            (200 * hour, 200, (0..200).map(candle).collect()),
+        ]));
+        let history = CandleHistory::new(store.clone(), provider.clone());
+
+        let candles = history
+            .load_before("BTC", Timeframe::Hour1, 1_200 * hour, 1_200)
+            .await
+            .expect("provider-truncated history");
+
+        assert_eq!(candles, (0..1_200).map(candle).collect::<Vec<_>>());
+        assert_eq!(
+            provider.requests.lock().unwrap_or_else(PoisonError::into_inner).as_slice(),
+            &[(1_200 * hour, 1_200), (700 * hour, 700), (200 * hour, 200)]
+        );
+        assert_eq!(store.writes.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]
@@ -358,6 +448,29 @@ mod tests {
         assert_eq!(
             provider.requests.lock().unwrap_or_else(PoisonError::into_inner).as_slice(),
             &[(10 * hour, 2)]
+        );
+        assert_eq!(store.writes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn listing_boundary_is_confirmed_by_an_empty_follow_up_page() {
+        let hour = Timeframe::Hour1.duration_ms();
+        let store = Arc::new(CachedStore::new(Vec::new()));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            (10 * hour, 5, vec![candle(8), candle(9)]),
+            (8 * hour, 3, Vec::new()),
+        ]));
+        let history = CandleHistory::new(store.clone(), provider.clone());
+
+        let candles = history
+            .load_before("BTC", Timeframe::Hour1, 10 * hour, 5)
+            .await
+            .expect("short listing history");
+
+        assert_eq!(candles, vec![candle(8), candle(9)]);
+        assert_eq!(
+            provider.requests.lock().unwrap_or_else(PoisonError::into_inner).as_slice(),
+            &[(10 * hour, 5), (8 * hour, 3)]
         );
         assert_eq!(store.writes.load(Ordering::Relaxed), 1);
     }

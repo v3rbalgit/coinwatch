@@ -16,10 +16,6 @@ runtime verification before landing.
   Verify whether the frontend actually calls the opener JS API or whether links
   open through a Rust command; narrow or drop the grant accordingly. Needs a
   runtime check.
-- **Degraded database mode** — when SQLite fails to open, sync runs
-  memory-only and settings/catalog commands fail with generic strings. Decide
-  the surfacing: a typed `storageUnavailable` error variant plus a persistent
-  UI banner, or a startup-blocking dialog.
 - **WebSocket subscription churn** — every universe refresh unsubscribes and
   resubscribes all candle streams. Fix is a pure set-diff of (coin, interval)
   subscriptions; logic is unit-testable, but the behavior change needs one
@@ -43,9 +39,9 @@ runtime verification before landing.
   request mix anyway.
 - **`Chart.svelte` decomposition** — the component is large, but the
   validation-marker UI is still moving; decomposing now would churn twice.
-- **`integrity_check` policy** — SQLite integrity is checked at startup but
-  the failure path only logs. Needs a policy (rebuild? refuse? warn?) before
-  code.
+- **Database recovery tooling** — a failed startup integrity check now preserves
+  the file and starts a visibly temporary session. Add explicit inspection,
+  export, or rebuild tooling before attempting any automatic repair.
 - **Legacy string IPC errors** — older commands return `String` errors; new
   commands are born with typed serde-tagged errors. Convert opportunistically
   when a command is next touched, not wholesale.
