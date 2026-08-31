@@ -275,8 +275,9 @@ fn publish_frame(text: &str, feed: &MarketFeed, store: &MarketStore) {
             }
         }
         WsMessage::Candle { data } => {
-            if let Some(event) = candle_event(&data) {
-                store.merge_candle(&event.coin, event.timeframe, event.candle.clone());
+            if let Some(event) = candle_event(&data)
+                && store.merge_active_candle(&event.coin, event.timeframe, event.candle.clone())
+            {
                 feed.publish(MarketEvent::Candle(event));
             }
         }

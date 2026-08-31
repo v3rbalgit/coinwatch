@@ -14,7 +14,7 @@ use chrono::DateTime;
 use domain::{Candle, Timeframe};
 use sqlx::SqlitePool;
 use sqlx::migrate::Migrator;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use thiserror::Error;
 
 /// A persisted candle series for one (coin, timeframe), oldest candle first.
@@ -195,6 +195,23 @@ impl SqliteStore {
         if !store.is_healthy().await? {
             return Err(StoreError::Integrity(path.to_owned()));
         }
+        MIGRATOR.run(&store.pool).await?;
+        Ok(store)
+    }
+
+    /// Open a migrated in-memory store for a session that cannot use its file database.
+    /// One pooled connection keeps SQLite's process-local database coherent.
+    pub async fn temporary() -> Result<Self, StoreError> {
+        let options = SqliteConnectOptions::new().filename(":memory:");
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .test_before_acquire(false)
+            .connect_with(options)
+            .await?;
+        let store = Self { pool };
         MIGRATOR.run(&store.pool).await?;
         Ok(store)
     }
@@ -593,6 +610,25 @@ mod tests {
             volume: "0".to_owned(),
         };
         assert!(matches!(Candle::try_from(row), Err(StoreError::InvalidCandleRow(0))));
+    }
+
+    #[tokio::test]
+    async fn temporary_store_is_migrated_and_process_local() {
+        let store = SqliteStore::temporary().await.expect("temporary store");
+        let candles = vec![candle(1, "100.5", "101", "99.5", "100.75", "12.3")];
+
+        store.save("BTC", Timeframe::Hour1, &candles).await.expect("save");
+
+        assert_eq!(
+            store.load_recent(10).await.expect("load"),
+            vec![CandleSeries {
+                coin: "BTC".to_owned(),
+                timeframe: Timeframe::Hour1,
+                candles,
+            }]
+        );
+        let isolated = SqliteStore::temporary().await.expect("second temporary store");
+        assert!(isolated.load_recent(10).await.expect("isolated load").is_empty());
     }
 
     #[tokio::test]

@@ -168,7 +168,10 @@ pub fn spawn_sync(
                 }
                 tracing::info!(restored, "restored persisted candle series");
             }
-            Err(error) => tracing::error!(%error, "failed to load persisted candles"),
+            Err(error) => {
+                store.record_storage_failure(error.to_string());
+                tracing::error!(%error, "failed to load persisted candles");
+            }
         }
 
         loop {
@@ -186,6 +189,7 @@ async fn refresh(store: &MarketStore, rest: &HyperliquidRest, config: &SyncConfi
     let universe = match rest.universe(config.universe_limit, config.min_day_volume_usd).await {
         Ok(universe) => universe,
         Err(error) => {
+            store.record_reconciliation_failure(format!("universe refresh failed: {error}"));
             tracing::warn!(%error, "universe fetch failed");
             return;
         }
@@ -202,12 +206,15 @@ async fn refresh(store: &MarketStore, rest: &HyperliquidRest, config: &SyncConfi
         .collect();
 
     if pending.is_empty() {
+        store.clear_reconciliation_error();
+        store.set_backfill(0, 0, 0, 0);
         store.set_phase(SyncPhase::Live);
         return;
     }
 
     let total = pending.len();
     store.set_phase(SyncPhase::Backfilling);
+    store.set_backfill(0, total, 0, 0);
     let started = Instant::now();
     let mut done = 0;
     let mut errors = 0;
@@ -219,6 +226,9 @@ async fn refresh(store: &MarketStore, rest: &HyperliquidRest, config: &SyncConfi
         store.set_backfill(done, total, errors, fetch_rate(done, started));
     }
     tracing::info!(done, errors, "candle reconciliation pass complete");
+    if errors == 0 {
+        store.clear_reconciliation_error();
+    }
     store.set_phase(SyncPhase::Live);
 }
 
@@ -246,6 +256,7 @@ async fn persist_streamed_heads(
                 continue;
             }
             if let Err(error) = persistence.save(coin, timeframe, tail).await {
+                store.record_storage_failure(error.to_string());
                 tracing::warn!(coin = %coin, timeframe = timeframe.as_hl(), %error, "failed to persist streamed candles");
             }
         }
@@ -301,6 +312,11 @@ async fn execute_fetch(
     store.notify_candle_update(&coin, timeframe);
     match rest.recent_candles(&coin, timeframe, limit).await {
         Ok(candles) if candles.is_empty() => {
+            store.record_reconciliation_failure(format!(
+                "{} {} candle fetch returned no rows",
+                coin,
+                timeframe.as_hl()
+            ));
             tracing::warn!(coin = %coin, timeframe = timeframe.as_hl(), "candle fetch returned no rows");
             false
         }
@@ -320,29 +336,50 @@ async fn execute_fetch(
             store.reconcile_candles(coin.clone(), timeframe, candles, mode, epoch, revision);
             match store.series_health(&coin, timeframe).integrity {
                 CandleIntegrity::Repair => {
+                    store.record_reconciliation_failure(format!(
+                        "{} {} candle snapshot still requires structural repair",
+                        coin,
+                        timeframe.as_hl()
+                    ));
                     tracing::warn!(coin = %coin, timeframe = timeframe.as_hl(), "candle snapshot requires structural repair");
                     return false;
                 }
                 CandleIntegrity::VerifyOverlap => {
-                    tracing::debug!(coin = %coin, timeframe = timeframe.as_hl(), "candle overlap remains unverified");
+                    store.record_reconciliation_failure(format!(
+                        "{} {} candle overlap remains unverified",
+                        coin,
+                        timeframe.as_hl()
+                    ));
+                    tracing::warn!(coin = %coin, timeframe = timeframe.as_hl(), "candle overlap remains unverified");
                     return false;
                 }
                 CandleIntegrity::Verified => {}
             }
             store.provision_forming_candle_after_reconcile(&coin, timeframe, timeframe.bar_open_ms(reconciled_at_ms));
             let Some(reconciled) = store.candles(&coin, timeframe) else {
+                store.record_reconciliation_failure(format!(
+                    "{} {} reconciled candle buffer is missing",
+                    coin,
+                    timeframe.as_hl()
+                ));
                 tracing::warn!(coin = %coin, timeframe = timeframe.as_hl(), "reconciled candle buffer is missing");
                 return false;
             };
             let Some(rows) =
                 completed_rows_in_range(&reconciled, timeframe, fetched_at_ms, first_open_ms, last_open_ms)
             else {
+                store.record_reconciliation_failure(format!(
+                    "{} {} reconciled candle range is invalid",
+                    coin,
+                    timeframe.as_hl()
+                ));
                 tracing::warn!(coin = %coin, timeframe = timeframe.as_hl(), "reconciled candle range is invalid");
                 return false;
             };
             if !rows.is_empty()
                 && let Err(error) = persistence.save(&coin, timeframe, rows).await
             {
+                store.record_storage_failure(error.to_string());
                 tracing::warn!(coin = %coin, timeframe = timeframe.as_hl(), %error, "failed to persist candles");
             }
             if store
@@ -351,12 +388,23 @@ async fn execute_fetch(
             {
                 true
             } else {
+                store.record_reconciliation_failure(format!(
+                    "{} {} candle snapshot is not current",
+                    coin,
+                    timeframe.as_hl()
+                ));
                 tracing::warn!(coin = %coin, timeframe = timeframe.as_hl(), "candle snapshot is not current");
                 false
             }
         }
         Err(error) => {
-            tracing::debug!(coin = %coin, timeframe = timeframe.as_hl(), %error, "candle fetch failed");
+            store.record_reconciliation_failure(format!(
+                "{} {} candle fetch failed: {}",
+                coin,
+                timeframe.as_hl(),
+                error
+            ));
+            tracing::warn!(coin = %coin, timeframe = timeframe.as_hl(), %error, "candle fetch failed");
             false
         }
     }

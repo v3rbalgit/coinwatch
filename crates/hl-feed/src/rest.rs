@@ -18,8 +18,9 @@ const META_WEIGHT: u32 = 20;
 const CANDLE_BASE_WEIGHT: u32 = 20;
 const PERP_MAX_PRICE_DECIMALS: u32 = 6;
 const MAX_PRICE_SIGNIFICANT_DIGITS: i32 = 5;
-// Hyperliquid caps time-range responses at 500 rows.
-pub(crate) const MAX_CANDLE_PAGE: usize = 500;
+/// Operational candle request ceiling. Pagination advances from the actual rows
+/// returned, so correctness does not depend on the provider honoring this size.
+pub(crate) const CANDLE_PAGE_SIZE: usize = 2_000;
 
 /// Shared Hyperliquid REST client and process-wide request-weight budget.
 pub struct HyperliquidRest {
@@ -43,7 +44,7 @@ impl HyperliquidRest {
         timeframe: Timeframe,
         limit: usize,
     ) -> Result<Vec<Candle>, FeedError> {
-        let limit = limit.clamp(1, MAX_CANDLE_PAGE);
+        let limit = limit.clamp(1, CANDLE_PAGE_SIZE);
         let end = Utc::now().timestamp_millis();
         let preceding = i64::try_from(limit - 1).unwrap_or(i64::MAX);
         let start = timeframe
@@ -63,7 +64,7 @@ impl HyperliquidRest {
         if count == 0 {
             return Ok(Vec::new());
         }
-        let count = count.min(MAX_CANDLE_PAGE);
+        let count = count.min(CANDLE_PAGE_SIZE);
         let duration = timeframe.duration_ms();
         let end = before_ms.checked_sub(duration).ok_or(FeedError::CandleRange)?;
         let preceding = i64::try_from(count - 1).map_err(|_| FeedError::CandleRange)?;
@@ -264,7 +265,7 @@ struct AssetContext {
 mod tests {
     use domain::Timeframe;
 
-    use super::{HyperliquidRest, candle_weight, price_decimals};
+    use super::{CANDLE_PAGE_SIZE, HyperliquidRest, candle_weight, price_decimals};
 
     #[tokio::test]
     #[ignore = "live network"]
@@ -284,10 +285,12 @@ mod tests {
     }
 
     #[test]
-    fn candle_weight_accounts_for_every_returned_row() {
+    fn candle_weight_reserves_for_every_requested_row() {
+        assert_eq!(CANDLE_PAGE_SIZE, 2_000);
         assert_eq!(candle_weight(0), 21);
         assert_eq!(candle_weight(60), 21);
         assert_eq!(candle_weight(61), 22);
+        assert_eq!(candle_weight(CANDLE_PAGE_SIZE), 54);
         assert_eq!(candle_weight(usize::MAX), u32::MAX);
     }
 
