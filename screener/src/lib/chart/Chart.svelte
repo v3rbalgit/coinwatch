@@ -47,6 +47,7 @@
     type IndicatorInstance,
     type InstanceOutput,
   } from "./indicators"
+  import { priceFormat } from "./price-format"
   import { PRICE_PANE_LAYOUT_ID, type PaneLayoutEntry, type ToolbarPosition } from "./settings"
   import { SignalValidationPrimitive } from "./signal-validation-primitive"
   import { chartTheme } from "./theme"
@@ -59,6 +60,7 @@
   const {
     bars,
     seed = 0,
+    priceDecimals,
     instances = [
       { id: "rsi", params: {} },
       { id: "macd", params: {} },
@@ -85,6 +87,7 @@
   }: {
     bars: Bar[]
     seed?: number
+    priceDecimals?: number
     instances?: IndicatorInstance[]
     drawings?: Drawing[]
     logScale: boolean
@@ -113,6 +116,8 @@
   const INDICATOR_PANE_STRETCH = 1
   const PANE_STRETCH_EPSILON = 1e-6
   const FOCUS_HALF_WINDOW = 60
+
+  const candlePriceFormat = $derived(priceFormat(priceDecimals))
 
   let container: HTMLDivElement
   let chart: IChartApi | undefined
@@ -485,6 +490,7 @@
     })
 
     candles = chart.addSeries(CandlestickSeries, {
+      priceFormat: candlePriceFormat,
       upColor: chartTheme.up,
       downColor: chartTheme.down,
       borderUpColor: chartTheme.up,
@@ -600,6 +606,11 @@
       chart = undefined
       validationPrimitive = undefined
     }
+  })
+
+  // Keep the external chart formatter in sync when navigation changes the market metadata.
+  $effect(() => {
+    candles?.applyOptions({ priceFormat: candlePriceFormat })
   })
 
   // Candles + volume: full reseed on seed change, else tail updates.

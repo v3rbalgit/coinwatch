@@ -590,6 +590,7 @@
     <Chart
       {bars}
       {seed}
+      priceDecimals={meta?.coin === coin ? meta.price_decimals : undefined}
       instances={indicatorInstances}
       drawings={chartDrawings}
       {logScale}

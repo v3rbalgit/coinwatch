@@ -6,6 +6,7 @@ import type { Bar } from "$lib/chart/types"
 export type ScreenerRow = {
   coin: string
   price: number
+  price_decimals: number
   prev_day: number
   volume_usd: number
   open_interest_usd: number

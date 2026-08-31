@@ -36,6 +36,7 @@ use crate::signal_validation::SignalValidationState;
 struct ScreenerRow {
     coin: String,
     price: f64,
+    price_decimals: u32,
     prev_day: f64,
     volume_usd: f64,
     open_interest_usd: f64,
@@ -56,6 +57,7 @@ fn screener_rows(store: tauri::State<'_, Arc<MarketStore>>) -> Vec<ScreenerRow> 
             ScreenerRow {
                 coin: coin.coin.clone(),
                 price: coin.mark_px.unwrap_or(0.0),
+                price_decimals: coin.price_decimals,
                 prev_day: coin.prev_day_px.unwrap_or(0.0),
                 volume_usd: coin.day_volume_usd,
                 open_interest_usd,

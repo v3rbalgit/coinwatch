@@ -16,6 +16,8 @@ use crate::ratelimit::WeightLimiter;
 const INFO_URL: &str = "https://api.hyperliquid.xyz/info";
 const META_WEIGHT: u32 = 20;
 const CANDLE_BASE_WEIGHT: u32 = 20;
+const PERP_MAX_PRICE_DECIMALS: u32 = 6;
+const MAX_PRICE_SIGNIFICANT_DIGITS: i32 = 5;
 // Hyperliquid caps time-range responses at 500 rows.
 pub(crate) const MAX_CANDLE_PAGE: usize = 500;
 
@@ -95,10 +97,12 @@ impl HyperliquidRest {
                 if day_volume_usd < min_day_volume_usd {
                     return None;
                 }
+                let mark_px = context.mark_px.as_ref().and_then(value_to_f64);
                 Some(UniverseCoin {
                     coin: entry.name,
                     day_volume_usd,
-                    mark_px: context.mark_px.as_ref().and_then(value_to_f64),
+                    mark_px,
+                    price_decimals: price_decimals(mark_px, entry.size_decimals),
                     prev_day_px: context.prev_day_px.as_ref().and_then(value_to_f64),
                     funding: context.funding.as_ref().and_then(value_to_f64),
                     open_interest: context.open_interest.as_ref().and_then(value_to_f64),
@@ -188,6 +192,18 @@ pub(crate) fn to_decimal(value: &serde_json::Value) -> Result<rust_decimal::Deci
     }
 }
 
+/// Resolve the current Hyperliquid tick precision from its five-significant-digit
+/// rule, capped by the asset's size-dependent decimal limit.
+fn price_decimals(mark_px: Option<f64>, size_decimals: u32) -> u32 {
+    let maximum = PERP_MAX_PRICE_DECIMALS.saturating_sub(size_decimals);
+    let Some(price) = mark_px.filter(|price| price.is_finite() && *price > 0.0) else {
+        return maximum;
+    };
+    let magnitude = price.log10().floor() as i32;
+    let significant = (MAX_PRICE_SIGNIFICANT_DIGITS - 1 - magnitude).max(0);
+    maximum.min(u32::try_from(significant).unwrap_or(maximum))
+}
+
 /// A perp in the tradable universe with a live metadata snapshot from
 /// `metaAndAssetCtxs`.
 #[derive(Debug, Clone)]
@@ -198,6 +214,8 @@ pub struct UniverseCoin {
     pub day_volume_usd: f64,
     /// Latest mark price.
     pub mark_px: Option<f64>,
+    /// Decimal places needed for the current valid price increment.
+    pub price_decimals: u32,
     /// Previous-day price (for the 24h change).
     pub prev_day_px: Option<f64>,
     /// Current funding rate (per hour).
@@ -223,6 +241,8 @@ struct Meta {
 #[derive(Deserialize)]
 struct UniverseEntry {
     name: String,
+    #[serde(rename = "szDecimals")]
+    size_decimals: u32,
     #[serde(rename = "isDelisted", default)]
     is_delisted: bool,
 }
@@ -244,7 +264,7 @@ struct AssetContext {
 mod tests {
     use domain::Timeframe;
 
-    use super::{HyperliquidRest, candle_weight};
+    use super::{HyperliquidRest, candle_weight, price_decimals};
 
     #[tokio::test]
     #[ignore = "live network"]
@@ -269,6 +289,16 @@ mod tests {
         assert_eq!(candle_weight(60), 21);
         assert_eq!(candle_weight(61), 22);
         assert_eq!(candle_weight(usize::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn price_precision_follows_hyperliquid_tick_rules() {
+        assert_eq!(price_decimals(Some(0.010_238), 0), 6);
+        assert_eq!(price_decimals(Some(2_451.0), 4), 1);
+        assert_eq!(price_decimals(Some(78_743.0), 5), 0);
+        assert_eq!(price_decimals(Some(0.000_000_1), 0), 6);
+        assert_eq!(price_decimals(None, 3), 3);
+        assert_eq!(price_decimals(Some(f64::NAN), 3), 3);
     }
 
     #[tokio::test]
