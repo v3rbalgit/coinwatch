@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core"
 
-import type { CandleSnapshot } from "$lib/chart/candle-snapshot"
 import type { Bar } from "$lib/chart/types"
+import type { CandleSnapshot } from "$lib/ipc/candles"
 
 /** One `screener_rows` row; field names mirror the Rust `ScreenerRow` payload. */
 export type ScreenerRow = {

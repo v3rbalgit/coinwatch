@@ -1,4 +1,5 @@
 import type { IndicatorDescriptor } from "$lib/chart/indicators"
+import type { CandleHealth } from "$lib/ipc/candles"
 import type { Condition, SignalDefinition, SignalNode } from "$lib/signals/definition"
 import { conditionLabel, directConditionIds } from "$lib/signals/format"
 import type { ConditionOutcome, EvalReport } from "$lib/signals/run"
@@ -56,8 +57,23 @@ export function conditionEvidence(
   })
 }
 
+export function pendingCandleMessage(health: CandleHealth): string {
+  switch (health) {
+    case "loading":
+      return "Candle data is still loading."
+    case "stale":
+      return "Waiting for the current candle boundary."
+    case "verifying":
+      return "Verifying candle continuity after reconnect."
+    case "repairing":
+      return "Repairing a structural candle gap."
+    case "ready":
+      return "Candle data was unexpectedly marked ready."
+  }
+}
+
 export function reportHasDataIssues(report: EvalReport): boolean {
-  if (report.missingData.length > 0 || Object.keys(report.unavailableData).length > 0) return true
+  if (Object.keys(report.pendingData).length > 0 || Object.keys(report.unavailableData).length > 0) return true
   return Object.values(report.conditions).some(
     outcome =>
       outcome.status === "noData" ||
@@ -99,7 +115,7 @@ export function rankClosestSignalRunReports(
   const conditionIds = directPositiveConditionIds(definition)
   if (conditionIds.length === 0) return []
   const scores: CandidateScore[] = reports
-    .filter(report => !report.satisfied && !reportHasDataIssues(report))
+    .filter(report => report.verdict === "notMatched" && !reportHasDataIssues(report))
     .map(report => {
       let satisfiedConditions = 0
       let thresholdDistance = 0
@@ -138,7 +154,7 @@ export function filterSignalRunReports(
 ): EvalReport[] {
   switch (filter) {
     case "matches":
-      return reports.filter(report => report.satisfied)
+      return reports.filter(report => report.verdict === "matched")
     case "closest":
       return rankClosestSignalRunReports(definition, reports).slice(0, 20)
     case "issues":

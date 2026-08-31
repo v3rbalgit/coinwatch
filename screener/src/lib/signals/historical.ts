@@ -34,6 +34,7 @@ export type SignalValidationFailure =
   | { type: "rangeBeyondCompleted"; timeframe: SignalTimeframe }
   | { type: "historyUnavailable"; timeframe: SignalTimeframe; message: string }
   | { type: "insufficientHistory"; timeframe: SignalTimeframe; required: number; available: number }
+  | { type: "undefinedOperands"; condition: string; timeframe: SignalTimeframe; evaluatedAt: string }
   | { type: "internal"; message: string }
 
 export type SignalValidationEvent =
@@ -133,6 +134,8 @@ export function signalValidationFailureMessage(failure: SignalValidationFailure)
       return `${failure.timeframe} candle history is unavailable: ${failure.message}`
     case "insufficientHistory":
       return `Only ${failure.available} of ${failure.required} required contiguous ${failure.timeframe} candles are available. Choose a shorter range or try again when more history is available.`
+    case "undefinedOperands":
+      return `Condition '${failure.condition}' has no defined ${failure.timeframe} value at ${failure.evaluatedAt}.`
     case "internal":
       return failure.message
   }

@@ -15,15 +15,19 @@ import { thresholdDefinition } from "./signals-fixture"
 
 const definition = thresholdDefinition()
 
-function report(satisfied: boolean): EvalReport {
+function report(verdict: EvalReport["verdict"]): EvalReport {
+  const matched = verdict === "matched"
   return {
     coin: "BTC",
-    satisfied,
-    lastEvidenceAt: satisfied ? "2026-01-01T00:00:00Z" : null,
+    verdict,
+    lastEvidenceAt: matched ? "2026-01-01T00:00:00Z" : null,
     conditions: {
-      price: { status: satisfied ? "satisfied" : "notSatisfied", lastTrueBar: null, evidence: null },
+      price:
+        verdict === "unknown"
+          ? { status: "noData", reason: "verifying", lastTrueBar: null, evidence: null }
+          : { status: matched ? "satisfied" : "notSatisfied", lastTrueBar: null, evidence: null },
     },
-    missingData: [],
+    pendingData: verdict === "unknown" ? { "1h": "verifying" } : {},
     unavailableData: {},
   }
 }
@@ -106,18 +110,18 @@ describe("signal run contract", () => {
     })
     state = reduceSignalRunProgress(state, {
       event: "evaluated",
-      data: { runId: 7, completed: 1, total: 2, report: report(true) },
+      data: { runId: 7, completed: 1, total: 2, report: report("matched") },
     })
     state = reduceSignalRunProgress(state, {
       event: "evaluated",
-      data: { runId: 7, completed: 2, total: 2, report: report(false) },
+      data: { runId: 7, completed: 2, total: 2, report: report("unknown") },
     })
     state = reduceSignalRunProgress(state, {
       event: "completed",
-      data: { runId: 7, completed: 2, total: 2, matched: 1 },
+      data: { runId: 7, completed: 2, total: 2, matched: 1, unknown: 1 },
     })
 
-    expect(state).toEqual({ status: "completed", runId: 7, completed: 2, total: 2, matched: 1 })
+    expect(state).toEqual({ status: "completed", runId: 7, completed: 2, total: 2, matched: 1, unknown: 1 })
   })
 
   it("ignores stale run IDs and preserves progress on failure", () => {
@@ -127,11 +131,11 @@ describe("signal run contract", () => {
     })
     const stale = reduceSignalRunProgress(running, {
       event: "evaluated",
-      data: { runId: 8, completed: 1, total: 3, report: report(true) },
+      data: { runId: 8, completed: 1, total: 3, report: report("matched") },
     })
     const progressed = reduceSignalRunProgress(stale, {
       event: "evaluated",
-      data: { runId: 7, completed: 1, total: 3, report: report(true) },
+      data: { runId: 7, completed: 1, total: 3, report: report("matched") },
     })
     const failed = reduceSignalRunProgress(progressed, {
       event: "failed",
@@ -145,6 +149,7 @@ describe("signal run contract", () => {
       completed: 1,
       total: 3,
       matched: 1,
+      unknown: 0,
       message: "history unavailable",
     })
   })
@@ -179,7 +184,7 @@ describe("signal run client", () => {
 
     fake.emit({ event: "started", data: { runId: 7, total: 1 } })
     expect(client.activeRunId()).toBe(7)
-    fake.emit({ event: "completed", data: { runId: 7, completed: 1, total: 1, matched: 0 } })
+    fake.emit({ event: "completed", data: { runId: 7, completed: 1, total: 1, matched: 0, unknown: 0 } })
     expect(client.activeRunId()).toBeNull()
     if (resolveStart === undefined) throw new Error("missing start resolver")
     resolveStart(7)

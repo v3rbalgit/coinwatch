@@ -116,6 +116,14 @@ describe("historical signal validation client", () => {
     expect(
       signalValidationFailureMessage({ type: "insufficientHistory", timeframe: "1w", required: 30, available: 12 })
     ).toContain("12 of 30")
+    expect(
+      signalValidationFailureMessage({
+        type: "undefinedOperands",
+        condition: "price",
+        timeframe: "1h",
+        evaluatedAt: "2026-08-25T04:00:00Z",
+      })
+    ).toContain("'price'")
   })
 
   it("queues cancellation when the channel starts before invoke resolves", async () => {

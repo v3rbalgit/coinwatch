@@ -4,7 +4,7 @@
   import type { Condition, SignalDefinition } from "$lib/signals/definition"
   import { crossEvidenceLabel, formatObservedValue, thresholdEvidenceLabel } from "$lib/signals/format"
   import type { ConditionOutcome, EvalReport } from "$lib/signals/run"
-  import { conditionEvidence } from "$lib/signals/run-results"
+  import { conditionEvidence, pendingCandleMessage } from "$lib/signals/run-results"
 
   const {
     definition,
@@ -26,7 +26,7 @@
       case "notSatisfied":
         return "Not satisfied"
       case "noData":
-        return "No data"
+        return pendingCandleMessage(outcome.reason)
       case "unavailable":
         return "Unavailable"
       case "insufficientHistory":

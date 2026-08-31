@@ -240,4 +240,27 @@ fn validation_events_and_failures_match_the_frontend_contract() {
             }
         })
     );
+    assert_eq!(
+        serde_json::to_value(SignalValidationEvent::Failed {
+            validation_id: 9,
+            failure: SignalValidationFailure::UndefinedOperands {
+                condition: "price".to_owned(),
+                timeframe: Timeframe::Hour1,
+                evaluated_at: Utc.timestamp_opt(14_400, 0).single().expect("evaluated instant"),
+            },
+        })
+        .expect("serializable undefined-operands failure"),
+        json!({
+            "event": "failed",
+            "data": {
+                "validationId": 9,
+                "failure": {
+                    "type": "undefinedOperands",
+                    "condition": "price",
+                    "timeframe": "1h",
+                    "evaluatedAt": "1970-01-01T04:00:00Z",
+                }
+            }
+        })
+    );
 }

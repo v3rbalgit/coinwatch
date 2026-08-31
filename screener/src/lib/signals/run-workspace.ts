@@ -80,6 +80,7 @@ function recordStartFailure(state: SignalRunWorkspaceState, message: string): vo
       completed: state.progress.completed,
       total: state.progress.total,
       matched: state.progress.matched,
+      unknown: state.progress.unknown,
       message,
     }
   }

@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use domain::{Candle, Timeframe, completed_prefix_len};
+use hl_feed::CandleHealth;
 use indicators::{Instance, InstanceOutput, Ohlcv, compute};
 use rust_decimal::prelude::ToPrimitive;
 use serde::Serialize;
@@ -29,8 +30,11 @@ pub enum OutcomeStatus {
     Satisfied,
     /// Data was available but the predicate did not hold in the window.
     NotSatisfied,
-    /// No completed candle data for the condition's timeframe was available.
-    NoData,
+    /// The store withheld this timeframe until its candle state becomes trustworthy.
+    NoData {
+        /// Authoritative store reason the series cannot currently be evaluated.
+        reason: CandleHealth,
+    },
     /// Required history could not be loaded because storage or the provider failed.
     Unavailable,
     /// Some candles exist, but not enough to evaluate the complete requested window.
@@ -42,6 +46,25 @@ pub enum OutcomeStatus {
     },
     /// A needed operand value is non-finite; the predicate is neither held nor refuted.
     UndefinedOperands,
+}
+
+/// Three-valued result of evaluating the complete signal tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EvaluationVerdict {
+    /// The complete tree is true.
+    Matched,
+    /// The complete tree is definitively false, even if an irrelevant branch is unknown.
+    NotMatched,
+    /// Missing, pending, failed, or insufficient data prevents a definitive result.
+    Unknown,
+}
+
+impl EvaluationVerdict {
+    /// Whether this verdict counts as a signal match.
+    pub const fn is_matched(self) -> bool {
+        matches!(self, Self::Matched)
+    }
 }
 
 /// Numeric evidence captured at the bar most relevant to a condition verdict.
@@ -91,20 +114,26 @@ pub struct ConditionOutcome {
 pub struct EvalReport {
     /// Coin symbol.
     pub coin: String,
-    /// Whether the logic tree holds now.
-    pub satisfied: bool,
+    /// Three-valued result of the complete logic tree.
+    pub verdict: EvaluationVerdict,
     /// Most recent evidence among satisfied positive leaves. `None` is valid when
     /// a signal holds exclusively through negation.
     pub last_evidence_at: Option<DateTime<Utc>>,
     /// Verdict per stable condition id.
     pub conditions: BTreeMap<String, ConditionOutcome>,
-    /// Timeframes whose conditions had no completed candle data. Their leaves
-    /// propagate an unknown verdict and remain visible here rather than failing
-    /// silently or satisfying negation.
-    pub missing_data: Vec<Timeframe>,
+    /// Store-gated timeframes and the authoritative reason each is pending.
+    /// Their leaves propagate an unknown verdict rather than satisfying negation.
+    pub pending_data: BTreeMap<Timeframe, CandleHealth>,
     /// History-load failures by timeframe. Their conditions have
     /// [`OutcomeStatus::Unavailable`] and propagate unknown.
     pub unavailable_data: BTreeMap<Timeframe, String>,
+}
+
+impl EvalReport {
+    /// Whether the complete signal tree is definitively matched.
+    pub const fn is_satisfied(&self) -> bool {
+        self.verdict.is_matched()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +155,7 @@ impl CompletedSeries {
 #[derive(Debug, Default, Clone)]
 pub struct CoinData {
     series: HashMap<Timeframe, CompletedSeries>,
+    pending: HashMap<Timeframe, CandleHealth>,
     unavailable: HashMap<Timeframe, String>,
 }
 
@@ -133,6 +163,7 @@ impl CoinData {
     /// Insert an owned completed-bar series, oldest first.
     pub fn insert(&mut self, timeframe: Timeframe, candles: Vec<Candle>) {
         let completed_len = candles.len();
+        self.pending.remove(&timeframe);
         self.unavailable.remove(&timeframe);
         self.series.insert(
             timeframe,
@@ -145,12 +176,21 @@ impl CoinData {
 
     pub(crate) fn insert_shared(&mut self, timeframe: Timeframe, candles: Arc<Vec<Candle>>, completed_len: usize) {
         let completed_len = completed_len.min(candles.len());
+        self.pending.remove(&timeframe);
         self.unavailable.remove(&timeframe);
         self.series.insert(timeframe, CompletedSeries { candles, completed_len });
     }
 
+    pub(crate) fn mark_pending(&mut self, timeframe: Timeframe, reason: CandleHealth) {
+        debug_assert_ne!(reason, CandleHealth::Ready);
+        self.series.remove(&timeframe);
+        self.unavailable.remove(&timeframe);
+        self.pending.insert(timeframe, reason);
+    }
+
     pub(crate) fn mark_unavailable(&mut self, timeframe: Timeframe, reason: String) {
         self.series.remove(&timeframe);
+        self.pending.remove(&timeframe);
         self.unavailable.insert(timeframe, reason);
     }
 
@@ -252,7 +292,7 @@ struct PreparedCondition {
 pub(crate) struct PreparedEvaluation<'a> {
     timeframes: HashMap<Timeframe, TimeframePrepared<'a>>,
     conditions: BTreeMap<String, PreparedCondition>,
-    missing_data: Vec<Timeframe>,
+    pending_data: BTreeMap<Timeframe, CandleHealth>,
     unavailable_data: BTreeMap<Timeframe, String>,
 }
 
@@ -264,15 +304,17 @@ impl<'a> PreparedEvaluation<'a> {
         }
 
         let mut timeframes = HashMap::with_capacity(by_timeframe.len());
-        let mut missing_data = Vec::with_capacity(by_timeframe.len());
+        let mut pending_data = BTreeMap::new();
         let mut unavailable_data = BTreeMap::new();
         for (timeframe, conditions) in &by_timeframe {
             if let Some(reason) = data.unavailable.get(timeframe) {
                 unavailable_data.insert(*timeframe, reason.clone());
+            } else if let Some(reason) = data.pending.get(timeframe) {
+                pending_data.insert(*timeframe, *reason);
             } else if let Some(candles) = data.get(*timeframe) {
                 timeframes.insert(*timeframe, TimeframePrepared::build(candles, conditions));
             } else {
-                missing_data.push(*timeframe);
+                pending_data.insert(*timeframe, CandleHealth::Loading);
             }
         }
 
@@ -311,7 +353,7 @@ impl<'a> PreparedEvaluation<'a> {
         Ok(Self {
             timeframes,
             conditions,
-            missing_data,
+            pending_data,
             unavailable_data,
         })
     }
@@ -328,6 +370,29 @@ impl<'a> PreparedEvaluation<'a> {
             .iter()
             .map(|(timeframe, prepared)| (*timeframe, completed_len(prepared.candles, *timeframe, evaluated_at)))
             .collect()
+    }
+
+    /// First condition whose operands are undefined at this historical instant.
+    pub(crate) fn undefined_condition_at<'definition>(
+        &self,
+        definition: &'definition SignalDefinition,
+        completed_lengths: &BTreeMap<Timeframe, usize>,
+    ) -> Option<(&'definition str, Timeframe)> {
+        definition.conditions.iter().find_map(|(id, condition)| {
+            if self.unavailable_data.contains_key(&condition.timeframe)
+                || self.pending_data.contains_key(&condition.timeframe)
+            {
+                return None;
+            }
+            let (timeframe, prepared_condition) =
+                (self.timeframes.get(&condition.timeframe)?, self.conditions.get(id)?);
+            let available = completed_lengths.get(&condition.timeframe).copied().unwrap_or_default();
+            matches!(
+                resolve_condition_at(condition, timeframe, prepared_condition, available).status,
+                OutcomeStatus::UndefinedOperands
+            )
+            .then_some((id.as_str(), condition.timeframe))
+        })
     }
 
     /// Tree verdict without report allocation, for per-instant historical replay.
@@ -367,6 +432,12 @@ impl<'a> PreparedEvaluation<'a> {
                     last_true_bar: None,
                     evidence: None,
                 }
+            } else if let Some(reason) = self.pending_data.get(&condition.timeframe) {
+                ConditionOutcome {
+                    status: OutcomeStatus::NoData { reason: *reason },
+                    last_true_bar: None,
+                    evidence: None,
+                }
             } else {
                 match (self.timeframes.get(&condition.timeframe), self.conditions.get(id)) {
                     (Some(timeframe), Some(prepared_condition)) => evaluate_condition_at(
@@ -376,7 +447,9 @@ impl<'a> PreparedEvaluation<'a> {
                         completed_lengths.get(&condition.timeframe).copied().unwrap_or_default(),
                     ),
                     _ => ConditionOutcome {
-                        status: OutcomeStatus::NoData,
+                        status: OutcomeStatus::NoData {
+                            reason: CandleHealth::Loading,
+                        },
                         last_true_bar: None,
                         evidence: None,
                     },
@@ -386,9 +459,9 @@ impl<'a> PreparedEvaluation<'a> {
         }
 
         let truth = eval_node(&definition.root, &outcomes);
-        let satisfied = truth == Truth::True;
+        let verdict = EvaluationVerdict::from(truth);
         let mut supporting = Vec::with_capacity(definition.conditions.len());
-        if satisfied {
+        if verdict.is_matched() {
             collect_supporting(&definition.root, &outcomes, &mut supporting);
         }
         let last_evidence_at = supporting
@@ -399,10 +472,10 @@ impl<'a> PreparedEvaluation<'a> {
 
         EvalReport {
             coin: coin.to_owned(),
-            satisfied,
+            verdict,
             last_evidence_at,
             conditions: outcomes,
-            missing_data: self.missing_data.clone(),
+            pending_data: self.pending_data.clone(),
             unavailable_data: self.unavailable_data.clone(),
         }
     }
@@ -460,6 +533,16 @@ pub(crate) enum Truth {
     Unknown,
 }
 
+impl From<Truth> for EvaluationVerdict {
+    fn from(truth: Truth) -> Self {
+        match truth {
+            Truth::True => Self::Matched,
+            Truth::False => Self::NotMatched,
+            Truth::Unknown => Self::Unknown,
+        }
+    }
+}
+
 /// Length of the completed prefix in an oldest-first candle series.
 pub(crate) fn completed_len(candles: &[Candle], timeframe: Timeframe, at: DateTime<Utc>) -> usize {
     completed_prefix_len(candles, timeframe, at.timestamp_millis())
@@ -469,7 +552,7 @@ const fn truth_of(status: OutcomeStatus) -> Truth {
     match status {
         OutcomeStatus::Satisfied => Truth::True,
         OutcomeStatus::NotSatisfied => Truth::False,
-        OutcomeStatus::NoData
+        OutcomeStatus::NoData { .. }
         | OutcomeStatus::Unavailable
         | OutcomeStatus::InsufficientHistory { .. }
         | OutcomeStatus::UndefinedOperands => Truth::Unknown,
@@ -764,7 +847,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CoinData, ConditionEvidence, ConditionOutcome, OutcomeStatus, PreparedEvaluation, completed_len, evaluate,
+        CandleHealth, CoinData, ConditionEvidence, ConditionOutcome, EvaluationVerdict, OutcomeStatus,
+        PreparedEvaluation, completed_len, evaluate,
     };
     use crate::definition::{
         CandleField, ComparisonOp, Condition, CrossDirection, DEFINITION_VERSION, DefinitionError, Direction,
@@ -849,11 +933,11 @@ mod tests {
         data.insert(Timeframe::Hour1, candles(&[10.0, 20.0, 100.0, 50.0]));
 
         let recent_report = evaluate(&recent, "BTC", &data).expect("valid recent signal");
-        assert!(recent_report.satisfied);
+        assert!(recent_report.is_satisfied());
         assert_eq!(recent_report.conditions["hot"].status, OutcomeStatus::Satisfied);
 
         let stale_report = evaluate(&stale, "BTC", &data).expect("valid stale signal");
-        assert!(!stale_report.satisfied);
+        assert!(!stale_report.is_satisfied());
         assert_eq!(stale_report.conditions["hot"].status, OutcomeStatus::NotSatisfied);
         assert_eq!(
             stale_report.conditions["hot"].last_true_bar,
@@ -902,7 +986,7 @@ mod tests {
         data.insert(Timeframe::Hour1, vec![candle_with_volume(0, 110.0, 1_500.0)]);
 
         let report = evaluate(&signal, "BTC", &data).expect("valid raw market signal");
-        assert!(report.satisfied);
+        assert!(report.is_satisfied());
         assert_eq!(report.conditions["price"].status, OutcomeStatus::Satisfied);
         assert_eq!(report.conditions["volume"].status, OutcomeStatus::Satisfied);
     }
@@ -932,7 +1016,7 @@ mod tests {
         data.insert(Timeframe::Day1, candles(&closes));
 
         let report = evaluate(&signal, "BTC", &data).expect("valid adjusted cross signal");
-        assert!(report.satisfied);
+        assert!(report.is_satisfied());
         assert_eq!(
             report.conditions["cross"].last_true_bar,
             Utc.timestamp_opt(15 * 3_600, 0).single()
@@ -971,7 +1055,7 @@ mod tests {
         data.insert(Timeframe::Day1, rising);
 
         let report = evaluate(&signal, "BTC", &data).expect("valid multi-timeframe RSI signal");
-        assert!(report.satisfied);
+        assert!(report.is_satisfied());
         assert!(
             report
                 .conditions
@@ -1004,7 +1088,7 @@ mod tests {
         data.insert(Timeframe::Hour1, candles(&[3.0, 2.0, 1.0, 2.0, 3.0]));
 
         let report = evaluate(&signal, "BTC", &data).expect("valid two-instance signal");
-        assert!(report.satisfied);
+        assert!(report.is_satisfied());
         assert_eq!(
             report.conditions["cross"].last_true_bar,
             Utc.timestamp_opt(4 * 3_600, 0).single()
@@ -1030,7 +1114,7 @@ mod tests {
         data.insert(Timeframe::Hour1, candles(&[10.0, 10.0, 10.0, 5.0, 10.0]));
 
         let report = evaluate(&signal, "BTC", &data).expect("valid cross signal");
-        assert!(report.satisfied, "expected a close-over-SMA cross on the final bar");
+        assert!(report.is_satisfied(), "expected a close-over-SMA cross on the final bar");
         assert!(matches!(
             report.conditions["cross"].evidence,
             Some(ConditionEvidence::Cross {
@@ -1095,6 +1179,17 @@ mod tests {
             json!({ "status": "unavailable" })
         );
         assert_eq!(
+            serde_json::to_value(OutcomeStatus::NoData {
+                reason: CandleHealth::Verifying,
+            })
+            .expect("serializable status"),
+            json!({ "status": "noData", "reason": "verifying" })
+        );
+        assert_eq!(
+            serde_json::to_value(EvaluationVerdict::Unknown).expect("serializable verdict"),
+            json!("unknown")
+        );
+        assert_eq!(
             serde_json::to_value(OutcomeStatus::UndefinedOperands).expect("serializable status"),
             json!({ "status": "undefinedOperands" })
         );
@@ -1137,8 +1232,8 @@ mod tests {
             report.unavailable_data.get(&Timeframe::Hour1).map(String::as_str),
             Some("provider unavailable")
         );
-        assert!(report.missing_data.is_empty());
-        assert!(!report.satisfied, "unavailable history must not satisfy negation");
+        assert!(report.pending_data.is_empty());
+        assert_eq!(report.verdict, EvaluationVerdict::Unknown);
     }
 
     #[test]
@@ -1158,7 +1253,7 @@ mod tests {
                 available: 0,
             }
         );
-        assert!(report.missing_data.is_empty());
+        assert!(report.pending_data.is_empty());
     }
 
     #[test]
@@ -1191,7 +1286,7 @@ mod tests {
                 available: 3,
             }
         );
-        assert!(!report.satisfied, "unknown history must not satisfy negation");
+        assert_eq!(report.verdict, EvaluationVerdict::Unknown);
     }
 
     #[test]
@@ -1341,7 +1436,7 @@ mod tests {
                 truncated.insert(Timeframe::Hour4, hour4.get(..hour4_len).expect("prefix").to_vec());
                 let fresh = evaluate(&signal, "BTC", &truncated).expect("fresh prefix evaluation");
 
-                assert_eq!(replay.satisfied, fresh.satisfied, "seed {seed} len {len}");
+                assert_eq!(replay.verdict, fresh.verdict, "seed {seed} len {len}");
                 for (id, outcome) in &fresh.conditions {
                     let replayed = replay.conditions.get(id).expect("replayed condition");
                     assert_eq!(replayed.status, outcome.status, "seed {seed} len {len} {id}");
@@ -1382,7 +1477,7 @@ mod tests {
 
         let report = evaluate(&signal, "BTC", &data).expect("valid undefined-operand signal");
         assert_eq!(report.conditions["aboveSma"].status, OutcomeStatus::UndefinedOperands);
-        assert!(!report.satisfied, "undefined operands must not satisfy negation");
+        assert_eq!(report.verdict, EvaluationVerdict::Unknown);
     }
 
     #[test]
@@ -1444,9 +1539,14 @@ mod tests {
 
         let report = evaluate(&signal, "BTC", &data).expect("valid missing-data signal");
         assert_eq!(report.conditions["hot"].status, OutcomeStatus::Satisfied);
-        assert_eq!(report.conditions["weekly"].status, OutcomeStatus::NoData);
-        assert_eq!(report.missing_data, vec![Timeframe::Week1]);
-        assert!(!report.satisfied);
+        assert_eq!(
+            report.conditions["weekly"].status,
+            OutcomeStatus::NoData {
+                reason: CandleHealth::Loading,
+            }
+        );
+        assert_eq!(report.pending_data, BTreeMap::from([(Timeframe::Week1, CandleHealth::Loading)]));
+        assert_eq!(report.verdict, EvaluationVerdict::Unknown);
 
         let negated = definition(
             vec![("weekly", sma_threshold(Timeframe::Week1, 80.0, 0))],
@@ -1459,8 +1559,52 @@ mod tests {
         assert!(
             !evaluate(&negated, "BTC", &CoinData::default())
                 .expect("valid negated signal")
-                .satisfied
+                .is_satisfied()
         );
+    }
+
+    #[test]
+    fn unknown_branches_preserve_definitive_all_and_any_verdicts() {
+        let mut data = CoinData::default();
+        data.insert(Timeframe::Hour4, candles(&[100.0, 100.0]));
+
+        let report_for = |hot_threshold, root| {
+            let signal = definition(
+                vec![
+                    ("hot", sma_threshold(Timeframe::Hour4, hot_threshold, 0)),
+                    ("weekly", sma_threshold(Timeframe::Week1, 80.0, 0)),
+                ],
+                root,
+            );
+            evaluate(&signal, "BTC", &data).expect("valid mixed-availability signal")
+        };
+        let children = || {
+            vec![
+                Node::Condition { id: "hot".to_owned() },
+                Node::Condition {
+                    id: "weekly".to_owned(),
+                },
+            ]
+        };
+
+        let false_and_unknown = report_for(200.0, Node::All { children: children() });
+        assert_eq!(false_and_unknown.verdict, EvaluationVerdict::NotMatched);
+        assert_eq!(
+            false_and_unknown.pending_data,
+            BTreeMap::from([(Timeframe::Week1, CandleHealth::Loading)])
+        );
+
+        let true_or_unknown = report_for(80.0, Node::Any { children: children() });
+        assert_eq!(true_or_unknown.verdict, EvaluationVerdict::Matched);
+
+        let false_or_unknown = report_for(200.0, Node::Any { children: children() });
+        assert_eq!(false_or_unknown.verdict, EvaluationVerdict::Unknown);
+
+        let true_and_unknown = report_for(80.0, Node::All { children: children() });
+        assert_eq!(true_and_unknown.verdict, EvaluationVerdict::Unknown);
+
+        let xor_with_unknown = report_for(80.0, Node::Xor { children: children() });
+        assert_eq!(xor_with_unknown.verdict, EvaluationVerdict::Unknown);
     }
 
     #[test]
@@ -1492,7 +1636,7 @@ mod tests {
         let mut data = CoinData::default();
         data.insert(Timeframe::Hour1, candles(&[100.0, 100.0]));
 
-        assert!(evaluate(&signal, "BTC", &data).expect("valid nested signal").satisfied);
+        assert!(evaluate(&signal, "BTC", &data).expect("valid nested signal").is_satisfied());
     }
 
     #[test]
@@ -1536,7 +1680,7 @@ mod tests {
         let mut data = CoinData::default();
         data.insert(Timeframe::Hour1, candles(&closes));
         let report = evaluate(&signal, "BTC", &data).expect("valid divergence signal");
-        assert!(report.satisfied);
+        assert!(report.is_satisfied());
         assert_eq!(
             report.conditions["div"].last_true_bar,
             Utc.timestamp_opt(17 * 3_600, 0).single()

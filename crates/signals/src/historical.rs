@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::definition::{DefinitionError, SignalDefinition};
-use crate::eval::{CoinData, EvalReport, OutcomeStatus, PreparedEvaluation, Truth};
+use crate::eval::{CoinData, EvalReport, EvaluationVerdict, OutcomeStatus, PreparedEvaluation, Truth};
 
 /// Inclusive evaluation bounds expressed as UTC instants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +122,16 @@ pub enum HistoricalValidationError {
         /// Contiguous candles available immediately before the range end.
         available: usize,
     },
+    /// A condition's operands could not be represented at an evaluated instant.
+    #[error("historical validation condition '{condition}' has undefined {timeframe:?} operands at {evaluated_at}")]
+    UndefinedOperands {
+        /// Condition identifier from the validated definition.
+        condition: String,
+        /// Affected timeframe.
+        timeframe: Timeframe,
+        /// Historical instant where the condition became undefined.
+        evaluated_at: DateTime<Utc>,
+    },
     /// A pure caller omitted a required timeframe.
     #[error("historical validation has no candle data for {timeframe:?}")]
     MissingData {
@@ -206,8 +216,12 @@ fn bars_between(
     usize::try_from(distance / timeframe.duration_ms()).map_err(|_| HistoricalValidationError::RangeOverflow)
 }
 
-fn ensure_known_report(definition: &SignalDefinition, report: &EvalReport) -> Result<(), HistoricalValidationError> {
-    if let Some(timeframe) = report.missing_data.first() {
+fn ensure_known_report(
+    definition: &SignalDefinition,
+    report: &EvalReport,
+    evaluated_at: DateTime<Utc>,
+) -> Result<(), HistoricalValidationError> {
+    if let Some(timeframe) = report.pending_data.keys().next() {
         return Err(HistoricalValidationError::MissingData { timeframe: *timeframe });
     }
     if let Some((timeframe, message)) = report.unavailable_data.first_key_value() {
@@ -217,14 +231,29 @@ fn ensure_known_report(definition: &SignalDefinition, report: &EvalReport) -> Re
         });
     }
     for (id, outcome) in &report.conditions {
-        if let OutcomeStatus::InsufficientHistory { required, available } = outcome.status
-            && let Some(condition) = definition.conditions.get(id)
-        {
-            return Err(HistoricalValidationError::InsufficientHistory {
-                timeframe: condition.timeframe,
-                required,
-                available,
-            });
+        let Some(condition) = definition.conditions.get(id) else {
+            continue;
+        };
+        match outcome.status {
+            OutcomeStatus::InsufficientHistory { required, available } => {
+                return Err(HistoricalValidationError::InsufficientHistory {
+                    timeframe: condition.timeframe,
+                    required,
+                    available,
+                });
+            }
+            OutcomeStatus::UndefinedOperands if report.verdict == EvaluationVerdict::Unknown => {
+                return Err(HistoricalValidationError::UndefinedOperands {
+                    condition: id.clone(),
+                    timeframe: condition.timeframe,
+                    evaluated_at,
+                });
+            }
+            OutcomeStatus::Satisfied
+            | OutcomeStatus::NotSatisfied
+            | OutcomeStatus::NoData { .. }
+            | OutcomeStatus::Unavailable
+            | OutcomeStatus::UndefinedOperands => {}
         }
     }
     Ok(())
@@ -327,7 +356,7 @@ where
 
     let pre_lengths = prepared.lengths_at(pre_range_evaluation);
     let pre_report = prepared.report_at(definition, coin, &pre_lengths);
-    ensure_known_report(definition, &pre_report)?;
+    ensure_known_report(definition, &pre_report, pre_range_evaluation)?;
     let total_points =
         coverage_and_points(data, &requirements, anchor, first_evaluation, pre_range_evaluation, range.end)?;
 
@@ -337,7 +366,7 @@ where
         evidence: EvalReport,
     }
 
-    let mut active = pre_report.satisfied.then_some(ActiveSpan {
+    let mut active = (pre_report.verdict == EvaluationVerdict::Matched).then_some(ActiveSpan {
         started_at: range.start,
         active_at_start: true,
         evidence: pre_report,
@@ -347,7 +376,17 @@ where
     let mut evaluated_at = first_evaluation;
     while evaluated_at <= range.end {
         let lengths = prepared.lengths_at(evaluated_at);
-        let satisfied = prepared.truth_at(definition, &lengths) == Truth::True;
+        let truth = prepared.truth_at(definition, &lengths);
+        if truth == Truth::Unknown
+            && let Some((condition, timeframe)) = prepared.undefined_condition_at(definition, &lengths)
+        {
+            return Err(HistoricalValidationError::UndefinedOperands {
+                condition: condition.to_owned(),
+                timeframe,
+                evaluated_at,
+            });
+        }
+        let satisfied = truth == Truth::True;
         evaluated_points += 1;
 
         match (active.take(), satisfied) {
@@ -501,7 +540,8 @@ mod tests {
         validate_historical,
     };
     use crate::definition::{
-        CandleField, ComparisonOp, Condition, DEFINITION_VERSION, Direction, Node, Operand, Predicate, SignalDefinition,
+        CandleField, ComparisonOp, Condition, DEFINITION_VERSION, Direction, Node, Operand, OperandAdjustment,
+        Predicate, SignalDefinition,
     };
     use crate::eval::{CoinData, ConditionEvidence};
 
@@ -535,6 +575,21 @@ mod tests {
                 },
                 op: ComparisonOp::GreaterThan,
                 right: Operand::Constant { value: threshold },
+            },
+            within_bars: 0,
+        }
+    }
+
+    fn overflowing_condition(timeframe: Timeframe) -> Condition {
+        Condition {
+            timeframe,
+            predicate: Predicate::Threshold {
+                left: Operand::Field {
+                    field: CandleField::Close,
+                    adjustment: Some(OperandAdjustment::Percent { value: 1e308 }),
+                },
+                op: ComparisonOp::GreaterThan,
+                right: Operand::Constant { value: 0.0 },
             },
             within_bars: 0,
         }
@@ -637,6 +692,96 @@ mod tests {
         assert_eq!(result.spans[0].ended_at, at_hour(2));
         assert!(result.spans[0].active_at_start);
         assert!(result.spans[0].active_at_end);
+    }
+
+    #[test]
+    fn undefined_operands_fail_at_the_exact_historical_instant() {
+        let signal = definition(
+            vec![("price", overflowing_condition(Timeframe::Hour1))],
+            Node::Condition { id: "price".to_owned() },
+        );
+        let mut data = CoinData::default();
+        data.insert(
+            Timeframe::Hour1,
+            [(-1, 1.0), (0, 1.0), (1, 1.0), (2, 1.0), (3, 1_000.0), (4, 1_000.0)]
+                .into_iter()
+                .map(|(index, close)| candle(Timeframe::Hour1, index, close))
+                .collect(),
+        );
+
+        let range = HistoricalRange {
+            start: at_hour(1),
+            end: at_hour(5),
+        };
+        assert!(matches!(
+            evaluate_historical(&signal, "BTC", &data, range),
+            Err(HistoricalValidationError::UndefinedOperands {
+                condition,
+                timeframe: Timeframe::Hour1,
+                evaluated_at,
+            }) if condition == "price" && evaluated_at == at_hour(4)
+        ));
+
+        let mut undefined_before_range = CoinData::default();
+        undefined_before_range.insert(
+            Timeframe::Hour1,
+            (-1..=4).map(|index| candle(Timeframe::Hour1, index, 1_000.0)).collect(),
+        );
+        assert!(matches!(
+            evaluate_historical(&signal, "BTC", &undefined_before_range, range),
+            Err(HistoricalValidationError::UndefinedOperands {
+                condition,
+                timeframe: Timeframe::Hour1,
+                evaluated_at,
+            }) if condition == "price" && evaluated_at == at_hour(0)
+        ));
+    }
+
+    #[test]
+    fn definitive_tree_verdicts_ignore_irrelevant_undefined_siblings() {
+        let mut data = CoinData::default();
+        data.insert(
+            Timeframe::Hour1,
+            [(-1, 1.0), (0, 1.0), (1, 1.0), (2, 1.0), (3, 1_000.0), (4, 1_000.0)]
+                .into_iter()
+                .map(|(index, close)| candle(Timeframe::Hour1, index, close))
+                .collect(),
+        );
+        let children = || {
+            vec![
+                Node::Condition { id: "known".to_owned() },
+                Node::Condition {
+                    id: "undefined".to_owned(),
+                },
+            ]
+        };
+        let range = HistoricalRange {
+            start: at_hour(1),
+            end: at_hour(5),
+        };
+
+        let matched = definition(
+            vec![
+                ("known", threshold_condition(Timeframe::Hour1, 0.0)),
+                ("undefined", overflowing_condition(Timeframe::Hour1)),
+            ],
+            Node::Any { children: children() },
+        );
+        let matched_result = evaluate_historical(&matched, "BTC", &data, range).expect("definitive matched replay");
+        assert_eq!(matched_result.spans.len(), 1);
+        assert!(matched_result.spans[0].active_at_start);
+        assert!(matched_result.spans[0].active_at_end);
+
+        let not_matched = definition(
+            vec![
+                ("known", threshold_condition(Timeframe::Hour1, 2_000.0)),
+                ("undefined", overflowing_condition(Timeframe::Hour1)),
+            ],
+            Node::All { children: children() },
+        );
+        let not_matched_result =
+            evaluate_historical(&not_matched, "BTC", &data, range).expect("definitive non-matched replay");
+        assert!(not_matched_result.spans.is_empty());
     }
 
     #[test]

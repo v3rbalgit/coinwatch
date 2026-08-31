@@ -17,7 +17,12 @@
   import Button from "$lib/components/ui/button.svelte"
   import { formatTimestamp } from "$lib/format"
   import type { EvalReport, SignalRunProgress } from "$lib/signals/run"
-  import { filterSignalRunReports, rankClosestSignalRunReports, reportHasDataIssues } from "$lib/signals/run-results"
+  import {
+    filterSignalRunReports,
+    pendingCandleMessage,
+    rankClosestSignalRunReports,
+    reportHasDataIssues,
+  } from "$lib/signals/run-results"
   import type { SignalRunResultFilter } from "$lib/signals/run-results"
   import type { SignalRunSnapshot } from "$lib/signals/run-workspace.svelte"
 
@@ -50,7 +55,7 @@
   const filters: readonly { value: SignalRunResultFilter; label: string }[] = [
     { value: "matches", label: "Matches" },
     { value: "closest", label: "Closest" },
-    { value: "all", label: "All evaluated" },
+    { value: "all", label: "All processed" },
     { value: "issues", label: "Data issues" },
   ]
   const filteredReports = $derived(filterSignalRunReports(snapshot.definition, reports, filter))
@@ -61,11 +66,23 @@
   const completed = $derived(progress.status === "idle" ? 0 : progress.completed)
   const total = $derived(progress.status === "idle" ? 0 : progress.total)
   const matched = $derived(progress.status === "idle" ? 0 : progress.matched)
+  const unknown = $derived(progress.status === "idle" ? 0 : progress.unknown)
   const percentage = $derived(total === 0 ? 0 : Math.min(100, Math.round((completed / total) * 100)))
   const displayedError = $derived(progress.status === "failed" ? progress.message : error)
 
   function satisfiedConditionCount(report: EvalReport): number {
     return Object.values(report.conditions).filter(outcome => outcome.status === "satisfied").length
+  }
+
+  function verdictLabel(report: EvalReport): string {
+    switch (report.verdict) {
+      case "matched":
+        return "Match"
+      case "notMatched":
+        return "No match"
+      case "unknown":
+        return "Could not evaluate"
+    }
   }
 </script>
 
@@ -110,15 +127,16 @@
           {/if}
         </span>
         <span class="text-muted-foreground"
-          ><strong class="text-foreground">{completed}</strong> / {total} evaluated</span
+          ><strong class="text-foreground">{completed}</strong> / {total} processed</span
         >
         <span class="text-muted-foreground"><strong class="text-foreground">{matched}</strong> matches</span>
+        <span class="text-muted-foreground"><strong class="text-foreground">{unknown}</strong> inconclusive</span>
         <span class="text-muted-foreground"><strong class="text-foreground">{issueCount}</strong> data issues</span>
       </div>
       <div
         class="mt-3 h-1.5 overflow-hidden rounded-full bg-muted"
         role="progressbar"
-        aria-label="Markets evaluated"
+        aria-label="Markets processed"
         aria-valuemin="0"
         aria-valuemax={total}
         aria-valuenow={completed}
@@ -160,18 +178,18 @@
         {#if active && reports.length === 0}
           <LoaderCircle class="size-6 animate-spin text-primary" />
           <h2 class="mt-3 text-sm font-medium text-foreground">Waiting for the first market</h2>
-          <p class="mt-1 text-xs text-muted-foreground">Results appear as each market finishes evaluation.</p>
+          <p class="mt-1 text-xs text-muted-foreground">Results appear as each market is processed.</p>
         {:else}
           <CircleAlert class="size-6 text-muted-foreground" />
           <h2 class="mt-3 text-sm font-medium text-foreground">No results in this view</h2>
           <p class="mt-1 text-xs text-muted-foreground">
             {filter === "matches"
-              ? "No evaluated markets have matched this signal."
+              ? "No processed markets have matched this signal."
               : filter === "closest"
                 ? "No defensible proximity ranking is available for these condition outcomes."
                 : filter === "issues"
-                  ? "No evaluated markets have reported data issues."
-                  : "No markets have been evaluated yet."}
+                  ? "No processed markets have reported data issues."
+                  : "No markets have been processed yet."}
           </p>
         {/if}
       </div>
@@ -181,11 +199,14 @@
           <details class="group rounded-lg border border-border bg-card">
             <summary class="flex cursor-pointer list-none flex-wrap items-center gap-3 px-4 py-3 marker:hidden">
               <span class="min-w-24 text-sm font-semibold text-foreground">{report.coin}</span>
-              <Badge variant={report.satisfied ? "success" : "outline"}>
-                {report.satisfied ? "Match" : "No match"}
+              <Badge
+                variant={report.verdict === "matched" ? "success" : "outline"}
+                class={report.verdict === "unknown" ? "border-amber-500/40 text-amber-500" : ""}
+              >
+                {verdictLabel(report)}
               </Badge>
-              {#if reportHasDataIssues(report)}
-                <Badge variant="outline" class="border-amber-500/40 text-amber-500">Data issue</Badge>
+              {#if report.verdict !== "unknown" && reportHasDataIssues(report)}
+                <Badge variant="outline" class="border-amber-500/40 text-amber-500">Partial data</Badge>
               {/if}
               {#if filter === "closest"}
                 <Badge variant="secondary">{satisfiedConditionCount(report)} / {conditionCount} conditions</Badge>
@@ -215,14 +236,14 @@
             <div class="border-t border-border px-4 py-4">
               <ConditionOutcomes definition={snapshot.definition} {report} {descriptors} />
 
-              {#if report.missingData.length > 0 || Object.keys(report.unavailableData).length > 0}
+              {#if Object.keys(report.pendingData).length > 0 || Object.keys(report.unavailableData).length > 0}
                 <h3 class="mt-4 text-xs font-medium tracking-wide text-muted-foreground uppercase">Data details</h3>
                 <div
                   class="mt-2 space-y-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400"
                 >
-                  {#if report.missingData.length > 0}
-                    <p>No candle data available: {report.missingData.join(", ")}</p>
-                  {/if}
+                  {#each Object.entries(report.pendingData) as [timeframe, health] (timeframe)}
+                    <p>{timeframe}: {pendingCandleMessage(health)}</p>
+                  {/each}
                   {#each Object.entries(report.unavailableData) as [timeframe, message] (timeframe)}
                     <p>{timeframe}: {message}</p>
                   {/each}

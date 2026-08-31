@@ -6,6 +6,7 @@ import {
   conditionEvidence,
   filterSignalRunReports,
   orderedConditionIds,
+  pendingCandleMessage,
   rankClosestSignalRunReports,
   reportHasDataIssues,
 } from "$lib/signals/run-results"
@@ -57,18 +58,20 @@ const definition: SignalDefinition = {
 function report(
   coin: string,
   satisfied: boolean,
-  overrides: Partial<Pick<EvalReport, "missingData" | "unavailableData">> = {}
+  overrides: Partial<Pick<EvalReport, "pendingData" | "unavailableData">> = {}
 ): EvalReport {
+  const unavailable =
+    Object.keys(overrides.pendingData ?? {}).length > 0 || Object.keys(overrides.unavailableData ?? {}).length > 0
   return {
     coin,
-    satisfied,
+    verdict: unavailable ? "unknown" : satisfied ? "matched" : "notMatched",
     lastEvidenceAt: satisfied ? "2026-08-26T10:00:00Z" : null,
     conditions: {
       trend: { status: "notSatisfied", lastTrueBar: null, evidence: null },
       volume: { status: "satisfied", lastTrueBar: "2026-08-26T08:00:00Z", evidence: null },
       retained: { status: "notSatisfied", lastTrueBar: null, evidence: null },
     },
-    missingData: overrides.missingData ?? [],
+    pendingData: overrides.pendingData ?? {},
     unavailableData: overrides.unavailableData ?? {},
   }
 }
@@ -85,7 +88,9 @@ describe("signal run result helpers", () => {
   it("filters matches, all reports, and every explicit data issue", () => {
     const matched = report("BTC", true)
     const plain = report("ETH", false)
-    const missing = report("SOL", false, { missingData: ["1d"] })
+    const missing = report("SOL", false, { pendingData: { "1d": "repairing" } })
+    const partialMatch = report("ARB", true, { pendingData: { "1d": "stale" } })
+    partialMatch.verdict = "matched"
     const unavailable = report("HYPE", false, { unavailableData: { "4h": "provider unavailable" } })
     unavailable.conditions.volume = { status: "unavailable", lastTrueBar: null, evidence: null }
     const insufficient = report("DOGE", false)
@@ -96,17 +101,22 @@ describe("signal run result helpers", () => {
       lastTrueBar: null,
       evidence: null,
     }
-    const reports = [matched, plain, missing, unavailable, insufficient]
+    const reports = [matched, plain, missing, partialMatch, unavailable, insufficient]
 
-    expect(filterSignalRunReports(definition, reports, "matches").map(item => item.coin)).toEqual(["BTC"])
+    expect(filterSignalRunReports(definition, reports, "matches").map(item => item.coin)).toEqual(["BTC", "ARB"])
     expect(filterSignalRunReports(definition, reports, "all")).toEqual(reports)
     expect(filterSignalRunReports(definition, reports, "issues").map(item => item.coin)).toEqual([
       "SOL",
+      "ARB",
       "HYPE",
       "DOGE",
     ])
     expect(reportHasDataIssues(plain)).toBe(false)
     expect(reportHasDataIssues(insufficient)).toBe(true)
+    expect(pendingCandleMessage("loading")).toContain("loading")
+    expect(pendingCandleMessage("stale")).toContain("current candle")
+    expect(pendingCandleMessage("verifying")).toContain("reconnect")
+    expect(pendingCandleMessage("repairing")).toContain("structural")
   })
 
   it("ranks honest closest candidates by satisfied leaves and normalized threshold miss", () => {
@@ -138,7 +148,8 @@ describe("signal run result helpers", () => {
       lastTrueBar: null,
       evidence: { type: "state", observedAt: "2026-08-26T08:00:00Z", left: 900, right: 1000 },
     }
-    const dataIssue = report("ISSUE", false, { missingData: ["1h"] })
+    const dataIssue = report("ISSUE", false, { pendingData: { "1h": "verifying" } })
+    dataIssue.verdict = "notMatched"
     const matched = report("MATCH", true)
 
     expect(

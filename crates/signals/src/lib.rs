@@ -14,7 +14,7 @@ pub use definition::{
     Direction, DirectionFilter, KindFilter, Node, Operand, OperandAdjustment, Predicate, SignalDefinition,
     decode_definition,
 };
-pub use eval::{CoinData, ConditionEvidence, ConditionOutcome, EvalReport, OutcomeStatus};
+pub use eval::{CoinData, ConditionEvidence, ConditionOutcome, EvalReport, EvaluationVerdict, OutcomeStatus};
 pub use historical::{
     HistoricalMatchSpan, HistoricalProgress, HistoricalRange, HistoricalValidation, HistoricalValidationError,
     evaluate_historical, validate_historical,
