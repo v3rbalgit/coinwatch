@@ -61,6 +61,7 @@ struct CandleFetch {
     limit: usize,
     mode: ReconcileMode,
     epoch: u64,
+    revision: u64,
 }
 
 fn candle_fetch(
@@ -86,6 +87,7 @@ fn candle_fetch(
                 limit: lookback,
                 mode: ReconcileMode::Replace,
                 epoch: health.repair_epoch,
+                revision: health.write_revision,
             });
         }
     };
@@ -104,6 +106,7 @@ fn candle_fetch(
             limit: lookback,
             mode: ReconcileMode::Replace,
             epoch: health.repair_epoch,
+            revision: health.write_revision,
         }
     } else {
         CandleFetch {
@@ -112,6 +115,7 @@ fn candle_fetch(
             limit: required,
             mode: ReconcileMode::Merge,
             epoch: health.repair_epoch,
+            revision: health.write_revision,
         }
     })
 }
@@ -234,8 +238,21 @@ fn drop_bars_closed_since_fetch(candles: &mut Vec<Candle>, timeframe: Timeframe,
     }
 }
 
-/// Re-plans at execution time so a moved bar boundary cannot stale the window;
-/// only bars that closed before the fetch persist or overwrite existing rows.
+fn completed_rows_in_range(
+    candles: &[Candle],
+    timeframe: Timeframe,
+    at_ms: i64,
+    first_open_ms: i64,
+    last_open_ms: i64,
+) -> Option<&[Candle]> {
+    let completed = candles.get(..completed_prefix_len(candles, timeframe, at_ms))?;
+    let start = completed.partition_point(|candle| candle.open_time.timestamp_millis() < first_open_ms);
+    let end = completed.partition_point(|candle| candle.open_time.timestamp_millis() <= last_open_ms);
+    completed.get(start..end)
+}
+
+/// Re-plans at execution time so a moved bar boundary cannot stale the window.
+/// Rows that close mid-flight are excluded, and persistence uses the reconciled winner.
 async fn execute_fetch(
     store: &MarketStore,
     rest: &HyperliquidRest,
@@ -251,6 +268,7 @@ async fn execute_fetch(
         limit,
         mode,
         epoch,
+        revision,
     }) = candle_fetch(store, coin, timeframe, config, fetched_at_ms)
     else {
         return true;
@@ -261,26 +279,43 @@ async fn execute_fetch(
             false
         }
         Ok(mut candles) => {
-            drop_bars_closed_since_fetch(&mut candles, timeframe, fetched_at_ms, Utc::now().timestamp_millis());
+            let reconciled_at_ms = Utc::now().timestamp_millis();
+            drop_bars_closed_since_fetch(&mut candles, timeframe, fetched_at_ms, reconciled_at_ms);
             if candles.is_empty() {
                 return true;
             }
-            // Reconcile before SQLite I/O so a newer WebSocket update cannot be
-            // overwritten after a slow persistence transaction completes.
-            store.reconcile_candles(coin.clone(), timeframe, candles.clone(), mode, epoch);
+            let (Some(first), Some(last)) = (candles.first(), candles.last()) else {
+                return true;
+            };
+            let first_open_ms = first.open_time.timestamp_millis();
+            let last_open_ms = last.open_time.timestamp_millis();
+            // Reconcile before SQLite I/O so the persisted rows come from the
+            // post-fetch winner and cannot regress a newer WebSocket tail.
+            store.reconcile_candles(coin.clone(), timeframe, candles, mode, epoch, revision);
             if store.series_health(&coin, timeframe).needs_repair {
                 tracing::warn!(coin = %coin, timeframe = timeframe.as_hl(), "candle snapshot is not contiguous");
                 return false;
             }
-            let final_rows = completed_prefix_len(&candles, timeframe, fetched_at_ms);
-            if let Some(rows) = candles.get(..final_rows)
-                && !rows.is_empty()
+            store.provision_forming_candle_after_reconcile(&coin, timeframe, timeframe.bar_open_ms(reconciled_at_ms));
+            let Some(reconciled) = store.candles(&coin, timeframe) else {
+                tracing::warn!(coin = %coin, timeframe = timeframe.as_hl(), "reconciled candle buffer is missing");
+                return false;
+            };
+            let Some(rows) =
+                completed_rows_in_range(&reconciled, timeframe, fetched_at_ms, first_open_ms, last_open_ms)
+            else {
+                tracing::warn!(coin = %coin, timeframe = timeframe.as_hl(), "reconciled candle range is invalid");
+                return false;
+            };
+            if !rows.is_empty()
                 && let Err(error) = persistence.save(&coin, timeframe, rows).await
             {
                 tracing::warn!(coin = %coin, timeframe = timeframe.as_hl(), %error, "failed to persist candles");
             }
-            let reconciled_at = Utc::now().timestamp_millis();
-            if store.series_health(&coin, timeframe).is_current(timeframe, reconciled_at) {
+            if store
+                .series_health(&coin, timeframe)
+                .is_current(timeframe, Utc::now().timestamp_millis())
+            {
                 true
             } else {
                 tracing::warn!(coin = %coin, timeframe = timeframe.as_hl(), "candle snapshot is not current");
@@ -315,7 +350,10 @@ mod tests {
     use rust_decimal::Decimal;
     use storage::{CandleSeries, CandleStore, StoreError};
 
-    use super::{SyncConfig, candle_fetch, drop_bars_closed_since_fetch, persist_streamed_heads, spawn_sync};
+    use super::{
+        SyncConfig, candle_fetch, completed_rows_in_range, drop_bars_closed_since_fetch, persist_streamed_heads,
+        spawn_sync,
+    };
     use crate::store::ReconcileMode;
     use crate::{CANDLE_WINDOW, HyperliquidRest, MarketStore};
 
@@ -417,12 +455,14 @@ mod tests {
                 "an unsuccessful fetch remains due",
             );
 
+            let health = store.series_health(coin, timeframe);
             store.reconcile_candles(
                 coin.to_owned(),
                 timeframe,
                 vec![candle_at(0), candle_at(next_open)],
                 ReconcileMode::Merge,
-                0,
+                health.repair_epoch,
+                health.write_revision,
             );
             assert!(candle_fetch(&store, coin.to_owned(), timeframe, &config, next_open + grace_ms + 1).is_none());
         }
@@ -486,6 +526,20 @@ mod tests {
         let mut same_bar = vec![candle_at(0), candle_at(hour)];
         drop_bars_closed_since_fetch(&mut same_bar, Timeframe::Hour1, hour + 1, hour + 2);
         assert_eq!(same_bar.len(), 2);
+    }
+
+    #[test]
+    fn persistence_range_uses_the_reconciled_winner() {
+        let hour = Timeframe::Hour1.duration_ms();
+        let mut corrected = candle_at(hour);
+        corrected.close = Decimal::TWO;
+        let winner = vec![candle_at(0), corrected, candle_at(2 * hour)];
+
+        let rows = completed_rows_in_range(&winner, Timeframe::Hour1, 3 * hour, hour, 2 * hour)
+            .expect("valid persistence range");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.first().expect("corrected row").close, Decimal::TWO);
     }
 
     #[tokio::test]
