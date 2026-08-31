@@ -13,7 +13,7 @@ use storage::{CandleSeries, CandleStore};
 use tokio::task::JoinHandle;
 
 use crate::rest::HyperliquidRest;
-use crate::store::ReconcileMode;
+use crate::store::{CandleIntegrity, ReconcileMode, STREAM_RECONCILE_WINDOW};
 use crate::{CANDLE_WINDOW, MarketStore, SyncPhase};
 
 /// How the sync engine seeds and refreshes the store.
@@ -73,13 +73,36 @@ fn candle_fetch(
 ) -> Option<CandleFetch> {
     let lookback = config.lookback.clamp(2, CANDLE_WINDOW);
     let health = store.series_health(&coin, timeframe);
+    match health.integrity {
+        CandleIntegrity::VerifyOverlap => {
+            return Some(CandleFetch {
+                coin,
+                timeframe,
+                limit: STREAM_RECONCILE_WINDOW,
+                mode: ReconcileMode::VerifyOverlap,
+                epoch: health.repair_epoch,
+                revision: health.write_revision,
+            });
+        }
+        CandleIntegrity::Repair => {
+            return Some(CandleFetch {
+                coin,
+                timeframe,
+                limit: lookback,
+                mode: ReconcileMode::Replace,
+                epoch: health.repair_epoch,
+                revision: health.write_revision,
+            });
+        }
+        CandleIntegrity::Verified => {}
+    }
     if health.is_current(timeframe, now_ms) {
         return None;
     }
 
     let current_open_ms = timeframe.bar_open_ms(now_ms);
     let latest_open_ms = match health.latest_open_ms {
-        Some(open_ms) if !health.needs_repair && timeframe.is_aligned(open_ms) && open_ms < current_open_ms => open_ms,
+        Some(open_ms) if timeframe.is_aligned(open_ms) && open_ms < current_open_ms => open_ms,
         _ => {
             return Some(CandleFetch {
                 coin,
@@ -292,9 +315,16 @@ async fn execute_fetch(
             // Reconcile before SQLite I/O so the persisted rows come from the
             // post-fetch winner and cannot regress a newer WebSocket tail.
             store.reconcile_candles(coin.clone(), timeframe, candles, mode, epoch, revision);
-            if store.series_health(&coin, timeframe).needs_repair {
-                tracing::warn!(coin = %coin, timeframe = timeframe.as_hl(), "candle snapshot is not contiguous");
-                return false;
+            match store.series_health(&coin, timeframe).integrity {
+                CandleIntegrity::Repair => {
+                    tracing::warn!(coin = %coin, timeframe = timeframe.as_hl(), "candle snapshot requires structural repair");
+                    return false;
+                }
+                CandleIntegrity::VerifyOverlap => {
+                    tracing::debug!(coin = %coin, timeframe = timeframe.as_hl(), "candle overlap remains unverified");
+                    return false;
+                }
+                CandleIntegrity::Verified => {}
             }
             store.provision_forming_candle_after_reconcile(&coin, timeframe, timeframe.bar_open_ms(reconciled_at_ms));
             let Some(reconciled) = store.candles(&coin, timeframe) else {
@@ -354,7 +384,7 @@ mod tests {
         SyncConfig, candle_fetch, completed_rows_in_range, drop_bars_closed_since_fetch, persist_streamed_heads,
         spawn_sync,
     };
-    use crate::store::ReconcileMode;
+    use crate::store::{ReconcileMode, STREAM_RECONCILE_WINDOW};
     use crate::{CANDLE_WINDOW, HyperliquidRest, MarketStore};
 
     struct NoopStore;
@@ -430,6 +460,13 @@ mod tests {
             .expect("missing series needs an initial fetch");
         assert_eq!(fetch.limit, CANDLE_WINDOW);
         assert_eq!(fetch.mode, ReconcileMode::Replace);
+
+        store.set_candles("ETH".to_owned(), Timeframe::Hour1, Vec::new());
+        store.mark_streamed_for_verification(&[Timeframe::Hour1]);
+        let empty_fetch = candle_fetch(&store, "ETH".to_owned(), Timeframe::Hour1, &config, 0)
+            .expect("an empty buffer still needs a full initial fetch");
+        assert_eq!(empty_fetch.limit, CANDLE_WINDOW);
+        assert_eq!(empty_fetch.mode, ReconcileMode::Replace);
     }
 
     #[test]
@@ -485,16 +522,21 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_streams_plan_a_full_rest_repair() {
+    fn interrupted_streams_plan_a_bounded_overlap_until_verified() {
         let store = MarketStore::new();
         let config = SyncConfig::default();
         store.set_candles("BTC".to_owned(), Timeframe::Hour1, vec![candle_at(0)]);
-        store.mark_streamed_for_reconciliation(&[Timeframe::Hour1]);
+        store.mark_streamed_for_verification(&[Timeframe::Hour1]);
 
         let fetch = candle_fetch(&store, "BTC".to_owned(), Timeframe::Hour1, &config, 0)
-            .expect("disconnected stream needs repair");
-        assert_eq!(fetch.limit, config.lookback);
-        assert_eq!(fetch.mode, ReconcileMode::Replace);
+            .expect("disconnected stream needs verification");
+        assert_eq!(fetch.limit, STREAM_RECONCILE_WINDOW);
+        assert_eq!(fetch.mode, ReconcileMode::VerifyOverlap);
+        assert_eq!(
+            candle_fetch(&store, "BTC".to_owned(), Timeframe::Hour1, &config, 0),
+            Some(fetch),
+            "a failed overlap remains pending",
+        );
     }
 
     #[test]
@@ -503,6 +545,7 @@ mod tests {
         let config = SyncConfig::default();
         store.merge_candle("BTC", Timeframe::Hour1, candle_at(0));
         store.merge_candle("BTC", Timeframe::Hour1, candle_at(2 * Timeframe::Hour1.duration_ms()));
+        store.mark_streamed_for_verification(&[Timeframe::Hour1]);
 
         let fetch = candle_fetch(
             &store,
