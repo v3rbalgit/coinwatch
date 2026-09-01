@@ -307,6 +307,16 @@ fn push_capped(candles: &mut Vec<Candle>, candle: Candle) {
     candles.push(candle);
 }
 
+fn series_has_live_consumer(
+    coin: &str,
+    timeframe: Timeframe,
+    global_timeframes: &[Timeframe],
+    active_series: Option<&ActiveSeries>,
+) -> bool {
+    global_timeframes.contains(&timeframe)
+        || active_series.is_some_and(|series| series.coin == coin && series.timeframe == timeframe)
+}
+
 pub(crate) fn candles_are_contiguous(candles: &[Candle], timeframe: Timeframe) -> bool {
     candles
         .iter()
@@ -666,11 +676,7 @@ impl MarketStore {
             return false;
         }
         let active = self.active_series.read().unwrap_or_else(PoisonError::into_inner);
-        if !global_timeframes.contains(&timeframe)
-            && !active
-                .as_ref()
-                .is_some_and(|series| series.coin == coin && series.timeframe == timeframe)
-        {
+        if !series_has_live_consumer(coin, timeframe, global_timeframes, active.as_ref()) {
             return false;
         }
         self.merge_candle(coin, timeframe, candle);
@@ -799,11 +805,7 @@ impl MarketStore {
     /// atomic with this check; completed rows retain their verification watermark.
     pub(crate) fn remove_unsubscribed_tail(&self, coin: &str, timeframe: Timeframe, global_timeframes: &[Timeframe]) {
         let active = self.active_series.read().unwrap_or_else(PoisonError::into_inner);
-        if global_timeframes.contains(&timeframe)
-            || active
-                .as_ref()
-                .is_some_and(|series| series.coin == coin && series.timeframe == timeframe)
-        {
+        if series_has_live_consumer(coin, timeframe, global_timeframes, active.as_ref()) {
             return;
         }
         let Some(mut entry) = self.candles.get_mut(&(coin.to_owned(), timeframe)) else {
