@@ -68,7 +68,9 @@ SQLite user data ──▶ watchlists · signal catalog · presets ────�
   series-reconciliation progress, failure diagnostics, series-job throughput, and storage durability)
   published on a `watch` channel. Each candle buffer distinguishes REST/SQLite hydration,
   its latest verified completed bar, and whether a current forming bar is present. Hot
-  buffers are retained only for the current universe.
+  buffers are retained only for the current universe. Production wraps the shared candle
+  persistence once so both background sync and on-demand history report storage failures
+  through this same status channel.
 - **`sync`** — refreshes the universe each cycle and re-plans fetches from per-series health:
   initial history hydration runs once per (coin, timeframe), with the active chart selected
   ahead of unrelated background jobs. Restored verified completed history lets global streams

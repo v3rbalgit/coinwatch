@@ -10,7 +10,6 @@ use thiserror::Error;
 
 use crate::error::FeedError;
 use crate::rest::CANDLE_PAGE_SIZE;
-use crate::store::MarketStore;
 
 /// Provider of candle pages ending immediately before an aligned boundary.
 #[async_trait]
@@ -56,32 +55,13 @@ pub enum HistoryError {
 pub struct CandleHistory {
     store: Arc<dyn CandleStore>,
     rest: Arc<dyn CandleProvider>,
-    status: Option<Arc<MarketStore>>,
 }
 
 impl CandleHistory {
     /// Combine a durable candle cache with a page provider (Hyperliquid in production).
     #[must_use]
     pub fn new(store: Arc<dyn CandleStore>, rest: Arc<dyn CandleProvider>) -> Self {
-        Self {
-            store,
-            rest,
-            status: None,
-        }
-    }
-
-    /// Report storage failures through the same market status contract as background sync.
-    #[must_use]
-    pub fn with_status(mut self, status: Arc<MarketStore>) -> Self {
-        self.status = Some(status);
-        self
-    }
-
-    fn store_error(&self, error: StoreError) -> HistoryError {
-        if let Some(status) = &self.status {
-            status.record_storage_failure(error.to_string());
-        }
-        HistoryError::Store(error)
+        Self { store, rest }
     }
 
     /// Load up to `limit` contiguous candles immediately before `before_ms`.
@@ -110,11 +90,7 @@ impl CandleHistory {
         let mut boundary = before_ms;
         let mut missing = limit;
         while missing > 0 {
-            let cached = self
-                .store
-                .candles_before(coin, timeframe, boundary, missing)
-                .await
-                .map_err(|error| self.store_error(error))?;
+            let cached = self.store.candles_before(coin, timeframe, boundary, missing).await?;
             let suffix = contiguous_suffix(&cached, timeframe, boundary);
             if let Some(first) = suffix.first() {
                 boundary = first.open_time.timestamp_millis();
@@ -133,10 +109,7 @@ impl CandleHistory {
             }
             let contiguous = contiguous_suffix(&fetched, timeframe, boundary);
             if contiguous.is_empty() {
-                self.store
-                    .save(coin, timeframe, &fetched)
-                    .await
-                    .map_err(|error| self.store_error(error))?;
+                self.store.save(coin, timeframe, &fetched).await?;
                 break;
             }
             if contiguous.len() != fetched.len() {
@@ -145,10 +118,7 @@ impl CandleHistory {
                     timeframe,
                 });
             }
-            self.store
-                .save(coin, timeframe, contiguous)
-                .await
-                .map_err(|error| self.store_error(error))?;
+            self.store.save(coin, timeframe, contiguous).await?;
             boundary = contiguous
                 .first()
                 .map_or(boundary, |candle| candle.open_time.timestamp_millis());
@@ -196,8 +166,8 @@ mod tests {
     use storage::{CandleSeries, CandleStore, StoreError};
 
     use super::{CandleHistory, CandleProvider, HistoryError, contiguous_suffix};
+    use crate::HyperliquidRest;
     use crate::error::FeedError;
-    use crate::{HyperliquidRest, MarketStore, StorageMode};
 
     struct CachedStore {
         candles: Mutex<BTreeMap<i64, Candle>>,
@@ -249,29 +219,6 @@ mod tests {
                 .collect();
             candles.reverse();
             Ok(candles)
-        }
-    }
-
-    struct FailingStore;
-
-    #[async_trait]
-    impl CandleStore for FailingStore {
-        async fn load_recent(&self, _limit: usize) -> Result<Vec<CandleSeries>, StoreError> {
-            Err(StoreError::InvalidCandleRow(0))
-        }
-
-        async fn save(&self, _coin: &str, _timeframe: Timeframe, _candles: &[Candle]) -> Result<(), StoreError> {
-            Err(StoreError::InvalidCandleRow(0))
-        }
-
-        async fn candles_before(
-            &self,
-            _coin: &str,
-            _timeframe: Timeframe,
-            _before_ms: i64,
-            _limit: usize,
-        ) -> Result<Vec<Candle>, StoreError> {
-            Err(StoreError::InvalidCandleRow(0))
         }
     }
 
@@ -365,23 +312,6 @@ mod tests {
             .expect("cached history");
         assert_eq!(candles, vec![candle(2), candle(3), candle(4)]);
         assert_eq!(store.writes.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn cache_failures_update_the_shared_storage_status() {
-        let status = MarketStore::new();
-        status.set_storage_mode(StorageMode::Persistent, None);
-        let history =
-            CandleHistory::new(Arc::new(FailingStore), Arc::new(UnusedProvider)).with_status(Arc::clone(&status));
-
-        let error = history
-            .load_before("BTC", Timeframe::Hour1, 5 * Timeframe::Hour1.duration_ms(), 3)
-            .await
-            .expect_err("cache read must fail");
-
-        assert!(matches!(error, HistoryError::Store(StoreError::InvalidCandleRow(0))));
-        assert_eq!(status.status().storage_failures, 1);
-        assert!(status.status().last_storage_error.is_some());
     }
 
     #[tokio::test]
