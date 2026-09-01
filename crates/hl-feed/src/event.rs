@@ -8,8 +8,8 @@ use rust_decimal::Decimal;
 /// forming bar updates and when a bar closes.
 #[derive(Debug, Clone)]
 pub enum MarketEvent {
-    /// Latest mid price.
-    Mid(MidEvent),
+    /// Latest mark price.
+    Mark(MarkPriceEvent),
     /// A new or updated candle for a (coin, timeframe).
     Candle(CandleEvent),
 }
@@ -19,18 +19,18 @@ impl MarketEvent {
     #[must_use]
     pub fn symbol(&self) -> &str {
         match self {
-            Self::Mid(event) => &event.symbol,
+            Self::Mark(event) => &event.symbol,
             Self::Candle(event) => &event.coin,
         }
     }
 }
 
-/// A mid-price update.
+/// A mark-price update.
 #[derive(Debug, Clone)]
-pub struct MidEvent {
+pub struct MarkPriceEvent {
     /// Coin symbol (e.g. `BTC`; Hyperliquid spot pairs arrive `@`-prefixed).
     pub symbol: String,
-    /// Mid price.
+    /// Provider mark price.
     pub price: Decimal,
     /// When the update was received.
     pub timestamp: DateTime<Utc>,

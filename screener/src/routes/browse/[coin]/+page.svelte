@@ -1,6 +1,6 @@
 <script lang="ts">
   import { ArrowLeft, Ban, CalendarRange, Eye, EyeOff, ListTree, LoaderCircle, RotateCcw, Trash2 } from "@lucide/svelte"
-  import { onMount } from "svelte"
+  import { onDestroy, onMount } from "svelte"
 
   import { goto } from "$app/navigation"
   import { page } from "$app/state"
@@ -38,9 +38,9 @@
   import { errorMessage } from "$lib/errors"
   import { formatCompactNumber, formatPrice, prevDayChangePct } from "$lib/format"
   import type { CandleHealth } from "$lib/ipc/candles"
-  import { onCandle, onCandleSnapshotUpdated, onMid } from "$lib/ipc/events"
+  import { onCandle, onCandleSnapshotUpdated, onMarkPrice } from "$lib/ipc/events"
   import { isRecord } from "$lib/ipc/guards"
-  import { coinCandles, coinHistory, getSetting, screenerRows, setActiveCoin, setSetting } from "$lib/ipc/screener"
+  import { coinCandles, coinHistory, getSetting, screenerRows, setActiveSeries, setSetting } from "$lib/ipc/screener"
   import type { ScreenerRow } from "$lib/ipc/screener"
   import { signalValidationFailureMessage, type HistoricalRange } from "$lib/signals/historical"
   import { loadHistoricalSignalOptions, type HistoricalSignalOption } from "$lib/signals/historical-options"
@@ -74,11 +74,13 @@
   let barsKey = ""
   let candleHealth = $state<CandleHealth>("loading")
   let candleRevision = 0
+  // Guards snapshot requests, so every new request and series change invalidates older responses.
   let candleLoadSequence = 0
+  // Guards scrollback requests across series changes without invalidating them on a snapshot refresh.
   let candleSeriesGeneration = 0
   let seed = $state(0)
   let meta = $state<ScreenerRow | null>(null)
-  let livePrice = $state<number | null>(null)
+  let markPrice = $state<number | null>(null)
   // Seed the chart with the core momentum and divergence set; the user toggles
   // additional instances through the chart picker.
   let instancesTouched = false
@@ -353,13 +355,27 @@
     else bars = [...bars, candle]
   }
 
-  // Stream only the viewed coin's live candles from the backend.
+  function resetCandleSeriesState() {
+    bars = []
+    barsKey = ""
+    candleHealth = "loading"
+    candleRevision = 0
+    candleLoadSequence += 1
+    candleSeriesGeneration += 1
+  }
+
+  // Keep exactly the viewed series subscribed without multiplying every chart
+  // timeframe across the whole market universe. IPC calls are serialized so rapid
+  // route or timeframe changes cannot commit an older selection last.
   $effect(() => {
-    if (!coin) return
-    void setActiveCoin(coin)
-    return () => {
-      void setActiveCoin(null)
-    }
+    const activeCoin = coin
+    const activeTimeframe = tf
+    const resolved = activeCoin !== "" && settingsCoin === activeCoin
+    void setActiveSeries(resolved ? activeCoin : null, resolved ? activeTimeframe : null)
+  })
+
+  onDestroy(() => {
+    void setActiveSeries(null, null)
   })
 
   // Resolve the coin's view before loading candles, avoiding an unnecessary
@@ -368,13 +384,13 @@
     const active = coin
     const revision = ++viewLoadRevision
     settingsCoin = ""
-    bars = []
-    barsKey = ""
-    candleHealth = "loading"
-    candleRevision = 0
-    candleLoadSequence += 1
-    candleSeriesGeneration += 1
-    if (active) void loadViewSettings(active, revision)
+    meta = null
+    markPrice = null
+    resetCandleSeriesState()
+    if (active) {
+      void loadMeta()
+      void loadViewSettings(active, revision)
+    }
   })
 
   // Reseed the chart whenever the resolved coin or timeframe changes.
@@ -383,12 +399,7 @@
     if (coin && settingsCoin === coin) {
       exhausted = false
       candlesError = ""
-      bars = []
-      barsKey = ""
-      candleHealth = "loading"
-      candleRevision = 0
-      candleLoadSequence += 1
-      candleSeriesGeneration += 1
+      resetCandleSeriesState()
       void loadCandles()
     }
   })
@@ -417,7 +428,6 @@
   })
 
   onMount(() => {
-    void loadMeta()
     void getSetting(CHART_CHROME_SETTINGS_KEY)
       .then(saved => {
         const settings = parseChartChromeSettings(saved)
@@ -442,8 +452,8 @@
       })
       .catch(error => console.error("failed to load chart indicators", error))
     const reload = setInterval(loadMeta, 5000)
-    const unMid = onMid(event => {
-      if (event.coin === coin) livePrice = event.price
+    const unMark = onMarkPrice(event => {
+      if (event.coin === coin) markPrice = event.price
     })
     const unCandle = onCandle(event => {
       const activeKey = `${coin}|${tf}`
@@ -459,22 +469,23 @@
     })
     const unSnapshot = onCandleSnapshotUpdated(event => {
       const activeKey = `${coin}|${tf}`
+      // Health-only invalidations can retain a revision; live candle events always advance it.
       if (event.coin !== coin || event.timeframe !== tf || event.revision < candleRevision) return
       candleHealth = event.health
       if (event.revision > candleRevision || barsKey !== activeKey) void loadCandles(event.revision)
     })
     return () => {
       clearInterval(reload)
-      void unMid.then(off => off())
+      void unMark.then(off => off())
       void unCandle.then(off => off())
       void unSnapshot.then(off => off())
     }
   })
 
   const candleStatusMessage = $derived(candleHealthMessage(candleHealth))
-  const price = $derived(livePrice ?? meta?.price ?? 0)
+  const price = $derived(markPrice ?? meta?.price ?? 0)
   const change = $derived(meta ? prevDayChangePct(meta.prev_day, price) : 0)
-  const hasPrice = $derived(livePrice !== null || meta !== null)
+  const hasPrice = $derived(markPrice !== null || meta !== null)
 </script>
 
 <div class="flex h-full flex-col gap-3 p-4">
@@ -486,6 +497,7 @@
     <CoinIcon {coin} size={28} />
     <h1 class="text-lg font-semibold text-foreground">{coin}</h1>
     {#if hasPrice}
+      <span class="text-xs font-medium tracking-wide text-muted-foreground uppercase">Mark</span>
       <span class="text-lg text-foreground tabular-nums">{formatPrice(price)}</span>
       <span
         class="tabular-nums {change > 0 ? 'text-green-500' : change < 0 ? 'text-red-500' : 'text-muted-foreground'}"

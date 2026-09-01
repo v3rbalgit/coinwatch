@@ -1,8 +1,8 @@
 //! The Hyperliquid WebSocket adapter: one session streaming prices and candles.
 //!
-//! Subscribes to `allMids` + `fastAssetCtxs` (prices) and reconciles `candle`
-//! streams with the current universe for the configured timeframes. Prices publish as
-//! [`MarketEvent::Mid`] and candles as [`MarketEvent::Candle`] onto the shared
+//! Subscribes to `fastAssetCtxs` for canonical mark prices and reconciles a
+//! bounded global candle set plus the active chart series. Marks publish as
+//! [`MarketEvent::Mark`] and candles as [`MarketEvent::Candle`] onto the shared
 //! [`MarketFeed`]; candles are also merged into the [`MarketStore`] for reads.
 //! Reconnects with exponential backoff, re-subscribing each session.
 
@@ -24,7 +24,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::error::FeedError;
-use crate::event::{CandleEvent, MarketEvent, MidEvent};
+use crate::event::{CandleEvent, MarkPriceEvent, MarketEvent};
 use crate::feed::MarketFeed;
 use crate::rest::to_decimal;
 use crate::store::{ConnectionState, MarketStore};
@@ -37,7 +37,7 @@ const RECONNECT_MAX: Duration = Duration::from_secs(30);
 const STABLE_SESSION: Duration = Duration::from_secs(60);
 const UNIVERSE_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 const WS_SUBSCRIPTION_LIMIT: usize = 1_000;
-const BASE_SUBSCRIPTIONS: [Subscription; 2] = [Subscription::AllMids, Subscription::FastAssetCtxs];
+const BASE_SUBSCRIPTIONS: [Subscription; 1] = [Subscription::FastAssetCtxs];
 const BASE_SUBSCRIPTION_COUNT: usize = BASE_SUBSCRIPTIONS.len();
 
 /// Streams live Hyperliquid market data (prices + candles) into a shared
@@ -82,6 +82,11 @@ impl HyperliquidAdapter {
     }
 
     /// Stop the streaming task; a later [`connect`](Self::connect) restarts it.
+    ///
+    /// This bypasses session cleanup and therefore cannot yet update connection
+    /// or candle-health state consistently. Keep it unused until a disconnected
+    /// state transition is modeled.
+    #[deprecated(note = "disconnect does not update connection or candle-health state")]
     pub fn disconnect(&mut self) {
         if let Some(task) = self.task.take() {
             task.abort();
@@ -93,7 +98,8 @@ async fn ws_loop(feed: MarketFeed, store: Arc<MarketStore>, intervals: Vec<Timef
     let mut backoff = RECONNECT_BASE;
     loop {
         let started = Instant::now();
-        let result = run_session(&feed, &store, &intervals).await;
+        let mut candle_subscriptions = BTreeSet::new();
+        let result = run_session(&feed, &store, &intervals, &mut candle_subscriptions).await;
         let session_was_live = store.status().connection == ConnectionState::Live;
         let capacity_exceeded = matches!(&result, Err(FeedError::SubscriptionLimit { .. }));
         match result {
@@ -108,7 +114,7 @@ async fn ws_loop(feed: MarketFeed, store: Arc<MarketStore>, intervals: Vec<Timef
             }
         }
         if session_was_live {
-            store.mark_streamed_for_verification(&intervals);
+            store.mark_series_for_verification(&subscription_series(&candle_subscriptions));
         }
         store.set_streaming(0);
         store.set_connection(ConnectionState::Reconnecting);
@@ -132,22 +138,27 @@ async fn wait_for_subscription_capacity(store: &MarketStore, intervals: &[Timefr
     }
 }
 
-async fn run_session(feed: &MarketFeed, store: &MarketStore, intervals: &[Timeframe]) -> Result<(), FeedError> {
+async fn run_session(
+    feed: &MarketFeed,
+    store: &MarketStore,
+    intervals: &[Timeframe],
+    candle_subscriptions: &mut BTreeSet<Subscription>,
+) -> Result<(), FeedError> {
     let (stream, _) = connect_async(WS_URL).await?;
     let (mut write, mut read) = stream.split();
-    let mut candle_subscriptions = BTreeSet::new();
-    let mut desired = desired_candle_subscriptions(store, intervals);
-    let (_, initial_subscriptions) = candle_subscription_changes(&candle_subscriptions, &desired)?;
+    candle_subscriptions.clear();
+    let desired = desired_candle_subscriptions(store, intervals);
+    let (_, initial_subscriptions) = candle_subscription_changes(candle_subscriptions, &desired)?;
 
     for subscription in &BASE_SUBSCRIPTIONS {
         let payload = subscription_payload(SubscriptionMethod::Subscribe, subscription)?;
         write.send(Message::Text(payload.into())).await?;
     }
-    for subscription in &initial_subscriptions {
-        let payload = subscription_payload(SubscriptionMethod::Subscribe, subscription)?;
+    for subscription in initial_subscriptions {
+        let payload = subscription_payload(SubscriptionMethod::Subscribe, &subscription)?;
         write.send(Message::Text(payload.into())).await?;
+        candle_subscriptions.insert(subscription);
     }
-    candle_subscriptions = desired;
     store.set_streaming(candle_subscriptions.len());
     store.set_connection(ConnectionState::Live);
     tracing::info!(streams = candle_subscriptions.len(), "websocket connected");
@@ -160,7 +171,7 @@ async fn run_session(feed: &MarketFeed, store: &MarketStore, intervals: &[Timefr
             frame = read.next() => {
                 let Some(frame) = frame else { return Ok(()) };
                 match frame? {
-                    Message::Text(text) => publish_frame(&text, feed, store),
+                    Message::Text(text) => publish_frame(&text, feed, store, intervals),
                     Message::Ping(payload) => write.send(Message::Pong(payload)).await?,
                     Message::Close(_) => return Ok(()),
                     _ => {}
@@ -171,24 +182,32 @@ async fn run_session(feed: &MarketFeed, store: &MarketStore, intervals: &[Timefr
                 write.send(Message::Text(ping.into())).await?;
             }
             _ = universe_check.tick() => {
-                desired = desired_candle_subscriptions(store, intervals);
-                let (removed, added) = candle_subscription_changes(&candle_subscriptions, &desired)?;
+                let desired = desired_candle_subscriptions(store, intervals);
+                let (removed, added) = candle_subscription_changes(candle_subscriptions, &desired)?;
                 if removed.is_empty() && added.is_empty() {
                     continue;
                 }
-                for subscription in &removed {
-                    let payload = subscription_payload(SubscriptionMethod::Unsubscribe, subscription)?;
+                let removed_count = removed.len();
+                let added_count = added.len();
+                for subscription in removed {
+                    let payload = subscription_payload(SubscriptionMethod::Unsubscribe, &subscription)?;
                     write.send(Message::Text(payload.into())).await?;
+                    candle_subscriptions.remove(&subscription);
+                    if let Some((coin, timeframe)) = subscription_series_key(&subscription)
+                        && !intervals.contains(&timeframe)
+                    {
+                        store.remove_unsubscribed_tail(&coin, timeframe, intervals);
+                    }
                 }
-                for subscription in &added {
-                    let payload = subscription_payload(SubscriptionMethod::Subscribe, subscription)?;
+                for subscription in added {
+                    let payload = subscription_payload(SubscriptionMethod::Subscribe, &subscription)?;
                     write.send(Message::Text(payload.into())).await?;
+                    candle_subscriptions.insert(subscription);
                 }
-                candle_subscriptions = desired;
                 store.set_streaming(candle_subscriptions.len());
                 tracing::debug!(
-                    added = added.len(),
-                    removed = removed.len(),
+                    added = added_count,
+                    removed = removed_count,
                     streams = candle_subscriptions.len(),
                     "reconciled candle streams"
                 );
@@ -198,16 +217,36 @@ async fn run_session(feed: &MarketFeed, store: &MarketStore, intervals: &[Timefr
 }
 
 fn desired_candle_subscriptions(store: &MarketStore, intervals: &[Timeframe]) -> BTreeSet<Subscription> {
-    store
-        .universe()
-        .into_iter()
+    let universe = store.universe();
+    let mut desired: BTreeSet<_> = universe
+        .iter()
         .flat_map(|coin| {
             intervals.iter().map(move |interval| Subscription::Candle {
                 coin: coin.coin.clone(),
                 interval: interval.as_hl().to_owned(),
             })
         })
-        .collect()
+        .collect();
+    if let Some(active) = store.active_series()
+        && universe.iter().any(|market| market.coin == active.coin)
+    {
+        desired.insert(Subscription::Candle {
+            coin: active.coin,
+            interval: active.timeframe.as_hl().to_owned(),
+        });
+    }
+    desired
+}
+
+fn subscription_series(subscriptions: &BTreeSet<Subscription>) -> Vec<(String, Timeframe)> {
+    subscriptions.iter().filter_map(subscription_series_key).collect()
+}
+
+fn subscription_series_key(subscription: &Subscription) -> Option<(String, Timeframe)> {
+    let Subscription::Candle { coin, interval } = subscription else {
+        return None;
+    };
+    Timeframe::from_hl(interval).map(|timeframe| (coin.clone(), timeframe))
 }
 
 fn candle_subscription_changes(
@@ -235,7 +274,7 @@ fn subscription_payload(method: SubscriptionMethod, subscription: &Subscription)
     serde_json::to_string(&SubscriptionRequest { method, subscription })
 }
 
-fn publish_frame(text: &str, feed: &MarketFeed, store: &MarketStore) {
+fn publish_frame(text: &str, feed: &MarketFeed, store: &MarketStore, global_timeframes: &[Timeframe]) {
     let message = match serde_json::from_str::<WsMessage>(text) {
         Ok(message) => message,
         Err(error) => {
@@ -245,28 +284,17 @@ fn publish_frame(text: &str, feed: &MarketFeed, store: &MarketStore) {
     };
     let timestamp = Utc::now();
     match message {
-        WsMessage::AllMids { data } => {
-            for (symbol, price) in data.mids {
-                if let Ok(price) = price.parse::<Decimal>() {
-                    feed.publish(MarketEvent::Mid(MidEvent {
-                        symbol,
-                        price,
-                        timestamp,
-                    }));
-                }
-            }
-        }
         WsMessage::FastAssetCtxs { data } => {
             let Some(prices) = decode_fast_asset_ctxs(&data) else {
                 tracing::debug!("failed to decode fastAssetCtxs frame");
                 return;
             };
             for (symbol, ctx) in prices {
-                let Some(raw) = ctx.mark_px.or(ctx.mid_px) else {
+                let Some(raw) = ctx.mark_px else {
                     continue;
                 };
                 if let Ok(price) = raw.parse::<Decimal>() {
-                    feed.publish(MarketEvent::Mid(MidEvent {
+                    feed.publish(MarketEvent::Mark(MarkPriceEvent {
                         symbol,
                         price,
                         timestamp,
@@ -276,7 +304,7 @@ fn publish_frame(text: &str, feed: &MarketFeed, store: &MarketStore) {
         }
         WsMessage::Candle { data } => {
             if let Some(event) = candle_event(&data)
-                && store.merge_active_candle(&event.coin, event.timeframe, event.candle.clone())
+                && store.merge_subscribed_candle(&event.coin, event.timeframe, event.candle.clone(), global_timeframes)
             {
                 feed.publish(MarketEvent::Candle(event));
             }
@@ -303,7 +331,7 @@ fn candle_event(data: &WsCandle) -> Option<CandleEvent> {
 }
 
 /// Decode a `fastAssetCtxs` frame: base64 of a raw deflate stream (no zlib
-/// wrapper) holding a coin -> mark/mid map for only the coins that moved.
+/// wrapper) holding mark updates for only the coins that moved.
 fn decode_fast_asset_ctxs(data: &str) -> Option<HashMap<String, FastPrices>> {
     let compressed = BASE64.decode(data).ok()?;
     let mut json = Vec::new();
@@ -327,7 +355,6 @@ enum SubscriptionMethod {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum Subscription {
-    AllMids,
     FastAssetCtxs,
     Candle { coin: String, interval: String },
 }
@@ -335,8 +362,6 @@ enum Subscription {
 #[derive(Deserialize)]
 #[serde(tag = "channel")]
 enum WsMessage {
-    #[serde(rename = "allMids")]
-    AllMids { data: AllMidsData },
     #[serde(rename = "fastAssetCtxs")]
     FastAssetCtxs { data: String },
     #[serde(rename = "candle")]
@@ -345,18 +370,11 @@ enum WsMessage {
     Other,
 }
 
-#[derive(Deserialize)]
-struct AllMidsData {
-    mids: HashMap<String, String>,
-}
-
-/// Mark/mid prices from a `fastAssetCtxs` frame; both optional and nullable.
+/// Mark prices from a `fastAssetCtxs` frame; omitted fields did not change.
 #[derive(Deserialize)]
 struct FastPrices {
     #[serde(rename = "markPx")]
     mark_px: Option<String>,
-    #[serde(rename = "midPx")]
-    mid_px: Option<String>,
 }
 
 /// A Hyperliquid WS candle payload (`o`/`h`/`l`/`c`/`v` arrive as JSON strings).
@@ -381,11 +399,11 @@ mod tests {
 
     use super::{
         BASE_SUBSCRIPTION_COUNT, Subscription, SubscriptionMethod, UNIVERSE_CHECK_INTERVAL, WS_SUBSCRIPTION_LIMIT,
-        candle_subscription_changes, decode_fast_asset_ctxs, subscription_payload, validate_subscription_capacity,
-        wait_for_subscription_capacity,
+        candle_subscription_changes, decode_fast_asset_ctxs, desired_candle_subscriptions, subscription_payload,
+        validate_subscription_capacity, wait_for_subscription_capacity,
     };
     use crate::error::FeedError;
-    use crate::{MarketStore, UniverseCoin};
+    use crate::{ActiveSeries, MarketStore, UniverseCoin};
 
     fn candle_subscription(coin: &str, timeframe: Timeframe) -> Subscription {
         Subscription::Candle {
@@ -414,9 +432,8 @@ mod tests {
         let prices = decode_fast_asset_ctxs(data).expect("valid frame");
         let btc = prices.get("BTC").expect("BTC present");
         assert_eq!(btc.mark_px.as_deref(), Some("65340.0"));
-        assert_eq!(btc.mid_px.as_deref(), Some("65339.5"));
         let doge = prices.get("DOGE").expect("DOGE present");
-        assert!(doge.mark_px.is_none() && doge.mid_px.is_none());
+        assert!(doge.mark_px.is_none());
     }
 
     #[test]
@@ -434,6 +451,34 @@ mod tests {
 
         assert_eq!(removed, vec![candle_subscription("BTC", Timeframe::Hour1)]);
         assert_eq!(added, vec![candle_subscription("SOL", Timeframe::Hour1)]);
+    }
+
+    #[test]
+    fn desired_subscriptions_add_only_the_active_non_global_series() {
+        let store = MarketStore::new();
+        store.set_universe(universe(2));
+        store.set_active_series(Some(ActiveSeries {
+            coin: "COIN0".to_owned(),
+            timeframe: Timeframe::Day1,
+        }));
+
+        let first = desired_candle_subscriptions(&store, &[Timeframe::Hour1]);
+        assert_eq!(first.len(), 3);
+        assert!(first.contains(&candle_subscription("COIN0", Timeframe::Day1)));
+        assert!(!first.contains(&candle_subscription("COIN1", Timeframe::Day1)));
+
+        store.set_active_series(Some(ActiveSeries {
+            coin: "COIN1".to_owned(),
+            timeframe: Timeframe::Week1,
+        }));
+        let second = desired_candle_subscriptions(&store, &[Timeframe::Hour1]);
+        let (removed, added) = candle_subscription_changes(&first, &second).expect("capacity available");
+        assert_eq!(removed, vec![candle_subscription("COIN0", Timeframe::Day1)]);
+        assert_eq!(added, vec![candle_subscription("COIN1", Timeframe::Week1)]);
+
+        store.set_active_series(None);
+        let cleared = desired_candle_subscriptions(&store, &[Timeframe::Hour1]);
+        assert_eq!(cleared.len(), 2);
     }
 
     #[test]

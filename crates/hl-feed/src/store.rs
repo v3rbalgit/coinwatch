@@ -31,8 +31,9 @@ pub enum SyncPhase {
     /// Fetching the universe/metadata snapshot.
     #[serde(rename = "loading")]
     LoadingUniverse,
-    /// Backfilling candle history over REST.
-    Backfilling,
+    /// Reconciling required candle-history series over REST.
+    #[serde(rename = "syncing_history")]
+    SyncingHistory,
     /// Warm; candles refresh quietly in the background.
     Live,
 }
@@ -59,16 +60,16 @@ pub struct MarketStatus {
     pub phase: SyncPhase,
     /// Active coins in the universe.
     pub universe: usize,
-    /// Candle (coin, timeframe) sets cached so far this backfill pass.
-    pub backfill_done: usize,
-    /// Total (coin, timeframe) sets to backfill this pass.
-    pub backfill_total: usize,
-    /// Candle fetch or reconciliation errors in the current pass.
-    pub backfill_errors: usize,
+    /// Candle-series reconciliation jobs completed in the current pass.
+    pub series_done: usize,
+    /// Total candle-series reconciliation jobs in the current pass.
+    pub series_total: usize,
+    /// Candle-series reconciliation errors in the current pass.
+    pub series_errors: usize,
     /// Candle streams currently subscribed over the WebSocket.
     pub streaming: usize,
-    /// Recent candle-fetch rate, in fetches per minute.
-    pub fetch_rate: u32,
+    /// Completed candle-series reconciliation jobs per minute.
+    pub series_jobs_per_minute: u32,
     /// Whether storage is durable or limited to this process.
     pub storage_mode: StorageMode,
     /// Storage failures observed during this process.
@@ -87,11 +88,11 @@ impl Default for MarketStatus {
             connection: ConnectionState::Connecting,
             phase: SyncPhase::LoadingUniverse,
             universe: 0,
-            backfill_done: 0,
-            backfill_total: 0,
-            backfill_errors: 0,
+            series_done: 0,
+            series_total: 0,
+            series_errors: 0,
             streaming: 0,
-            fetch_rate: 0,
+            series_jobs_per_minute: 0,
             storage_mode: StorageMode::Initializing,
             storage_failures: 0,
             last_storage_error: None,
@@ -117,13 +118,15 @@ pub enum CandleHealth {
     Repairing,
 }
 
-/// Candle data and its authoritative chart-consumer health.
+/// Candle data and its readiness for live-chart and completed-history consumers.
 #[derive(Debug, Clone)]
 pub struct CandleSnapshot {
     /// Cached candles, oldest first. Unhealthy rows may be shown as last-known data.
     pub candles: Arc<Vec<Candle>>,
-    /// Whether consumers may treat the snapshot as current and verified.
-    pub health: CandleHealth,
+    /// Whether a chart may treat the current forming candle as live and verified.
+    pub live_health: CandleHealth,
+    /// Whether consumers may evaluate the verified completed history.
+    pub completed_health: CandleHealth,
     /// Monotonic per-series version for rejecting stale asynchronous responses.
     pub revision: u64,
 }
@@ -137,12 +140,23 @@ pub struct CandleUpdate {
     pub timeframe: Timeframe,
 }
 
+/// The exact candle series currently consumed by the open chart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveSeries {
+    /// Coin symbol.
+    pub coin: String,
+    /// Candle timeframe.
+    pub timeframe: Timeframe,
+}
+
 struct CandleBuffer {
     candles: Arc<Vec<Candle>>,
     integrity: CandleIntegrity,
     repair_epoch: u64,
     stream_revision: u64,
     revision: u64,
+    hydrated: bool,
+    completed_through_ms: Option<i64>,
     recent_stream_writes: Vec<(i64, u64)>,
 }
 
@@ -153,6 +167,8 @@ impl CandleBuffer {
             integrity: self.integrity,
             repair_epoch: self.repair_epoch,
             write_revision: self.stream_revision,
+            hydrated: self.hydrated,
+            completed_through_ms: self.completed_through_ms,
         }
     }
 
@@ -160,12 +176,20 @@ impl CandleBuffer {
         self.revision = self.revision.saturating_add(1);
     }
 
-    fn consumer_health(&self, timeframe: Timeframe, now_ms: i64) -> CandleHealth {
+    fn live_health(&self, timeframe: Timeframe, now_ms: i64) -> CandleHealth {
+        self.consumer_health(self.health().is_live_current(timeframe, now_ms))
+    }
+
+    fn completed_health(&self, timeframe: Timeframe, now_ms: i64) -> CandleHealth {
+        self.consumer_health(self.health().is_completed_current(timeframe, now_ms))
+    }
+
+    fn consumer_health(&self, current: bool) -> CandleHealth {
         match self.integrity {
             CandleIntegrity::VerifyOverlap => CandleHealth::Verifying,
             CandleIntegrity::Repair => CandleHealth::Repairing,
-            CandleIntegrity::Verified if self.candles.is_empty() => CandleHealth::Loading,
-            CandleIntegrity::Verified if self.health().is_current(timeframe, now_ms) => CandleHealth::Ready,
+            CandleIntegrity::Verified if !self.hydrated || self.candles.is_empty() => CandleHealth::Loading,
+            CandleIntegrity::Verified if current => CandleHealth::Ready,
             CandleIntegrity::Verified => CandleHealth::Stale,
         }
     }
@@ -179,6 +203,8 @@ impl Default for CandleBuffer {
             repair_epoch: 0,
             stream_revision: 0,
             revision: 0,
+            hydrated: false,
+            completed_through_ms: None,
             recent_stream_writes: Vec::with_capacity(RECENT_STREAM_WRITE_WINDOW),
         }
     }
@@ -217,17 +243,33 @@ pub(crate) struct SeriesHealth {
     pub repair_epoch: u64,
     /// Bumped whenever WebSocket candle values change during a REST request.
     pub write_revision: u64,
+    /// Whether REST or persisted history has seeded this series.
+    pub hydrated: bool,
+    /// Latest bar proven complete by persistence, REST, or an advancing stream.
+    pub completed_through_ms: Option<i64>,
 }
 
 impl SeriesHealth {
-    /// Whether the series is safe to expose at this instant. A buffer one bar
-    /// ahead of `now_ms` (clock skew, a boundary crossed mid-run) is current too.
-    pub(crate) fn is_current(self, timeframe: Timeframe, now_ms: i64) -> bool {
-        self.integrity == CandleIntegrity::Verified
+    /// Whether verified history and a current forming candle are present. A buffer
+    /// one bar ahead of `now_ms` (clock skew, a boundary crossed mid-run) is live too.
+    pub(crate) fn is_live_current(self, timeframe: Timeframe, now_ms: i64) -> bool {
+        self.hydrated
+            && self.integrity == CandleIntegrity::Verified
             && self.latest_open_ms.is_some_and(|open_ms| {
                 let expected = timeframe.bar_open_ms(now_ms);
                 open_ms == expected || open_ms == expected.saturating_add(timeframe.duration_ms())
             })
+    }
+
+    /// Whether the latest bar that should be closed has been independently proven
+    /// complete. A forming candle is not required; a hydrated listing with only its
+    /// first forming bar is also current and evaluates as insufficient history.
+    pub(crate) fn is_completed_current(self, timeframe: Timeframe, now_ms: i64) -> bool {
+        let expected = timeframe.bar_open_ms(now_ms).saturating_sub(timeframe.duration_ms());
+        self.hydrated
+            && self.integrity == CandleIntegrity::Verified
+            && (self.completed_through_ms.is_some_and(|open_ms| open_ms >= expected)
+                || (self.completed_through_ms.is_none() && self.latest_open_ms == Some(timeframe.bar_open_ms(now_ms))))
     }
 }
 
@@ -239,8 +281,8 @@ pub struct MarketStore {
     candle_updates: broadcast::Sender<CandleUpdate>,
     universe: RwLock<Vec<UniverseCoin>>,
     status: watch::Sender<MarketStatus>,
-    /// The coin whose live candles the UI wants forwarded (the open detail page).
-    active_coin: RwLock<Option<String>>,
+    /// The exact series whose live candles the open chart consumes.
+    active_series: RwLock<Option<ActiveSeries>>,
 }
 
 /// Bars fetched to verify a disconnect and still replaceable by late streamed updates.
@@ -305,7 +347,7 @@ impl MarketStore {
             candle_updates,
             universe: RwLock::new(Vec::new()),
             status,
-            active_coin: RwLock::new(None),
+            active_series: RwLock::new(None),
         })
     }
 
@@ -319,18 +361,20 @@ impl MarketStore {
             .map(|entry| Arc::clone(&entry.candles))
     }
 
-    /// Candle data plus explicit health for chart consumers.
+    /// Candle data plus readiness for live-chart and completed-history consumers.
     #[must_use]
     pub fn candle_snapshot(&self, coin: &str, timeframe: Timeframe, now_ms: i64) -> CandleSnapshot {
         self.candles.get(&(coin.to_owned(), timeframe)).map_or(
             CandleSnapshot {
                 candles: Arc::new(Vec::new()),
-                health: CandleHealth::Loading,
+                live_health: CandleHealth::Loading,
+                completed_health: CandleHealth::Loading,
                 revision: 0,
             },
             |entry| CandleSnapshot {
                 candles: Arc::clone(&entry.candles),
-                health: entry.consumer_health(timeframe, now_ms),
+                live_health: entry.live_health(timeframe, now_ms),
+                completed_health: entry.completed_health(timeframe, now_ms),
                 revision: entry.revision,
             },
         )
@@ -350,15 +394,14 @@ impl MarketStore {
         });
     }
 
-    /// A current, contiguous candle snapshot suitable for signal evaluation.
-    ///
-    /// The latest row must be the expected forming bar at `now_ms`. During a bar
-    /// boundary or detected gap this returns `None` until REST reconciliation has
-    /// repaired the series, so stale data cannot become a completed-bar signal.
+    /// A live, contiguous candle snapshot with the current forming bar present.
     #[must_use]
     pub fn current_candles(&self, coin: &str, timeframe: Timeframe, now_ms: i64) -> Option<Arc<Vec<Candle>>> {
         let entry = self.candles.get(&(coin.to_owned(), timeframe))?;
-        entry.health().is_current(timeframe, now_ms).then(|| Arc::clone(&entry.candles))
+        entry
+            .health()
+            .is_live_current(timeframe, now_ms)
+            .then(|| Arc::clone(&entry.candles))
     }
 
     /// Latest-open and gap state for REST reconciliation planning.
@@ -369,6 +412,8 @@ impl MarketStore {
                 integrity: CandleIntegrity::Verified,
                 repair_epoch: 0,
                 write_revision: 0,
+                hydrated: false,
+                completed_through_ms: None,
             },
             |entry| entry.health(),
         )
@@ -380,17 +425,28 @@ impl MarketStore {
         self.universe.read().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
-    /// The coin whose live candles the UI wants forwarded (the open detail page).
+    /// The exact series whose live candles the open chart consumes.
     #[must_use]
-    pub fn active_coin(&self) -> Option<String> {
-        self.active_coin.read().unwrap_or_else(PoisonError::into_inner).clone()
+    pub fn active_series(&self) -> Option<ActiveSeries> {
+        self.active_series.read().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
-    /// Set (or clear) the coin whose live candles are forwarded to the UI.
-    pub fn set_active_coin(&self, coin: Option<String>) {
+    /// Whether this is the exact series currently consumed by the open chart.
+    #[must_use]
+    pub fn is_active_series(&self, coin: &str, timeframe: Timeframe) -> bool {
+        self.active_series
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|active| active.coin == coin && active.timeframe == timeframe)
+    }
+
+    /// Set (or clear) the exact series whose live candles are forwarded to the UI.
+    pub fn set_active_series(&self, series: Option<ActiveSeries>) {
         let universe = self.universe.read().unwrap_or_else(PoisonError::into_inner);
-        let coin = coin.filter(|coin| universe.is_empty() || universe.iter().any(|market| market.coin == *coin));
-        *self.active_coin.write().unwrap_or_else(PoisonError::into_inner) = coin;
+        let series =
+            series.filter(|series| universe.is_empty() || universe.iter().any(|market| market.coin == series.coin));
+        *self.active_series.write().unwrap_or_else(PoisonError::into_inner) = series;
     }
 
     /// The current sync status.
@@ -414,13 +470,19 @@ impl MarketStore {
         } else {
             CandleIntegrity::Repair
         };
+        let completed_through_ms = candles.last().map(|candle| candle.open_time.timestamp_millis());
         let update_coin = coin.clone();
         let mut entry = self.candles.entry((coin, timeframe)).or_default();
         let state = entry.value_mut();
-        let changed = state.candles.as_ref() != &candles || state.integrity != integrity;
+        let changed = state.candles.as_ref() != &candles
+            || state.integrity != integrity
+            || !state.hydrated
+            || state.completed_through_ms != completed_through_ms;
         if changed {
             state.candles = Arc::new(candles);
             state.integrity = integrity;
+            state.hydrated = true;
+            state.completed_through_ms = completed_through_ms;
             state.bump_revision();
         }
         state.recent_stream_writes.clear();
@@ -447,6 +509,7 @@ impl MarketStore {
         let mut entry = self.candles.entry((coin, timeframe)).or_default();
         let state = entry.value_mut();
         let previous_integrity = state.integrity;
+        let previous_hydrated = state.hydrated;
         let mut content_changed = false;
         let incoming_contiguous = candles_are_contiguous(&candles, timeframe);
         let verification_sufficient = overlap_verification_is_sufficient(&state.candles, &candles, timeframe);
@@ -503,13 +566,42 @@ impl MarketStore {
                 CandleIntegrity::Verified
             };
         }
-        let changed = content_changed || previous_integrity != state.integrity;
+        if state.integrity == CandleIntegrity::Verified {
+            state.hydrated = true;
+        }
+        let changed = content_changed || previous_integrity != state.integrity || previous_hydrated != state.hydrated;
         if changed {
             state.bump_revision();
         }
         drop(entry);
         if changed {
             self.notify_candle_update(&update_coin, timeframe);
+        }
+    }
+
+    /// Record a successful REST hydration and the newest row proven closed at
+    /// request time. This metadata is separate from the mutable forming tail.
+    pub(crate) fn record_rest_hydration(&self, coin: &str, timeframe: Timeframe, completed_through_ms: Option<i64>) {
+        let Some(mut entry) = self.candles.get_mut(&(coin.to_owned(), timeframe)) else {
+            return;
+        };
+        let state = entry.value_mut();
+        if state.integrity != CandleIntegrity::Verified {
+            return;
+        }
+        let next_completed = match (state.completed_through_ms, completed_through_ms) {
+            (Some(existing), Some(incoming)) => Some(existing.max(incoming)),
+            (existing, incoming) => existing.or(incoming),
+        };
+        let changed = !state.hydrated || state.completed_through_ms != next_completed;
+        state.hydrated = true;
+        state.completed_through_ms = next_completed;
+        if changed {
+            state.bump_revision();
+        }
+        drop(entry);
+        if changed {
+            self.notify_candle_update(coin, timeframe);
         }
     }
 
@@ -559,12 +651,26 @@ impl MarketStore {
         true
     }
 
-    /// Merge a streamed candle only while its market belongs to the current universe.
-    /// Holding the universe read lock through the write prevents a late frame from
-    /// recreating a buffer while a universe refresh evicts it.
-    pub(crate) fn merge_active_candle(&self, coin: &str, timeframe: Timeframe, candle: Candle) -> bool {
+    /// Merge a streamed candle only while its market belongs to the universe and
+    /// its series is globally configured or consumed by the active chart. Holding
+    /// both read locks through the write rejects late frames after either removal.
+    pub(crate) fn merge_subscribed_candle(
+        &self,
+        coin: &str,
+        timeframe: Timeframe,
+        candle: Candle,
+        global_timeframes: &[Timeframe],
+    ) -> bool {
         let universe = self.universe.read().unwrap_or_else(PoisonError::into_inner);
         if !universe.iter().any(|market| market.coin == coin) {
+            return false;
+        }
+        let active = self.active_series.read().unwrap_or_else(PoisonError::into_inner);
+        if !global_timeframes.contains(&timeframe)
+            && !active
+                .as_ref()
+                .is_some_and(|series| series.coin == coin && series.timeframe == timeframe)
+        {
             return false;
         }
         self.merge_candle(coin, timeframe, candle);
@@ -585,8 +691,11 @@ impl MarketStore {
         let mut entry = self.candles.entry((coin.to_owned(), timeframe)).or_default();
         let state = entry.value_mut();
         let previous_integrity = state.integrity;
-        let buffer = Arc::make_mut(&mut state.candles);
         let candle_open_ms = candle.open_time.timestamp_millis();
+        let previous_latest_open_ms = state.candles.last().map(|existing| existing.open_time.timestamp_millis());
+        let advances_contiguously = previous_latest_open_ms
+            .is_some_and(|open_ms| open_ms.saturating_add(timeframe.duration_ms()) == candle_open_ms);
+        let buffer = Arc::make_mut(&mut state.candles);
         let merge = match buffer.last() {
             Some(last) if last.open_time == candle.open_time => Merge::ReplaceAt(buffer.len() - 1),
             Some(last) if candle.open_time > last.open_time => {
@@ -630,6 +739,12 @@ impl MarketStore {
             Merge::Ignore => false,
         };
         if changed {
+            if advances_contiguously && state.integrity == CandleIntegrity::Verified {
+                state.completed_through_ms = match (state.completed_through_ms, previous_latest_open_ms) {
+                    (Some(existing), Some(completed)) => Some(existing.max(completed)),
+                    (existing, completed) => existing.or(completed),
+                };
+            }
             state.stream_revision = state.stream_revision.wrapping_add(1);
             state.bump_revision();
             state.recent_stream_writes.retain(|(open_ms, _)| *open_ms != candle_open_ms);
@@ -647,22 +762,82 @@ impl MarketStore {
 
     /// Keep streamed series unavailable after a disconnect until a bounded REST
     /// overlap verifies them. Proven structural damage is never downgraded.
+    #[cfg(test)]
     pub(crate) fn mark_streamed_for_verification(&self, timeframes: &[Timeframe]) {
+        let series = self
+            .candles
+            .iter()
+            .filter_map(|entry| timeframes.contains(&entry.key().1).then(|| entry.key().clone()))
+            .collect::<Vec<_>>();
+        self.mark_series_for_verification(&series);
+    }
+
+    /// Mark exactly the series that were subscribed by a disconnected session.
+    pub(crate) fn mark_series_for_verification(&self, series: &[(String, Timeframe)]) {
         let mut updates = Vec::new();
-        for mut entry in self.candles.iter_mut() {
-            let (coin, timeframe) = entry.key().clone();
-            if timeframes.contains(&timeframe) && !entry.candles.is_empty() {
-                if entry.integrity != CandleIntegrity::Repair {
-                    entry.integrity = CandleIntegrity::VerifyOverlap;
-                }
-                entry.repair_epoch = entry.repair_epoch.wrapping_add(1);
-                entry.bump_revision();
-                updates.push((coin, timeframe));
+        for (coin, timeframe) in series {
+            let Some(mut entry) = self.candles.get_mut(&(coin.clone(), *timeframe)) else {
+                continue;
+            };
+            if entry.candles.is_empty() {
+                continue;
             }
+            if entry.integrity != CandleIntegrity::Repair {
+                entry.integrity = CandleIntegrity::VerifyOverlap;
+            }
+            entry.repair_epoch = entry.repair_epoch.wrapping_add(1);
+            entry.bump_revision();
+            updates.push((coin.clone(), *timeframe));
         }
         for (coin, timeframe) in updates {
             self.notify_candle_update(&coin, timeframe);
         }
+    }
+
+    /// Remove a mutable streamed tail only while no live consumer owns it.
+    /// Holding the active-series read lock through the mutation makes activation
+    /// atomic with this check; completed rows retain their verification watermark.
+    pub(crate) fn remove_unsubscribed_tail(&self, coin: &str, timeframe: Timeframe, global_timeframes: &[Timeframe]) {
+        let active = self.active_series.read().unwrap_or_else(PoisonError::into_inner);
+        if global_timeframes.contains(&timeframe)
+            || active
+                .as_ref()
+                .is_some_and(|series| series.coin == coin && series.timeframe == timeframe)
+        {
+            return;
+        }
+        let Some(mut entry) = self.candles.get_mut(&(coin.to_owned(), timeframe)) else {
+            return;
+        };
+        let state = entry.value_mut();
+        let completed_through_ms = state.completed_through_ms;
+        let buffer = Arc::make_mut(&mut state.candles);
+        let mut removed_opens = Vec::new();
+        while buffer.last().is_some_and(|candle| {
+            let open_ms = candle.open_time.timestamp_millis();
+            completed_through_ms.is_none_or(|completed| open_ms > completed)
+        }) {
+            if let Some(removed) = buffer.pop() {
+                removed_opens.push(removed.open_time.timestamp_millis());
+            }
+        }
+        if removed_opens.is_empty() {
+            return;
+        }
+        state.stream_revision = state.stream_revision.wrapping_add(1);
+        let revision = state.stream_revision;
+        for open_ms in removed_opens {
+            state
+                .recent_stream_writes
+                .retain(|(written_open_ms, _)| *written_open_ms != open_ms);
+            if state.recent_stream_writes.len() >= RECENT_STREAM_WRITE_WINDOW {
+                state.recent_stream_writes.remove(0);
+            }
+            state.recent_stream_writes.push((open_ms, revision));
+        }
+        state.bump_revision();
+        drop(entry);
+        self.notify_candle_update(coin, timeframe);
     }
 
     /// Replace the cached universe, evict inactive hot series, and update its status count.
@@ -672,16 +847,12 @@ impl MarketStore {
         let count = universe.len();
         let mut current = self.universe.write().unwrap_or_else(PoisonError::into_inner);
         *current = universe;
-        self.candles.retain(|(coin, _), _| active.contains(coin));
-        if self
-            .active_coin
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .is_some_and(|coin| !active.contains(coin))
-        {
-            *self.active_coin.write().unwrap_or_else(PoisonError::into_inner) = None;
+        let mut active_series = self.active_series.write().unwrap_or_else(PoisonError::into_inner);
+        if active_series.as_ref().is_some_and(|series| !active.contains(&series.coin)) {
+            *active_series = None;
         }
+        self.candles.retain(|(coin, _), _| active.contains(coin));
+        drop(active_series);
         drop(current);
         self.status.send_modify(|status| status.universe = count);
     }
@@ -701,13 +872,13 @@ impl MarketStore {
         self.status.send_modify(|status| status.phase = phase);
     }
 
-    /// Update backfill progress: sets completed / total, errors, and rate.
-    pub(crate) fn set_backfill(&self, done: usize, total: usize, errors: usize, fetch_rate: u32) {
+    /// Update candle-series reconciliation progress for the current pass.
+    pub(crate) fn set_series_progress(&self, done: usize, total: usize, errors: usize, jobs_per_minute: u32) {
         self.status.send_modify(|status| {
-            status.backfill_done = done;
-            status.backfill_total = total;
-            status.backfill_errors = errors;
-            status.fetch_rate = fetch_rate;
+            status.series_done = done;
+            status.series_total = total;
+            status.series_errors = errors;
+            status.series_jobs_per_minute = jobs_per_minute;
         });
     }
 
@@ -752,7 +923,7 @@ mod tests {
     use domain::{Candle, Timeframe, completed_prefix_len};
     use rust_decimal::Decimal;
 
-    use super::{CANDLE_WINDOW, CandleHealth, CandleIntegrity, MarketStore, ReconcileMode, StorageMode};
+    use super::{ActiveSeries, CANDLE_WINDOW, CandleHealth, CandleIntegrity, MarketStore, ReconcileMode, StorageMode};
     use crate::UniverseCoin;
 
     fn candle(hour: i64) -> Candle {
@@ -784,18 +955,75 @@ mod tests {
         store.set_universe(vec![market("BTC"), market("ETH")]);
         store.set_candles("BTC".to_owned(), Timeframe::Hour1, vec![candle(0)]);
         store.set_candles("ETH".to_owned(), Timeframe::Hour1, vec![candle(0)]);
-        store.set_active_coin(Some("ETH".to_owned()));
+        store.set_active_series(Some(ActiveSeries {
+            coin: "ETH".to_owned(),
+            timeframe: Timeframe::Hour1,
+        }));
 
         store.set_universe(vec![market("BTC")]);
 
         assert!(store.candles("BTC", Timeframe::Hour1).is_some());
         assert!(store.candles("ETH", Timeframe::Hour1).is_none());
-        assert!(store.active_coin().is_none());
+        assert!(store.active_series().is_none());
         assert_eq!(store.status().universe, 1);
-        store.set_active_coin(Some("ETH".to_owned()));
-        assert!(store.active_coin().is_none());
-        assert!(!store.merge_active_candle("ETH", Timeframe::Hour1, candle(1)));
+        store.set_active_series(Some(ActiveSeries {
+            coin: "ETH".to_owned(),
+            timeframe: Timeframe::Hour1,
+        }));
+        assert!(store.active_series().is_none());
+        assert!(!store.merge_subscribed_candle("ETH", Timeframe::Hour1, candle(1), &[]));
         assert!(store.candles("ETH", Timeframe::Hour1).is_none());
+    }
+
+    #[test]
+    fn streamed_candles_accept_global_or_exact_active_series_only() {
+        let store = MarketStore::new();
+        store.set_universe(vec![market("BTC")]);
+        store.set_active_series(Some(ActiveSeries {
+            coin: "BTC".to_owned(),
+            timeframe: Timeframe::Day1,
+        }));
+
+        assert!(store.merge_subscribed_candle("BTC", Timeframe::Hour1, candle(0), &[Timeframe::Hour1]));
+        assert!(store.merge_subscribed_candle("BTC", Timeframe::Day1, candle(0), &[Timeframe::Hour1]));
+        assert!(!store.merge_subscribed_candle("BTC", Timeframe::Week1, candle(0), &[Timeframe::Hour1]));
+
+        store.set_active_series(None);
+        assert!(!store.merge_subscribed_candle("BTC", Timeframe::Day1, candle(1), &[Timeframe::Hour1]));
+    }
+
+    #[test]
+    fn unsubscribing_drops_only_the_unverified_streamed_tail() {
+        let store = MarketStore::new();
+        store.set_candles("BTC".to_owned(), Timeframe::Hour1, vec![candle(0), candle(1)]);
+        store.merge_candle("BTC", Timeframe::Hour1, candle(2));
+        let planned = store.series_health("BTC", Timeframe::Hour1);
+        store.set_active_series(Some(ActiveSeries {
+            coin: "BTC".to_owned(),
+            timeframe: Timeframe::Hour1,
+        }));
+
+        store.remove_unsubscribed_tail("BTC", Timeframe::Hour1, &[]);
+        assert_eq!(store.candles("BTC", Timeframe::Hour1).expect("active tail remains").len(), 3);
+        store.set_active_series(None);
+        store.remove_unsubscribed_tail("BTC", Timeframe::Hour1, &[]);
+        store.reconcile_candles(
+            "BTC".to_owned(),
+            Timeframe::Hour1,
+            vec![candle(1), candle(2)],
+            ReconcileMode::Merge,
+            planned.repair_epoch,
+            planned.write_revision,
+        );
+
+        let candles = store.candles("BTC", Timeframe::Hour1).expect("completed history remains");
+        assert_eq!(candles.as_ref(), &[candle(0), candle(1)]);
+        assert_eq!(
+            store
+                .candle_snapshot("BTC", Timeframe::Hour1, 2 * Timeframe::Hour1.duration_ms())
+                .completed_health,
+            CandleHealth::Ready
+        );
     }
 
     #[test]
@@ -827,7 +1055,7 @@ mod tests {
     }
 
     #[test]
-    fn contiguous_merges_flag_nothing() {
+    fn stream_only_series_remains_loading_until_history_is_hydrated() {
         let store = MarketStore::new();
         for hour in 0..3 {
             store.merge_candle("BTC", Timeframe::Hour1, candle(hour));
@@ -836,14 +1064,59 @@ mod tests {
             store.series_health("BTC", Timeframe::Hour1).integrity,
             CandleIntegrity::Verified
         );
+        assert!(store.current_candles("BTC", Timeframe::Hour1, 2 * 3_600_000).is_none());
+
+        store.record_rest_hydration("BTC", Timeframe::Hour1, Some(3_600_000));
+
         assert!(store.current_candles("BTC", Timeframe::Hour1, 2 * 3_600_000).is_some());
+    }
+
+    #[test]
+    fn verified_completed_history_is_ready_without_a_forming_candle() {
+        let store = MarketStore::new();
+        let hour = Timeframe::Hour1.duration_ms();
+        store.set_candles("BTC".to_owned(), Timeframe::Hour1, vec![candle(0), candle(1)]);
+
+        let current = store.candle_snapshot("BTC", Timeframe::Hour1, 2 * hour);
+        assert_eq!(current.live_health, CandleHealth::Stale);
+        assert_eq!(current.completed_health, CandleHealth::Ready);
+        assert_eq!(
+            store.candle_snapshot("BTC", Timeframe::Hour1, 3 * hour).completed_health,
+            CandleHealth::Stale
+        );
+    }
+
+    #[test]
+    fn a_new_listing_with_only_a_forming_bar_is_completed_ready_for_one_period() {
+        let store = MarketStore::new();
+        let day = Timeframe::Day1.duration_ms();
+        let planned = store.series_health("PONS", Timeframe::Day1);
+        store.reconcile_candles(
+            "PONS".to_owned(),
+            Timeframe::Day1,
+            vec![candle(24)],
+            ReconcileMode::Replace,
+            planned.repair_epoch,
+            planned.write_revision,
+        );
+        store.record_rest_hydration("PONS", Timeframe::Day1, None);
+
+        assert_eq!(
+            store.candle_snapshot("PONS", Timeframe::Day1, day).completed_health,
+            CandleHealth::Ready
+        );
+        assert_eq!(
+            store.candle_snapshot("PONS", Timeframe::Day1, 2 * day).completed_health,
+            CandleHealth::Stale
+        );
     }
 
     #[test]
     fn chart_snapshots_expose_health_revisions_and_invalidations() {
         let store = MarketStore::new();
         let missing = store.candle_snapshot("BTC", Timeframe::Hour1, 0);
-        assert_eq!(missing.health, CandleHealth::Loading);
+        assert_eq!(missing.live_health, CandleHealth::Loading);
+        assert_eq!(missing.completed_health, CandleHealth::Loading);
         assert_eq!(missing.revision, 0);
         assert_eq!(serde_json::to_string(&CandleHealth::Ready).expect("serializable"), "\"ready\"");
         assert_eq!(
@@ -854,16 +1127,16 @@ mod tests {
         let mut updates = store.subscribe_candle_updates();
         store.set_candles("BTC".to_owned(), Timeframe::Hour1, vec![candle(0), candle(1), candle(2)]);
         let ready = store.candle_snapshot("BTC", Timeframe::Hour1, 2 * 3_600_000);
-        assert_eq!(ready.health, CandleHealth::Ready);
+        assert_eq!(ready.live_health, CandleHealth::Ready);
         assert!(ready.revision > missing.revision);
         let stale = store.candle_snapshot("BTC", Timeframe::Hour1, 3 * 3_600_000);
-        assert_eq!(stale.health, CandleHealth::Stale);
+        assert_eq!(stale.live_health, CandleHealth::Stale);
         assert_eq!(stale.revision, ready.revision);
         updates.try_recv().expect("seed invalidation");
 
         store.mark_streamed_for_verification(&[Timeframe::Hour1]);
         let verifying = store.candle_snapshot("BTC", Timeframe::Hour1, 2 * 3_600_000);
-        assert_eq!(verifying.health, CandleHealth::Verifying);
+        assert_eq!(verifying.live_health, CandleHealth::Verifying);
         assert!(verifying.revision > ready.revision);
         let disconnect_update = updates.try_recv().expect("disconnect invalidation");
         assert_eq!(disconnect_update.coin, "BTC");
@@ -879,13 +1152,13 @@ mod tests {
             health.write_revision,
         );
         let repaired = store.candle_snapshot("BTC", Timeframe::Hour1, 2 * 3_600_000);
-        assert_eq!(repaired.health, CandleHealth::Ready);
+        assert_eq!(repaired.live_health, CandleHealth::Ready);
         assert!(repaired.revision > verifying.revision);
         updates.try_recv().expect("REST invalidation");
 
         store.merge_candle("BTC", Timeframe::Hour1, candle(4));
         let repairing = store.candle_snapshot("BTC", Timeframe::Hour1, 4 * 3_600_000);
-        assert_eq!(repairing.health, CandleHealth::Repairing);
+        assert_eq!(repairing.live_health, CandleHealth::Repairing);
         assert!(repairing.revision > repaired.revision);
         updates.try_recv().expect("structural repair invalidation");
     }
@@ -954,6 +1227,33 @@ mod tests {
             health.write_revision,
         );
         assert!(store.current_candles("BTC", Timeframe::Hour1, 0).is_some());
+    }
+
+    #[test]
+    fn disconnect_verification_preserves_an_interleaved_stream_write() {
+        let store = MarketStore::new();
+        store.set_candles("BTC".to_owned(), Timeframe::Hour1, vec![candle(0), candle(1), candle(2)]);
+        store.mark_series_for_verification(&[("BTC".to_owned(), Timeframe::Hour1)]);
+        let planned = store.series_health("BTC", Timeframe::Hour1);
+        let mut streamed = candle(2);
+        streamed.close = Decimal::TWO;
+        store.merge_candle("BTC", Timeframe::Hour1, streamed.clone());
+
+        store.reconcile_candles(
+            "BTC".to_owned(),
+            Timeframe::Hour1,
+            vec![candle(1), candle(2)],
+            ReconcileMode::VerifyOverlap,
+            planned.repair_epoch,
+            planned.write_revision,
+        );
+
+        let candles = store.candles("BTC", Timeframe::Hour1).expect("verified candles");
+        assert_eq!(candles.last(), Some(&streamed));
+        assert_eq!(
+            store.series_health("BTC", Timeframe::Hour1).integrity,
+            CandleIntegrity::Verified
+        );
     }
 
     #[test]

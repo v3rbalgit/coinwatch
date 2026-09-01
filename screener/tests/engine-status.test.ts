@@ -8,11 +8,11 @@ function status(overrides: Partial<MarketEngineStatus> = {}): MarketEngineStatus
     connection: "live",
     phase: "live",
     universe: 177,
-    backfill_done: 0,
-    backfill_total: 0,
-    backfill_errors: 0,
+    series_done: 0,
+    series_total: 0,
+    series_errors: 0,
     streaming: 354,
-    fetch_rate: 0,
+    series_jobs_per_minute: 0,
     storage_mode: "persistent",
     storage_failures: 0,
     last_storage_error: null,
@@ -25,7 +25,7 @@ function status(overrides: Partial<MarketEngineStatus> = {}): MarketEngineStatus
 describe("engine status degradation", () => {
   it("keeps a failed reconciliation visible after the sync phase completes", () => {
     expect(candleEngineIsDegraded(status())).toBe(false)
-    expect(candleEngineIsDegraded(status({ backfill_errors: 1 }))).toBe(true)
+    expect(candleEngineIsDegraded(status({ series_errors: 1 }))).toBe(true)
     expect(candleEngineIsDegraded(status({ last_reconciliation_error: "universe refresh failed" }))).toBe(true)
   })
 

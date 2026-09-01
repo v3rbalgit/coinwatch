@@ -42,7 +42,7 @@ Signal definitions declare their exact history requirements; a run uses the hot 
 then hydrates older completed candles through `CandleHistory` when necessary.
 
 ```text
-Hyperliquid ──WS (allMids + fastAssetCtxs + candle)──▶ MarketStore ──▶ Browse · chart
+Hyperliquid ──WS (fastAssetCtxs marks + bounded/active candles)──▶ MarketStore ──▶ Browse · chart
             │                                               └─completed streamed bars──▶ SQLite history
             └─REST (metaAndAssetCtxs + candleSnapshot)──┬────────────▶ SQLite history
                                                         └────────────▶ signal hydration
@@ -51,10 +51,11 @@ SQLite user data ──▶ watchlists · signal catalog · presets ────�
 
 ## hl-feed internals
 
-- **`stream`** — one WebSocket session. Subscribes `allMids` + `fastAssetCtxs` (prices) and,
-  once the universe is known, `candle` streams for the configured timeframes. Publishes
-  `MarketEvent::Mid` / `MarketEvent::Candle` on a shared `MarketFeed` and merges candles into
-  the store. Reconnects with exponential backoff.
+- **`stream`** — one WebSocket session. `fastAssetCtxs` is the single canonical mark-price
+  source. Candle subscriptions combine a deliberately bounded whole-universe set with the
+  exact active chart `(coin, timeframe)`; changing charts reconciles that one dynamic slot.
+  Publishes `MarketEvent::Mark` / `MarketEvent::Candle` on a shared `MarketFeed`, merges only
+  currently desired candle series, and reconnects with exponential backoff.
 - **`rest`** — `metaAndAssetCtxs` (universe + funding / OI / mark / prev-day) and
   `candleSnapshot` (candle-history backfill). History uses a 2,000-row operational request
   ceiling, but advances from the actual oldest returned row so provider truncation remains safe.
@@ -64,25 +65,42 @@ SQLite user data ──▶ watchlists · signal catalog · presets ────�
   1200/min per-IP cap). One limiter is shared across all REST callers.
 - **`store`** — `MarketStore`: candle buffers per (coin, timeframe), the volume-ranked
   universe, and a granular `MarketStatus` (connection state, sync phase, universe size,
-  backfill progress, failure diagnostics, fetch rate, and storage durability) published on
-  a `watch` channel. Hot buffers are retained only for the current universe.
+  series-reconciliation progress, failure diagnostics, series-job throughput, and storage durability)
+  published on a `watch` channel. Each candle buffer distinguishes REST/SQLite hydration,
+  its latest verified completed bar, and whether a current forming bar is present. Hot
+  buffers are retained only for the current universe.
 - **`sync`** — refreshes the universe each cycle and re-plans fetches from per-series health:
-  the initial backfill runs once per (coin, timeframe) and is not re-downloaded while current;
-  the WebSocket then keeps the streamed timeframes live, REST advances non-streamed timeframes
-  one bar at a time after a boundary grace, fully repairs gapped or disconnected series, and
-  writes streamed series' freshly completed bars through to SQLite each cycle.
+  initial history hydration runs once per (coin, timeframe), with the active chart selected
+  ahead of unrelated background jobs. Restored verified completed history lets global streams
+  resume without REST requests for forming heads; REST fallback becomes due only when a completed
+  watermark falls behind. Active charts additionally require a live forming bar. REST-only
+  timeframes reconcile again when a new bar closes. REST also fully repairs gapped or disconnected series
+  and writes newly completed bars through to SQLite.
 - **`event` / `feed`** — typed market events and a broadcast `MarketFeed` the UI and future
   consumers subscribe to.
 
 ## Key decisions
 
-- **One WS session** for prices and candles, not two connections.
-- **Hybrid candles**: the WebSocket keeps short timeframes live; REST backfills history,
-  paced to the weight limit, and stays the liveness mechanism for the slow timeframes,
-  whose bars complete rarely enough that one small fetch per close is nearly free.
+- **One WS session** for mark prices and candles, not two connections.
+- **Canonical mark price**: REST initialization and live updates share `markPx`; midpoint and
+  trade-derived candle prices are not collapsed into that contract.
+- **Consumer-driven candles**: WebSocket coverage is the bounded whole-universe set plus one
+  active chart series, so adding chart timeframes does not multiply every market's subscriptions.
+  REST hydrates history and reconciles non-streamed series after closes rather than polling a
+  frozen forming candle merely to satisfy chart-style currentness. Capacity validation counts
+  the mark stream and dynamic slot before any subscribe request; with two global intervals the
+  current budget supports at most 499 markets. Approaching that bound requires narrowing the
+  global set or implementing the aggregation design below, not opening another socket.
+- **Separate readiness**: signals require verified completed bars; charts require a current
+  forming bar. Global sync phase is background cache progress, not a claim that every screen is
+  unavailable until all series finish.
 - **Metadata-first Browse workspace**: it needs one `metaAndAssetCtxs` call, so it is usable
   immediately; chart depth and signal evidence improve as candle history accumulates.
 - **Granular status** on a `watch` channel, surfaced plainly in the UI.
+- **Aggregation only with a whole-universe consumer**: if future alerts require many concurrent
+  higher timeframes, derive them from a canonical lower stream only with source continuity,
+  replacement-safe volume accounting, health propagation, and REST reconciliation of closes.
+  The active chart alone does not justify that state machine.
 
 ### Candle retention and degraded storage
 

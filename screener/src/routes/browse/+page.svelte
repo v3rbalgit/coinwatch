@@ -11,7 +11,7 @@
   import Input from "$lib/components/ui/input.svelte"
   import Skeleton from "$lib/components/ui/skeleton.svelte"
   import { formatCompactNumber, formatPrice, prevDayChangePct } from "$lib/format"
-  import { onMid } from "$lib/ipc/events"
+  import { onMarkPrice } from "$lib/ipc/events"
   import {
     addToList,
     createList,
@@ -29,7 +29,7 @@
   let logoMap = $state<Record<string, string>>({})
   let loading = $state(true)
   let error = $state("")
-  const livePrices = $state<Record<string, number>>({})
+  const markPrices = $state<Record<string, number>>({})
   let live = $state(false)
 
   // Inline list creation (window.prompt is unreliable in the webview).
@@ -58,9 +58,9 @@
   void loadLogos()
 
   onMount(() => {
-    const unlisten = onMid(event => {
+    const unlisten = onMarkPrice(event => {
       live = true
-      livePrices[event.coin] = event.price
+      markPrices[event.coin] = event.price
     })
     const reload = setInterval(loadRows, 5000)
     // Pick up logos as the background cache task fills them in this session.
@@ -101,7 +101,7 @@
 
   const change = (row: Row, price: number) => prevDayChangePct(row.prev_day, price)
 
-  // Depends only on rows and the browse view — never livePrices — so a price tick
+  // Depends only on rows and the browse view — never markPrices — so a price tick
   // updates only the affected cells rather than re-sorting the whole table.
   const sorted = $derived.by(() => {
     const q = browseView.query.trim().toLowerCase()
@@ -143,7 +143,7 @@
   }
   const cols: { key: SortKey; label: string; num: boolean }[] = [
     { key: "coin", label: "Coin", num: false },
-    { key: "price", label: "Price", num: true },
+    { key: "price", label: "Mark", num: true },
     { key: "change_24h_pct", label: "24h %", num: true },
     { key: "volume_usd", label: "Volume", num: true },
     { key: "open_interest_usd", label: "OI", num: true },
@@ -261,7 +261,7 @@
         </thead>
         <tbody>
           {#each sorted as row (row.coin)}
-            {@const price = livePrices[row.coin] ?? row.price}
+            {@const price = markPrices[row.coin] ?? row.price}
             {@const chg = change(row, price)}
             <tr
               class="cursor-pointer border-t border-border/60 hover:bg-accent/40"
