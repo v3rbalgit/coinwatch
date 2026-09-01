@@ -13,6 +13,7 @@ mod event;
 mod feed;
 mod history;
 mod ratelimit;
+mod reporting_store;
 mod rest;
 mod store;
 mod stream;
@@ -22,6 +23,7 @@ pub use error::FeedError;
 pub use event::{CandleEvent, MarkPriceEvent, MarketEvent};
 pub use feed::MarketFeed;
 pub use history::{CandleHistory, CandleProvider, HistoryError};
+pub use reporting_store::ReportingCandleStore;
 pub use rest::{HyperliquidRest, UniverseCoin};
 pub use store::{
     ActiveSeries, CandleHealth, CandleSnapshot, CandleUpdate, ConnectionState, MarketStatus, MarketStore, StorageMode,

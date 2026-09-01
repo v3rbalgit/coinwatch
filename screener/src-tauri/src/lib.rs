@@ -20,7 +20,7 @@ use chrono::Utc;
 use domain::{Candle, Timeframe};
 use hl_feed::{
     ActiveSeries, CandleHealth, CandleHistory, CandleProvider, HyperliquidAdapter, HyperliquidRest, MarketEvent,
-    MarketStatus, MarketStore, StorageMode, SyncConfig, spawn_sync,
+    MarketStatus, MarketStore, ReportingCandleStore, StorageMode, SyncConfig, spawn_sync,
 };
 use rust_decimal::prelude::ToPrimitive;
 use serde::Serialize;
@@ -365,10 +365,13 @@ pub fn run() {
             };
             sync_store.set_storage_mode(storage_mode, storage_error);
             let database = Arc::new(database);
-            let persistence: Arc<dyn CandleStore> = database.clone();
+            // Wrap persistence once so sync and on-demand history report failures consistently.
+            let persistence: Arc<dyn CandleStore> = Arc::new(ReportingCandleStore::new(
+                database.clone(),
+                Arc::clone(&sync_store),
+            ));
             let provider: Arc<dyn CandleProvider> = rest.clone();
-            let history =
-                Arc::new(CandleHistory::new(Arc::clone(&persistence), provider).with_status(Arc::clone(&sync_store)));
+            let history = Arc::new(CandleHistory::new(Arc::clone(&persistence), provider));
             app.manage(Arc::clone(&database));
             app.manage(history);
             let logo_db = Arc::clone(&database);

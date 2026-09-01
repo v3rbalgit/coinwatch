@@ -179,7 +179,6 @@ pub fn spawn_sync(
                 tracing::info!(restored, "restored persisted candle series");
             }
             Err(error) => {
-                store.record_storage_failure(error.to_string());
                 tracing::error!(%error, "failed to load persisted candles");
             }
         }
@@ -306,7 +305,6 @@ async fn persist_streamed_heads(
                 continue;
             }
             if let Err(error) = persistence.save(coin, timeframe, tail).await {
-                store.record_storage_failure(error.to_string());
                 tracing::warn!(coin = %coin, timeframe = timeframe.as_hl(), %error, "failed to persist streamed candles");
             }
         }
@@ -456,7 +454,6 @@ async fn execute_fetch(
             if !rows.is_empty()
                 && let Err(error) = persistence.save(&coin, timeframe, rows).await
             {
-                store.record_storage_failure(error.to_string());
                 tracing::warn!(coin = %coin, timeframe = timeframe.as_hl(), %error, "failed to persist candles");
             }
             let health = store.series_health(&coin, timeframe);
