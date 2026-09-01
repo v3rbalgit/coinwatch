@@ -26,8 +26,8 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::error::FeedError;
 use crate::event::{CandleEvent, MarkPriceEvent, MarketEvent};
 use crate::feed::MarketFeed;
+use crate::market_store::{ConnectionState, MarketStore};
 use crate::rest::to_decimal;
-use crate::store::{ConnectionState, MarketStore};
 
 const WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 const PING_INTERVAL: Duration = Duration::from_secs(15);

@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use domain::{Candle, Timeframe};
 use storage::{CandleSeries, CandleStore, StoreError};
 
-use crate::store::MarketStore;
+use crate::market_store::MarketStore;
 
 /// A candle store that records every failed operation in the shared market status.
 pub struct ReportingCandleStore {
