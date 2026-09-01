@@ -40,7 +40,7 @@ runtime verification before landing.
   Correct derivation requires source continuity, replacement
   rather than volume double-counting, trust propagation, persisted provenance,
   and REST reconciliation of every newly closed target bar.
-- **`MarketStore` module split** — `store.rs` is large, but its integrity,
+- **`MarketStore` module split** — `market_store.rs` is large, but its integrity,
   revision, readiness, and reconciliation logic is intentionally coupled. Split
   only when a stable submodule boundary reduces that coupling rather than moving
   the same state machine across files.

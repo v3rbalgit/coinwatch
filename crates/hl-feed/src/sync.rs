@@ -13,8 +13,8 @@ use domain::{Candle, Timeframe, completed_prefix_len};
 use storage::{CandleSeries, CandleStore};
 use tokio::task::JoinHandle;
 
+use crate::market_store::{CandleIntegrity, ReconcileMode, STREAM_RECONCILE_WINDOW};
 use crate::rest::HyperliquidRest;
-use crate::store::{CandleIntegrity, ReconcileMode, STREAM_RECONCILE_WINDOW};
 use crate::{ActiveSeries, CANDLE_WINDOW, MarketStore, SyncPhase};
 
 /// How the sync engine seeds and refreshes the store.
@@ -512,7 +512,7 @@ mod tests {
         SyncConfig, candle_fetch, completed_rows_in_range, drop_bars_closed_since_fetch, enqueue_active_fetch,
         next_pending_index, persist_streamed_heads, spawn_sync,
     };
-    use crate::store::{ReconcileMode, STREAM_RECONCILE_WINDOW};
+    use crate::market_store::{ReconcileMode, STREAM_RECONCILE_WINDOW};
     use crate::{ActiveSeries, CANDLE_WINDOW, HyperliquidRest, MarketStore};
 
     struct NoopStore;

@@ -12,10 +12,10 @@ mod error;
 mod event;
 mod feed;
 mod history;
+mod market_store;
 mod ratelimit;
 mod reporting_store;
 mod rest;
-mod store;
 mod stream;
 mod sync;
 
@@ -23,12 +23,12 @@ pub use error::FeedError;
 pub use event::{CandleEvent, MarkPriceEvent, MarketEvent};
 pub use feed::MarketFeed;
 pub use history::{CandleHistory, CandleProvider, HistoryError};
-pub use reporting_store::ReportingCandleStore;
-pub use rest::{HyperliquidRest, UniverseCoin};
-pub use store::{
+pub use market_store::{
     ActiveSeries, CandleHealth, CandleSnapshot, CandleUpdate, ConnectionState, MarketStatus, MarketStore, StorageMode,
     SyncPhase,
 };
+pub use reporting_store::ReportingCandleStore;
+pub use rest::{HyperliquidRest, UniverseCoin};
 pub use stream::HyperliquidAdapter;
 pub use sync::{SyncConfig, spawn_sync};
 
