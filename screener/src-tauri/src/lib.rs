@@ -2,8 +2,8 @@
 //!
 //! The market sync engine keeps a hot [`MarketStore`] cache warm from Hyperliquid.
 //! Commands expose live metadata, candle history, user data, and personal signal
-//! evaluation. Live mids, active-coin candles, candle snapshot invalidations, and
-//! engine status are relayed to the frontend as typed events.
+//! evaluation. Live marks, active-series candles, candle snapshot invalidations,
+//! and engine status are relayed to the frontend as typed events.
 
 mod indicator_presets;
 mod naming;
@@ -19,8 +19,8 @@ use std::time::Duration;
 use chrono::Utc;
 use domain::{Candle, Timeframe};
 use hl_feed::{
-    CandleHealth, CandleHistory, CandleProvider, HyperliquidAdapter, HyperliquidRest, MarketEvent, MarketStatus,
-    MarketStore, StorageMode, SyncConfig, spawn_sync,
+    ActiveSeries, CandleHealth, CandleHistory, CandleProvider, HyperliquidAdapter, HyperliquidRest, MarketEvent,
+    MarketStatus, MarketStore, StorageMode, SyncConfig, spawn_sync,
 };
 use rust_decimal::prelude::ToPrimitive;
 use serde::Serialize;
@@ -74,9 +74,9 @@ fn screener_rows(store: tauri::State<'_, Arc<MarketStore>>) -> Vec<ScreenerRow> 
         .collect()
 }
 
-/// A live mid-price update forwarded to the frontend as a `mid` event.
+/// A live mark-price update forwarded to the frontend as a `mark-price` event.
 #[derive(Clone, Serialize)]
-struct MidPayload {
+struct MarkPricePayload {
     coin: String,
     price: f64,
 }
@@ -126,7 +126,7 @@ fn coin_candles(store: tauri::State<'_, Arc<MarketStore>>, coin: String, timefra
     let snapshot = store.candle_snapshot(&coin, timeframe, Utc::now().timestamp_millis());
     CandleSnapshotPayload {
         candles: snapshot.candles.iter().map(CandlePayload::from).collect(),
-        health: snapshot.health,
+        health: snapshot.live_health,
         revision: snapshot.revision,
     }
 }
@@ -194,16 +194,19 @@ fn emit_candle_snapshot_update(handle: &tauri::AppHandle, store: &MarketStore, c
     let payload = CandleSnapshotUpdatePayload {
         coin: coin.to_owned(),
         timeframe: timeframe.as_hl().to_owned(),
-        health: snapshot.health,
+        health: snapshot.live_health,
         revision: snapshot.revision,
     };
     let _ = handle.emit("candle-snapshot-updated", payload);
 }
 
-/// Set (or clear) the coin whose live candles are streamed to the UI (the open detail page).
+/// Set (or clear) the exact candle series consumed by the open detail chart.
 #[tauri::command]
-fn set_active_coin(store: tauri::State<'_, Arc<MarketStore>>, coin: Option<String>) {
-    store.set_active_coin(coin);
+fn set_active_series(store: tauri::State<'_, Arc<MarketStore>>, coin: Option<String>, timeframe: Option<String>) {
+    let series = coin
+        .zip(timeframe)
+        .and_then(|(coin, timeframe)| Timeframe::from_hl(&timeframe).map(|timeframe| ActiveSeries { coin, timeframe }));
+    store.set_active_series(series);
 }
 
 /// Open a coin's Hyperliquid trade page in the browser.
@@ -396,7 +399,7 @@ pub fn run() {
                 loop {
                     match updates.recv().await {
                         Ok(update) => {
-                            if candle_update_store.active_coin().as_deref() == Some(update.coin.as_str()) {
+                            if candle_update_store.is_active_series(&update.coin, update.timeframe) {
                                 emit_candle_snapshot_update(
                                     &candle_update_handle,
                                     &candle_update_store,
@@ -406,15 +409,13 @@ pub fn run() {
                             }
                         }
                         Err(RecvError::Lagged(_)) => {
-                            if let Some(coin) = candle_update_store.active_coin() {
-                                for timeframe in Timeframe::ALL {
-                                    emit_candle_snapshot_update(
-                                        &candle_update_handle,
-                                        &candle_update_store,
-                                        &coin,
-                                        timeframe,
-                                    );
-                                }
+                            if let Some(active) = candle_update_store.active_series() {
+                                emit_candle_snapshot_update(
+                                    &candle_update_handle,
+                                    &candle_update_store,
+                                    &active.coin,
+                                    active.timeframe,
+                                );
                             }
                         }
                         Err(RecvError::Closed) => break,
@@ -422,7 +423,7 @@ pub fn run() {
                 }
             });
 
-            // Stream live mids and relay them to the UI as `mid` events.
+            // Stream canonical mark prices and relay active-series candles.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let event_store = Arc::clone(&adapter_store);
@@ -432,15 +433,15 @@ pub fn run() {
                 loop {
                     match events.recv().await {
                         Ok(event) => match &*event {
-                            MarketEvent::Mid(mid) => {
-                                let payload = MidPayload {
-                                    coin: mid.symbol.clone(),
-                                    price: mid.price.to_f64().unwrap_or(0.0),
+                            MarketEvent::Mark(mark) => {
+                                let payload = MarkPricePayload {
+                                    coin: mark.symbol.clone(),
+                                    price: mark.price.to_f64().unwrap_or(0.0),
                                 };
-                                let _ = handle.emit("mid", payload);
+                                let _ = handle.emit("mark-price", payload);
                             }
                             MarketEvent::Candle(candle) => {
-                                if event_store.active_coin().as_deref() == Some(candle.coin.as_str()) {
+                                if event_store.is_active_series(&candle.coin, candle.timeframe) {
                                     let snapshot = event_store.candle_snapshot(
                                         &candle.coin,
                                         candle.timeframe,
@@ -450,7 +451,7 @@ pub fn run() {
                                         coin: candle.coin.clone(),
                                         timeframe: candle.timeframe.as_hl().to_owned(),
                                         candle: CandlePayload::from(&candle.candle),
-                                        health: snapshot.health,
+                                        health: snapshot.live_health,
                                         revision: snapshot.revision,
                                     };
                                     let _ = handle.emit("candle", payload);
@@ -478,7 +479,7 @@ pub fn run() {
             coin_history,
             get_setting,
             set_setting,
-            set_active_coin,
+            set_active_series,
             signal_catalog::list_signals,
             signal_catalog::get_signal,
             signal_catalog::create_signal,

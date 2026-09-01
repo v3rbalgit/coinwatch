@@ -5,7 +5,7 @@ import type { UnlistenFn } from "@tauri-apps/api/event"
 import type { Bar } from "$lib/chart/types"
 import type { CandleHealth } from "$lib/ipc/candles"
 
-export type MidEvent = { coin: string; price: number }
+export type MarkPriceEvent = { coin: string; price: number }
 
 export type CandleEvent = {
   coin: string
@@ -25,13 +25,13 @@ export type CandleSnapshotUpdate = {
 /** Engine status snapshot; field names mirror the Rust `MarketStatus`. */
 export type MarketEngineStatus = {
   connection: "connecting" | "live" | "reconnecting"
-  phase: "loading" | "backfilling" | "live"
+  phase: "loading" | "syncing_history" | "live"
   universe: number
-  backfill_done: number
-  backfill_total: number
-  backfill_errors: number
+  series_done: number
+  series_total: number
+  series_errors: number
   streaming: number
-  fetch_rate: number
+  series_jobs_per_minute: number
   storage_mode: "initializing" | "persistent" | "temporary"
   storage_failures: number
   last_storage_error: string | null
@@ -39,8 +39,8 @@ export type MarketEngineStatus = {
   last_reconciliation_error: string | null
 }
 
-export function onMid(handler: (event: MidEvent) => void): Promise<UnlistenFn> {
-  return listen<MidEvent>("mid", event => handler(event.payload))
+export function onMarkPrice(handler: (event: MarkPriceEvent) => void): Promise<UnlistenFn> {
+  return listen<MarkPriceEvent>("mark-price", event => handler(event.payload))
 }
 
 export function onCandle(handler: (event: CandleEvent) => void): Promise<UnlistenFn> {

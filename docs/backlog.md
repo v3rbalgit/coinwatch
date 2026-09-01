@@ -16,15 +16,11 @@ runtime verification before landing.
   Verify whether the frontend actually calls the opener JS API or whether links
   open through a Rust command; narrow or drop the grant accordingly. Needs a
   runtime check.
-- **WebSocket subscription churn** — every universe refresh unsubscribes and
-  resubscribes all candle streams. Fix is a pure set-diff of (coin, interval)
-  subscriptions; logic is unit-testable, but the behavior change needs one
-  live session to validate against Hyperliquid's subscription limits.
 - **`disconnect()` status hole** — `HyperliquidAdapter::disconnect` aborts the
   task but leaves `ConnectionState::Live` and skips
-  `mark_streamed_for_reconciliation`. No caller exists today; fixing properly
-  wants a `Disconnected` variant in the state model, which touches the UI
-  status contract.
+  `mark_series_for_verification`. No caller exists today; the method is deprecated
+  until a proper fix can add a `Disconnected` variant to the state model, which
+  touches the UI status contract.
 - **Dialog chrome / pill class extraction** — repeated dialog scaffolding and
   status-pill class strings across components. Mechanical, but purely visual
   and uncovered by tests; extract when next touching those components.
@@ -34,6 +30,20 @@ runtime verification before landing.
 - **Storage insert batching** — batching candle inserts would replace
   compile-time `sqlx::query!` macros with runtime query building. Compile-time
   checking wins until write volume actually hurts.
+- **Bounded REST concurrency** — concurrent series fetches can overlap network
+  latency but cannot beat Hyperliquid's shared request-weight floor. Measure the
+  consumer-driven startup path first; add bounded concurrency only if cold
+  background hydration remains materially slower than the limiter permits.
+- **Higher-timeframe candle aggregation** — introduce only when a whole-universe
+  alerting workload needs more simultaneous timeframes than the subscription
+  budget supports, or the two global intervals approach their 499-market budget.
+  Correct derivation requires source continuity, replacement
+  rather than volume double-counting, trust propagation, persisted provenance,
+  and REST reconciliation of every newly closed target bar.
+- **`MarketStore` module split** — `store.rs` is large, but its integrity,
+  revision, readiness, and reconciliation logic is intentionally coupled. Split
+  only when a stable submodule boundary reduces that coupling rather than moving
+  the same state machine across files.
 - **Rate-limiter fairness queue** — the REST limiter is first-come; a fairness
   queue is design work. Revisit with the alerting milestone, which changes the
   request mix anyway.

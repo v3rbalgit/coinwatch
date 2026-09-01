@@ -61,7 +61,7 @@ async fn hydrate_coin_data(
     let now_ms = now.timestamp_millis();
     for (&timeframe, &required) in requirements {
         let snapshot = store.candle_snapshot(coin, timeframe, now_ms);
-        match snapshot.health {
+        match snapshot.completed_health {
             CandleHealth::Ready => {
                 hydrate_timeframe(&mut data, history, coin, timeframe, required, snapshot.candles, now).await;
             }

@@ -4,6 +4,7 @@
 //! interval so the cache stays warm. Consumers read the store instead of fetching,
 //! which is what makes scans and screener reads instant.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,7 +15,7 @@ use tokio::task::JoinHandle;
 
 use crate::rest::HyperliquidRest;
 use crate::store::{CandleIntegrity, ReconcileMode, STREAM_RECONCILE_WINDOW};
-use crate::{CANDLE_WINDOW, MarketStore, SyncPhase};
+use crate::{ActiveSeries, CANDLE_WINDOW, MarketStore, SyncPhase};
 
 /// How the sync engine seeds and refreshes the store.
 #[derive(Debug, Clone)]
@@ -96,7 +97,13 @@ fn candle_fetch(
         }
         CandleIntegrity::Verified => {}
     }
-    if health.is_current(timeframe, now_ms) {
+    let requires_forming = store.is_active_series(&coin, timeframe);
+    let current = if requires_forming {
+        health.is_live_current(timeframe, now_ms)
+    } else {
+        health.is_completed_current(timeframe, now_ms)
+    };
+    if current {
         return None;
     }
 
@@ -155,15 +162,18 @@ pub fn spawn_sync(
     tokio::spawn(async move {
         match persistence.load_recent(CANDLE_WINDOW).await {
             Ok(series) => {
-                let restored = series.len();
+                let mut restored = 0usize;
                 for CandleSeries {
                     coin,
                     timeframe,
-                    candles,
+                    mut candles,
                 } in series
                 {
+                    let completed = completed_prefix_len(&candles, timeframe, Utc::now().timestamp_millis());
+                    candles.truncate(completed);
                     if !candles.is_empty() {
                         store.set_candles(coin, timeframe, candles);
+                        restored += 1;
                     }
                 }
                 tracing::info!(restored, "restored persisted candle series");
@@ -184,6 +194,38 @@ pub fn spawn_sync(
 /// Freshly completed streamed bars persisted per refresh cycle.
 const STREAMED_PERSIST_TAIL: usize = 3;
 
+fn next_pending_index(pending: &[(String, Timeframe)], active: Option<&ActiveSeries>) -> usize {
+    let Some(active) = active else {
+        return 0;
+    };
+    pending
+        .iter()
+        .position(|(coin, timeframe)| coin == &active.coin && *timeframe == active.timeframe)
+        .or_else(|| pending.iter().position(|(coin, _)| coin == &active.coin))
+        .unwrap_or(0)
+}
+
+fn enqueue_active_fetch(
+    pending: &mut Vec<(String, Timeframe)>,
+    attempted: &HashSet<(String, Timeframe)>,
+    store: &MarketStore,
+    config: &SyncConfig,
+    now_ms: i64,
+) -> bool {
+    let Some(active) = store.active_series() else {
+        return false;
+    };
+    let key = (active.coin, active.timeframe);
+    if pending.iter().any(|candidate| candidate == &key)
+        || attempted.contains(&key)
+        || candle_fetch(store, key.0.clone(), key.1, config, now_ms).is_none()
+    {
+        return false;
+    }
+    pending.push(key);
+    true
+}
+
 /// One full pass: refresh the universe, then backfill each coin/timeframe.
 async fn refresh(store: &MarketStore, rest: &HyperliquidRest, config: &SyncConfig, persistence: &dyn CandleStore) {
     let universe = match rest.universe(config.universe_limit, config.min_day_volume_usd).await {
@@ -199,7 +241,7 @@ async fn refresh(store: &MarketStore, rest: &HyperliquidRest, config: &SyncConfi
 
     let now_ms = Utc::now().timestamp_millis();
     persist_streamed_heads(store, config, persistence, &coins, now_ms).await;
-    let pending: Vec<(String, Timeframe)> = coins
+    let mut pending: Vec<(String, Timeframe)> = coins
         .iter()
         .flat_map(|coin| config.timeframes.iter().map(move |&timeframe| (coin.clone(), timeframe)))
         .filter(|(coin, timeframe)| candle_fetch(store, coin.clone(), *timeframe, config, now_ms).is_some())
@@ -207,23 +249,31 @@ async fn refresh(store: &MarketStore, rest: &HyperliquidRest, config: &SyncConfi
 
     if pending.is_empty() {
         store.clear_reconciliation_error();
-        store.set_backfill(0, 0, 0, 0);
+        store.set_series_progress(0, 0, 0, 0);
         store.set_phase(SyncPhase::Live);
         return;
     }
 
-    let total = pending.len();
-    store.set_phase(SyncPhase::Backfilling);
-    store.set_backfill(0, total, 0, 0);
+    let mut total = pending.len();
+    store.set_phase(SyncPhase::SyncingHistory);
+    store.set_series_progress(0, total, 0, 0);
     let started = Instant::now();
     let mut done = 0;
     let mut errors = 0;
-    for (coin, timeframe) in pending {
+    let mut attempted = HashSet::new();
+    while !pending.is_empty() {
+        if enqueue_active_fetch(&mut pending, &attempted, store, config, Utc::now().timestamp_millis()) {
+            total = total.saturating_add(1);
+            store.set_series_progress(done, total, errors, series_job_rate(done, started));
+        }
+        let index = next_pending_index(&pending, store.active_series().as_ref());
+        let (coin, timeframe) = pending.remove(index);
+        attempted.insert((coin.clone(), timeframe));
         if !execute_fetch(store, rest, config, persistence, coin, timeframe).await {
             errors += 1;
         }
         done += 1;
-        store.set_backfill(done, total, errors, fetch_rate(done, started));
+        store.set_series_progress(done, total, errors, series_job_rate(done, started));
     }
     tracing::info!(done, errors, "candle reconciliation pass complete");
     if errors == 0 {
@@ -242,7 +292,7 @@ async fn persist_streamed_heads(
 ) {
     for coin in coins {
         for &timeframe in &config.streamed_timeframes {
-            if !store.series_health(coin, timeframe).is_current(timeframe, now_ms) {
+            if !store.series_health(coin, timeframe).is_live_current(timeframe, now_ms) {
                 continue;
             }
             let Some(candles) = store.candles(coin, timeframe) else {
@@ -323,8 +373,24 @@ async fn execute_fetch(
         Ok(mut candles) => {
             let reconciled_at_ms = Utc::now().timestamp_millis();
             drop_bars_closed_since_fetch(&mut candles, timeframe, fetched_at_ms, reconciled_at_ms);
+            let requires_forming = store.is_active_series(&coin, timeframe);
+            let forming_open_ms = timeframe.bar_open_ms(reconciled_at_ms);
+            let keep_listing_forming = !requires_forming
+                && !candles.is_empty()
+                && candles
+                    .iter()
+                    .all(|candle| candle.open_time.timestamp_millis() >= forming_open_ms);
+            if !requires_forming && !keep_listing_forming {
+                candles.retain(|candle| candle.open_time.timestamp_millis() < forming_open_ms);
+            }
             if candles.is_empty() {
-                return true;
+                store.record_reconciliation_failure(format!(
+                    "{} {} candle fetch returned no usable rows",
+                    coin,
+                    timeframe.as_hl()
+                ));
+                tracing::warn!(coin = %coin, timeframe = timeframe.as_hl(), "candle fetch returned no usable rows");
+                return false;
             }
             let (Some(first), Some(last)) = (candles.first(), candles.last()) else {
                 return true;
@@ -355,7 +421,13 @@ async fn execute_fetch(
                 }
                 CandleIntegrity::Verified => {}
             }
-            store.provision_forming_candle_after_reconcile(&coin, timeframe, timeframe.bar_open_ms(reconciled_at_ms));
+            if requires_forming {
+                store.provision_forming_candle_after_reconcile(
+                    &coin,
+                    timeframe,
+                    timeframe.bar_open_ms(reconciled_at_ms),
+                );
+            }
             let Some(reconciled) = store.candles(&coin, timeframe) else {
                 store.record_reconciliation_failure(format!(
                     "{} {} reconciled candle buffer is missing",
@@ -376,16 +448,24 @@ async fn execute_fetch(
                 tracing::warn!(coin = %coin, timeframe = timeframe.as_hl(), "reconciled candle range is invalid");
                 return false;
             };
+            let completed_through_ms = rows.last().map(|candle| candle.open_time.timestamp_millis());
+            store.record_rest_hydration(&coin, timeframe, completed_through_ms);
+            if !requires_forming && !keep_listing_forming {
+                store.remove_unsubscribed_tail(&coin, timeframe, &config.streamed_timeframes);
+            }
             if !rows.is_empty()
                 && let Err(error) = persistence.save(&coin, timeframe, rows).await
             {
                 store.record_storage_failure(error.to_string());
                 tracing::warn!(coin = %coin, timeframe = timeframe.as_hl(), %error, "failed to persist candles");
             }
-            if store
-                .series_health(&coin, timeframe)
-                .is_current(timeframe, Utc::now().timestamp_millis())
-            {
+            let health = store.series_health(&coin, timeframe);
+            let current = if requires_forming {
+                health.is_live_current(timeframe, Utc::now().timestamp_millis())
+            } else {
+                health.is_completed_current(timeframe, Utc::now().timestamp_millis())
+            };
+            if current {
                 true
             } else {
                 store.record_reconciliation_failure(format!(
@@ -410,8 +490,8 @@ async fn execute_fetch(
     }
 }
 
-/// Average candle-fetch rate (fetches per minute) since the pass started.
-fn fetch_rate(done: usize, since: Instant) -> u32 {
+/// Average completed series-job rate per minute since the pass started.
+fn series_job_rate(done: usize, since: Instant) -> u32 {
     let secs = since.elapsed().as_secs();
     if secs == 0 {
         return 0;
@@ -432,11 +512,11 @@ mod tests {
     use storage::{CandleSeries, CandleStore, StoreError};
 
     use super::{
-        SyncConfig, candle_fetch, completed_rows_in_range, drop_bars_closed_since_fetch, persist_streamed_heads,
-        spawn_sync,
+        SyncConfig, candle_fetch, completed_rows_in_range, drop_bars_closed_since_fetch, enqueue_active_fetch,
+        next_pending_index, persist_streamed_heads, spawn_sync,
     };
     use crate::store::{ReconcileMode, STREAM_RECONCILE_WINDOW};
-    use crate::{CANDLE_WINDOW, HyperliquidRest, MarketStore};
+    use crate::{ActiveSeries, CANDLE_WINDOW, HyperliquidRest, MarketStore};
 
     struct NoopStore;
 
@@ -521,51 +601,122 @@ mod tests {
     }
 
     #[test]
-    fn rest_series_fetch_once_per_new_bar_after_the_grace_period() {
+    fn rest_series_use_verified_completed_history_until_a_new_bar_closes() {
         let config = SyncConfig::default();
         let grace_ms = i64::try_from(config.boundary_grace.as_millis()).expect("grace fits i64");
 
         for (coin, timeframe) in [("BTC", Timeframe::Day1), ("ETH", Timeframe::Week1)] {
             let store = MarketStore::new();
             store.set_candles(coin.to_owned(), timeframe, vec![candle_at(0)]);
-            let next_open = timeframe.duration_ms();
+            let first_forming_open = timeframe.duration_ms();
+            let next_forming_open = first_forming_open.saturating_mul(2);
 
-            assert!(store.current_candles(coin, timeframe, next_open).is_none());
-            assert!(candle_fetch(&store, coin.to_owned(), timeframe, &config, next_open + grace_ms - 1).is_none());
-
-            let fetch = candle_fetch(&store, coin.to_owned(), timeframe, &config, next_open + grace_ms)
-                .expect("new REST bar is due");
-            assert_eq!(fetch.limit, 2);
-            assert_eq!(fetch.mode, ReconcileMode::Merge);
-            assert_eq!(
-                candle_fetch(&store, coin.to_owned(), timeframe, &config, next_open + grace_ms),
-                Some(fetch),
-                "an unsuccessful fetch remains due",
+            assert!(store.current_candles(coin, timeframe, first_forming_open).is_none());
+            assert!(
+                candle_fetch(&store, coin.to_owned(), timeframe, &config, first_forming_open + grace_ms,).is_none()
             );
+            assert!(
+                candle_fetch(&store, coin.to_owned(), timeframe, &config, next_forming_open + grace_ms - 1,).is_none()
+            );
+
+            let fetch = candle_fetch(&store, coin.to_owned(), timeframe, &config, next_forming_open + grace_ms)
+                .expect("newly closed REST bar is due");
+            assert_eq!(fetch.limit, 3);
+            assert_eq!(fetch.mode, ReconcileMode::Merge);
 
             let health = store.series_health(coin, timeframe);
             store.reconcile_candles(
                 coin.to_owned(),
                 timeframe,
-                vec![candle_at(0), candle_at(next_open)],
+                vec![candle_at(0), candle_at(first_forming_open)],
                 ReconcileMode::Merge,
                 health.repair_epoch,
                 health.write_revision,
             );
-            assert!(candle_fetch(&store, coin.to_owned(), timeframe, &config, next_open + grace_ms + 1).is_none());
+            store.record_rest_hydration(coin, timeframe, Some(first_forming_open));
+            assert!(
+                candle_fetch(&store, coin.to_owned(), timeframe, &config, next_forming_open + grace_ms + 1,).is_none()
+            );
         }
     }
 
     #[test]
-    fn streamed_timeframes_use_rest_only_when_websocket_is_behind() {
+    fn active_rest_series_requires_a_forming_candle_for_the_chart() {
         let store = MarketStore::new();
         let config = SyncConfig::default();
-        let current_open = 10 * Timeframe::Hour1.duration_ms();
-        store.set_candles("BTC".to_owned(), Timeframe::Hour1, vec![candle_at(current_open)]);
+        let day = Timeframe::Day1.duration_ms();
+        let grace_ms = i64::try_from(config.boundary_grace.as_millis()).expect("grace fits i64");
+        store.set_candles("BTC".to_owned(), Timeframe::Day1, vec![candle_at(0)]);
+
+        assert!(candle_fetch(&store, "BTC".to_owned(), Timeframe::Day1, &config, day + grace_ms,).is_none());
+
+        store.set_active_series(Some(ActiveSeries {
+            coin: "BTC".to_owned(),
+            timeframe: Timeframe::Day1,
+        }));
+        let fetch = candle_fetch(&store, "BTC".to_owned(), Timeframe::Day1, &config, day + grace_ms)
+            .expect("active chart needs its forming candle");
+        assert_eq!(fetch.limit, 2);
+    }
+
+    #[test]
+    fn active_series_and_coin_are_prioritized_during_background_hydration() {
+        let active = ActiveSeries {
+            coin: "BTC".to_owned(),
+            timeframe: Timeframe::Day1,
+        };
+        let mut pending = vec![
+            ("ETH".to_owned(), Timeframe::Hour1),
+            ("BTC".to_owned(), Timeframe::Hour4),
+            ("BTC".to_owned(), Timeframe::Day1),
+            ("SOL".to_owned(), Timeframe::Hour1),
+        ];
+
+        let exact = next_pending_index(&pending, Some(&active));
+        assert_eq!(pending.remove(exact), ("BTC".to_owned(), Timeframe::Day1));
+        let same_coin = next_pending_index(&pending, Some(&active));
+        assert_eq!(pending.remove(same_coin), ("BTC".to_owned(), Timeframe::Hour4));
+        assert_eq!(next_pending_index(&pending, None), 0);
+    }
+
+    #[test]
+    fn newly_active_series_joins_an_existing_background_pass_once() {
+        let store = MarketStore::new();
+        let config = SyncConfig::default();
+        let day = Timeframe::Day1.duration_ms();
+        let grace_ms = i64::try_from(config.boundary_grace.as_millis()).expect("grace fits i64");
+        store.set_candles("BTC".to_owned(), Timeframe::Day1, vec![candle_at(0)]);
+        store.set_active_series(Some(ActiveSeries {
+            coin: "BTC".to_owned(),
+            timeframe: Timeframe::Day1,
+        }));
+        let mut pending = vec![("ETH".to_owned(), Timeframe::Hour1)];
+        let attempted = std::collections::HashSet::new();
+
+        assert!(enqueue_active_fetch(&mut pending, &attempted, &store, &config, day + grace_ms,));
+        assert_eq!(pending.last(), Some(&("BTC".to_owned(), Timeframe::Day1)));
+        assert!(!enqueue_active_fetch(&mut pending, &attempted, &store, &config, day + grace_ms,));
+    }
+
+    #[test]
+    fn completed_stream_history_skips_rest_until_behind_or_active() {
+        let store = MarketStore::new();
+        let config = SyncConfig::default();
+        let hour = Timeframe::Hour1.duration_ms();
+        let current_open = 10 * hour;
+        let completed = (0..10).map(|index| candle_at(index * hour)).collect();
+        store.set_candles("BTC".to_owned(), Timeframe::Hour1, completed);
         assert!(candle_fetch(&store, "BTC".to_owned(), Timeframe::Hour1, &config, current_open).is_none());
 
-        store.set_candles("BTC".to_owned(), Timeframe::Hour1, vec![candle_at(0)]);
         let grace_ms = i64::try_from(config.boundary_grace.as_millis()).expect("grace fits i64");
+        store.set_active_series(Some(ActiveSeries {
+            coin: "BTC".to_owned(),
+            timeframe: Timeframe::Hour1,
+        }));
+        assert!(candle_fetch(&store, "BTC".to_owned(), Timeframe::Hour1, &config, current_open + grace_ms,).is_some());
+
+        store.set_active_series(None);
+        store.set_candles("BTC".to_owned(), Timeframe::Hour1, vec![candle_at(0)]);
         let fetch = candle_fetch(&store, "BTC".to_owned(), Timeframe::Hour1, &config, current_open + grace_ms)
             .expect("stale streamed series needs REST fallback");
         assert_eq!(fetch.limit, 11);

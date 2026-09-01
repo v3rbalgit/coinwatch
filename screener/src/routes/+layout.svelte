@@ -13,11 +13,11 @@
     connection: "connecting",
     phase: "loading",
     universe: 0,
-    backfill_done: 0,
-    backfill_total: 0,
-    backfill_errors: 0,
+    series_done: 0,
+    series_total: 0,
+    series_errors: 0,
     streaming: 0,
-    fetch_rate: 0,
+    series_jobs_per_minute: 0,
     storage_mode: "initializing",
     storage_failures: 0,
     last_storage_error: null,
@@ -33,11 +33,7 @@
         : "bg-muted-foreground animate-pulse"
   )
   const connLabel = $derived(
-    status.connection === "live"
-      ? "Live prices"
-      : status.connection === "reconnecting"
-        ? "Reconnecting…"
-        : "Connecting…"
+    status.connection === "live" ? "Live marks" : status.connection === "reconnecting" ? "Reconnecting…" : "Connecting…"
   )
 
   const candleDegraded = $derived(candleEngineIsDegraded(status))
@@ -51,10 +47,10 @@
           ? `degraded · ${status.storage_failures}`
           : "local"
   )
-  const pct = $derived(status.backfill_total > 0 ? Math.round((status.backfill_done / status.backfill_total) * 100) : 0)
+  const pct = $derived(status.series_total > 0 ? Math.round((status.series_done / status.series_total) * 100) : 0)
   const etaMin = $derived(
-    status.backfill_total - status.backfill_done > 0 && status.fetch_rate > 0
-      ? Math.ceil((status.backfill_total - status.backfill_done) / status.fetch_rate)
+    status.series_total - status.series_done > 0 && status.series_jobs_per_minute > 0
+      ? Math.ceil((status.series_total - status.series_done) / status.series_jobs_per_minute)
       : 0
   )
 
@@ -115,24 +111,24 @@
         class="flex items-center justify-between text-muted-foreground"
         title={status.last_reconciliation_error ?? undefined}
       >
-        <span>Candles</span>
-        {#if status.phase === "backfilling"}
+        <span>History series</span>
+        {#if status.phase === "syncing_history"}
           <span class="text-foreground tabular-nums">
-            {status.backfill_done}/{status.backfill_total}{status.backfill_errors
-              ? ` · ${status.backfill_errors} failed`
+            {status.series_done}/{status.series_total}{status.series_errors
+              ? ` · ${status.series_errors} failed`
               : etaMin
                 ? ` · ~${etaMin}m`
                 : ""}
           </span>
         {:else if status.phase === "live"}
           <span class={candleDegraded ? "text-amber-500" : "text-green-500"}>
-            {candleDegraded ? `degraded · ${status.reconciliation_failures}` : "ready"}
+            {candleDegraded ? `degraded · ${status.reconciliation_failures}` : "current"}
           </span>
         {:else}
-          <span class={candleDegraded ? "text-amber-500" : ""}>{candleDegraded ? "retrying…" : "starting…"}</span>
+          <span class={candleDegraded ? "text-amber-500" : ""}>{candleDegraded ? "retrying…" : "planning…"}</span>
         {/if}
       </div>
-      {#if status.phase === "backfilling"}
+      {#if status.phase === "syncing_history"}
         <div class="h-1 w-full overflow-hidden rounded-full bg-muted">
           <div class="h-full bg-primary transition-all" style="width: {pct}%"></div>
         </div>

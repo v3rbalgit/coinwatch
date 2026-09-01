@@ -48,8 +48,12 @@ export function openOnHyperliquid(coin: string): Promise<void> {
   return invoke<void>("open_on_hyperliquid", { coin })
 }
 
-export function setActiveCoin(coin: string | null): Promise<void> {
-  return invoke<void>("set_active_coin", { coin })
+let activeSeriesQueue = Promise.resolve()
+
+export function setActiveSeries(coin: string | null, timeframe: string | null): Promise<void> {
+  const invocation = activeSeriesQueue.then(() => invoke<void>("set_active_series", { coin, timeframe }))
+  activeSeriesQueue = invocation.catch(error => console.error("failed to synchronize active chart series", error))
+  return invocation
 }
 
 export function coinCandles(coin: string, timeframe: string): Promise<CandleSnapshot> {
